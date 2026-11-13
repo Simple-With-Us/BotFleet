@@ -36,7 +36,8 @@ export interface WorkspaceVoiceDeps {
     patch:
       | { tts: { voice: string } }
       | { tts: { pronunciations: Pronunciation[] } }
-      | { tts: { audioRetentionDays: number } },
+      | { tts: { audioRetentionDays: number } }
+      | { tts: { enabled: boolean } },
   ): Promise<ConfigStatus>;
   speak(text: string, voiceId: string): void;
 }
@@ -382,6 +383,66 @@ export function AudioRetentionPicker({
       </select>
       <p className="mt-1.5 text-[12px] text-ink-secondary">{AUDIO_RETENTION_HELP}</p>
       {error && <div role="alert" className="mt-1.5 text-[12px] text-danger">{error}</div>}
+    </div>
+  );
+}
+
+export const VOICE_MASTER_HELP =
+  "Turns auto-speak, calls, and hosted speech on or off for this workspace.  Existing replies stay on screen; nothing is spoken and new calls will not start while this is off.";
+
+export function VoiceMasterSwitch({
+  tts,
+  onConfig,
+  deps = defaultWorkspaceVoiceDeps,
+}: {
+  tts?: WorkspaceTts;
+  onConfig: (config: ConfigStatus) => void;
+  deps?: WorkspaceVoiceDeps;
+}) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const enabled = tts?.enabled !== false;
+
+  async function save(next: boolean) {
+    setSaving(true);
+    setError(null);
+    try {
+      onConfig(await deps.saveConfig({ tts: { enabled: next } }));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not save the voice switch.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="mt-3 flex flex-col gap-1.5">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-[13px] font-medium text-ink">Voice</div>
+          <p className="mt-0.5 text-[12px] text-ink-secondary">{VOICE_MASTER_HELP}</p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={enabled}
+          aria-label="Voice on"
+          disabled={saving}
+          onClick={() => void save(!enabled)}
+          className={cn(
+            "relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+            enabled ? "bg-success" : "bg-raised-hover",
+          )}
+        >
+          <span
+            className={cn(
+              "absolute top-0.5 size-5 rounded-full bg-white shadow transition-transform",
+              enabled ? "translate-x-5" : "translate-x-0.5",
+            )}
+          />
+        </button>
+      </div>
+      {error && <div className="text-[12px] text-danger">{error}</div>}
     </div>
   );
 }

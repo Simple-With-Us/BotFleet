@@ -535,6 +535,7 @@ import {
 } from "./store.ts";
 import * as tts from "./tts/index.ts";
 import { speechUsageTotals } from "./tts/usage.ts";
+import { handleXaiSttRoutes, voiceIsOff, VOICE_OFF_ERROR } from "./stt/routes.ts";
 import {
   VOICE_SUMMARY_PROMPT,
   spokenReply,
@@ -19083,6 +19084,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // token and nothing else.  The policy -- which provider, why not, how
     // often -- lives in server/sts-access.ts and the minting itself in
     // shared/sts-tokens.ts, so a phone and the desktop cannot disagree.
+    if (await handleXaiSttRoutes({ method, path, req, res, cfg, json, readBody })) return;
+
     if (method === "GET" && path === "/api/sts/status") {
       // Booleans only.  Reading that a provider is set up is not reading its
       // key, which is the same line /api/config draws.
@@ -19098,6 +19101,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, 200, stsStatusBody(keys, preference));
     }
     if (method === "POST" && path === "/api/sts/token") {
+      if (voiceIsOff(cfg)) return json(res, 409, { error: VOICE_OFF_ERROR });
       // Parsed here, at the door: everything below works on a provider, not
       // on whatever a device put in the body.
       const parsed = stsTokenRequest.safeParse(await readBody(req));
@@ -20182,6 +20186,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return res.end(result.bytes ? Buffer.from(result.bytes) : undefined);
       }
       if (clipIndex !== undefined) return json(res, 405, { error: "POST the message audio route" });
+      if (voiceIsOff(cfg)) return json(res, 409, { error: VOICE_OFF_ERROR });
       if (!owner) return json(res, 404, { error: "no voice owner" });
       const body = await readBody(req);
       const result = await messageAudio.post({ threadId, messageId, owner, body, startedAt });
@@ -20214,6 +20219,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
     }
     if (method === "POST" && path === "/api/tts/speak") {
+      if (voiceIsOff(cfg)) return json(res, 409, { error: VOICE_OFF_ERROR });
       if (cfg.tts?.provider !== "system" && workspaceCredentialPending(cfg, "ttsKey")) {
         return json(res, 409, { error: "Voice synthesis is waiting for its encrypted credential" });
       }
@@ -20243,6 +20249,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // Uses the same authenticated workspace-settings boundary as key changes.
     // Never treat an arbitrary nonce as proof of ownership.
     if (method === "POST" && path === "/api/tts/voice-clone") {
+      if (voiceIsOff(cfg)) return json(res, 409, { error: VOICE_OFF_ERROR });
       // The clone clip is up to 20 MB; base64 expands it to ~27 MB.
       // Only this route accepts the larger body, after the normal host/origin gate.
       const body = await readBody(req, 28_000_000);

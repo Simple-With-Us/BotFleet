@@ -109,6 +109,7 @@ describe("configuration", () => {
     expect(described).toEqual({
       configured: true,
       ready: true,
+      enabled: true,
       voice: "English_Graceful_Lady",
       provider: "minimax",
       optimizedSummary: false,
@@ -317,6 +318,7 @@ describe("built-in macOS voices", () => {
     expect(described).toEqual({
       configured: onMac,
       ready: onMac,
+      enabled: true,
       voice: "Albert",
       provider: "system", optimizedSummary: false,
       pronunciations: SEEDED,

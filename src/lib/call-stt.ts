@@ -11,6 +11,10 @@ import {
   type AssemblyAITranscript,
   type AssemblyAITranscriptionSession,
 } from "./assemblyai-transcription";
+import {
+  startXaiTranscription,
+  type XaiTranscriptionSession,
+} from "./xai-transcription";
 
 import type { CloudSttProvider } from "../../shared/voice-providers.ts";
 
@@ -39,6 +43,8 @@ export interface STTStartOptions {
   keyterms?: readonly string[];
   /** Speech model override; assemblyai only. */
   speechModel?: string;
+  /** Language hint for xAI STT (and ignored by Apple). */
+  language?: string;
 }
 
 export interface STTSession {
@@ -242,7 +248,140 @@ export function createAssemblyAISTTSession(): STTSession {
         if (generation !== attempt) return;
         running = false;
         releaseMedia();
-        const reason = (error as Error)?.message ?? String(error);
+        const reason = error instanceof Error ? error.message : String(error);
+        emitEnd({ code: 1, reason });
+      }
+    },
+    async stop() {
+      await stopCloud("stopped");
+    },
+    async finish() {
+      await stopCloud("finished");
+    },
+    onTranscript(cb) {
+      transcriptListeners.add(cb);
+      return () => transcriptListeners.delete(cb);
+    },
+    onEnd(cb) {
+      endListeners.add(cb);
+      return () => endListeners.delete(cb);
+    },
+  };
+}
+
+/** Factory that picks an implementation by name. Throws if the requested
+ * provider has no usable bridge on this platform. */
+export function createXaiSTTSession(
+  start: typeof startXaiTranscription = startXaiTranscription,
+): STTSession {
+  if (!globalThis.navigator?.mediaDevices?.getUserMedia) {
+    throw new Error("This environment cannot capture the microphone.");
+  }
+
+  const transcriptListeners = new Set<(line: STTTranscriptLine) => void>();
+  const endListeners = new Set<(info: STTEndInfo) => void>();
+
+  let stream: MediaStream | null = null;
+  let session: XaiTranscriptionSession | null = null;
+  let running = false;
+  let generation = 0;
+  let finals: string[] = [];
+  let partial = "";
+
+  const releaseMedia = () => {
+    if (!stream) return;
+    for (const track of stream.getTracks()) track.stop();
+    stream = null;
+  };
+
+  const emitEnd = (info: STTEndInfo) => {
+    for (const cb of endListeners) cb(info);
+  };
+
+  const emitTranscript = (text: string, isPartial: boolean) => {
+    const line: STTTranscriptLine = { text, partial: isPartial };
+    for (const cb of transcriptListeners) cb(line);
+  };
+
+  const stopCloud = async (reason: string, notify = true) => {
+    if (!running) return;
+    running = false;
+    generation += 1;
+    const drainGeneration = generation;
+    const live = session;
+    session = null;
+    releaseMedia();
+    try {
+      await live?.stop();
+    } catch {
+      // best-effort; the harness session may already have closed
+    }
+    if (notify && generation === drainGeneration) emitEnd({ code: 0, reason });
+  };
+
+  return {
+    provider: "xai",
+    async start(opts) {
+      if (running) return;
+      running = true;
+      const attempt = ++generation;
+      finals = [];
+      partial = "";
+      let media: MediaStream;
+      try {
+        media = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+      } catch (error) {
+        if (generation !== attempt) return;
+        running = false;
+        const reason = error instanceof Error ? error.message : String(error);
+        emitEnd({ code: 1, reason: `Microphone unavailable: ${reason}` });
+        return;
+      }
+      if (!running || generation !== attempt) {
+        for (const track of media.getTracks()) track.stop();
+        return;
+      }
+      stream = media;
+      try {
+        const opened = await start({
+          stream,
+          onTurn: (turn) => {
+            if (generation !== attempt || !running) return;
+            if (turn.final) {
+              finals.push(turn.text);
+              partial = "";
+            } else {
+              partial = turn.text;
+            }
+            emitTranscript([...finals, partial].filter(Boolean).join(" "), !turn.final);
+          },
+          onError: (message) => {
+            if (generation !== attempt || !running) return;
+            void (async () => {
+              await stopCloud("error", false);
+              if (generation === attempt + 1) emitEnd({ code: 1, reason: message });
+            })();
+          },
+          keyterms: opts?.keyterms,
+          minTurnSilenceMs: opts?.endpointMs,
+          language: opts?.language,
+        });
+        if (!running || generation !== attempt) {
+          await opened.stop().catch(() => {});
+          return;
+        }
+        session = opened;
+      } catch (error) {
+        if (generation !== attempt) return;
+        running = false;
+        releaseMedia();
+        const reason = error instanceof Error ? error.message : String(error);
         emitEnd({ code: 1, reason });
       }
     },
@@ -268,7 +407,8 @@ export function createAssemblyAISTTSession(): STTSession {
 export function createSTTSession(provider: STTProvider): STTSession {
   if (provider === "apple") return createAppleSTTSession();
   if (provider === "assemblyai") return createAssemblyAISTTSession();
+  if (provider === "xai") return createXaiSTTSession();
   throw new Error(
-    `Cloud transcription for "${provider}" is configured but this desktop build does not ship its streaming bridge yet. Pick AssemblyAI or Apple in Transcription settings for now.`,
+    `Cloud transcription for "${provider}" is configured but this desktop build does not ship its streaming bridge yet. Pick xAI, AssemblyAI, or Apple in Transcription settings for now.`,
   );
 }

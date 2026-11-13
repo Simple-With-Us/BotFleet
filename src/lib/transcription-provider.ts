@@ -39,7 +39,7 @@ export type ProviderChoice =
   | { provider: null; reason: "no-provider"; missing: "cloud-stt-key" | "apple-bridge-unavailable" };
 
 /** Cloud providers the desktop build can stream today. */
-export const DESKTOP_STT_BRIDGE_CLOUD: readonly CloudSttProvider[] = ["assemblyai"];
+export const DESKTOP_STT_BRIDGE_CLOUD: readonly CloudSttProvider[] = ["xai", "assemblyai"];
 
 /** Legacy single-flag input used while call sites migrate. */
 export function cloudSttFromLegacy(configured: boolean): CloudSttCapabilities {
@@ -64,10 +64,9 @@ function firstBridgedCloudProvider(cap: CloudSttCapabilities, ladder: readonly C
   return null;
 }
 
-/** Decide which provider handles a call-mode dictation session. macOS
- * defaults to Apple on-device STT when no cloud key is configured and flips
- * to the first configured cloud provider when one is on file. The user's
- * explicit preference (when saved) wins over the platform default. */
+/** Decide which provider handles a call-mode dictation session. Auto prefers
+ * Apple on-device STT wherever it works, then xAI, then AssemblyAI. The
+ * user's explicit preference (when saved and usable) wins over Auto. */
 export function pickSTTProvider(input: ProviderPickerInput): ProviderChoice {
   const {
     explicitPreference,
@@ -94,17 +93,13 @@ export function pickSTTProvider(input: ProviderPickerInput): ProviderChoice {
     return { provider: "apple" };
   }
 
-  if (appleUsable && !cloudUsable) {
+  // Auto prefers on-device Apple first wherever it works: it is private and
+  // free.  Cloud providers are used when Apple is unavailable, or when the
+  // user pins one explicitly above.
+  if (appleUsable) {
     return { provider: "apple" };
   }
-  if (appleUsable && cloudUsable) {
-    const cloud = firstBridgedCloudProvider(cloudStt, ladder);
-    if (cloud) return { provider: cloud, reason: "macos-with-key" };
-    // A credential for an unbridged provider must not disable working
-    // on-device dictation.  Keep Apple until that cloud bridge ships.
-    return { provider: "apple" };
-  }
-  if (!appleUsable && cloudUsable) {
+  if (cloudUsable) {
     const cloud = firstBridgedCloudProvider(cloudStt, ladder);
     if (cloud) return { provider: cloud, reason: "platform-default" };
   }

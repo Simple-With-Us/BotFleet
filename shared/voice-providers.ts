@@ -32,9 +32,9 @@ export const DEFAULT_TTS_LADDER: readonly HostedTtsProvider[] = ["xai", "azure",
 
 /** Cloud STT attempt order when `callStt.ladder` is absent. */
 export const DEFAULT_CLOUD_STT_LADDER: readonly CloudSttProvider[] = [
-  "meta",
   "xai",
   "assemblyai",
+  "meta",
   "azure",
   "groq",
 ];
@@ -149,7 +149,7 @@ function normalizeHostedLadder(ladder: readonly string[] | undefined): HostedTts
 }
 
 function normalizeCloudLadder(ladder: readonly string[] | undefined): CloudSttProvider[] {
-  if (!ladder?.length) return [...CLOUD_STT_PROVIDERS];
+  if (!ladder?.length) return [...DEFAULT_CLOUD_STT_LADDER];
   const seen = new Set<CloudSttProvider>();
   const out: CloudSttProvider[] = [];
   for (const entry of ladder) {
@@ -158,7 +158,7 @@ function normalizeCloudLadder(ladder: readonly string[] | undefined): CloudSttPr
     seen.add(id);
     out.push(id);
   }
-  for (const id of CLOUD_STT_PROVIDERS) {
+  for (const id of DEFAULT_CLOUD_STT_LADDER) {
     if (!seen.has(id)) out.push(id);
   }
   return out;

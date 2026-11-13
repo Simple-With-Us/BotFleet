@@ -5,7 +5,7 @@ vi.mock("./assemblyai-transcription", async (importOriginal) => ({
   ...await importOriginal<typeof import("./assemblyai-transcription")>(),
   startAssemblyAITranscription: mocks.start,
 }));
-import { createAppleSTTSession, createAssemblyAISTTSession, disposeAppleSTTSession } from "./call-stt";
+import { createAppleSTTSession, createAssemblyAISTTSession, createSTTSession, createXaiSTTSession, disposeAppleSTTSession } from "./call-stt";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -121,5 +121,37 @@ describe("STT teardown", () => {
     disposeAppleSTTSession(session);
     expect(offTranscript).toHaveBeenCalledOnce();
     expect(offEnd).toHaveBeenCalledOnce();
+  });
+});
+
+describe("xAI STT lifecycle", () => {
+  it("accumulates final turns and replaces the current partial", async () => {
+    setup();
+    let onTurn: ((value: { text: string; final: boolean }) => void) | undefined;
+    const close = vi.fn().mockResolvedValue(undefined);
+    const session = createXaiSTTSession(async (opts) => {
+      onTurn = opts.onTurn;
+      return { stop: close };
+    });
+    expect(session.provider).toBe("xai");
+    const transcript = vi.fn();
+    session.onTranscript(transcript);
+    await session.start({ keyterms: ["BotFleet"], endpointMs: 850, language: "en" });
+    if (!onTurn) throw new Error("expected the xAI session to register onTurn");
+    onTurn({ text: "First sentence.", final: true });
+    onTurn({ text: "Second", final: false });
+    onTurn({ text: "Second sentence.", final: true });
+    expect(transcript.mock.calls.map(([line]) => line)).toEqual([
+      { text: "First sentence.", partial: false },
+      { text: "First sentence. Second", partial: true },
+      { text: "First sentence. Second sentence.", partial: false },
+    ]);
+    await session.stop();
+  });
+
+  it("createSTTSession wires the xAI provider", () => {
+    setup();
+    expect(createSTTSession("xai").provider).toBe("xai");
+    expect(() => createSTTSession("meta")).toThrow(/does not ship its streaming bridge/i);
   });
 });
