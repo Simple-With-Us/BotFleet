@@ -261,6 +261,10 @@ describe("harness trust boundary", () => {
       // forwarded by the companion with its own content-type.
       const upload = await raw("/api/attachments", "not-json", { "content-type": "image/png" });
       expect(upload.status).not.toBe(415);
+      const xaiAudio = await raw("/api/stt/xai/sessions/sess-test/audio", "pcm", {
+        "content-type": "application/octet-stream",
+      });
+      expect(xaiAudio.status).not.toBe(415);
       // A bodyless mutating request has no content type to check.
       const stoppable = (await api("POST", "/api/bots", { name: "Stopper" })).body.bot;
       expect((await api("POST", `/api/bots/${stoppable.id}/interrupt`, {})).status).not.toBe(415);

@@ -743,7 +743,8 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
       // A call takes the microphone, so drop the composer listener at once
       // and close its cloud socket without a final hidden draft update.
       const callStarted = Boolean(currentCall());
-      finalizing = !callStarted && session?.provider === "assemblyai";
+      const drainsFinal = session?.provider === "assemblyai" || session?.provider === "xai";
+      finalizing = !callStarted && drainsFinal;
       if (callStarted) {
         offTranscript();
         offEnd();
@@ -751,7 +752,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
       // An ordinary mic-off still drains the last formatted cloud turn.
       void (async () => {
         try {
-          if (session?.provider === "assemblyai" && !callStarted) await session.finish();
+          if (drainsFinal && !callStarted) await session.finish();
           else await session?.stop();
         } catch {
           // A provider can close during navigation; still detach listeners.

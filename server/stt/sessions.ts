@@ -19,6 +19,7 @@ interface LiveSession {
   stream: XaiSttStreamSession;
   listeners: Set<SttListener>;
   timer: NodeJS.Timeout;
+  pending: SttSessionEvent[];
 }
 
 const MAX_SESSIONS = 8;
@@ -26,6 +27,10 @@ const IDLE_MS = 8 * 60 * 1000;
 const sessions = new Map<string, LiveSession>();
 
 function emit(live: LiveSession, event: SttSessionEvent): void {
+  if (live.listeners.size === 0) {
+    live.pending.push(event);
+    return;
+  }
   for (const listener of live.listeners) {
     try { listener(event); } catch { /* one bad subscriber must not drop the rest */ }
   }
@@ -34,7 +39,7 @@ function emit(live: LiveSession, event: SttSessionEvent): void {
 function touch(live: LiveSession): void {
   clearTimeout(live.timer);
   live.timer = setTimeout(() => {
-    void drop(live.id, "idle");
+    void drop(live.id, "idle").catch(() => {});
   }, IDLE_MS);
 }
 
@@ -58,38 +63,37 @@ export async function createXaiSttSession(options: CreateXaiSessionOptions): Pro
   }
   const id = randomUUID();
   const listeners = new Set<SttListener>();
+  const early: SttSessionEvent[] = [];
+  const deliver = (event: SttSessionEvent) => {
+    const live = sessions.get(id);
+    if (live) emit(live, event);
+    else early.push(event);
+  };
   const stream = await openStreamingSession(options.apiKey, options.params, {
-    onReady: () => {
-      const live = sessions.get(id);
-      if (live) emit(live, { type: "ready" });
-    },
+    onReady: () => deliver({ type: "ready" }),
     onPartial: (text, final) => {
       const live = sessions.get(id);
-      if (live) {
-        touch(live);
-        emit(live, { type: "partial", text, final });
-      }
+      if (live) touch(live);
+      deliver({ type: "partial", text, final });
     },
     onDone: (duration) => {
-      const live = sessions.get(id);
-      if (!live) return;
-      emit(live, { type: "done", duration });
-      void drop(id, "stop");
+      deliver({ type: "done", duration });
+      void drop(id, "stop").catch(() => {});
     },
     onError: (message) => {
-      const live = sessions.get(id);
-      if (!live) return;
-      emit(live, { type: "error", message });
-      void drop(id, "stop");
+      deliver({ type: "error", message });
+      void drop(id, "stop").catch(() => {});
     },
   }, { openSocket: options.openSocket });
   const live: LiveSession = {
     id,
     stream,
     listeners,
-    timer: setTimeout(() => { void drop(id, "idle"); }, IDLE_MS),
+    pending: [],
+    timer: setTimeout(() => { void drop(id, "idle").catch(() => {}); }, IDLE_MS),
   };
   sessions.set(id, live);
+  for (const event of early) emit(live, event);
   return id;
 }
 
@@ -105,6 +109,10 @@ export function subscribeXaiSttSession(id: string, listener: SttListener): (() =
   const live = sessions.get(id);
   if (!live) return null;
   live.listeners.add(listener);
+  const queued = live.pending.splice(0);
+  for (const event of queued) {
+    try { listener(event); } catch { /* one bad subscriber must not drop the rest */ }
+  }
   return () => { live.listeners.delete(listener); };
 }
 

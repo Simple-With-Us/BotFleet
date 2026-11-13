@@ -138,11 +138,14 @@ export const XaiSttFileResultSchema = z.object({
   text: z.string().optional(),
   duration: z.number().optional(),
 });
+export type XaiSttFileResult = z.infer<typeof XaiSttFileResultSchema>;
 export const XaiSttHttpErrorSchema = z.object({
   message: z.string().optional(),
   error: z.string().optional(),
 });
 
+// Unknown xAI wire-event fields are intentionally ignored.  The vendor may
+// add fields to streaming events, and a strict schema would drop valid turns.
 export const XaiSttWireEventSchema = z.object({
   type: z.string().optional(),
   text: z.string().optional(),
@@ -163,5 +166,5 @@ export function parseXaiSttEvent(value: XaiSttWireEvent): XaiSttServerEvent | nu
 export function xaiPartialToTurn(event: XaiSttPartialEvent): { text: string; final: boolean } | null {
   const text = (event.text ?? "").trim();
   if (!text) return null;
-  return { text, final: event.speech_final === true };
+  return { text, final: event.speech_final === true || event.is_final === true };
 }

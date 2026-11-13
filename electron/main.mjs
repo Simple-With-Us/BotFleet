@@ -2485,13 +2485,20 @@ function reportStsSession(provider) {
   }).catch(() => {});
 }
 
+function desktopVoiceIsOff() {
+  // Same default-on rule as shared/voice-master.ts: absent or true means on.
+  return readConfigFile(desktopConfigPath())?.tts?.enabled === false;
+}
+
 ipcMain.handle("sts:xai-token", async () => {
+  if (desktopVoiceIsOff()) throw new Error("Voice is turned off in Settings.");
   const minted = await mintXaiRealtimeToken(xaiCredential(secureCredentials));
   reportStsSession("xai");
   return minted;
 });
 
 ipcMain.handle("sts:gemini-token", async () => {
+  if (desktopVoiceIsOff()) throw new Error("Voice is turned off in Settings.");
   const minted = await mintGeminiLiveToken(geminiCredential(secureCredentials));
   reportStsSession("gemini");
   return minted;

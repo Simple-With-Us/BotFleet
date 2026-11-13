@@ -67,6 +67,10 @@ describe("xAI STT helpers", () => {
       text: "Hel",
       final: false,
     });
+    expect(xaiPartialToTurn({ type: "transcript.partial", text: "Hello there", is_final: true })).toEqual({
+      text: "Hello there",
+      final: true,
+    });
     expect(parseXaiSttEvent({ type: "transcript.created" })).toEqual({ type: "transcript.created" });
     expect(parseXaiSttEvent({ no: "type" })).toBeNull();
   });

@@ -428,7 +428,11 @@ export function VoiceMasterSwitch({
           aria-checked={enabled}
           aria-label="Voice on"
           disabled={saving}
-          onClick={() => void save(!enabled)}
+          onClick={() => {
+            void save(!enabled).catch((caught: unknown) => {
+              console.error(caught instanceof Error ? caught.message : "Could not save the voice switch.");
+            });
+          }}
           className={cn(
             "relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50",
             enabled ? "bg-success" : "bg-raised-hover",

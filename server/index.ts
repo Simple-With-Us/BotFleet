@@ -12418,10 +12418,15 @@ function readBody(req: IncomingMessage, maxBytes = 1_000_000): Promise<any> {
 // parsed any content type, so a page anywhere could drive them.
 //
 // Bodyless mutating requests (a stop, a cancel) are exempt — there is no
-// content type to check.  The binary upload is exempt by name, because it is
-// the one route whose body is not JSON, and the phone sends its own type
+// content type to check.  Binary uploads are exempt by name or pattern,
+// because their bodies are not JSON, and the phone sends its own type
 // through `companion/src/proxy.ts`, which forwards it verbatim.
 const NON_JSON_BODY_ROUTES = new Set(["/api/attachments"]);
+const NON_JSON_BODY_ROUTE_PATTERN = /^\/api\/stt\/xai\/sessions\/[^/]+\/audio$/;
+
+function isNonJsonBodyRoute(path: string): boolean {
+  return NON_JSON_BODY_ROUTES.has(path) || NON_JSON_BODY_ROUTE_PATTERN.test(path);
+}
 
 /** The 415 a mutating request gets when it carries a body the harness will
  *  not parse.  One string for one condition: the shared gate and the per-route
@@ -13703,7 +13708,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         path !== "/api/health" && path !== "/api/update/status") {
       return json(res, 503, { error: controlShutdownPending ? "server shutdown is in progress" : "BotFleet is quiescing for an update" });
     }
-    if (mutatingApiRequest && !NON_JSON_BODY_ROUTES.has(path) && hasRequestBody(req) && !isJsonContentType(req)) {
+    if (mutatingApiRequest && !isNonJsonBodyRoute(path) && hasRequestBody(req) && !isJsonContentType(req)) {
       // the commands route names its code so a client can branch on it
       return json(res, 415, /^\/api\/bots\/[\w-]+\/commands$/.test(path)
         ? { error: UNSUPPORTED_JSON_BODY, code: "unsupported_media_type" }

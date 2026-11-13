@@ -9,6 +9,7 @@ import {
   parseXaiSttEvent,
   XaiSttWireEventSchema,
   xaiPartialToTurn,
+  type XaiSttFileResult,
   type XaiSttStreamingParams,
 } from "../../shared/xai-stt.ts";
 import { openAuthorizedWebSocket, type AuthorizedWs, type AuthorizedWsOpener } from "./authorized-ws.ts";
@@ -21,11 +22,6 @@ export interface XaiSttFileInput {
   language?: string;
   keyterms?: readonly string[];
   model?: string;
-}
-
-export interface XaiSttFileResult {
-  text: string;
-  duration?: number;
 }
 
 export interface XaiSttStreamHandlers {

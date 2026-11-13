@@ -139,4 +139,24 @@ describe("session store", () => {
     expect(events.some((event) => event.type === "partial")).toBe(true);
     expect(appendXaiSttAudio(id, new Uint8Array([1]))).toBe(false);
   });
+
+  it("delivers a buffered ready event when a subscriber joins", async () => {
+    const fake = fakeSocket();
+    const id = await createXaiSttSession({ apiKey: "sk-test", params: { language: "en" }, openSocket: fake.open });
+    const events: Array<{ type: string }> = [];
+    subscribeXaiSttSession(id, (event) => events.push(event));
+    expect(events.some((event) => event.type === "ready")).toBe(true);
+    await stopXaiSttSession(id);
+  });
+
+  it("ends the session when the socket closes without transcript.done", async () => {
+    const fake = fakeSocket();
+    const id = await createXaiSttSession({ apiKey: "sk-test", params: { language: "en" }, openSocket: fake.open });
+    const events: Array<{ type: string }> = [];
+    subscribeXaiSttSession(id, (event) => events.push(event));
+    fake.hangup();
+    await Promise.resolve();
+    expect(events.some((event) => event.type === "done")).toBe(true);
+    expect(appendXaiSttAudio(id, new Uint8Array([1]))).toBe(false);
+  });
 });

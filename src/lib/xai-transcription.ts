@@ -137,18 +137,46 @@ export async function startXaiTranscription({
     }
   });
 
+  const chunks: Uint8Array[] = [];
+  let flushTimer: ReturnType<typeof setTimeout> | null = null;
   let sending = Promise.resolve();
+
+  const flushAudio = async () => {
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+    if (!chunks.length) return;
+    const pending = chunks.splice(0);
+    const total = pending.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+    const packed = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of pending) {
+      packed.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    await io.postAudio(sessionId, packed.buffer);
+  };
+
+  const enqueueAudio = (payload: ArrayBuffer) => {
+    if (stopping || !payload.byteLength) return;
+    chunks.push(new Uint8Array(payload));
+    if (!flushTimer) {
+      flushTimer = setTimeout(() => {
+        flushTimer = null;
+        sending = sending.then(flushAudio).catch((error) => {
+          if (!stopping) onError(error instanceof Error ? error.message : String(error));
+        });
+      }, 150);
+    }
+  };
+
   let capture: XaiCaptureHandle;
   try {
-    capture = await io.attachCapture(stream, (payload) => {
-      if (stopping || !payload.byteLength) return;
-      sending = sending.then(() => io.postAudio(sessionId, payload)).catch((error) => {
-        if (!stopping) onError(error instanceof Error ? error.message : String(error));
-      });
-    }, () => !stopping);
+    capture = await io.attachCapture(stream, enqueueAudio, () => !stopping);
   } catch (error) {
-    unsubscribe();
     await io.stopSession(sessionId);
+    unsubscribe();
     throw error;
   }
 
@@ -157,9 +185,10 @@ export async function startXaiTranscription({
       if (stopping) return;
       stopping = true;
       await capture.stop().catch(() => {});
+      await flushAudio().catch(() => {});
       await sending.catch(() => {});
-      unsubscribe();
       await io.stopSession(sessionId);
+      unsubscribe();
     },
   };
 }

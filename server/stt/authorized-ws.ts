@@ -5,6 +5,12 @@ import { Buffer } from "node:buffer";
 import { randomBytes, createHash } from "node:crypto";
 import { request as httpsRequest } from "node:https";
 import { request as httpRequest, type IncomingMessage } from "node:http";
+import { z } from "zod";
+
+export const UpgradeResponseSchema = z.object({
+  statusCode: z.number().int().optional(),
+}).passthrough();
+export type UpgradeResponse = z.infer<typeof UpgradeResponseSchema>;
 
 export interface AuthorizedWs {
   sendText(text: string): void;
@@ -122,9 +128,16 @@ export const openAuthorizedWebSocket: AuthorizedWsOpener = (url, headers, handle
     };
     request.on("error", (error) => fail(error instanceof Error ? error : new Error(String(error))));
     request.on("upgrade", (response: IncomingMessage, socket, head) => {
-      if (response.statusCode !== 101) {
+      const parsedResponse = UpgradeResponseSchema.safeParse(response);
+      if (!parsedResponse.success) {
         socket.destroy();
-        fail(new Error(`WebSocket upgrade failed (HTTP ${response.statusCode ?? "unknown"}).`));
+        fail(new Error("WebSocket upgrade failed (invalid response)."));
+        return;
+      }
+      const statusCode = parsedResponse.data.statusCode;
+      if (statusCode !== 101) {
+        socket.destroy();
+        fail(new Error(`WebSocket upgrade failed (HTTP ${statusCode ?? "unknown"}).`));
         return;
       }
       const expected = acceptKey(secKey);
@@ -184,7 +197,9 @@ export const openAuthorizedWebSocket: AuthorizedWsOpener = (url, headers, handle
       handlers.onOpen?.();
     });
     request.on("response", (response) => {
-      fail(new Error(`WebSocket upgrade failed (HTTP ${response.statusCode ?? "unknown"}).`));
+      const parsedResponse = UpgradeResponseSchema.safeParse(response);
+      const statusCode = parsedResponse.success ? parsedResponse.data.statusCode : undefined;
+      fail(new Error(`WebSocket upgrade failed (HTTP ${statusCode ?? "unknown"}).`));
       response.resume();
     });
     request.end();

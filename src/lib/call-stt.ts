@@ -233,7 +233,7 @@ export function createAssemblyAISTTSession(): STTSession {
             void (async () => {
               await stopCloud("error", false);
               if (generation === attempt + 1) emitEnd({ code: 1, reason: message });
-            })();
+            })().catch(() => {});
           },
           keyterms: opts?.keyterms,
           minTurnSilenceMs: opts?.endpointMs,
@@ -306,8 +306,6 @@ export function createXaiSTTSession(
   const stopCloud = async (reason: string, notify = true) => {
     if (!running) return;
     running = false;
-    generation += 1;
-    const drainGeneration = generation;
     const live = session;
     session = null;
     releaseMedia();
@@ -316,7 +314,8 @@ export function createXaiSTTSession(
     } catch {
       // best-effort; the harness session may already have closed
     }
-    if (notify && generation === drainGeneration) emitEnd({ code: 0, reason });
+    generation += 1;
+    if (notify) emitEnd({ code: 0, reason });
   };
 
   return {
@@ -352,7 +351,9 @@ export function createXaiSTTSession(
         const opened = await start({
           stream,
           onTurn: (turn) => {
-            if (generation !== attempt || !running) return;
+            // Keep the original attempt during finish()/stop() so the last
+            // drained final can still land after running is cleared.
+            if (generation !== attempt) return;
             if (turn.final) {
               finals.push(turn.text);
               partial = "";

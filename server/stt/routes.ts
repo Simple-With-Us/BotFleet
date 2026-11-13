@@ -12,13 +12,14 @@ import {
 } from "./sessions.ts";
 
 export const VOICE_OFF_ERROR = "Voice is turned off in Settings.";
+export const INVALID_STT_SESSION_REQUEST = "invalid_stt_session_request";
 
 export function voiceIsOff(cfg: AppConfig): boolean {
   return !voiceMasterEnabled(cfg.tts);
 }
 
 export type SttJsonResponse =
-  | { error: string }
+  | { error: string; code?: string }
   | { sessionId: string }
   | { ok: true }
   | { text: string; duration?: number };
@@ -26,18 +27,18 @@ export type SttJsonResponse =
 type JsonFn = (res: ServerResponse, status: number, body: SttJsonResponse) => ServerResponse | void;
 
 const SttFileRequestSchema = z.object({
-  audioBase64: z.string(),
-  filename: z.string().optional(),
-  mime: z.string().optional(),
-  language: z.string().optional(),
-  keyterms: z.array(z.string()).optional(),
-});
+  audioBase64: z.string().max(12_000_000),
+  filename: z.string().max(255).optional(),
+  mime: z.string().max(127).optional(),
+  language: z.string().max(32).optional(),
+  keyterms: z.array(z.string().max(50)).max(100).optional(),
+}).strict();
 
 const SttSessionRequestSchema = z.object({
-  language: z.string().optional(),
-  keyterms: z.array(z.string()).optional(),
-  endpointMs: z.number().optional(),
-});
+  language: z.string().max(32).optional(),
+  keyterms: z.array(z.string().max(50)).max(100).optional(),
+  endpointMs: z.number().finite().max(60_000).optional(),
+}).strict();
 
 function readRawBytes(req: IncomingMessage, maxBytes = 1_000_000): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -99,7 +100,11 @@ export async function handleXaiSttRoutes(args: {
 
   if (method === "POST" && path === "/api/stt/xai") {
     const parsed = SttFileRequestSchema.safeParse(await readBody(req, 12_000_000));
-    if (!parsed.success || !parsed.data.audioBase64) {
+    if (!parsed.success) {
+      json(res, 400, { error: "Invalid speech-to-text file request." });
+      return true;
+    }
+    if (!parsed.data.audioBase64) {
       json(res, 400, { error: "audioBase64 required" });
       return true;
     }
@@ -128,14 +133,17 @@ export async function handleXaiSttRoutes(args: {
 
   if (method === "POST" && path === "/api/stt/xai/sessions") {
     const parsed = SttSessionRequestSchema.safeParse(await readBody(req));
-    const body = parsed.success ? parsed.data : {};
+    if (!parsed.success) {
+      json(res, 400, { error: "Invalid speech-to-text session request.", code: INVALID_STT_SESSION_REQUEST });
+      return true;
+    }
     try {
       const id = await createXaiSttSession({
         apiKey,
         params: {
-          language: body.language,
-          keyterms: body.keyterms,
-          endpointingMs: body.endpointMs,
+          language: parsed.data.language,
+          keyterms: parsed.data.keyterms,
+          endpointingMs: parsed.data.endpointMs,
         },
       });
       json(res, 200, { sessionId: id });
