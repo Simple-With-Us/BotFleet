@@ -333,10 +333,13 @@ export function computeRoomAttentionIndex(
  * room's unread is its own chat.  Errors still overlap (a dead bot is dead
  * in every room it belongs to), so the totals here count each bot once per
  * state, matched by `botId`, and each unread room chat once.  The `rooms*`
- * fields stay per room: how many rooms are affected.
+ * fields stay per room: how many rooms are affected.  Callers pass the
+ * fleet bots so a wait or turn that owns no room (a 1:1, or one the server
+ * never attributed) still counts once in the totals.
  */
 export function summarizeFleetAttention(
   attentionList: readonly RoomAttention[],
+  bots?: readonly MinimalBot[],
 ): AttentionSummaryRollup {
   let roomsWithErrors = 0;
   let roomsNeedingAction = 0;
@@ -359,6 +362,16 @@ export function summarizeFleetAttention(
     for (const bot of item.needsAction.bots) needsActionBotIds.add(bot.botId);
     for (const bot of item.working.bots) workingBotIds.add(bot.botId);
     for (const bot of item.unread.bots) unreadBotIds.add(bot.botId);
+  }
+
+  // Room attribution drives the room badges, but a wait or turn on a
+  // thread no room owns (a 1:1, or one the server never attributed) lands
+  // in no room list.  The fleet totals are distinct bots in the state
+  // anywhere in the fleet, so union the direct activity states in.
+  for (const bot of bots ?? []) {
+    if (bot.hidden) continue;
+    if (bot.activity === "waiting-on-you") needsActionBotIds.add(bot.id);
+    if (bot.activity === "working") workingBotIds.add(bot.id);
   }
 
   return {

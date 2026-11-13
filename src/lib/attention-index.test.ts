@@ -455,8 +455,10 @@ describe("summarizeFleetAttention", () => {
     const rooms = computeRoomAttentionIndex(groups, bots);
     expect(rooms.map((r) => r.working.count)).toEqual([0, 0]);
 
-    const summary = summarizeFleetAttention(rooms);
-    expect(summary.totalWorking).toBe(0);
+    // No room claims the turn, but the fleet total still counts the bot:
+    // the pills report distinct bots in the state anywhere in the fleet.
+    const summary = summarizeFleetAttention(rooms, bots);
+    expect(summary.totalWorking).toBe(1);
     expect(summary.roomsWorking).toBe(0);
   });
 
@@ -532,6 +534,8 @@ describe("summarizeFleetAttention", () => {
     for (const bots of [waitingNowhere, waitingUnattributed]) {
       const rooms = computeRoomAttentionIndex(groups, bots);
       expect(rooms.map((r) => r.needsAction.count)).toEqual([0, 0]);
+      // The fleet pill still counts the waiting bot once.
+      expect(summarizeFleetAttention(rooms, bots).totalNeedsAction).toBe(1);
     }
 
     const turningNowhere: MinimalBot[] = [
@@ -545,6 +549,7 @@ describe("summarizeFleetAttention", () => {
     ];
     const rooms = computeRoomAttentionIndex(groups, turningNowhere);
     expect(rooms.map((r) => r.working.count)).toEqual([0, 0]);
+    expect(summarizeFleetAttention(rooms, turningNowhere).totalWorking).toBe(1);
   });
 
   it("attributes a wait on a room task thread to that room", () => {
