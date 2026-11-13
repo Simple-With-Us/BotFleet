@@ -29,10 +29,6 @@ const ANTIGRAVITY_FLASH_BY_TIER: Record<string, string> = {
   low: "gemini-3.8-flash-low",
 };
 
-const LEGACY_ANTIGRAVITY_PRO_FLASH = new Map<string, string>([
-  ["gemini-2.5-pro", "gemini-2.5-flash"],
-]);
-
 const LEGACY_ANTIGRAVITY_PRO_IDS = new Set([
   "gemini-3.1-pro-high",
   "gemini-3.1-pro-low",
@@ -45,8 +41,6 @@ function antigravityFlashModel(model: string): string {
   // (any id outside the catalog, even one containing "-pro") stays as-is.
   const isCatalog = STATIC_ANTIGRAVITY_MODELS.options.some((option) => option.id === model);
   if (!isCatalog && !LEGACY_ANTIGRAVITY_PRO_IDS.has(model)) return model;
-  const legacyFlash = LEGACY_ANTIGRAVITY_PRO_FLASH.get(model);
-  if (legacyFlash) return legacyFlash;
   const candidate = model.replace("-pro", "-flash");
   if (candidate === model) return model;
   if (STATIC_ANTIGRAVITY_MODELS.options.some((option) => option.id === candidate)) {

@@ -15,6 +15,7 @@ import {
   remainingPercentDisplay,
 } from "./antigravity-quota.ts";
 import { QuotaCooldownRegistry } from "./model-fallback.ts";
+import { antigravityQuotaCatalogId } from "./antigravity-models.ts";
 
 // QuotaCooldownRegistry.get drops cooldowns whose resetsAt is already past
 // Date.now().  Hardcoded 2026-09-05T03:58:25Z started failing every PR once
@@ -391,5 +392,18 @@ describe("findAntigravityUsageBin", () => {
     expect(overlay["claude-sonnet-4-6"]?.windowsLabel).toBe("5hr");
     expect(overlay["gemini-3.1-pro-high"]?.secondaryRemainingPercent).toBe(1);
     expect(overlay["gemini-3.1-pro-high"]?.windowsLabel).toBe("5hr/Week");
+  });
+});
+
+describe("antigravityQuotaCatalogId legacy aliases", () => {
+  it("resolves a retired id to itself so its cooldown is still tracked", () => {
+    expect(antigravityQuotaCatalogId({ modelId: "gemini-2.5-flash", label: "Gemini 2.5 Flash" })).toBe("gemini-2.5-flash");
+    expect(antigravityQuotaCatalogId({ modelId: "gemini-3.6-flash-low", label: "Gemini 3.6 Flash (Low)" })).toBe("gemini-3.6-flash-low");
+  });
+  it("keeps opaque upstream ids unresolved", () => {
+    expect(antigravityQuotaCatalogId({ modelId: "uploads/opaque-123", label: "?" })).toBeUndefined();
+  });
+  it("still resolves active catalog ids", () => {
+    expect(antigravityQuotaCatalogId({ modelId: "gemini-3.8-flash-low", label: "Gemini 3.8 Flash (Low)" })).toBe("gemini-3.8-flash-low");
   });
 });
