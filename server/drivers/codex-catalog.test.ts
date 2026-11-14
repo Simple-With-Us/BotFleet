@@ -224,11 +224,11 @@ model = "gpt-5.4"
 
   it("preserves profile models when the main provider defaults to OpenAI", async () => {
     const home = scratchHome({
-      "config.toml": 'model = "gpt-5.6-sol"\n',
+      "config.toml": 'model = "gpt-6.1-sol"\n',
       "legacy.config.toml": 'model = "gpt-5.4"\n',
     });
     const catalog = await readCodexModelCatalog({ HOME: home });
-    expect(catalog.default).toBe("gpt-5.6-sol");
+    expect(catalog.default).toBe("gpt-6.1-sol");
     expect(catalog.options).toContainEqual({
       id: encodeCodexSelection("openai", "gpt-5.4"),
       label: "gpt-5.4",
