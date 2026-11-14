@@ -84,8 +84,8 @@ export function FleetMatrixView({
   }, [attentionList]);
 
   const fleetSummary = useMemo(
-    () => summarizeFleetAttention(attentionList),
-    [attentionList],
+    () => summarizeFleetAttention(attentionList, activeBots),
+    [attentionList, activeBots],
   );
 
   const cwdBasename = (cwd?: string | null) => {

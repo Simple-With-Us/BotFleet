@@ -73,8 +73,8 @@ export function AppDeck({
   }, [attentionList]);
 
   const fleetSummary = useMemo(
-    () => summarizeFleetAttention(attentionList),
-    [attentionList],
+    () => summarizeFleetAttention(attentionList, state.bots),
+    [attentionList, state.bots],
   );
 
   const activeGroup = useMemo(

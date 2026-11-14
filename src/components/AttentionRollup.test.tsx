@@ -45,15 +45,17 @@ function room(id: string, name: string, memberIds: string[]): Group {
   };
 }
 
-/** One bot in each state the pills count, all members of all three rooms. */
+/** One bot in each state the pills count, all members of all three rooms.
+ * The wait and the turn both belong to room-a's thread, so only room-a's
+ * chip claims them; the fleet pills still count each bot once. */
 function sharedBotsState(): AppState {
   const memberIds = ["bot-dead", "bot-waiting", "bot-working", "bot-reader"];
   return {
     ...initialState,
     bots: [
       bot("bot-dead", "Crashy", "dead"),
-      bot("bot-waiting", "Approver", "waiting-on-you"),
-      bot("bot-working", "Builder", "working"),
+      { ...bot("bot-waiting", "Approver", "waiting-on-you"), waitingThreadId: "room-a-thread" },
+      { ...bot("bot-working", "Builder", "working"), inflightThreadId: "room-a-thread" },
       bot("bot-reader", "Reader", "idle", true),
     ],
     groups: [
@@ -114,7 +116,8 @@ describe("fleet rollup counts each bot once", () => {
     expect(rollup(/title="(\d+) bots? working"/)).toBe("1");
     expect(rollup(/title="(\d+) unread updates"/)).toBe("1");
 
-    // The per-app chips are per room and still show the shared bot in each one.
-    expect(html.split('title="Working: Builder"').length - 1).toBe(3);
+    // The per-app chips are per room: only the room that owns the turn
+    // thread shows the shared bot as working.
+    expect(html.split('title="Working: Builder"').length - 1).toBe(1);
   });
 });

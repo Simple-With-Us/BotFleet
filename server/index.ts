@@ -5721,7 +5721,7 @@ bus.subscribe((event: RuntimeEvent) => {
             unattended: unattended || undefined,
           });
           if (buzz) {
-            if (asker.busy) store.setActivity(asker.id, "waiting-on-you");
+            if (asker.busy) store.setWaiting(asker.id, event.threadId);
             notify(
               buildNotification("approval", asker, event.threadId, summary, {
                 requestId,
@@ -5938,7 +5938,7 @@ bus.subscribe((event: RuntimeEvent) => {
         const card = store.messagesFor(event.threadId).find((candidate) => candidate.id === message.id)?.card;
         if (!card || card.answered) return;
         // the bot is not working now — it is waiting on a person
-        if (asker.busy) store.setActivity(asker.id, "waiting-on-you");
+        if (asker.busy) store.setWaiting(asker.id, event.threadId);
         // The request id travels with the frame so a phone can answer THIS
         // card from a lock screen rather than looking for whatever is
         // pending on the thread — which is the wrong card as soon as two

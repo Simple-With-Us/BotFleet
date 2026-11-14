@@ -6,19 +6,26 @@
  *
  * Note on Scope:
  * Each bot currently has a single global activity state (server/store.ts).
- * This module computes a per-room AGGREGATION of bot-global states for
- * bots explicitly assigned to each room via `group.memberIds`.
- * Per-(bot, room) activity tracking remains a planned future enhancement (#815).
+ * This module attributes that state to rooms through threads, for bots
+ * explicitly assigned to each room via `group.memberIds`. A wait counts in
+ * the room that owns the thread holding the open card
+ * (`bot.waitingThreadId`, set alongside the activity); a turn counts in the
+ * room that owns the provider process (`group.busyBotId`) or the live turn
+ * thread. Full per-(bot, room) activity tracking remains a planned future
+ * enhancement (#815).
  *
  * Invariants:
  * - Room membership is strictly determined by explicit `group.memberIds`.
  * - Do not infer membership from mutable section labels, names, or cwd similarity.
+ * - A badge on a room means something is happening IN that room. Global
+ *   state with no thread in the room counts nowhere at room altitude.
  *
  * Four distinct, un-summed badges per room:
  * - Errors:       durable failures and dead bots.
- * - Needs Action: waiting-on-you (permissions / questions open).
- * - Working:      turns currently in flight.
- * - Unread:       unread room and member responses.
+ * - Needs Action: waiting-on-you on a thread this room owns.
+ * - Working:      a turn this room owns (provider process or live thread).
+ * - Unread:       the room chat only. Member 1:1 unread feeds the fleet
+ *   rollup, never a room count.
  *
  * Fleet rollup (`summarizeFleetAttention`):
  * Because a bot's state is global, a bot that belongs to N rooms is listed by
@@ -52,13 +59,14 @@ export interface RoomAttention {
     bots: AttentionParticipant[];
   };
   unread: {
-    /** Room chat (when unread) plus each unread member bot.  Per room. */
+    /** The room chat only: 1 when `roomUnread`, else 0.  Member 1:1 unread
+     * never inflates a room count. */
     count: number;
     hasUnread: boolean;
     /** The room chat's own unread flag (`group.unread`). */
     roomUnread: boolean;
-    /** Member bots whose own 1:1 thread is unread.  That flag belongs to the
-     * bot, so every room the bot is in lists it. */
+    /** Member bots whose own 1:1 thread is unread.  Listed for the fleet
+     * rollup (each unread bot counts once there), not for the room. */
     bots: AttentionParticipant[];
   };
 }
@@ -101,6 +109,15 @@ export interface MinimalBot {
   /** Leaf of the visible branch.  Absent falls back to the flat list. */
   activeLeafId?: string | null;
   messages?: readonly AttentionMessage[];
+  /** The bot's own 1:1 thread.  Never a room thread. */
+  threadId?: string | null;
+  /** The turn currently dispatched, if any.  A room turn points at the
+   * room's thread; a 1:1 turn points at the bot's own thread. */
+  inflightThreadId?: string | null;
+  /** The thread holding the bot's open approval or question while activity
+   * is waiting-on-you.  Set alongside the activity by the server; a wait
+   * with no thread belongs to no room. */
+  waitingThreadId?: string | null;
 }
 
 /** One id index per messages-array identity.  Rooms that share a bot, and
@@ -156,10 +173,24 @@ export interface MinimalGroup {
   dm?: boolean;
   busyBotId?: string | null;
   cwd?: string | null;
+  /** The room's shared thread.  A wait or turn on this thread (or one of
+   * the task threads) is what puts a badge on THIS room. */
+  threadId: string;
+  /** The room's independent conversations (DMs omit the collection). */
+  tasks?: readonly { threadId: string }[];
 }
 
 /**
  * Computes per-room attention state for all non-DM groups across the fleet.
+ *
+ * A bot's activity is global, but a badge on a room must mean something is
+ * happening IN that room. Waiting and working are therefore attributed
+ * through threads: the wait counts only in the room that owns the thread
+ * holding the open approval or question, and a turn counts only in the
+ * room that owns the provider process (busyBotId) or the live turn thread.
+ * A 1:1 wait or turn belongs to no room, so no room chip claims it — the
+ * bot's own thread and status still show it. Unread on a room is the room
+ * chat only; member bots' 1:1 unread feeds the fleet rollup, not rooms.
  */
 export function computeRoomAttentionIndex(
   groups: readonly MinimalGroup[],
@@ -167,9 +198,28 @@ export function computeRoomAttentionIndex(
 ): RoomAttention[] {
   const activeBots = bots.filter((b) => !b.hidden);
   const botMap = new Map(activeBots.map((b) => [b.id, b]));
+  const rooms = groups.filter((g) => !g.dm);
 
-  return groups
-    .filter((g) => !g.dm)
+  // Thread -> room, mirroring the server's groupByThread: a room owns its
+  // shared thread plus each task thread. A thread that maps nowhere (a
+  // bot's 1:1 thread, a DM thread) belongs to no room.
+  const threadRoom = new Map<string, string>();
+  for (const room of rooms) {
+    threadRoom.set(room.threadId, room.id);
+    for (const task of room.tasks ?? []) threadRoom.set(task.threadId, room.id);
+  }
+  const roomOfThread = (threadId?: string | null): string | undefined =>
+    threadId ? threadRoom.get(threadId) : undefined;
+
+  // busyBotId names the speaker that owns the provider process in a room.
+  // A bot it names anywhere is claimed: no other room may count that bot
+  // as working through the global activity.
+  const claimedByRoom = new Map<string, string>();
+  for (const room of rooms) {
+    if (room.busyBotId) claimedByRoom.set(room.busyBotId, room.id);
+  }
+
+  return rooms
     .map((group) => {
       // Membership invariant: Strictly use explicit memberIds.
       // Mutable section labels and cwd similarity must never infer membership.
@@ -203,9 +253,12 @@ export function computeRoomAttentionIndex(
         });
       }
 
-      // 2. Needs Action: waiting-on-you (prompts, permissions, confirmation)
+      // 2. Needs Action: waiting-on-you, in the room that owns the thread
+      // holding the open card. A wait with no attributed thread (or one
+      // outside every room) counts nowhere: it is real, but it is not
+      // waiting in this room.
       const needsActionBots: AttentionParticipant[] = assignedBots
-        .filter((b) => b.activity === "waiting-on-you")
+        .filter((b) => b.activity === "waiting-on-you" && roomOfThread(b.waitingThreadId) === group.id)
         .map((b) => ({
           botId: b.id,
           botName: b.name,
@@ -213,9 +266,16 @@ export function computeRoomAttentionIndex(
           reason: "Awaiting permission or response",
         }));
 
-      // 3. Working: turns currently in-flight
+      // 3. Working: the room that owns the provider process, else the room
+      // that owns the live turn thread. A 1:1 turn touches no room.
       const workingBots: AttentionParticipant[] = assignedBots
-        .filter((b) => b.activity === "working" || group.busyBotId === b.id)
+        .filter((b) => {
+          if (group.busyBotId === b.id) return true;
+          if (b.activity !== "working") return false;
+          if (claimedByRoom.has(b.id)) return false;
+          const liveThread = b.inflightThreadId ?? b.threadId ?? undefined;
+          return roomOfThread(liveThread) === group.id;
+        })
         .map((b) => ({
           botId: b.id,
           botName: b.name,
@@ -223,7 +283,9 @@ export function computeRoomAttentionIndex(
           reason: "Turn in flight",
         }));
 
-      // 4. Unread: room unread state plus assigned bot unread flags
+      // 4. Unread: the room chat only. Member bots' 1:1 unread is still
+      // listed (the fleet rollup counts each unread bot once) but it no
+      // longer inflates rooms whose own chat has nothing unread.
       const unreadBots: AttentionParticipant[] = assignedBots
         .filter((b) => b.unread)
         .map((b) => ({
@@ -232,7 +294,7 @@ export function computeRoomAttentionIndex(
           avatarUrl: b.avatarUrl,
         }));
       const roomUnread = Boolean(group.unread);
-      const unreadCount = (roomUnread ? 1 : 0) + unreadBots.length;
+      const unreadCount = roomUnread ? 1 : 0;
       const hasUnread = unreadCount > 0;
 
       return {
@@ -266,16 +328,18 @@ export function computeRoomAttentionIndex(
 /**
  * Summarizes fleet-wide room attention numbers for higher-level rollups and badges.
  *
- * A bot has one global activity and one unread flag, and every room it belongs
- * to copies them, so the room counts overlap.  Summing them multiplied one
- * working bot by its room count.  The totals here count each bot once per
- * state, matched by `botId` (a bot that is working through `busyBotId` in one
- * room and through its global activity in another is still one), and each
- * unread room chat once.  The `rooms*` fields stay per room: how many rooms
- * are affected.
+ * Room counts no longer overlap for waits, turns, or unread: each wait and
+ * each turn is attributed to at most one room through its thread, and each
+ * room's unread is its own chat.  Errors still overlap (a dead bot is dead
+ * in every room it belongs to), so the totals here count each bot once per
+ * state, matched by `botId`, and each unread room chat once.  The `rooms*`
+ * fields stay per room: how many rooms are affected.  Callers pass the
+ * fleet bots so a wait, turn, or failure that owns no room (a 1:1, or one
+ * the server never attributed) still counts once in the totals.
  */
 export function summarizeFleetAttention(
   attentionList: readonly RoomAttention[],
+  bots?: readonly MinimalBot[],
 ): AttentionSummaryRollup {
   let roomsWithErrors = 0;
   let roomsNeedingAction = 0;
@@ -298,6 +362,32 @@ export function summarizeFleetAttention(
     for (const bot of item.needsAction.bots) needsActionBotIds.add(bot.botId);
     for (const bot of item.working.bots) workingBotIds.add(bot.botId);
     for (const bot of item.unread.bots) unreadBotIds.add(bot.botId);
+  }
+
+  // Room attribution drives the room badges, but a wait or turn on a
+  // thread no room owns (a 1:1, or one the server never attributed) lands
+  // in no room list.  The fleet totals are distinct bots in the state
+  // anywhere in the fleet, so union the direct activity states in.
+  for (const bot of bots ?? []) {
+    if (bot.hidden) continue;
+    // Errors: mirror the room predicate so a dead or failed bot that owns
+    // no room still counts once in the fleet total.
+    if (
+      bot.activity === "dead" ||
+      bot.hasError ||
+      messageIsTurnError(visibleAttentionTail(bot.messages, bot.activeLeafId))
+    ) {
+      errorBotIds.add(bot.id);
+    }
+    // A room may already count the bot as working through busyBotId while
+    // its raw activity is a wait (or vice versa through a stale wait
+    // thread): each bot counts once per pill.
+    if (bot.activity === "waiting-on-you" && !workingBotIds.has(bot.id)) {
+      needsActionBotIds.add(bot.id);
+    }
+    if (bot.activity === "working" && !needsActionBotIds.has(bot.id)) {
+      workingBotIds.add(bot.id);
+    }
   }
 
   return {
