@@ -8,13 +8,13 @@ describe("evaluateModelRiskForBypass", () => {
       "claude-3-5-haiku-20241022",
       "gpt-4o-mini",
       "o1-mini",
-      "o3-mini",
+      "gemini-3.8-flash-low",
       "gemini-1.5-flash",
       "gemini-2.0-flash-lite",
       "qwen-2.5-7b",
       "llama-3.1-8b-instruct",
       "deepseek-flash",
-      "gpt-3.5-turbo",
+      "claude-haiku-4-5",
       "claude-instant-1.2",
     ];
 
@@ -28,13 +28,20 @@ describe("evaluateModelRiskForBypass", () => {
     }
   });
 
+  it("keeps the shipped gpt-3.5 high-risk pattern covered", () => {
+    // The gpt-3.5 entry still lives in HIGH_RISK_PATTERNS; keep one fixture on it while it does.
+    const evaluation = evaluateModelRiskForBypass("gpt-3.5-turbo");
+    expect(evaluation.isDangerous).toBe(true);
+    expect(evaluation.tier).toBe("high_risk");
+  });
+
   it("identifies frontier reasoning models as safe from high-risk warning", () => {
     const frontier = [
       "claude-3-5-sonnet-20241022",
       "claude-3-7-sonnet",
       "claude-3-opus-20240229",
       "gpt-4o",
-      "o1",
+      "claude-sonnet-5-5",
       "o3",
       "deepseek-chat",
       "deepseek-r1",
