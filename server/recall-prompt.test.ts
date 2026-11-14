@@ -36,6 +36,10 @@ describe("recallPromptFor", () => {
     expect(prompt).toContain("before substantive action or reply, including continuations and mechanical tasks");
     expect(prompt).toContain("A turn starts with new user/task input or an automatic continuation/wake");
     expect(prompt).toContain("tool results and substeps within that same turn do not restart this requirement");
+    expect(prompt).toContain("Before any search, scan the exact query");
+    expect(prompt).toContain("credential scan/redaction gate before transmission");
+    expect(prompt).toContain("refuse the search and report only the affected field, refusal code and identifier");
+    expect(prompt.indexOf("Before any search, scan the exact query")).toBeLessThan(prompt.indexOf("Treat a hit"));
     expect(prompt).toContain("At the end of every turn");
     expect(prompt).toContain("For an appropriate lesson, search for duplicates");
     expect(prompt).toContain("If no durable, nonduplicate lesson is appropriate, add nothing");
