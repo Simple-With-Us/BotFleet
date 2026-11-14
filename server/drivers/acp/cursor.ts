@@ -119,7 +119,6 @@ export const STATIC_CURSOR_MODELS: ModelCatalog = {
     { id: "claude-sonnet-5-thinking-high", label: "Claude Sonnet 5 1M Thinking" },
     { id: "grok-4.7-high", label: "Grok 4.7 High" },
     { id: "gpt-5.6-luna-high", label: "GPT-5.6 Luna 1M High" },
-    { id: "gpt-5.3-codex", label: "Codex 5.3" },
   ],
 };
 
