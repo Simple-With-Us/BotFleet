@@ -82,6 +82,7 @@ import { fileURLToPath } from "node:url";
 import { backup, DatabaseSync } from "node:sqlite";
 import { redactSecrets, redactSecretsInText } from "../shared/redact.ts";
 import { EvidenceBundleSchema } from "./decommission-evidence-bundle.mjs";
+import { z } from "zod";
 
 /** The marker every archive manifest this script writes carries. */
 export const ARCHIVE_MARKER = "botfleet-node-store-archive";
@@ -1023,6 +1024,34 @@ const IMPORT_PARITY_COUNT_PAIRS = [
 ];
 
 /**
+ * The import parity report, as the receipt reads it.
+ *
+ * The report is external data, so it is decoded at the boundary rather than
+ * narrowed as it is used:  a field the verdict is computed from that is
+ * missing or the wrong shape fails the decode, and a report that does not
+ * decode does not hold.  The two flags are part of the contract, because the
+ * report's own summary is one of the things the verdict checks.
+ */
+const importParityCount = z.number().int().nonnegative();
+const ImportParityReportSchema = z.looseObject({
+  ...Object.fromEntries(
+    IMPORT_PARITY_COUNT_PAIRS.flatMap(([, source, target]) => [
+      [source, importParityCount],
+      [target, importParityCount],
+    ]),
+  ),
+  orphanedMessageCount: importParityCount,
+  perThreadMessageCountsMatch: z.boolean(),
+  sourceBodyDigestSHA256: z.string().min(1),
+  targetBodyDigestSHA256: z.string().min(1),
+  mismatches: z.array(z.string()),
+  warnings: z.array(z.string()),
+  sourceMessageMetadataDroppedCount: importParityCount.optional(),
+  isParityVerified: z.boolean(),
+  isFullyVerified: z.boolean(),
+});
+
+/**
  * The import parity verdict, computed out of the report's own details.
  *
  * The importer's report carries its verdict as two booleans, and the receipt
@@ -1048,103 +1077,53 @@ const IMPORT_PARITY_COUNT_PAIRS = [
  * rather than only that something did.
  */
 export function importParityVerdict(report) {
+  const parsed = ImportParityReportSchema.safeParse(report);
+  if (!parsed.success) {
+    const problems = parsed.error.issues.map(
+      (issue) => `${issue.path.join(".") || "report"}: ${issue.message}`,
+    );
+    return { isParityVerified: false, isFullyVerified: false, problems };
+  }
+  const data = parsed.data;
   const problems = [];
-  if (!report || typeof report !== "object" || Array.isArray(report)) {
-    return { isParityVerified: false, isFullyVerified: false, problems: ["the parity report is not a JSON object"] };
-  }
 
-  // A field the verdict is computed from is either there and readable or the
-  // report does not hold, so every reader below marks the report incomplete
-  // when the field is missing or the wrong shape.
-  let complete = true;
-  const counts = new Map();
-  const readCount = (field) => {
-    const value = report[field];
-    if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
-      complete = false;
-      problems.push(`the report does not carry a whole, non-negative count for "${field}"`);
-      return undefined;
-    }
-    counts.set(field, value);
-    return value;
-  };
-  const readBoolean = (field) => {
-    const value = report[field];
-    if (typeof value !== "boolean") {
-      complete = false;
-      problems.push(`the report does not carry a boolean for "${field}"`);
-      return undefined;
-    }
-    return value;
-  };
-  const readDigest = (field) => {
-    const value = report[field];
-    if (typeof value !== "string" || value.length === 0) {
-      complete = false;
-      problems.push(`the report does not carry a body digest for "${field}"`);
-      return undefined;
-    }
-    return value;
-  };
-  const readStrings = (field) => {
-    const value = report[field];
-    if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
-      complete = false;
-      problems.push(`the report does not carry a list of strings for "${field}"`);
-      return undefined;
-    }
-    return value;
-  };
-
-  for (const [, source, target] of IMPORT_PARITY_COUNT_PAIRS) {
-    readCount(source);
-    readCount(target);
-  }
-  const orphaned = readCount("orphanedMessageCount");
-  const perThreadMatch = readBoolean("perThreadMessageCountsMatch");
-  const sourceDigest = readDigest("sourceBodyDigestSHA256");
-  const targetDigest = readDigest("targetBodyDigestSHA256");
-  const mismatches = readStrings("mismatches");
-  const warnings = readStrings("warnings");
-
-  // The verdict itself, the way the Swift side computes it.  A report that
-  // does not carry the fields the verdict is computed from does not hold.
-  let parityHolds = complete;
+  // The verdict itself, the way the Swift side computes it.
+  let parityHolds = true;
   for (const [name, source, target] of IMPORT_PARITY_COUNT_PAIRS) {
-    if (counts.get(source) !== counts.get(target)) {
+    if (data[source] !== data[target]) {
       parityHolds = false;
-      problems.push(`the ${name} counts do not match: ${source} is ${counts.get(source)} and ${target} is ${counts.get(target)}`);
+      problems.push(`the ${name} counts do not match: ${source} is ${data[source]} and ${target} is ${data[target]}`);
     }
   }
-  if (perThreadMatch !== true) {
+  if (!data.perThreadMessageCountsMatch) {
     parityHolds = false;
     problems.push("the per-thread message counts do not match");
   }
-  if (orphaned !== undefined && orphaned !== 0) {
+  if (data.orphanedMessageCount !== 0) {
     parityHolds = false;
-    problems.push(`the report names ${orphaned} orphaned message(s)`);
+    problems.push(`the report names ${data.orphanedMessageCount} orphaned message(s)`);
   }
-  if (sourceDigest !== undefined && targetDigest !== undefined && sourceDigest !== targetDigest) {
+  if (data.sourceBodyDigestSHA256 !== data.targetBodyDigestSHA256) {
     parityHolds = false;
     problems.push("the source and target body digests differ");
   }
-  if (mismatches !== undefined && mismatches.length > 0) {
+  if (data.mismatches.length > 0) {
     parityHolds = false;
-    problems.push(`the report names ${mismatches.length} mismatch(es)`);
+    problems.push(`the report names ${data.mismatches.length} mismatch(es)`);
   }
 
   // A warning is a known gap:  the migration carried every byte it could and
   // named what it could not, so a report with a warning is parity-verified
   // but not fully verified.
-  let fullyHolds = parityHolds && warnings !== undefined && warnings.length === 0;
-  if (warnings !== undefined && warnings.length > 0) {
-    problems.push(`the report names ${warnings.length} warning(s), so it is not fully verified`);
+  let fullyHolds = parityHolds && data.warnings.length === 0;
+  if (data.warnings.length > 0) {
+    problems.push(`the report names ${data.warnings.length} warning(s), so it is not fully verified`);
   }
 
   // Metadata the importer could not preserve is a warning, so a report that
   // dropped metadata and named no warning contradicts itself.
-  const dropped = report.sourceMessageMetadataDroppedCount;
-  if (typeof dropped === "number" && Number.isInteger(dropped) && dropped > 0 && warnings !== undefined && warnings.length === 0) {
+  const dropped = data.sourceMessageMetadataDroppedCount;
+  if (dropped !== undefined && dropped > 0 && data.warnings.length === 0) {
     fullyHolds = false;
     problems.push(`the report names ${dropped} dropped message(s) but no warning`);
   }
@@ -1152,20 +1131,18 @@ export function importParityVerdict(report) {
   // The report's own flags have to agree with the details they summarize,
   // and with each other:  a report that is fully verified is parity
   // verified, so the two flags cannot disagree in that direction.
-  const declaredParity = readBoolean("isParityVerified");
-  const declaredFully = readBoolean("isFullyVerified");
-  if (declaredParity !== undefined && declaredParity !== parityHolds) {
-    problems.push(`the report says isParityVerified is ${declaredParity} and its details say ${parityHolds}`);
+  if (data.isParityVerified !== parityHolds) {
+    problems.push(`the report says isParityVerified is ${data.isParityVerified} and its details say ${parityHolds}`);
   }
-  if (declaredFully !== undefined && declaredFully !== fullyHolds) {
-    problems.push(`the report says isFullyVerified is ${declaredFully} and its details say ${fullyHolds}`);
+  if (data.isFullyVerified !== fullyHolds) {
+    problems.push(`the report says isFullyVerified is ${data.isFullyVerified} and its details say ${fullyHolds}`);
   }
-  const flagsConsistent = !(declaredFully === true && declaredParity === false);
+  const flagsConsistent = !(data.isFullyVerified === true && data.isParityVerified === false);
   if (!flagsConsistent) {
     problems.push("the report says it is fully verified while it is not parity verified");
   }
-  const parityAgrees = declaredParity === parityHolds && flagsConsistent;
-  const fullyAgrees = declaredFully === fullyHolds && flagsConsistent;
+  const parityAgrees = data.isParityVerified === parityHolds && flagsConsistent;
+  const fullyAgrees = data.isFullyVerified === fullyHolds && flagsConsistent;
   return {
     isParityVerified: parityHolds && parityAgrees,
     isFullyVerified: fullyHolds && fullyAgrees,
