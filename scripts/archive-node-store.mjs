@@ -1048,9 +1048,16 @@ const ImportParityReportSchema = z.looseObject({
   // bodies matched.
   sourceBodyDigestSHA256: z.string().regex(/^[0-9a-f]{64}$/i),
   targetBodyDigestSHA256: z.string().regex(/^[0-9a-f]{64}$/i),
-  mismatches: z.array(z.string()),
-  warnings: z.array(z.string()),
-  sourceMessageMetadataDroppedCount: importParityCount.optional(),
+  // The mismatch and warning lists are named by the importer and are short,
+  // and they are external input, so they are bounded:  a report carrying a
+  // million of them is not a report the importer wrote, and an unbounded
+  // list would be expanded into a problem list of the same size.
+  mismatches: z.array(z.string().max(512)).max(1000),
+  warnings: z.array(z.string().max(512)).max(1000),
+  // The importer always writes this count, so a report that does not carry
+  // it did not come from the importer, and without it the dropped-metadata
+  // contradiction below cannot be checked at all.
+  sourceMessageMetadataDroppedCount: importParityCount,
   isParityVerified: z.boolean(),
   isFullyVerified: z.boolean(),
 });

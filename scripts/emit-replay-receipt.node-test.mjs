@@ -392,6 +392,25 @@ test("an engine that says it held without measuring a fixture is refused", () =>
   );
 });
 
+test("a report carrying more engines than the bundle inventory holds is refused", () => {
+  // The report is external input, so its list is bounded:  the bundle names
+  // at most 32 engines, and the probe reports one entry per engine.
+  const engines = Array.from({ length: 33 }, (_, index) => ({
+    engineId: `engine-${index}`,
+    measured: true,
+    fixtureCount: 1,
+    passedCount: 1,
+    isFullyVerified: true,
+  }));
+  const path = writeReport({
+    version: 1,
+    requestedEngines: engines.map((entry) => entry.engineId),
+    isFullyVerified: true,
+    engines,
+  });
+  assert.throws(() => readReplayReport(path), /does not match the contract/);
+});
+
 test("an engine entry that carries no measurement is refused", () => {
   const path = writeReport({
     version: 1,

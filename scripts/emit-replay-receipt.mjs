@@ -70,15 +70,19 @@ export const REPLAY_RECEIPT_FILE = "replay.receipt.json";
  */
 const ReplayReportSchema = z.looseObject({
   version: z.literal(1),
-  requestedEngines: z.array(z.string().min(1)).min(1),
+  // The report is external input, so its lists are bounded:  the bundle's
+  // own inventory names at most 32 engines, the probe reports one entry per
+  // engine it asked about, and an unbounded list here would be walked once
+  // per entry by the checks below.
+  requestedEngines: z.array(z.string().min(1).max(128)).min(1).max(32),
   isFullyVerified: z.boolean(),
   engines: z.array(z.looseObject({
-    engineId: z.string().min(1),
+    engineId: z.string().min(1).max(128),
     measured: z.boolean(),
     fixtureCount: z.number().int().nonnegative(),
     passedCount: z.number().int().nonnegative(),
     isFullyVerified: z.boolean(),
-  })).min(1),
+  })).min(1).max(32),
 }).superRefine((report, ctx) => {
   // One engine id, one verdict.  The verdict is read by first match, so a
   // report that names the same engine twice could hide a failing verdict

@@ -377,6 +377,35 @@ test("a parity report whose body digests are not digests fails closed", () => {
   assert.match(verdict.problems.join("; "), /BodyDigestSHA256/);
 });
 
+test("a parity report that omits the dropped-metadata count fails closed", () => {
+  // The importer always writes the count, so a report without it did not
+  // come from the importer, and without it the dropped-metadata
+  // contradiction cannot be checked at all.
+  const report = makeParityReport();
+  delete report.sourceMessageMetadataDroppedCount;
+  const verdict = importParityVerdict(report);
+  assert.equal(verdict.isFullyVerified, false);
+  assert.match(verdict.problems.join("; "), /sourceMessageMetadataDroppedCount/);
+});
+
+test("a parity report carrying an unbounded mismatch list fails closed", () => {
+  // The lists are external input, so they are bounded at the boundary:  a
+  // report carrying a million of them is not a report the importer wrote.
+  const verdict = importParityVerdict(makeParityReport({
+    mismatches: Array.from({ length: 1001 }, (_, index) => `mismatch ${index}`),
+  }));
+  assert.equal(verdict.isFullyVerified, false);
+  assert.match(verdict.problems.join("; "), /mismatches/);
+});
+
+test("a parity report carrying an unbounded warning string fails closed", () => {
+  const verdict = importParityVerdict(makeParityReport({
+    warnings: ["w".repeat(513)],
+  }));
+  assert.equal(verdict.isFullyVerified, false);
+  assert.match(verdict.problems.join("; "), /warnings/);
+});
+
 test("a parity report that is not an object fails closed", () => {
   assert.equal(importParityVerdict(null).isFullyVerified, false);
   assert.equal(importParityVerdict([]).isFullyVerified, false);
