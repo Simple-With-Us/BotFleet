@@ -468,11 +468,19 @@ export function checkLineageWrite(
 }
 
 /** Predicate for `rewriteModelSelection` that preserves operator-defined custom
- *  catalog rows even when their id matches a retired official spelling. */
+ *  catalog rows even when their id matches a retired official spelling.
+ *  When `skipUnloaded` is true, unregistered (`undefined`) and shadowed
+ *  (`catalogPending`) engines are also left untouched because their custom rows
+ *  cannot be distinguished until a catalog loads. */
 export function customModelSkip(
   contextFor: (instanceId: string) => LineageContext | undefined,
+  opts?: { skipUnloaded?: boolean },
 ): (entry: Pick<ModelSelection, "instanceId" | "model">) => boolean {
-  return (entry) => Boolean(contextFor(entry.instanceId)?.customIds?.includes(entry.model));
+  return (entry) => {
+    const context = contextFor(entry.instanceId);
+    if (opts?.skipUnloaded && (!context || context.catalogPending)) return true;
+    return Boolean(context?.customIds?.includes(entry.model));
+  };
 }
 
 /** A per-turn override (a fallback or retry pick) reconciled the way a saved

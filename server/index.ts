@@ -2446,7 +2446,7 @@ function lineageContextForInstance(instanceId: string): LineageContext | undefin
   return gateLineageByCliVersion(context, cliVersionByInstance.get(instanceId));
 }
 
-const skipCustomModels = customModelSkip(lineageContextForInstance);
+const skipCustomModels = customModelSkip(lineageContextForInstance, { skipUnloaded: true });
 
 /** Reconcile saved selections against the engines' current catalogs.  The
  *  store posts one notice per bot it moved and emits the bot frames. */
