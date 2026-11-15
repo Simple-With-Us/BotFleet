@@ -24,6 +24,14 @@
 // replay into evidence of a successful one.  So every exit code here comes
 // from the artifact it names, and an engine the report does not cover earns a
 // failing code rather than a passing one.
+
+// The report's summary is checked against the report's own details.  The probe
+// computes that summary as "every engine the packet named was measured and
+// held", so a report whose summary says one thing and whose per-engine
+// verdicts say another did not come from the probe, and a report that did not
+// come from the probe is not evidence that a replay held.  An engine's own
+// counts are checked the same way:  a verdict that claims more fixtures
+// passed than were run is refused rather than read as a pass.
 //
 // An engine the packet names that no replay family drives earns the same
 // failing code, because the probe cannot measure it.  The reason is in the
@@ -51,15 +59,26 @@ export const REPLAY_RECEIPT_FILE = "replay.receipt.json";
  * the verdict, and a report that does not carry them is refused here, where
  * the reason can be said, instead of being read loosely and turned into an
  * exit code.
+ *
+ * The report's summary is checked against its own details here as well.  The
+ * probe computes the summary as "every engine held", so a report whose
+ * summary says one thing and whose per-engine verdicts say another is not a
+ * report the probe wrote, and a report that was not written by the probe is
+ * not evidence of a replay.  The same goes for an engine's own counts:  a
+ * verdict that claims more fixtures passed than were run is refused rather
+ * than read as a pass.
  */
 const ReplayReportSchema = z.looseObject({
   version: z.literal(1),
-  requestedEngines: z.array(z.string()),
+  requestedEngines: z.array(z.string().min(1)).min(1),
   isFullyVerified: z.boolean(),
   engines: z.array(z.looseObject({
-    engineId: z.string(),
+    engineId: z.string().min(1),
+    measured: z.boolean(),
+    fixtureCount: z.number().int().nonnegative(),
+    passedCount: z.number().int().nonnegative(),
     isFullyVerified: z.boolean(),
-  })),
+  })).min(1),
 }).superRefine((report, ctx) => {
   // One engine id, one verdict.  The verdict is read by first match, so a
   // report that names the same engine twice could hide a failing verdict
@@ -76,6 +95,95 @@ const ReplayReportSchema = z.looseObject({
     }
     seen.add(entry.engineId);
   });
+
+  // The same engine asked for twice is the same problem in the request
+  // list:  the probe names one verdict per engine it asked about, so two
+  // requests for one engine mean the report and the request disagree.
+  const requested = new Set();
+  report.requestedEngines.forEach((engineId, index) => {
+    if (requested.has(engineId)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["requestedEngines", index],
+        message: `the report asks for the engine "${engineId}" more than once`,
+      });
+    }
+    requested.add(engineId);
+  });
+
+  // The engines the report carries and the engines it says it asked for are
+  // the same list.  An engine it asked for and carries no verdict for was
+  // never replayed, and an engine it carries a verdict for it never asked
+  // for is not part of this packet's inventory.
+  report.requestedEngines.forEach((engineId, index) => {
+    if (!seen.has(engineId)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["requestedEngines", index],
+        message: `the report asks for the engine "${engineId}" and carries no verdict for it`,
+      });
+    }
+  });
+  report.engines.forEach((entry, index) => {
+    if (!requested.has(entry.engineId)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["engines", index, "engineId"],
+        message: `the report carries a verdict for the engine "${entry.engineId}" it did not ask for`,
+      });
+    }
+  });
+
+  // An engine's verdict has to agree with what it measured.
+  report.engines.forEach((entry, index) => {
+    const where = ["engines", index];
+    if (entry.passedCount > entry.fixtureCount) {
+      ctx.addIssue({
+        code: "custom",
+        path: where,
+        message: `the engine "${entry.engineId}" passes ${entry.passedCount} of ${entry.fixtureCount} fixtures`,
+      });
+    }
+    if (!entry.measured && (entry.fixtureCount > 0 || entry.passedCount > 0)) {
+      ctx.addIssue({
+        code: "custom",
+        path: where,
+        message: `the engine "${entry.engineId}" was not measured but carries ${entry.fixtureCount} fixture(s)`,
+      });
+    }
+    if (entry.isFullyVerified && !entry.measured) {
+      ctx.addIssue({
+        code: "custom",
+        path: where,
+        message: `the engine "${entry.engineId}" says it held while it was not measured`,
+      });
+    }
+    if (entry.isFullyVerified && entry.passedCount !== entry.fixtureCount) {
+      ctx.addIssue({
+        code: "custom",
+        path: where,
+        message: `the engine "${entry.engineId}" says it held while ${entry.passedCount} of ${entry.fixtureCount} fixtures passed`,
+      });
+    }
+  });
+
+  // And the summary has to agree with the verdicts it summarizes.
+  const held = report.engines.filter((entry) => entry.isFullyVerified).length;
+  if (report.isFullyVerified && held !== report.engines.length) {
+    const failing = report.engines.find((entry) => !entry.isFullyVerified);
+    ctx.addIssue({
+      code: "custom",
+      path: ["isFullyVerified"],
+      message: `the report says every engine held and the engine "${failing.engineId}" did not`,
+    });
+  }
+  if (!report.isFullyVerified && held === report.engines.length) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["isFullyVerified"],
+      message: "the report says an engine did not hold and every engine it names held",
+    });
+  }
 });
 
 /** The provenance source has to be an https URL, because the receipt says where the run came from. */

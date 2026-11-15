@@ -20,6 +20,7 @@ import {
   archiveStore,
   emitReceipts,
   exclusionReason,
+  importParityVerdict,
   looksTextual,
   proveReadOnly,
   resolveInside,
@@ -62,6 +63,49 @@ function makeStore() {
   database.close();
   symlinkSync("/etc/passwd", join(root, "escape"));
   return root;
+}
+
+/**
+ * An import parity report the probe would have written:  every surface
+ * matched, nothing was dropped, nothing is outstanding, and the report's own
+ * flags say so.
+ */
+function makeParityReport(overrides = {}) {
+  return {
+    sourceBotCount: 3,
+    targetBotCount: 3,
+    sourceThreadCount: 12,
+    targetThreadCount: 12,
+    sourceMessageCount: 232142,
+    targetMessageCount: 232142,
+    sourceRoutineCount: 5,
+    targetRoutineCount: 5,
+    sourceRoutineRunCount: 41,
+    targetRoutineRunCount: 41,
+    sourceRoutineRequestReceiptCount: 7,
+    targetRoutineRequestReceiptCount: 7,
+    sourceWebhookCount: 2,
+    targetWebhookCount: 2,
+    sourceWebhookDeliveryCount: 9,
+    targetWebhookDeliveryCount: 9,
+    sourceWebhookDeliveryLedgerCount: 6,
+    targetWebhookDeliveryLedgerCount: 6,
+    sourceMessageMetadataPreservedCount: 18,
+    sourceMessageMetadataPreservedFields: ["parentId"],
+    sourceMessageMetadataPreservedDigestSHA256: "f".repeat(64),
+    sourceMessageMetadataDroppedCount: 0,
+    routineRequestReceipts: [],
+    perThreadMessageCountsMatch: true,
+    orphanedMessageCount: 0,
+    sourceBodyDigestSHA256: "d".repeat(64),
+    targetBodyDigestSHA256: "d".repeat(64),
+    newlyInsertedMessages: 0,
+    mismatches: [],
+    warnings: [],
+    isParityVerified: true,
+    isFullyVerified: true,
+    ...overrides,
+  };
 }
 
 /** A request the receipts are bound to. */
@@ -234,7 +278,7 @@ test("the import receipt is refused without a parity report and carries one with
   const withoutParity = emitReceipts({ captureDir, request: makeRequest(), provenance });
   assert.equal(withoutParity.import, undefined, "no import receipt without a parity report");
 
-  writeFileSync(join(captureDir, "import-parity.json"), '{"isFullyVerified":true}\n', { mode: 0o600 });
+  writeFileSync(join(captureDir, "import-parity.json"), `${JSON.stringify(makeParityReport(), null, 2)}\n`, { mode: 0o600 });
   const withParity = emitReceipts({
     captureDir,
     request: makeRequest(),
@@ -244,6 +288,119 @@ test("the import receipt is refused without a parity report and carries one with
   const receipt = parseEvidenceReceipt("import", readFileSync(join(captureDir, "import.receipt.json")));
   assert.deepEqual(receipt.data.checks.map((check) => check.name).sort(), ["parity", "read-only-archive"]);
   assert.ok(withParity.import);
+});
+
+test("a parity report whose details agree earns a passing parity check", () => {
+  const verdict = importParityVerdict(makeParityReport());
+  assert.equal(verdict.isParityVerified, true);
+  assert.equal(verdict.isFullyVerified, true);
+  assert.deepEqual(verdict.problems, []);
+});
+
+test("a parity report that says it was verified while a surface disagrees fails closed", () => {
+  // Each of these is a report that claims parity while one of the surfaces
+  // the verdict is computed from says otherwise.
+  const cases = [
+    ["the message count disagrees", { sourceMessageCount: 232142, targetMessageCount: 232141 }],
+    ["the bot count disagrees", { sourceBotCount: 3, targetBotCount: 2 }],
+    ["the webhook delivery ledger count disagrees", { sourceWebhookDeliveryLedgerCount: 6, targetWebhookDeliveryLedgerCount: 5 }],
+    ["the body digests differ", { targetBodyDigestSHA256: "e".repeat(64) }],
+    ["the per-thread counts do not match", { perThreadMessageCountsMatch: false }],
+    ["there are orphaned messages", { orphanedMessageCount: 3 }],
+    ["the report names a mismatch", { mismatches: ["message count 232142 != 232141"] }],
+  ];
+  for (const [name, override] of cases) {
+    const verdict = importParityVerdict(makeParityReport(override));
+    assert.equal(verdict.isFullyVerified, false, name);
+    assert.ok(verdict.problems.length > 0, name);
+  }
+});
+
+test("a parity report whose own flags disagree with its details fails closed", () => {
+  // The details hold, so the report's own false is the lie.
+  const claimsFalse = importParityVerdict(makeParityReport({ isParityVerified: false }));
+  assert.equal(claimsFalse.isParityVerified, false);
+  assert.equal(claimsFalse.isFullyVerified, false);
+  assert.match(claimsFalse.problems.join("; "), /isParityVerified/);
+
+  // The details do not hold, so the report's own true is the lie.
+  const claimsTrue = importParityVerdict(makeParityReport({
+    sourceMessageCount: 232142,
+    targetMessageCount: 232141,
+    isFullyVerified: true,
+  }));
+  assert.equal(claimsTrue.isFullyVerified, false);
+  assert.match(claimsTrue.problems.join("; "), /isFullyVerified/);
+});
+
+test("a parity report missing a field the verdict is computed from fails closed", () => {
+  const report = makeParityReport();
+  delete report.targetBodyDigestSHA256;
+  const verdict = importParityVerdict(report);
+  assert.equal(verdict.isFullyVerified, false);
+  assert.match(verdict.problems.join("; "), /targetBodyDigestSHA256/);
+});
+
+test("a parity report with a warning is not fully verified, and says so honestly", () => {
+  // A warning is a known gap, so the report is parity-verified but not
+  // fully verified, and it declares exactly that.
+  const warned = importParityVerdict(makeParityReport({
+    warnings: ["2 manual bot snooze(s) name a bot not in bots.json"],
+    isFullyVerified: false,
+  }));
+  assert.equal(warned.isParityVerified, true);
+  assert.equal(warned.isFullyVerified, false);
+
+  // The same report that claims to be fully verified contradicts itself.
+  const lying = importParityVerdict(makeParityReport({
+    warnings: ["2 manual bot snooze(s) name a bot not in bots.json"],
+  }));
+  assert.equal(lying.isFullyVerified, false);
+  assert.match(lying.problems.join("; "), /warning/);
+});
+
+test("a parity report that dropped metadata and named no warning contradicts itself", () => {
+  const verdict = importParityVerdict(makeParityReport({ sourceMessageMetadataDroppedCount: 4 }));
+  assert.equal(verdict.isFullyVerified, false);
+  assert.match(verdict.problems.join("; "), /dropped message/);
+});
+
+test("a parity report that is not an object fails closed", () => {
+  assert.equal(importParityVerdict(null).isFullyVerified, false);
+  assert.equal(importParityVerdict([]).isFullyVerified, false);
+  assert.equal(importParityVerdict("verified").isFullyVerified, false);
+});
+
+test("a parity report that contradicts itself earns a failing parity check in the receipt", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  const parent = privateScratch("capture-");
+  const captureDir = join(parent, "capture");
+  await archiveStore({ storeRoot: store, outDir: captureDir });
+  restoreArchive({ archiveDir: captureDir, intoDir: join(parent, "restored") });
+  writeBoundedReport(join(captureDir, "restore-health.json"), restoredHealth(join(parent, "restored")));
+  writeFileSync(join(captureDir, "provenance.txt"), "captured on the server by the MM seat\n", { mode: 0o600 });
+  // The report says it was verified, and its own message count says
+  // otherwise.  The flag alone would have earned a passing check.
+  writeFileSync(
+    join(captureDir, "import-parity.json"),
+    `${JSON.stringify(makeParityReport({ sourceMessageCount: 232142, targetMessageCount: 232141 }), null, 2)}\n`,
+    { mode: 0o600 },
+  );
+
+  emitReceipts({
+    captureDir,
+    request: makeRequest(),
+    provenance: {
+      by: "MM",
+      at: new Date().toISOString(),
+      source: "https://example.invalid/capture",
+      record: join(captureDir, "provenance.txt"),
+    },
+    parityReportPath: join(captureDir, "import-parity.json"),
+  });
+  const receipt = parseEvidenceReceipt("import", readFileSync(join(captureDir, "import.receipt.json")));
+  const codes = Object.fromEntries(receipt.data.checks.map((check) => [check.name, check.exitCode]));
+  assert.equal(codes["parity"], 1, "a report that contradicts itself does not certify parity");
 });
 
 test("the store root follows the app's own rule", () => {
@@ -535,7 +692,7 @@ test("a capture with a redaction failure does not certify itself clean", { skip:
   const health = restoredHealth(join(parent, "restored"));
   writeBoundedReport(join(captureDir, "restore-health.json"), health);
   writeFileSync(join(captureDir, "provenance.txt"), "captured on the server by the MM seat\n", { mode: 0o600 });
-  writeFileSync(join(captureDir, "import-parity.json"), '{"isFullyVerified":true}\n', { mode: 0o600 });
+  writeFileSync(join(captureDir, "import-parity.json"), `${JSON.stringify(makeParityReport(), null, 2)}\n`, { mode: 0o600 });
 
   emitReceipts({
     captureDir,

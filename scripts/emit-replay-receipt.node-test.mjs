@@ -148,8 +148,8 @@ test("a report that names the same engine twice is refused, so a failing verdict
     requestedEngines: ["claude"],
     isFullyVerified: false,
     engines: [
-      { engineId: "claude", isFullyVerified: true },
-      { engineId: "claude", isFullyVerified: false },
+      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 19, isFullyVerified: false },
     ],
   };
   writeFileSync(join(captureDir, "replay-parity.json"), JSON.stringify(report), { mode: 0o600 });
@@ -226,7 +226,9 @@ test("an artifact outside the capture directory is refused", () => {
   ]));
   const outside = mkdtempSync(join(tmpdir(), "replay-outside-"));
   const outsideReport = join(outside, "replay-parity.json");
-  writeFileSync(outsideReport, JSON.stringify(makeReport([])), { mode: 0o600 });
+  writeFileSync(outsideReport, JSON.stringify(makeReport([
+    { engineId: "claude", family: "claude", measured: true, isFullyVerified: true, fixtureCount: 20, passedCount: 20 },
+  ])), { mode: 0o600 });
 
   assert.throws(() => emitReplayReceipt({
     captureDir,
@@ -234,6 +236,159 @@ test("an artifact outside the capture directory is refused", () => {
     reportPath: outsideReport,
     provenance: { ...PROVENANCE, record: join(captureDir, "provenance.txt") },
   }), /not inside the capture directory/);
+});
+
+/**
+ * A report the boundary refuses, written to a file and read back.
+ *
+ * The refusal is the point of these fixtures:  a report that contradicts
+ * itself is refused where the reason can be said, rather than read loosely
+ * and turned into an exit code.
+ */
+function writeReport(report) {
+  const captureDir = mkdtempSync(join(tmpdir(), "replay-refused-"));
+  const path = join(captureDir, "replay-parity.json");
+  writeFileSync(path, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
+  return path;
+}
+
+test("a report whose summary says every engine held while an engine did not is refused", () => {
+  const path = writeReport({
+    version: 1,
+    requestedEngines: ["claude", "grok-acp"],
+    isFullyVerified: true,
+    engines: [
+      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+      { engineId: "grok-acp", measured: true, fixtureCount: 27, passedCount: 26, isFullyVerified: false },
+    ],
+  });
+  assert.throws(
+    () => readReplayReport(path),
+    /the report says every engine held and the engine "grok-acp" did not/,
+  );
+});
+
+test("a report whose summary says an engine did not hold while every engine held is refused", () => {
+  const path = writeReport({
+    version: 1,
+    requestedEngines: ["claude"],
+    isFullyVerified: false,
+    engines: [
+      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+    ],
+  });
+  assert.throws(
+    () => readReplayReport(path),
+    /the report says an engine did not hold and every engine it names held/,
+  );
+});
+
+test("a report that asks for an engine it carries no verdict for is refused", () => {
+  const path = writeReport({
+    version: 1,
+    requestedEngines: ["claude", "grok-acp"],
+    isFullyVerified: false,
+    engines: [
+      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+    ],
+  });
+  assert.throws(
+    () => readReplayReport(path),
+    /the report asks for the engine "grok-acp" and carries no verdict for it/,
+  );
+});
+
+test("a report that carries a verdict for an engine it did not ask for is refused", () => {
+  const path = writeReport({
+    version: 1,
+    requestedEngines: ["claude"],
+    isFullyVerified: false,
+    engines: [
+      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+      { engineId: "grok-acp", measured: true, fixtureCount: 27, passedCount: 27, isFullyVerified: true },
+    ],
+  });
+  assert.throws(
+    () => readReplayReport(path),
+    /the report carries a verdict for the engine "grok-acp" it did not ask for/,
+  );
+});
+
+test("a report that asks for the same engine twice is refused", () => {
+  const path = writeReport({
+    version: 1,
+    requestedEngines: ["claude", "claude"],
+    isFullyVerified: false,
+    engines: [
+      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+    ],
+  });
+  assert.throws(
+    () => readReplayReport(path),
+    /the report asks for the engine "claude" more than once/,
+  );
+});
+
+test("an engine that claims more fixtures passed than it ran is refused", () => {
+  const path = writeReport({
+    version: 1,
+    requestedEngines: ["claude"],
+    isFullyVerified: true,
+    engines: [
+      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 21, isFullyVerified: true },
+    ],
+  });
+  assert.throws(
+    () => readReplayReport(path),
+    /the engine "claude" passes 21 of 20 fixtures/,
+  );
+});
+
+test("an engine that says it held while it was not measured is refused", () => {
+  const path = writeReport({
+    version: 1,
+    requestedEngines: ["opencode"],
+    isFullyVerified: true,
+    engines: [
+      { engineId: "opencode", measured: false, fixtureCount: 0, passedCount: 0, isFullyVerified: true },
+    ],
+  });
+  assert.throws(
+    () => readReplayReport(path),
+    /the engine "opencode" says it held while it was not measured/,
+  );
+});
+
+test("an engine that says it held while a fixture did not pass is refused", () => {
+  const path = writeReport({
+    version: 1,
+    requestedEngines: ["claude"],
+    isFullyVerified: true,
+    engines: [
+      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 19, isFullyVerified: true },
+    ],
+  });
+  assert.throws(
+    () => readReplayReport(path),
+    /the engine "claude" says it held while 19 of 20 fixtures passed/,
+  );
+});
+
+test("an engine entry that carries no measurement is refused", () => {
+  const path = writeReport({
+    version: 1,
+    requestedEngines: ["claude"],
+    isFullyVerified: true,
+    engines: [
+      { engineId: "claude", isFullyVerified: true },
+    ],
+  });
+  assert.throws(() => readReplayReport(path), /does not match the contract/);
+});
+
+test("a report with no engines at all is refused", () => {
+  const path = writeReport({ version: 1, requestedEngines: [], isFullyVerified: true, engines: [] });
+  assert.throws(() => readReplayReport(path), /does not match the contract/);
 });
 
 test("the CLI runs when the script is invoked through a symlink", () => {
