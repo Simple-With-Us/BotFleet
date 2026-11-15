@@ -1042,8 +1042,12 @@ const ImportParityReportSchema = z.looseObject({
   ),
   orphanedMessageCount: importParityCount,
   perThreadMessageCountsMatch: z.boolean(),
-  sourceBodyDigestSHA256: z.string().min(1),
-  targetBodyDigestSHA256: z.string().min(1),
+  // The importer writes a SHA-256 as 64 hexadecimal characters, so a report
+  // whose digest is anything else did not come from the importer, and a
+  // report whose two digests are the same string is not evidence that the
+  // bodies matched.
+  sourceBodyDigestSHA256: z.string().regex(/^[0-9a-f]{64}$/i),
+  targetBodyDigestSHA256: z.string().regex(/^[0-9a-f]{64}$/i),
   mismatches: z.array(z.string()),
   warnings: z.array(z.string()),
   sourceMessageMetadataDroppedCount: importParityCount.optional(),

@@ -374,6 +374,24 @@ test("an engine that says it held while a fixture did not pass is refused", () =
   );
 });
 
+test("an engine that says it held without measuring a fixture is refused", () => {
+  // The probe's verdict is "every fixture behind this engine passed" over a
+  // non-empty set, so a fully verified engine with no fixture is a verdict
+  // the probe cannot have written.
+  const path = writeReport({
+    version: 1,
+    requestedEngines: ["claude"],
+    isFullyVerified: true,
+    engines: [
+      { engineId: "claude", measured: true, fixtureCount: 0, passedCount: 0, isFullyVerified: true },
+    ],
+  });
+  assert.throws(
+    () => readReplayReport(path),
+    /the engine "claude" says it held without measuring a fixture/,
+  );
+});
+
 test("an engine entry that carries no measurement is refused", () => {
   const path = writeReport({
     version: 1,

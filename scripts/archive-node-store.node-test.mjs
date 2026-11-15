@@ -365,6 +365,18 @@ test("a parity report that dropped metadata and named no warning contradicts its
   assert.match(verdict.problems.join("; "), /dropped message/);
 });
 
+test("a parity report whose body digests are not digests fails closed", () => {
+  // The importer writes a SHA-256 as 64 hexadecimal characters, so two
+  // matching strings that are not digests are not evidence that the bodies
+  // matched, and a report like that did not come from the importer.
+  const verdict = importParityVerdict(makeParityReport({
+    sourceBodyDigestSHA256: "x",
+    targetBodyDigestSHA256: "x",
+  }));
+  assert.equal(verdict.isFullyVerified, false);
+  assert.match(verdict.problems.join("; "), /BodyDigestSHA256/);
+});
+
 test("a parity report that is not an object fails closed", () => {
   assert.equal(importParityVerdict(null).isFullyVerified, false);
   assert.equal(importParityVerdict([]).isFullyVerified, false);

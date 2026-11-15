@@ -158,6 +158,17 @@ const ReplayReportSchema = z.looseObject({
         message: `the engine "${entry.engineId}" says it held while it was not measured`,
       });
     }
+    // An engine that measured nothing did not hold:  the probe's own verdict
+    // is "every fixture behind this engine passed" over a non-empty set, so
+    // a fully verified engine with no fixture is a verdict the probe cannot
+    // have written.
+    if (entry.isFullyVerified && entry.fixtureCount === 0) {
+      ctx.addIssue({
+        code: "custom",
+        path: where,
+        message: `the engine "${entry.engineId}" says it held without measuring a fixture`,
+      });
+    }
     if (entry.isFullyVerified && entry.passedCount !== entry.fixtureCount) {
       ctx.addIssue({
         code: "custom",
