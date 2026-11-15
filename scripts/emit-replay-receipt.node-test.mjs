@@ -427,6 +427,10 @@ test("a report naming an engine id as long as a check name allows still decodes"
   const report = readReplayReport(path);
   assert.equal(report.engines.length, 1);
   assert.equal(replayVerdict(report, engineId), true);
+  // The bound is exact:  the check name the receipt writes for the longest
+  // id the report may carry is exactly the bundle's own check-name limit,
+  // and not one character more.
+  assert.equal(`engine:${engineId}`.length, 2048);
 });
 
 test("a report naming an engine id longer than a check name allows is refused", () => {

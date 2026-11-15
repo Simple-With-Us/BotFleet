@@ -76,9 +76,11 @@ const ReplayReportSchema = z.looseObject({
   // The report is external input, so its lists are bounded:  the bundle's
   // own inventory names at most 32 engines, the probe reports one entry per
   // engine it asked about, and an unbounded list here would be walked once
-  // per entry by the checks below.  An engine id is bounded by the bundle
-  // request's own text contract, which accepts 2048 characters, so a report
-  // naming a longer id is refused rather than a valid one.
+  // per entry by the checks below.  An engine id is bounded so that the
+  // check name the receipt writes for it, `engine:<id>`, fits the bundle's
+  // own 2048-character check-name limit:  2041 characters of id plus the
+  // prefix is exactly 2048.  A report naming a longer id is refused here
+  // rather than producing a check name the bundle will not accept.
   requestedEngines: z.array(z.string().min(1).max(2041)).min(1).max(32),
   isFullyVerified: z.boolean(),
   engines: z.array(z.looseObject({
