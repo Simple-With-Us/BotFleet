@@ -411,6 +411,23 @@ test("a report carrying more engines than the bundle inventory holds is refused"
   assert.throws(() => readReplayReport(path), /does not match the contract/);
 });
 
+test("a report naming an engine id as long as the bundle allows still decodes", () => {
+  // The bundle request accepts an engine id of 2048 characters, so the
+  // report has to accept one too.
+  const engineId = "e".repeat(2048);
+  const path = writeReport({
+    version: 1,
+    requestedEngines: [engineId],
+    isFullyVerified: true,
+    engines: [
+      { engineId, measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+    ],
+  });
+  const report = readReplayReport(path);
+  assert.equal(report.engines.length, 1);
+  assert.equal(replayVerdict(report, engineId), true);
+});
+
 test("an engine entry that carries no measurement is refused", () => {
   const path = writeReport({
     version: 1,

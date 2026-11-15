@@ -398,12 +398,29 @@ test("a parity report carrying an unbounded mismatch list fails closed", () => {
   assert.match(verdict.problems.join("; "), /mismatches/);
 });
 
-test("a parity report carrying an unbounded warning string fails closed", () => {
+test("a parity report carrying an unbounded warning list fails closed", () => {
+  // The list is bounded even though its entries are not:  a report carrying
+  // a thousand and one warnings is not a report the importer wrote.
   const verdict = importParityVerdict(makeParityReport({
-    warnings: ["w".repeat(513)],
+    warnings: Array.from({ length: 1001 }, (_, index) => `warning ${index}`),
+    isFullyVerified: false,
   }));
   assert.equal(verdict.isFullyVerified, false);
   assert.match(verdict.problems.join("; "), /warnings/);
+});
+
+test("a parity report with a long warning still decodes", () => {
+  // The importer joins the user-controlled metadata key names into one
+  // warning, so no fixed length can be called valid for it, and a report
+  // whose warning is long is a report the importer wrote.
+  const verdict = importParityVerdict(makeParityReport({
+    warnings: ["2 source message(s) carry JSON metadata the importer could not preserve (fields: " + "k".repeat(600) + ")"],
+    isFullyVerified: false,
+  }));
+  assert.equal(verdict.isParityVerified, true);
+  assert.equal(verdict.isFullyVerified, false);
+  assert.match(verdict.problems.join("; "), /warning/);
+  assert.doesNotMatch(verdict.problems.join("; "), /does not match the contract/);
 });
 
 test("a parity report that is not an object fails closed", () => {
