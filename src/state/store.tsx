@@ -1892,8 +1892,14 @@ export function reducer(state: AppState, action: Action): AppState {
       }
       // every server-side append chains onto (and becomes) the active leaf
       const next = updateBot(state, bot.id, (b) => {
+        // An edit's fork (or any message) can reach the client twice — once
+        // as the POST response, once as the canonical SSE frame — in either
+        // order, and a reconnect can redeliver an already-known message
+        // too. Reverting the active leaf back to a repeat would hide a
+        // newer reply that already won that race and became the active
+        // leaf; a duplicate must be a no-op (upstream OpenMausBot #1387).
         if (b.messages.some((m) => m.id === action.message.id)) {
-          return { ...b, activeLeafId: action.message.id };
+          return b;
         }
         let messages = [...b.messages, action.message];
         // base64 screen frames are big; a long computer-use session would
