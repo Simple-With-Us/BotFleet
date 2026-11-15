@@ -167,4 +167,28 @@ describe("rewriteModelSelection", () => {
       latest: "flash",
     });
   });
+
+  it("respects an optional skip predicate per entry across primary and fallbacks", () => {
+    const customOnly = {
+      instanceId: "dshCustom",
+      model: "MiniMax-M3",
+      fallbacks: [
+        { instanceId: "dshCustom", model: "MiniMax-M3" },
+        { instanceId: "minimax", model: "MiniMax-M3" },
+      ],
+    };
+    const { selection, changed } = rewriteModelSelection(
+      customOnly,
+      (entry) => entry.instanceId === "dshCustom" && entry.model === "MiniMax-M3",
+    );
+    expect(changed).toBe(true);
+    expect(selection).toEqual({
+      instanceId: "dshCustom",
+      model: "MiniMax-M3",
+      fallbacks: [
+        { instanceId: "dshCustom", model: "MiniMax-M3" },
+        { instanceId: "minimax", model: "MiniMax-M3.1-Flash" },
+      ],
+    });
+  });
 });

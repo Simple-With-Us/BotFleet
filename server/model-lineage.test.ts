@@ -277,14 +277,52 @@ describe("reconcileTurnOverride", () => {
       selection: { instanceId: "dsh", model: "DeepSeek-V4.1-Flash" },
       freshSession: false,
     });
-    // An operator custom row keeps its exact id.
+    // An operator custom row keeps its exact id, including via lineageContextFor on lineage-less engines.
+    const dshCustom = lineageContextFor({
+      driverKind: "dshAgent",
+      models: {
+        default: "DeepSeek-V4.1-Flash",
+        options: [
+          { id: "DeepSeek-V4.1-Flash", label: "DeepSeek V4.1 Flash" },
+          { id: "MiniMax-M3", label: "Custom M3", custom: true },
+        ],
+      },
+    });
+    expect(dshCustom?.customIds).toEqual(["MiniMax-M3"]);
+    expect(
+      reconcileTurnOverride({ instanceId: "dshCustom", model: "MiniMax-M3" }, dshCustom),
+    ).toEqual({
+      selection: { instanceId: "dshCustom", model: "MiniMax-M3" },
+      freshSession: false,
+    });
+    // Nested fallbacks resolve customIds per entry via contextFor.
+    const byInstance: Record<string, LineageContext | undefined> = {
+      claude: contextFor("claude"),
+      dshCustom,
+      minimax: contextFor("minimax"),
+    };
     expect(
       reconcileTurnOverride(
-        { instanceId: "dsh", model: "MiniMax-M3" },
-        { driverKind: "dshAgent", offeredIds: [], customIds: ["MiniMax-M3"], authoritative: false },
+        {
+          instanceId: "claude",
+          model: "claude-sonnet-5-5",
+          fallbacks: [
+            { instanceId: "dshCustom", model: "MiniMax-M3" },
+            { instanceId: "minimax", model: "MiniMax-M3" },
+          ],
+        },
+        byInstance.claude,
+        (id) => byInstance[id],
       ),
     ).toEqual({
-      selection: { instanceId: "dsh", model: "MiniMax-M3" },
+      selection: {
+        instanceId: "claude",
+        model: "claude-sonnet-5-5",
+        fallbacks: [
+          { instanceId: "dshCustom", model: "MiniMax-M3" },
+          { instanceId: "minimax", model: "MiniMax-M3.1-Flash" },
+        ],
+      },
       freshSession: false,
     });
   });

@@ -77,13 +77,15 @@ export function lineageContextFor(
   instance: { driverKind: string; models: CatalogLike } | undefined,
   effortLevels?: (model: string) => readonly string[] | undefined,
 ): LineageContext | undefined {
-  if (!instance || !hasLineage(instance.driverKind)) {
-    return instance ? { driverKind: instance.driverKind, offeredIds: [], authoritative: false } : undefined;
+  if (!instance) return undefined;
+  const customIds = instance.models.options.filter((option) => option.custom).map((option) => option.id);
+  if (!hasLineage(instance.driverKind)) {
+    return { driverKind: instance.driverKind, offeredIds: [], customIds, authoritative: false };
   }
   return {
     driverKind: instance.driverKind,
     offeredIds: officialIds(instance.models),
-    customIds: instance.models.options.filter((option) => option.custom).map((option) => option.id),
+    customIds,
     authoritative: catalogIsAuthoritative(instance.driverKind, instance.models),
     ...(effortLevels ? { effortLevels } : {}),
   };
@@ -474,10 +476,16 @@ export function checkLineageWrite(
 export function reconcileTurnOverride(
   selection: ModelSelection,
   context: LineageContext | undefined,
+  contextFor?: (instanceId: string) => LineageContext | undefined,
 ): { selection: ModelSelection; freshSession: boolean } {
-  const rewritten = context?.customIds?.includes(selection.model)
-    ? selection
-    : rewriteModelSelection(selection).selection;
+  const rewritten = rewriteModelSelection(selection, (entry) => {
+    const entryContext = contextFor
+      ? contextFor(entry.instanceId)
+      : entry.instanceId === selection.instanceId
+        ? context
+        : undefined;
+    return Boolean(entryContext?.customIds?.includes(entry.model));
+  }).selection;
   const reconciled = reconcileEntry(rewritten, context).entry;
   return {
     selection: reconciled,

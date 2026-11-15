@@ -7081,9 +7081,13 @@ function restoreHeldWork(work: HeldWork, context: string) {
     };
     if (round.cardContinuation !== undefined) restored.cardContinuation = round.cardContinuation;
     if (round.turnSelection) {
+      const turnContext = lineageContextForInstance(round.turnSelection.instanceId);
+      const model = turnContext?.customIds?.includes(round.turnSelection.model)
+        ? round.turnSelection.model
+        : rewriteRetiredModelId(round.turnSelection.model);
       restored.turnSelection = {
         instanceId: round.turnSelection.instanceId,
-        model: rewriteRetiredModelId(round.turnSelection.model),
+        model,
       };
       if (isEffortLevel(round.turnSelection.effort)) restored.turnSelection.effort = round.turnSelection.effort;
       if (round.turnSelection.latest) restored.turnSelection.latest = round.turnSelection.latest;
@@ -7307,7 +7311,11 @@ async function startTurn(
       ? { instanceId: fallbackPolicy.instanceId, model: fallbackPolicy.model, effort: fallbackPolicy.effort }
       : quotaCooldowns.resolveModel(bot.id, fallbackPolicy).selection);
   if (opts?.modelSelection) {
-    const override = reconcileTurnOverride(selection, lineageContextForInstance(selection.instanceId));
+    const override = reconcileTurnOverride(
+      selection,
+      lineageContextForInstance(selection.instanceId),
+      lineageContextForInstance,
+    );
     // A Codex thread keeps the model it started with, so an override the
     // reconcile moved must not resume this task's old thread there.
     if (override.freshSession) store.setResumeCursor(bot.id, selection.instanceId, undefined, threadId);
@@ -10083,7 +10091,11 @@ async function runGroupMemberTurn(
   // Room turns pass no resume cursor, so only the reconciled selection is
   // used here.
   const selection = turnSelection
-    ? reconcileTurnOverride(turnSelection, lineageContextForInstance(turnSelection.instanceId)).selection
+    ? reconcileTurnOverride(
+        turnSelection,
+        lineageContextForInstance(turnSelection.instanceId),
+        lineageContextForInstance,
+      ).selection
     : bot.modelSelection;
   if (turnExternalCredentialPending(bot, selection.instanceId)) {
     const queued = queueRoomRound(
