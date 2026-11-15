@@ -248,8 +248,8 @@ describe("applySpokenYears", () => {
       "Released in twenty twenty-six (twenty twenty-five-twenty twenty-six).",
     );
     expect(applySpokenYears("See <#0.3#> 2026 notes.")).toBe("See <#0.3#> twenty twenty-six notes.");
-    expect(applySpokenYears("BF-2026 #2026 $2026 v2026 2026px 2026.1.0 https://example.com/2026")).toBe(
-      "BF-2026 #2026 $2026 v2026 2026px 2026.1.0 https://example.com/2026",
+    expect(applySpokenYears("BF-2026 #2026 $2026 €2026 £2026 ¥2026 v2026 2026px 2026.1.0 https://example.com/2026")).toBe(
+      "BF-2026 #2026 $2026 €2026 £2026 ¥2026 v2026 2026px 2026.1.0 https://example.com/2026",
     );
   });
 });

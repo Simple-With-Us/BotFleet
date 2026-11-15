@@ -288,7 +288,7 @@ export function findSpokenYears(text: string): TextReplacement[] {
     if (tags.some(([a, b]) => a < end && b > start)) continue;
     const before = charBefore(text, start);
     const after = charAt(text, end);
-    if (isWordChar(before) || before === "#" || before === "$" || before === "/" || before === ":") continue;
+    if (isWordChar(before) || before === "#" || before === "/" || before === ":" || /\p{Sc}/u.test(before)) continue;
     if (before === "-" && start >= 2 && /[A-Za-z]/.test(text[start - 2])) continue;
     if (isWordChar(after) || after === "/") continue;
     const [c, d] = chunkAround(plain, start, end);
