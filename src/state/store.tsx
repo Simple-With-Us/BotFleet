@@ -387,6 +387,11 @@ export interface Bot {
   activityStartedAt?: number;
   /** what the bot is doing, as the harness sees it; busy is derived from it */
   activity?: "working" | "waiting-on-you" | "idle" | "no-signal" | "dead";
+  /** The turn currently dispatched, if any (server wireBot spread). */
+  inflightThreadId?: string | null;
+  /** The thread holding the open approval or question while waiting
+   * (server wireBot spread). Attributed to its room by the attention index. */
+  waitingThreadId?: string | null;
   modelSelection: ModelSelection;
   /** Active engine actually in use (including fallback rollover). */
   activeModelSelection?: ModelSelection;

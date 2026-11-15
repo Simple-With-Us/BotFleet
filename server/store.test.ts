@@ -907,6 +907,34 @@ describe("Store bot activity state", () => {
     expect(Boolean(again.bot(bot.id)?.busy)).toBe(false);
   });
 
+  it("attributes a wait to its thread, and drops the thread when the wait ends", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.setWaiting(bot.id, "thread-room-a");
+    expect(store.bot(bot.id)?.activity).toBe("waiting-on-you");
+    expect(store.bot(bot.id)?.waitingThreadId).toBe("thread-room-a");
+    // Any transition out of waiting clears the attribution, so a stale
+    // thread can never pin a badge after the wait is gone.
+    store.setActivity(bot.id, "working");
+    expect(store.bot(bot.id)?.waitingThreadId).toBeNull();
+    store.setWaiting(bot.id, "thread-room-b");
+    store.setActivity(bot.id, "idle");
+    expect(store.bot(bot.id)?.waitingThreadId).toBeNull();
+  });
+
+  it("never persists the waiting thread, and resets it on load like activity", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.setWaiting(bot.id, "thread-room-a");
+    store.patchBot(bot.id, { name: "Unrelated save" });
+    store.flushBotsNow();
+    const raw = readFileSync(join(DATA_DIR, "bots.json"), "utf8");
+    expect(raw).not.toContain("waitingThreadId");
+    const again = new Store(selection);
+    expect(again.bot(bot.id)?.waitingThreadId ?? null).toBeNull();
+    expect(again.bot(bot.id)?.activity).toBe("idle");
+  });
+
   it("never writes bots.json on an activity transition, and never persists busy/activity at all", () => {
     const store = new Store(selection);
     const bot = store.createBot();
