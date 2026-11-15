@@ -411,10 +411,11 @@ test("a report carrying more engines than the bundle inventory holds is refused"
   assert.throws(() => readReplayReport(path), /does not match the contract/);
 });
 
-test("a report naming an engine id as long as the bundle allows still decodes", () => {
-  // The bundle request accepts an engine id of 2048 characters, so the
-  // report has to accept one too.
-  const engineId = "e".repeat(2048);
+test("a report naming an engine id as long as a check name allows still decodes", () => {
+  // The receipt names its check `engine:<id>` and the bundle bounds a check
+  // name at 2048 characters, so an id of 2041 is the longest one that can
+  // still be named.
+  const engineId = "e".repeat(2041);
   const path = writeReport({
     version: 1,
     requestedEngines: [engineId],
@@ -426,6 +427,38 @@ test("a report naming an engine id as long as the bundle allows still decodes", 
   const report = readReplayReport(path);
   assert.equal(report.engines.length, 1);
   assert.equal(replayVerdict(report, engineId), true);
+});
+
+test("a report naming an engine id longer than a check name allows is refused", () => {
+  const engineId = "e".repeat(2042);
+  const path = writeReport({
+    version: 1,
+    requestedEngines: [engineId],
+    isFullyVerified: true,
+    engines: [
+      { engineId, measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+    ],
+  });
+  assert.throws(() => readReplayReport(path), /does not match the contract/);
+});
+
+test("a bundle naming an engine the check name cannot hold is refused", () => {
+  // The bundle's own engine id is over the limit the check name has, so the
+  // receipt would be one the bundle refuses.  Nothing is written.  The
+  // report covers the other engine only, which is the path that reaches the
+  // guard:  a report that covered this engine could not have decoded.
+  const engine = "e".repeat(2048);
+  const request = makeRequest(["claude", engine]);
+  const captureDir = makeCapture(makeReport([
+    { engineId: "claude", family: "claude", measured: true, isFullyVerified: true, fixtureCount: 20, passedCount: 20 },
+  ]));
+
+  assert.throws(() => emitReplayReceipt({
+    captureDir,
+    request,
+    reportPath: join(captureDir, "replay-parity.json"),
+    provenance: { ...PROVENANCE, record: join(captureDir, "provenance.txt") },
+  }), /over the bundle's check-name limit/);
 });
 
 test("an engine entry that carries no measurement is refused", () => {

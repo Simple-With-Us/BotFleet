@@ -1048,15 +1048,17 @@ const ImportParityReportSchema = z.looseObject({
   // bodies matched.
   sourceBodyDigestSHA256: z.string().regex(/^[0-9a-f]{64}$/i),
   targetBodyDigestSHA256: z.string().regex(/^[0-9a-f]{64}$/i),
-  // The mismatch and warning lists are external input, so the LIST is
-  // bounded:  a report carrying a million of them is not a report the
-  // importer wrote.  The entries themselves are not length-capped, because
-  // the importer joins the user-controlled metadata key names into a warning
-  // and no fixed length can be called valid for it.  Nothing here copies an
-  // entry into the problem list:  a problem names how many there are, so a
-  // long entry costs a long string in the report and nothing more.
-  mismatches: z.array(z.string()).max(1000),
-  warnings: z.array(z.string()).max(1000),
+  // The mismatch and warning lists are external input, so both the number of
+  // entries and the length of each one are bounded:  a report carrying a
+  // million of them, or one enormous entry, is not a report the importer
+  // wrote.  The bound on an entry is generous on purpose, because the
+  // importer joins the user-controlled metadata key names into one warning
+  // and a report whose warning is long is still a report the importer wrote.
+  // Nothing here copies an entry into the problem list:  a problem names how
+  // many there are, so a long entry costs a long string in the report and
+  // nothing more.
+  mismatches: z.array(z.string().max(16384)).max(1000),
+  warnings: z.array(z.string().max(16384)).max(1000),
   // The importer always writes this count, so a report that does not carry
   // it did not come from the importer, and without it the dropped-metadata
   // contradiction below cannot be checked at all.

@@ -423,6 +423,17 @@ test("a parity report with a long warning still decodes", () => {
   assert.doesNotMatch(verdict.problems.join("; "), /does not match the contract/);
 });
 
+test("a parity report carrying an enormous warning fails closed", () => {
+  // The entry is bounded as well as the list:  a report carrying one
+  // enormous warning is not a report the importer wrote.
+  const verdict = importParityVerdict(makeParityReport({
+    warnings: ["w".repeat(16385)],
+    isFullyVerified: false,
+  }));
+  assert.equal(verdict.isFullyVerified, false);
+  assert.match(verdict.problems.join("; "), /warnings/);
+});
+
 test("a parity report that is not an object fails closed", () => {
   assert.equal(importParityVerdict(null).isFullyVerified, false);
   assert.equal(importParityVerdict([]).isFullyVerified, false);

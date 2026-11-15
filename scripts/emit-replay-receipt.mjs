@@ -51,6 +51,9 @@ import { evidenceRef, validateBundleRequest } from "./archive-node-store.mjs";
 export const REPLAY_RECEIPT_VERSION = 1;
 export const REPLAY_RECEIPT_FILE = "replay.receipt.json";
 
+/** The longest a check name may be, which is the bundle's own text limit. */
+export const CHECK_NAME_LIMIT = 2048;
+
 /**
  * The report's shape, as far as the receipt reads it.
  *
@@ -76,10 +79,10 @@ const ReplayReportSchema = z.looseObject({
   // per entry by the checks below.  An engine id is bounded by the bundle
   // request's own text contract, which accepts 2048 characters, so a report
   // naming a longer id is refused rather than a valid one.
-  requestedEngines: z.array(z.string().min(1).max(2048)).min(1).max(32),
+  requestedEngines: z.array(z.string().min(1).max(2041)).min(1).max(32),
   isFullyVerified: z.boolean(),
   engines: z.array(z.looseObject({
-    engineId: z.string().min(1).max(2048),
+    engineId: z.string().min(1).max(2041),
     measured: z.boolean(),
     fixtureCount: z.number().int().nonnegative(),
     passedCount: z.number().int().nonnegative(),
@@ -279,11 +282,22 @@ export function emitReplayReceipt({ captureDir, request, provenance, reportPath 
   const report = readReplayReport(reportPath);
   const reportReference = evidenceRef(capture, reportPath);
 
-  const checks = bundle.engines.map((engine) => ({
-    name: `engine:${engine}`,
-    exitCode: replayVerdict(report, engine) ? 0 : 1,
-    artifact: reportReference,
-  }));
+  // A check name the bundle's own schema refuses is a receipt the bundle
+  // will reject, so the bundle's engine id is checked against that limit
+  // before anything is written.
+  const checks = bundle.engines.map((engine) => {
+    const name = `engine:${engine}`;
+    if (name.length > CHECK_NAME_LIMIT) {
+      throw new Error(
+        `the check name for the engine "${engine.slice(0, 32)}" is ${name.length} characters, which is over the bundle's check-name limit of ${CHECK_NAME_LIMIT}`,
+      );
+    }
+    return {
+      name,
+      exitCode: replayVerdict(report, engine) ? 0 : 1,
+      artifact: reportReference,
+    };
+  });
 
   const receipt = {
     version: REPLAY_RECEIPT_VERSION,
