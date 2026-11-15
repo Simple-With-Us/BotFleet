@@ -346,7 +346,7 @@ public final class HostMacCuaDriver: CuaDriverProtocol {
         guard macDriver.checkPermissions().hasAccessibility else {
             throw ContainerSocketError.httpStatus(
                 code: 403,
-                body: "Accessibility permission is not granted, so BotFleet cannot control this Mac."
+                body: "Accessibility permission is not granted, so BotFleet cannot control this Mac.\u{00A0} Turn it on in System Settings › Privacy & Security › Accessibility."
             )
         }
     }
