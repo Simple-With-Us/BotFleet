@@ -296,11 +296,6 @@ describe("reconcileTurnOverride", () => {
       freshSession: false,
     });
     // Nested fallbacks resolve customIds per entry via contextFor.
-    const byInstance: Record<string, LineageContext | undefined> = {
-      claude: contextFor("claude"),
-      dshCustom,
-      minimax: contextFor("minimax"),
-    };
     expect(
       reconcileTurnOverride(
         {
@@ -311,8 +306,8 @@ describe("reconcileTurnOverride", () => {
             { instanceId: "minimax", model: "MiniMax-M3" },
           ],
         },
-        byInstance.claude,
-        (id) => byInstance[id],
+        contextFor("claude"),
+        (id) => (id === "dshCustom" ? dshCustom : contextFor(id)),
       ),
     ).toEqual({
       selection: {
