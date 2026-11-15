@@ -467,6 +467,14 @@ export function checkLineageWrite(
   return { ok: true, selection: reconciled.selection, current: reconciledCurrent, changes: reconciled.changes };
 }
 
+/** Predicate for `rewriteModelSelection` that preserves operator-defined custom
+ *  catalog rows even when their id matches a retired official spelling. */
+export function customModelSkip(
+  contextFor: (instanceId: string) => LineageContext | undefined,
+): (entry: Pick<ModelSelection, "instanceId" | "model">) => boolean {
+  return (entry) => Boolean(contextFor(entry.instanceId)?.customIds?.includes(entry.model));
+}
+
 /** A per-turn override (a fallback or retry pick) reconciled the way a saved
  *  chain is, so a retired or superseded id is never dispatched or recorded.
  *  `freshSession` is true when the reconcile moved the model on an engine
@@ -478,14 +486,10 @@ export function reconcileTurnOverride(
   context: LineageContext | undefined,
   contextFor?: (instanceId: string) => LineageContext | undefined,
 ): { selection: ModelSelection; freshSession: boolean } {
-  const rewritten = rewriteModelSelection(selection, (entry) => {
-    const entryContext = contextFor
-      ? contextFor(entry.instanceId)
-      : entry.instanceId === selection.instanceId
-        ? context
-        : undefined;
-    return Boolean(entryContext?.customIds?.includes(entry.model));
-  }).selection;
+  const rewritten = rewriteModelSelection(
+    selection,
+    customModelSkip(contextFor ?? ((instanceId) => (instanceId === selection.instanceId ? context : undefined))),
+  ).selection;
   const reconciled = reconcileEntry(rewritten, context).entry;
   return {
     selection: reconciled,
