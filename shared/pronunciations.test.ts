@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   applyPronunciations,
+  applySpokenYears,
   checkPronunciations,
   DEFAULT_PRONUNCIATIONS,
   effectivePronunciations,
@@ -14,6 +15,7 @@ import {
   pronouncer,
   PronunciationDraftListSchema,
   sanitizeStoredPronunciations,
+  spokenYear,
   type Pronunciation,
 } from "./pronunciations.ts";
 import { pronounceUtterance, sourceOffsetAt, utterancesWithSpans } from "./speech-spans.ts";
@@ -217,5 +219,37 @@ describe("pronounceUtterance", () => {
   it("returns the same utterance when nothing matches", () => {
     const [u] = utterancesWithSpans("Nothing to say differently here.");
     expect(pronounceUtterance(u, DEFAULT_PRONUNCIATIONS)).toBe(u);
+  });
+
+  it("reads 4-digit years in spoken form and preserves spans even with an empty list", () => {
+    const source = "Shipped in 2026.";
+    const [u] = utterancesWithSpans(source);
+    const p = pronounceUtterance(u, []);
+    expect(p.text).toBe("Shipped in twenty twenty-six.");
+    const spoken = p.segments.find((seg) => p.text.slice(seg.spokenStart, seg.spokenEnd) === "twenty twenty-six");
+    expect(spoken?.kind).toBe("insert");
+    expect(source.slice(spoken!.srcStart, spoken!.srcEnd)).toBe("2026");
+  });
+});
+
+describe("applySpokenYears", () => {
+  it("formats 1900–2099 years in spoken style", () => {
+    expect(spokenYear(1900)).toBe("nineteen hundred");
+    expect(spokenYear(1905)).toBe("nineteen oh five");
+    expect(spokenYear(1984)).toBe("nineteen eighty-four");
+    expect(spokenYear(2000)).toBe("two thousand");
+    expect(spokenYear(2005)).toBe("twenty oh five");
+    expect(spokenYear(2010)).toBe("twenty ten");
+    expect(spokenYear(2026)).toBe("twenty twenty-six");
+  });
+
+  it("rewrites standalone years and skips identifiers, prices, versions, and URLs", () => {
+    expect(applySpokenYears("Released in 2026 (2025-2026).")).toBe(
+      "Released in twenty twenty-six (twenty twenty-five-twenty twenty-six).",
+    );
+    expect(applySpokenYears("See <#0.3#> 2026 notes.")).toBe("See <#0.3#> twenty twenty-six notes.");
+    expect(applySpokenYears("BF-2026 #2026 $2026 v2026 2026px 2026.1.0 https://example.com/2026")).toBe(
+      "BF-2026 #2026 $2026 v2026 2026px 2026.1.0 https://example.com/2026",
+    );
   });
 });

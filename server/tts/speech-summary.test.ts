@@ -264,6 +264,7 @@ describe("summarizeForVoice", () => {
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("<negative_constraints>");
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("Do not paraphrase");
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("Do not spell out numbers");
+    expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("twenty twenty-six");
   });
 
   it("keeps a short reply's deterministic script, and MiniMax still gets the acoustic pass", async () => {

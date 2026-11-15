@@ -23,7 +23,7 @@
 // The rules here must stay in lockstep with speakable(): a rule changed there
 // and not here fails the parity test rather than drifting silently.
 
-import { findPronunciations, type Pronunciation } from "./pronunciations.ts";
+import { findPronunciations, findSpokenYears, type Pronunciation, type TextReplacement } from "./pronunciations.ts";
 
 /** `copy`: the spoken characters are the source characters, one for one.
  * `insert`: literal text the rules wrote in place of the source span (it may
@@ -540,18 +540,7 @@ function trackedFromUtterance(u: SpokenUtterance): Tracked {
   return { text: u.text, srcStart, srcEnd, kind };
 }
 
-/**
- * `u` as the voice should say it: every term on the pronunciation list
- * (shared/pronunciations.ts) replaced by its respelling, with the spans kept
- * valid.  A replaced term becomes one `insert` segment whose source span is
- * the term's own, so karaoke still lands "sequel" on "SQL".  Utterance
- * offsets are not shifted for later utterances; consumers read the local
- * segments, which is all encodeSpokenSpans sends.
- */
-export function pronounceUtterance(u: SpokenUtterance, list: readonly Pronunciation[]): SpokenUtterance {
-  const matches = findPronunciations(u.text, list);
-  if (!matches.length) return u;
-  const t = trackedFromUtterance(u);
+function rewriteTracked(t: Tracked, matches: readonly TextReplacement[]): Tracked {
   const out = new TrackedBuilder();
   let last = 0;
   for (const m of matches) {
@@ -561,6 +550,26 @@ export function pronounceUtterance(u: SpokenUtterance, list: readonly Pronunciat
     last = m.end;
   }
   out.copy(t, last, t.text.length);
-  const built = out.build();
-  return { text: built.text, spokenStart: u.spokenStart, spokenEnd: u.spokenStart + built.text.length, segments: segmentsOf(built) };
+  return out.build();
+}
+
+/**
+ * `u` as the voice should say it: every term on the pronunciation list
+ * (shared/pronunciations.ts) replaced by its respelling, and standalone
+ * 4-digit years (1900–2099) written as spoken ("twenty twenty-six"), with
+ * the spans kept valid.  A replaced term becomes one `insert` segment whose
+ * source span is the term's own, so karaoke still lands "sequel" on "SQL"
+ * and "twenty twenty-six" on "2026".  Utterance offsets are not shifted for
+ * later utterances; consumers read the local segments, which is all
+ * encodeSpokenSpans sends.
+ */
+export function pronounceUtterance(u: SpokenUtterance, list: readonly Pronunciation[]): SpokenUtterance {
+  const matches = findPronunciations(u.text, list);
+  let t = matches.length ? rewriteTracked(trackedFromUtterance(u), matches) : null;
+  const yearMatches = findSpokenYears(t ? t.text : u.text);
+  if (yearMatches.length) {
+    t = rewriteTracked(t ?? trackedFromUtterance(u), yearMatches);
+  }
+  if (!t) return u;
+  return { text: t.text, spokenStart: u.spokenStart, spokenEnd: u.spokenStart + t.text.length, segments: segmentsOf(t) };
 }
