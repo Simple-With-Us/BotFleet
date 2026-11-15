@@ -2613,4 +2613,43 @@ describe("retired MiniMax-M3 ids are rewritten before failover", () => {
       fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3.1-Flash" }],
     });
   });
+
+  it("resolveModel and selectTurnFallback preserve custom catalog ids when skipRetiredModel matches", () => {
+    const skipRetiredModel = (entry: { instanceId: string; model: string }) =>
+      entry.instanceId === "dshCustom" && entry.model === "MiniMax-M3";
+
+    const registry = new QuotaCooldownRegistry();
+    const resolved = registry.resolveModel(
+      "director",
+      {
+        instanceId: "dshCustom",
+        model: "MiniMax-M3",
+        fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3" }],
+      },
+      undefined,
+      { skipRetiredModel },
+    );
+    expect(resolved.selection).toEqual({
+      instanceId: "dshCustom",
+      model: "MiniMax-M3",
+      fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3.1-Flash" }],
+    });
+
+    const next = selectTurnFallback({
+      ok: false,
+      produced: false,
+      fallbacks: [
+        { instanceId: "dshCustom", model: "MiniMax-M3" },
+        { instanceId: "minimax", model: "MiniMax-M3" },
+      ],
+      used: 0,
+      current: { instanceId: "grok", model: "grok-4.7" },
+      skipRetiredModel,
+    });
+    expect(next).toEqual({
+      instanceId: "dshCustom",
+      model: "MiniMax-M3",
+      nextUsed: 1,
+    });
+  });
 });

@@ -362,6 +362,7 @@ import { modelEffortLevels } from "../src/lib/model-effort.ts";
 import type { LineageContext } from "../shared/model-lineage.ts";
 import {
   checkLineageWrite,
+  customModelSkip,
   gateLineageByCliVersion,
   lineageContextFor,
   modelNameFor,
@@ -1858,7 +1859,7 @@ function executionInstanceFor(
     const boxCloud = registry.instances().find((candidate) => candidate.driverKind === "boxAgent");
     if (boxCloud) return boxCloud.instanceId;
   }
-  return quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId;
+  return quotaCooldowns.resolveModel(bot.id, policy, undefined, { skipRetiredModel: skipCustomModels }).selection.instanceId;
 }
 
 /** Engines this bot's queued runs would actually execute on.
@@ -1915,7 +1916,9 @@ function dispatchHoldFor(
   const boxCloud = cloudRunUsesBoxAgent(runOn, bot.cloudBackend ?? undefined, cfg.botDefaults?.cloudBackend)
     ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent")
     : undefined;
-  const modelRoute = boxCloud ? undefined : quotaCooldowns.resolveModel(bot.id, policy);
+  const modelRoute = boxCloud
+    ? undefined
+    : quotaCooldowns.resolveModel(bot.id, policy, undefined, { skipRetiredModel: skipCustomModels });
   // A Box-backed cloud run does NOT execute on the bot's model engine:
   // `startTurn` switches it to the boxAgent instance. Judging the hold against
   // the local engine queued healthy cloud work whenever the local engine was
@@ -2443,6 +2446,8 @@ function lineageContextForInstance(instanceId: string): LineageContext | undefin
   return gateLineageByCliVersion(context, cliVersionByInstance.get(instanceId));
 }
 
+const skipCustomModels = customModelSkip(lineageContextForInstance);
+
 /** Reconcile saved selections against the engines' current catalogs.  The
  *  store posts one notice per bot it moved and emits the bot frames. */
 function reconcileModelLineage(opts: { botIds?: readonly string[]; ownerDirective?: boolean; skipBusy?: boolean } = {}) {
@@ -2601,7 +2606,7 @@ function checkedModelSelection(
   // checks so a PATCH cannot re-introduce them.  model-lineage deliberately
   // omits those engines; Claude/Grok retired ids still move via lineage below.
   {
-    const rewritten = rewriteModelSelection(selection);
+    const rewritten = rewriteModelSelection(selection, skipCustomModels);
     if (rewritten.changed) {
       selection.model = rewritten.selection.model;
       if (rewritten.selection.fallbacks) selection.fallbacks = rewritten.selection.fallbacks;
@@ -5339,6 +5344,7 @@ async function launchFallbackTurn(input: {
             botId,
             isCooling: (candidateBotId, instanceId, model, now) =>
               Boolean(quotaCooldowns.get(candidateBotId, instanceId, model, now)) || Boolean(transientRouteHealth.get(instanceId, model, now)),
+            skipRetiredModel: skipCustomModels,
           });
       if (!following) {
         fallbackAttemptByTurn.delete(key);
@@ -6321,6 +6327,7 @@ bus.subscribe((event: RuntimeEvent) => {
           botId: fallbackBot.id,
           isCooling: (candidateBotId, instanceId, model, now) =>
             Boolean(quotaCooldowns.get(candidateBotId, instanceId, model, now)) || Boolean(transientRouteHealth.get(instanceId, model, now)),
+          skipRetiredModel: skipCustomModels,
         });
         // Receipt now that the failover decision exists: while a fallback is
         // launching the run stays open and receipts on the fallback's own
@@ -7309,7 +7316,7 @@ async function startTurn(
   let selection = opts?.modelSelection
     ?? (opts?.command
       ? { instanceId: fallbackPolicy.instanceId, model: fallbackPolicy.model, effort: fallbackPolicy.effort }
-      : quotaCooldowns.resolveModel(bot.id, fallbackPolicy).selection);
+      : quotaCooldowns.resolveModel(bot.id, fallbackPolicy, undefined, { skipRetiredModel: skipCustomModels }).selection);
   if (opts?.modelSelection) {
     const override = reconcileTurnOverride(
       selection,
@@ -9680,7 +9687,10 @@ function threadExternalCredentialPending(bot: NonNullable<ReturnType<typeof stor
   // only caller re-checked by catching `startTurn`'s refusal, and wrong now
   // that the recovery PLAN has to know before it decides anything.
   const policy = store.taskByThread(bot.id, threadId)?.modelSelection ?? bot.modelSelection;
-  return turnExternalCredentialPending(bot, quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId);
+  return turnExternalCredentialPending(
+    bot,
+    quotaCooldowns.resolveModel(bot.id, policy, undefined, { skipRetiredModel: skipCustomModels }).selection.instanceId,
+  );
 }
 
 // ── one recovery coordinator ─────────────────────────────────────────────
