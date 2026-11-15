@@ -16,6 +16,10 @@ import {
   verifyReleaseAgainstCommit,
 } from "./release-provenance.mjs";
 
+// Root bypasses the file-mode checks this fixture is built on: as root the
+// dependency root is readable, so the case would fail for the wrong reason.
+const ROOT_IS_ROOT = process.getuid?.() === 0;
+
 /**
  * A real repository and a real exported tree: the verifier's whole claim is
  * byte-equality with git's objects, so faking either side would test the fake.
@@ -564,7 +568,7 @@ test("a trusted fingerprint verifies the dependency scope, and a wrong one is dr
   assert.equal(wrong.driftScope, "deps");
 });
 
-test("an unreadable dependency root is unverifiable, never absent", (t) => {
+test("an unreadable dependency root is unverifiable, never absent", { skip: ROOT_IS_ROOT }, (t) => {
   const { dir, git } = makeRepo(t);
   const commit = commitTree(git, dir, { "a.txt": "one\n" });
   const root = exportTree(git, dir, commit);

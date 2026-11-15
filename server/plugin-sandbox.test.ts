@@ -19,6 +19,7 @@ import {
 import { PluginCardResultSchema } from "./plugin-sandbox-protocol.ts";
 import type { PluginEventEnvelope } from "../shared/plugin-events.ts";
 import { removeDirSafe } from "./plugin-registry.ts";
+import { runningAsRoot } from "./testing/privilege.ts";
 import type { PluginListing } from "./plugin-types.ts";
 
 const SECRET_ENV = "BOTFLEET_SANDBOX_TEST_SECRET";
@@ -107,7 +108,10 @@ afterEach(async () => {
   await removeDirSafe(outsideDir);
 });
 
-describe("plugin sandbox isolation", () => {
+// The sandbox denies what the plugin must not reach, and root is not denied the
+// things a plugin must not reach.  The suite says so instead of failing on a
+// root host or passing without isolating anything.
+describe.skipIf(runningAsRoot())("plugin sandbox isolation", () => {
   it("runs handlers out of process and answers host calls from the snapshot", async () => {
     writePlugin("ok", `
       export function getCardData({ host }) { return { result: { bots: host.getBots().length, pid: process.pid } }; }

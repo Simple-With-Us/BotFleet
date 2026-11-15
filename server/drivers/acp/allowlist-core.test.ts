@@ -14,6 +14,7 @@ import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import { removeTempDir } from "../../testing/cleanup.ts";
 import { sanitizeToolPolicy, type ToolPolicy } from "../../tool-policy.ts";
 import { openedFileIsListed } from "./allowlist.ts";
+import { runningAsRoot } from "../../testing/privilege.ts";
 import { GrokAgentDriver, grokAllowlistProblem } from "./grok.ts";
 import { McodeAgentDriver } from "./mcode.ts";
 
@@ -122,7 +123,11 @@ afterEach(async () => {
 // `/bin/cat` and `/bin/pwd`, which `isCleanAbsolutePath` rightly refuses on Windows, where mkdtemp
 // hands back `C:\Users\...\fake-simple-chat`.  The suite is POSIX-only;  `grokAllowlistProblem` below
 // is pure logic and runs everywhere.
-const posix = describe.skipIf(process.platform === "win32");
+// The suites below build their fixtures out of links the bot does not own, and the
+// policy refuses to follow a link it does not own.  Root owns every link it
+// creates, so as root the policy follows them and the suite cannot test what
+// it means to test.  It says so here rather than depending on the host.
+const posix = describe.skipIf(process.platform === "win32" || runningAsRoot());
 
 posix("an allowlist turn on Grok", () => {
   it("spawns in an asking mode, offers a terminal and files, registers the hook, and mounts no MCP", async () => {

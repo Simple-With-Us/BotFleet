@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { removeTempDir } from "./testing/cleanup.ts";
+import { runningAsRoot } from "./testing/privilege.ts";
 
 // The module stores shadow repos under DATA_DIR, which config.ts reads from
 // OMB_DATA_DIR at import time — so the env var must be set before the import
@@ -152,7 +153,7 @@ describe("restore", () => {
     expect(existsSync(join(cwd, "run.log"))).toBe(true);
   });
 
-  it.skipIf(process.platform === "win32")("refuses to restore when the safety checkpoint misses a path", async () => {
+  it.skipIf(process.platform === "win32" || runningAsRoot())("refuses to restore when the safety checkpoint misses a path", async () => {
     const { bot, cwd } = workspace();
     writeFileSync(join(cwd, "a.txt"), "one");
     const checkpoint = await snapshot(bot, cwd, "turn 1");
