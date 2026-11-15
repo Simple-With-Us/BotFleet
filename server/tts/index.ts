@@ -5,7 +5,7 @@
 // is a voice at all.
 import { isPersonalVoiceId, readableVoiceId } from "../../shared/bot-voice.ts";
 import { voiceMasterEnabled } from "../../shared/voice-master.ts";
-import { applyPronunciations, effectivePronunciations, type Pronunciation } from "../../shared/pronunciations.ts";
+import { applyPronunciations, applySpokenYears, effectivePronunciations, type Pronunciation } from "../../shared/pronunciations.ts";
 import { stripPauseTags } from "../../shared/spoken-script.ts";
 import type { AppConfig } from "../config.ts";
 import * as azure from "./azure.ts";
@@ -155,7 +155,7 @@ export function listCustomVoices() {
  * is left as it is. */
 export function speak(cfg: AppConfig, rawText: string, voiceId?: string, run?: systemVoices.Runner) {
   const provider = voiceProvider(cfg);
-  let text = applyPronunciations(rawText, pronunciations(cfg));
+  let text = applySpokenYears(applyPronunciations(rawText, pronunciations(cfg)));
   // MiniMax pause tags are for that engine only; macOS `say` reads them aloud
   // or truncates the utterance after the first marker.
   if (provider === "system") text = stripPauseTags(text);

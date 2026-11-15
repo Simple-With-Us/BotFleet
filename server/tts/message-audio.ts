@@ -72,7 +72,7 @@
 import { z } from "zod";
 
 import { isPersonalVoiceId, isSpeechDevice, SPEECH_DEVICES, voiceForDevice, type BotVoices, type SpeechDevice } from "../../shared/bot-voice.ts";
-import { pronouncer, type Pronunciation } from "../../shared/pronunciations.ts";
+import { applySpokenYears, pronouncer, type Pronunciation } from "../../shared/pronunciations.ts";
 import { pronounceUtterance, utterancesWithSpans, type SpokenUtterance } from "../../shared/speech-spans.ts";
 import { encodeSpokenSpans, stripOnDeviceProsodyMarkup, type SpokenScriptKind, type SpokenSpansWire } from "../../shared/spoken-script.ts";
 import { voiceScriptKind, writtenReply, type VoiceSummaryMode } from "../../shared/voice-summary.ts";
@@ -591,15 +591,15 @@ export class MessageAudio {
       let onDevice: string[];
       let onDeviceSpans = spansWire;
       if (label === "written" && written) {
-        const respelled = list.length ? written.map((u) => pronounceUtterance(u, list)) : written;
+        const respelled = written.map((u) => pronounceUtterance(u, list));
         onDevice = respelled.map((u) => u.text);
-        if (spans && respelled !== written) onDeviceSpans = encodeSpokenSpans(source, respelled);
+        if (spans && respelled.some((u, i) => u !== written[i])) onDeviceSpans = encodeSpokenSpans(source, respelled);
       } else {
         const respell = pronouncer(list);
         onDevice = utterances
           .map(stripOnDeviceProsodyMarkup)
           .filter((u) => /[\p{L}\p{N}]/u.test(u))
-          .map(respell);
+          .map((u) => applySpokenYears(respell(u)));
       }
       // `script` and `spans` only for a client that asked, as extra() does,
       // with the spans of what the device is actually handed.

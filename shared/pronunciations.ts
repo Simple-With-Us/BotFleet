@@ -112,10 +112,15 @@ export type PronunciationDraft = z.infer<typeof PronunciationDraftSchema>;
 /** A value read from the config file: JSON, nothing narrower known yet. */
 export type StoredJson = string | number | boolean | null | StoredJson[] | { [key: string]: StoredJson };
 
-export interface PronunciationMatch {
-  /** UTF-16 offsets of the matched term, end exclusive. */
+export interface TextReplacement {
+  /** UTF-16 offsets of the matched span, end exclusive. */
   start: number;
   end: number;
+  /** Replacement text. */
+  replacement: string;
+}
+
+export interface PronunciationMatch extends TextReplacement {
   /** What replaces it, including any space a symbol term needs. */
   replacement: string;
   entry: Pronunciation;
@@ -233,7 +238,7 @@ export function pronouncer(list: readonly Pronunciation[]): (text: string) => st
   return (text) => rewrite(text, scan(text, byFirst));
 }
 
-function rewrite(text: string, matches: readonly PronunciationMatch[]): string {
+function rewrite(text: string, matches: readonly TextReplacement[]): string {
   if (!matches.length) return text;
   let out = "";
   let last = 0;
@@ -242,6 +247,61 @@ function rewrite(text: string, matches: readonly PronunciationMatch[]): string {
     last = m.end;
   }
   return out + text.slice(last);
+}
+
+const YEAR_ONES = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"];
+const YEAR_TEENS = [
+  "ten", "eleven", "twelve", "thirteen", "fourteen",
+  "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+];
+const YEAR_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"];
+const YEAR_PATTERN = /(19\d{2}|20\d{2})/g;
+
+function twoDigitYearWords(n: number): string {
+  if (n < 10) return YEAR_ONES[n];
+  if (n < 20) return YEAR_TEENS[n - 10];
+  const ones = n % 10;
+  return ones > 0 ? `${YEAR_TENS[Math.floor(n / 10)]}-${YEAR_ONES[ones]}` : YEAR_TENS[Math.floor(n / 10)];
+}
+
+/** Spoken English reading for a four-digit year (1900–2099), e.g. 2026 -> "twenty twenty-six". */
+export function spokenYear(year: number): string {
+  if (year === 2000) return "two thousand";
+  if (year === 1900) return "nineteen hundred";
+  const head = Math.floor(year / 100) === 19 ? "nineteen" : "twenty";
+  const rest = year % 100;
+  return rest < 10 ? `${head} oh ${YEAR_ONES[rest]}` : `${head} ${twoDigitYearWords(rest)}`;
+}
+
+/** Find standalone 4-digit years (1900–2099) outside pause tags and protected chunks. */
+export function findSpokenYears(text: string): TextReplacement[] {
+  if (!text) return [];
+  const tags: Array<[number, number]> = [];
+  if (text.includes("<#")) {
+    for (const m of text.matchAll(PAUSE_TAG)) tags.push([m.index ?? 0, (m.index ?? 0) + m[0].length]);
+  }
+  const plain = tags.length ? text.replace(PAUSE_TAG, (t) => " ".repeat(t.length)) : text;
+  const out: TextReplacement[] = [];
+  for (const m of text.matchAll(YEAR_PATTERN)) {
+    const start = m.index ?? 0;
+    const end = start + m[0].length;
+    if (tags.some(([a, b]) => a < end && b > start)) continue;
+    const before = charBefore(text, start);
+    const after = charAt(text, end);
+    if (isWordChar(before) || before === "#" || before === "/" || before === ":" || /\p{Sc}/u.test(before)) continue;
+    if (before === "-" && start >= 2 && /[A-Za-z]/.test(text[start - 2])) continue;
+    if (isWordChar(after) || after === "/") continue;
+    const [c, d] = chunkAround(plain, start, end);
+    const probe = `${plain.slice(c, start)}w${plain.slice(end, d)}`;
+    if (PROTECTED_CHUNK.test(probe)) continue;
+    out.push({ start, end, replacement: spokenYear(Number(m[1])) });
+  }
+  return out;
+}
+
+/** Replace standalone 4-digit years (1900–2099) with their spoken readings. */
+export function applySpokenYears(text: string): string {
+  return rewrite(text, findSpokenYears(text));
 }
 
 export type PronunciationCheck =
