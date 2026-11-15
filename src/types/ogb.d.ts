@@ -1,5 +1,7 @@
 // The narrow bridge the Electron preload exposes. Absent in the browser.
 
+import type { CompanionEndpoint } from "../lib/companion-pairing";
+
 declare global {
 type NativeSkillRecordingEvent = {
   type: "app" | "click" | "scroll" | "key" | "typing" | "clipboard" | "download";
@@ -131,6 +133,22 @@ type SkillRecordingPayload = {
       getCapabilities(): Promise<DesktopCapabilities>;
       onCapabilitiesChanged(cb: (capabilities: DesktopCapabilities) => void): () => void;
       appInfo?(): Promise<AppRuntimeInfo>;
+      /** The companion sidecar: the one part of this app that listens off the
+       * machine, so it runs as its own process and is off until switched on.
+       * Every call answers with the whole state.  This is the preload's real
+       * contract (electron/preload.cjs), stated once here. */
+      companion?: {
+        state(): Promise<CompanionState>;
+        start(): Promise<CompanionState>;
+        stop(): Promise<CompanionState>;
+        /** Turns the hosted tunnel on or off.  The answer is the managed
+         * connection's own state, not the companion's. */
+        tryCloudflare(enabled: boolean): Promise<CompanionManagedConnection>;
+        keepAwake(enabled: boolean): Promise<CompanionState>;
+        pairing(open: boolean, expectedToken?: string): Promise<CompanionState>;
+        cloudDesktop(deviceId: string, allowed: boolean): Promise<CompanionState>;
+        revoke(deviceId: string): Promise<CompanionState>;
+      };
       companionAccount?: {
         state(): Promise<CompanionAccountState>;
         requestCode(email: string): Promise<CompanionAccountState>;
@@ -351,6 +369,44 @@ export interface UpdaterState {
   message?: string;
   /** True when this Mac has ~/apps/update-botfleet.sh (owner local rebuild). */
   canLocalUpdate?: boolean;
+}
+
+export interface CompanionPhoneDevice {
+  id: string;
+  name: string;
+  createdAt: number;
+  lastSeenAt: number;
+  cloudDesktopAccess: boolean;
+}
+
+/** The companion sidecar's whole state, as the preload hands it over. */
+export interface CompanionState {
+  enabled: boolean;
+  keepAwake: boolean;
+  port: number;
+  devices: CompanionPhoneDevice[];
+  connectedDeviceIds?: string[];
+  pairing: { code: string; token: string; expiresAt: number } | null;
+  addresses?: string[];
+  tailscale?: string;
+  tailnetName?: string;
+  lan?: string | null;
+  hosts?: string[];
+  endpoints?: CompanionEndpoint[];
+  discovery?: { advertising: boolean; name: string };
+  error?: string;
+  /** The hosted tunnel, when the desktop app manages one. */
+  managedConnection?: CompanionManagedConnection;
+}
+
+/** The hosted tunnel the companion can be reached through. */
+export interface CompanionManagedConnection {
+  status: string;
+  configured: boolean;
+  ready: boolean;
+  url?: string;
+  retryInMs?: number;
+  error?: string;
 }
 
 export interface CompanionAccountState {

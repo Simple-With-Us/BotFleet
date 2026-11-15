@@ -176,23 +176,10 @@ interface IngressTestResult {
   tunnel?: string;
 }
 
-/** The two companion-sidecar calls this component makes.  `src/types/ogb.d.ts`
- *  does not carry the `companion` member, so the contract is named here
- *  instead of reaching for `window as any` at each of the three call sites. */
-interface CompanionTunnelBridge {
-  state(): Promise<{ url?: string }>;
-  /** The pairing result is not part of this component's contract: the caller
-   *  fires and forgets, and the poll below is what reports the outcome. */
-  tryCloudflare(enabled: boolean): Promise<void>;
-}
-
-/** The companion tunnel bridge, or undefined off the desktop. */
-function companionTunnel(): CompanionTunnelBridge | undefined {
-  // SAFETY: `companion` is declared unconditionally on the preload's `ogb`
-  // object (electron/preload.cjs), so in the packaged app the member and both
-  // methods are present; the browser build injects no `ogb` at all, which is
-  // exactly what the optional chain is for.
-  return (window.ogb as { companion?: CompanionTunnelBridge } | undefined)?.companion;
+/** The companion tunnel bridge, or undefined off the desktop.  The contract
+ *  is the preload's own, stated once in `src/types/ogb.d.ts`. */
+function companionTunnel(): NonNullable<Window["ogb"]>["companion"] {
+  return window.ogb?.companion;
 }
 
 function CustomIngressFields() {
@@ -228,12 +215,16 @@ function CustomIngressFields() {
     const bridge = companionTunnel();
     if (!bridge) return;
 
-    // Poll the companion state
+    // Poll the companion state.  The free URL is the managed connection's,
+    // not the companion's own: the sidecar's state carries the paired phones
+    // and the pairing code, and the hosted tunnel hangs off the managed
+    // connection the desktop app wraps around it.
     const poll = async () => {
       try {
         const state = await bridge.state();
-        if (active && state?.url) {
-          setTunnelUrl(state.url);
+        const url = state?.managedConnection?.url;
+        if (active && url) {
+          setTunnelUrl(url);
         }
       } catch {}
       if (active) setTimeout(poll, 2000);
