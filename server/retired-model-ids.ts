@@ -50,18 +50,21 @@ export function isRetiredModelId(model: string): boolean {
 /** Rewrite primary + nested fallbacks.  Effort and instanceId stay put —
  *  only the model spelling changes.  Returns whether anything changed so
  *  a store migration can persist once. */
-export function rewriteModelSelection(selection: ModelSelection): {
+export function rewriteModelSelection(
+  selection: ModelSelection,
+  skip?: (entry: ModelSelection) => boolean,
+): {
   selection: ModelSelection;
   changed: boolean;
 } {
   let changed = false;
-  const model = rewriteRetiredModelId(selection.model);
+  const model = skip?.(selection) ? selection.model : rewriteRetiredModelId(selection.model);
   if (model !== selection.model) changed = true;
   let fallbacks = selection.fallbacks;
   if (fallbacks && fallbacks.length > 0) {
     const next: ModelSelection[] = [];
     for (const entry of fallbacks) {
-      const rewritten = rewriteModelSelection(entry);
+      const rewritten = rewriteModelSelection(entry, skip);
       if (rewritten.changed) changed = true;
       next.push(rewritten.selection);
     }
@@ -69,10 +72,10 @@ export function rewriteModelSelection(selection: ModelSelection): {
   }
   if (!changed) return { selection, changed: false };
   const out: ModelSelection = {
-    instanceId: selection.instanceId,
+    ...selection,
     model,
   };
-  if (selection.effort !== undefined) out.effort = selection.effort;
   if (fallbacks && fallbacks.length > 0) out.fallbacks = fallbacks;
+  else delete out.fallbacks;
   return { selection: out, changed: true };
 }
