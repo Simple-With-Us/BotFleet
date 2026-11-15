@@ -1356,7 +1356,7 @@ export class Store {
     // busy/activity never survive a restart (reset on load above) and
     // change on every turn transition, so they are excluded here rather
     // than debounced — nothing to coalesce for state nobody reads back.
-    writeFileAtomic(BOTS_FILE, JSON.stringify(this.bots.map(({ busy, activity, waitingThreadId, ...bot }) => bot), null, 2));
+    writeFileAtomic(BOTS_FILE, JSON.stringify(this.bots.map(({ busy, activity, waitingThreadId: _waitingThreadId, ...bot }) => bot), null, 2));
     this.botsDirty = false;
   }
 
