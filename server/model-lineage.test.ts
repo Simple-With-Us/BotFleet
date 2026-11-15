@@ -236,6 +236,58 @@ describe("reconcileTurnOverride", () => {
     expect(moved.selection.model).toBe("claude-sonnet-5-5");
     expect(moved.freshSession).toBe(false);
   });
+
+  it("rewrites retired ids on lineage-less engines while preserving optional fields and custom rows", () => {
+    expect(
+      reconcileTurnOverride(
+        { instanceId: "minimax", model: "MiniMax-M3", effort: "high", contextCap: 262_144, maxOutputTokens: 8192 },
+        contextFor("minimax"),
+      ),
+    ).toEqual({
+      selection: {
+        instanceId: "minimax",
+        model: "MiniMax-M3.1-Flash",
+        effort: "high",
+        contextCap: 262_144,
+        maxOutputTokens: 8192,
+      },
+      freshSession: false,
+    });
+    expect(
+      reconcileTurnOverride({ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" }, { driverKind: "dshAgent", offeredIds: [], authoritative: false }),
+    ).toEqual({
+      selection: { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
+      freshSession: false,
+    });
+    expect(
+      reconcileTurnOverride({ instanceId: "mcode", model: "MiniMax-M3.1-Flash-Preview-thinking" }, undefined),
+    ).toEqual({
+      selection: { instanceId: "mcode", model: "MiniMax-M3.1-Flash-thinking" },
+      freshSession: false,
+    });
+    expect(
+      reconcileTurnOverride({ instanceId: "dsh", model: "DeepSeek-V4.1-Pro" }, { driverKind: "dshAgent", offeredIds: [], authoritative: false }),
+    ).toEqual({
+      selection: { instanceId: "dsh", model: "DeepSeek-V4-Pro" },
+      freshSession: false,
+    });
+    expect(
+      reconcileTurnOverride({ instanceId: "dsh", model: "deepseek-v4-flash" }, { driverKind: "dshAgent", offeredIds: [], authoritative: false }),
+    ).toEqual({
+      selection: { instanceId: "dsh", model: "DeepSeek-V4.1-Flash" },
+      freshSession: false,
+    });
+    // An operator custom row keeps its exact id.
+    expect(
+      reconcileTurnOverride(
+        { instanceId: "dsh", model: "MiniMax-M3" },
+        { driverKind: "dshAgent", offeredIds: [], customIds: ["MiniMax-M3"], authoritative: false },
+      ),
+    ).toEqual({
+      selection: { instanceId: "dsh", model: "MiniMax-M3" },
+      freshSession: false,
+    });
+  });
 });
 
 describe("checkLineageWrite", () => {

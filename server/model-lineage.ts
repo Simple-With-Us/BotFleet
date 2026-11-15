@@ -5,6 +5,7 @@
 // Kept out of index.ts so it is testable without booting the server.
 import type { ModelSelection } from "./contracts.ts";
 import { STATIC_CODEX_MODELS } from "./drivers/codex-catalog.ts";
+import { rewriteModelSelection } from "./retired-model-ids.ts";
 import {
   anyLineageLabel,
   classifyModel,
@@ -474,7 +475,10 @@ export function reconcileTurnOverride(
   selection: ModelSelection,
   context: LineageContext | undefined,
 ): { selection: ModelSelection; freshSession: boolean } {
-  const reconciled = reconcileEntry(selection, context).entry;
+  const rewritten = context?.customIds?.includes(selection.model)
+    ? selection
+    : rewriteModelSelection(selection).selection;
+  const reconciled = reconcileEntry(rewritten, context).entry;
   return {
     selection: reconciled,
     freshSession: reconciled.model !== selection.model && resumeKeepsStartedModel(context?.driverKind),

@@ -147,4 +147,24 @@ describe("rewriteModelSelection", () => {
     expect(changed).toBe(false);
     expect(selection).toBe(input);
   });
+
+  it("preserves contextCap, maxOutputTokens, and latest when rewriting a retired id", () => {
+    const { selection, changed } = rewriteModelSelection({
+      instanceId: "dsh",
+      model: "MiniMax-M3.1-Flash-Preview-1M",
+      effort: "high",
+      contextCap: 524_288,
+      maxOutputTokens: 16_384,
+      latest: "flash",
+    });
+    expect(changed).toBe(true);
+    expect(selection).toEqual({
+      instanceId: "dsh",
+      model: "MiniMax-M3.1-Flash-1M",
+      effort: "high",
+      contextCap: 524_288,
+      maxOutputTokens: 16_384,
+      latest: "flash",
+    });
+  });
 });

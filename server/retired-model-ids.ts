@@ -69,10 +69,10 @@ export function rewriteModelSelection(selection: ModelSelection): {
   }
   if (!changed) return { selection, changed: false };
   const out: ModelSelection = {
-    instanceId: selection.instanceId,
+    ...selection,
     model,
   };
-  if (selection.effort !== undefined) out.effort = selection.effort;
   if (fallbacks && fallbacks.length > 0) out.fallbacks = fallbacks;
+  else delete out.fallbacks;
   return { selection: out, changed: true };
 }

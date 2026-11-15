@@ -7081,7 +7081,10 @@ function restoreHeldWork(work: HeldWork, context: string) {
     };
     if (round.cardContinuation !== undefined) restored.cardContinuation = round.cardContinuation;
     if (round.turnSelection) {
-      restored.turnSelection = { instanceId: round.turnSelection.instanceId, model: round.turnSelection.model };
+      restored.turnSelection = {
+        instanceId: round.turnSelection.instanceId,
+        model: rewriteRetiredModelId(round.turnSelection.model),
+      };
       if (isEffortLevel(round.turnSelection.effort)) restored.turnSelection.effort = round.turnSelection.effort;
       if (round.turnSelection.latest) restored.turnSelection.latest = round.turnSelection.latest;
     }
