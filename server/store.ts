@@ -46,6 +46,7 @@ import {
   type LineageContext,
 } from "../shared/model-lineage.ts";
 import { mergeTaskStats, type TurnStatsSample } from "./turn-stats.ts";
+import { customModelSkip } from "./model-lineage.ts";
 import { rewriteModelSelection } from "./retired-model-ids.ts";
 import { automationRolloverSeedText } from "./automation-rollover.ts";
 import type { ToolPolicy } from "./tool-policy.ts";
@@ -2893,12 +2894,7 @@ export class Store {
     };
     /** `directive` names the saved selection (bot and scope) when the
      *  owner-directed flags may apply to it. */
-    const skipRetired = (entry: Pick<ModelSelection, "instanceId" | "model">) => {
-      const context = opts.contextFor(entry.instanceId);
-      // Leave unloaded instances and operator-defined custom catalog rows
-      // untouched: without a loaded catalog we cannot distinguish custom ids.
-      return !context || Boolean(context.customIds?.includes(entry.model));
-    };
+    const skipRetired = customModelSkip(opts.contextFor, { skipUnloaded: true });
     const pass = (selection: ModelSelection, directive?: { botId: string; scope: string }) => {
       const retiredRewritten = rewriteModelSelection(selection, skipRetired).selection;
       let flagged: { selection: ModelSelection; flagged: LineageChange[] } = { selection: retiredRewritten, flagged: [] };

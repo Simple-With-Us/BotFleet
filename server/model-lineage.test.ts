@@ -7,6 +7,7 @@ import {
   catalogIsLive,
   checkLineageWrite,
   claudeModelsTooNewFor,
+  customModelSkip,
   gateLineageByCliVersion,
   lineageContextFor,
   matchesStaticFallback,
@@ -320,6 +321,19 @@ describe("reconcileTurnOverride", () => {
       },
       freshSession: false,
     });
+  });
+
+  it("customModelSkip skips unregistered and catalogPending engines when skipUnloaded is set", () => {
+    const contextById = new Map<string, LineageContext>([
+      ["shadow", { driverKind: "dshAgent", offeredIds: [], authoritative: false, catalogPending: true }],
+      ["custom", { driverKind: "dshAgent", offeredIds: ["MiniMax-M3"], customIds: ["MiniMax-M3"], authoritative: true }],
+      ["loaded", { driverKind: "minimax", offeredIds: ["MiniMax-M3.1-Flash"], customIds: [], authoritative: true }],
+    ]);
+    const skip = customModelSkip((id) => contextById.get(id), { skipUnloaded: true });
+    expect(skip({ instanceId: "missing", model: "MiniMax-M3" })).toBe(true);
+    expect(skip({ instanceId: "shadow", model: "MiniMax-M3" })).toBe(true);
+    expect(skip({ instanceId: "custom", model: "MiniMax-M3" })).toBe(true);
+    expect(skip({ instanceId: "loaded", model: "MiniMax-M3" })).toBe(false);
   });
 });
 

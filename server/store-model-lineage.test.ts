@@ -575,4 +575,33 @@ describe("Store load: one flat fallback chain", () => {
       model: "MiniMax-M3",
     });
   });
+
+  it("leaves retired-spelling ids untouched while an engine is shadowed (catalogPending)", () => {
+    seedBots([
+      {
+        id: "shadow-custom-bot",
+        modelSelection: {
+          instanceId: "dshShadow",
+          model: "MiniMax-M3",
+        },
+      },
+    ]);
+    const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
+    store.reconcileModelLineage({
+      contextFor: (instanceId: string) =>
+        instanceId === "dshShadow"
+          ? {
+              driverKind: "dshAgent",
+              offeredIds: [],
+              authoritative: false,
+              catalogPending: true,
+            }
+          : undefined,
+      nameFor: (_instanceId: string, model: string) => model,
+    });
+    expect(store.bot("shadow-custom-bot")!.modelSelection).toEqual({
+      instanceId: "dshShadow",
+      model: "MiniMax-M3",
+    });
+  });
 });
