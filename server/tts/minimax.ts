@@ -315,12 +315,17 @@ export async function listVoices(key: string): Promise<Voice[]> {
     ...(body?.system_voice ?? []).map((v) => ({ voice: v, cloned: false })),
     ...(body?.voice_cloning ?? []).map((v) => ({ voice: v, cloned: true })),
     ...(body?.voice_generation ?? []).map((v) => ({ voice: v, cloned: false })),
-  ].map(({ voice: v, cloned }): Voice => ({
-    id: String(v.voice_id ?? ""),
-    label: String(v.voice_name ?? v.voice_id ?? "Voice"),
-    description: v.description?.join(" · ") || undefined,
-    ...(cloned ? { cloned: true } : {}),
-  })).filter((v) => v.id);
+  ].map(({ voice: v, cloned }): Voice => {
+    const listed: Voice = {
+      id: String(v.voice_id ?? ""),
+      label: String(v.voice_name ?? v.voice_id ?? "Voice"),
+      description: v.description?.join(" · ") || undefined,
+    };
+    // Only the cloning list holds clones, and the gate that keeps a clone
+    // out of the default slot has to be able to see that.
+    if (cloned) listed.cloned = true;
+    return listed;
+  }).filter((v) => v.id);
   upstreamClonedVoiceIds = new Set(upstream.filter((v) => v.cloned).map((v) => v.id));
   const catalog = [...listClonedVoices(), ...upstream, ...CANNED_VOICES];
   return catalog.filter((voice, index) => catalog.findIndex((other) => other.id === voice.id) === index);
