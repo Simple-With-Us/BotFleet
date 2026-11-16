@@ -50,10 +50,14 @@ export function providerConfigured(cfg: AppConfig): boolean {
 
 export function voiceConfigured(cfg: AppConfig): boolean {
   if (isPersonalVoice(cfg.tts?.voice)) return true;
+  // The default voice is the gated one:  a clone that is the stored default
+  // while the switch is off is not a voice the workspace can speak with, so
+  // readiness has to say so.
+  const voice = defaultVoice(cfg);
   if (voiceProvider(cfg) === "system") {
-    return systemVoices.systemVoicesAvailable() && Boolean(cfg.tts?.voice);
+    return systemVoices.systemVoicesAvailable() && Boolean(voice);
   }
-  return Boolean(cfg.tts?.key && cfg.tts?.voice);
+  return Boolean(cfg.tts?.key && voice);
 }
 
 /** The prefix rule lives in shared/bot-voice.ts so the clients and the

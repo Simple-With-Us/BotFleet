@@ -4,6 +4,9 @@
 // through a local HTTP server, the API base is overridden, and the timeout
 // path is hit by swapping fetch for a rejecting stub.
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -161,6 +164,10 @@ describe("listVoices", () => {
     // keeps clones out of the default slot knows about it.
     expect(isClonedVoiceId("jay-upstream-clone")).toBe(true);
     expect(isClonedVoiceId("English_Graceful_Lady")).toBe(false);
+    // And it is kept, so the answer survives the process that listed it:  a
+    // fresh process must not classify an upstream clone as a plain voice.
+    const kept = readFileSync(join(homedir(), ".botfleet", "tts-upstream-clones.json"), "utf8");
+    expect(JSON.parse(kept)).toContain("jay-upstream-clone");
   });
 
   it("throws when the upstream returns a non-zero base_resp", async () => {

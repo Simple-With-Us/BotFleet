@@ -22,6 +22,8 @@
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
+import { z } from "zod";
+
 import type { Audio, VerifyResult, Voice } from "./types.ts";
 import { recordSpeechUsage } from "./usage.ts";
 import { dataDir } from "../data-dir.ts";
@@ -35,6 +37,11 @@ const MAX_CHARS = 10_000;
 
 const DATA_DIR = dataDir();
 const CLONED_VOICES_FILE = join(DATA_DIR, "tts-cloned-voices.json");
+/** The clones MiniMax reported, kept apart from the workspace's own store.
+ *
+ *  They are not the workspace's to delete, so they do not go in the file the
+ *  delete route owns. */
+const UPSTREAM_CLONES_FILE = join(DATA_DIR, "tts-upstream-clones.json");
 
 // ── Documented starter voices ────────────────────────────────────────────────
 // MiniMax's published T2A HTTP reference lists these English voice IDs.
@@ -74,6 +81,25 @@ function writeClonedVoices(records: ClonedVoiceRecord[]): void {
   renameSync(tmp, CLONED_VOICES_FILE);
 }
 
+/** The cloned voice ids this workspace knows, kept in memory so a request
+ *  does not read the clone store from disk every time.
+ *
+ *  The store is the answer for a clone made here;  the upstream listing is
+ *  the answer for a clone made elsewhere. */
+let localClonedVoiceIds = new Set<string>();
+let localClonedVoiceIdsLoaded = false;
+let upstreamClonedVoiceIds = new Set<string>();
+let upstreamClonesLoaded = false;
+
+/** The ids in the local clone store, read once and kept. */
+function localClonedIds(): Set<string> {
+  if (!localClonedVoiceIdsLoaded) {
+    localClonedVoiceIds = new Set(readClonedVoices().map((record) => record.voiceId));
+    localClonedVoiceIdsLoaded = true;
+  }
+  return localClonedVoiceIds;
+}
+
 /** List cloned voices as Voice objects, newest first. */
 export function listClonedVoices(): Voice[] {
   return readClonedVoices()
@@ -81,15 +107,42 @@ export function listClonedVoices(): Voice[] {
     .map((r) => ({ id: r.voiceId, label: r.label, description: "Custom", cloned: true }));
 }
 
-/** The cloned voices MiniMax knows about, as the last listing reported
- *  them.
+/** The clone ids MiniMax reported, read once and kept. */
+function readUpstreamClones(): string[] {
+  try {
+    if (!existsSync(UPSTREAM_CLONES_FILE)) return [];
+    const raw = readFileSync(UPSTREAM_CLONES_FILE, "utf8");
+    const parsed = z.array(z.string()).safeParse(JSON.parse(raw));
+    return parsed.success ? parsed.data : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Keep the clones MiniMax reported.
  *
  *  A clone made elsewhere — in another machine, or before this workspace
- *  existed — is not in the local store, so the store alone cannot answer
- *  "is this id a clone".  The last upstream listing is kept for that, and it
- *  is read whenever the voice list is read, which is before the settings
- *  panel lets anyone pick a default. */
-let upstreamClonedVoiceIds = new Set<string>();
+ *  existed — is in no local store, so the store alone cannot answer "is this
+ *  id a clone" after the process restarts.  Keeping the reported clones means
+ *  the answer survives the restart, and the gate that keeps clones out of
+ *  the default slot works from the first request rather than from the first
+ *  voice listing. */
+function rememberUpstreamClones(clones: Voice[]): void {
+  const ids = clones.map((clone) => clone.id);
+  const known = new Set(readUpstreamClones());
+  const missing = ids.filter((id) => !known.has(id));
+  const next = [...known, ...missing];
+  upstreamClonedVoiceIds = new Set(next);
+  if (!missing.length) return;
+  try {
+    mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+    const tmp = `${UPSTREAM_CLONES_FILE}.tmp`;
+    writeFileSync(tmp, JSON.stringify(next, null, 2), { mode: 0o600 });
+    renameSync(tmp, UPSTREAM_CLONES_FILE);
+  } catch {
+    // The in-memory answer still holds for this process.
+  }
+}
 
 /** True when this id names one of the workspace's cloned voices.
  *
@@ -99,7 +152,22 @@ export function isClonedVoiceId(voiceId: string | null | undefined): boolean {
   const id = voiceId?.trim();
   if (!id) return false;
   if (upstreamClonedVoiceIds.has(id)) return true;
-  return readClonedVoices().some((record) => record.voiceId === id);
+  if (localClonedIds().has(id)) return true;
+  // A clone MiniMax reported before this process started is still a clone.
+  if (!upstreamClonesLoaded) {
+    upstreamClonedVoiceIds = new Set(readUpstreamClones());
+    upstreamClonesLoaded = true;
+  }
+  return upstreamClonedVoiceIds.has(id);
+}
+
+/** Whether this id names a clone that only the upstream listing knows.
+ *
+ *  A clone made elsewhere — in another machine, or before this workspace
+ *  existed — is in no local store, so the local answer is not the whole
+ *  answer.  The upstream listing is the answer for it. */
+export function isUpstreamClonedVoiceId(voiceId: string): boolean {
+  return upstreamClonedVoiceIds.has(voiceId.trim());
 }
 
 /** Add a custom voice record by identifier/label. */
@@ -110,6 +178,9 @@ export function addCustomVoice(voiceId: string, label?: string): Voice {
   const records = readClonedVoices().filter((r) => r.voiceId !== trimmed);
   records.push({ voiceId: trimmed, label: displayLabel, createdAt: Date.now() });
   writeClonedVoices(records);
+  // The cached ids follow the store, so the next read is not a disk read.
+  localClonedVoiceIds = new Set(records.map((record) => record.voiceId));
+  localClonedVoiceIdsLoaded = true;
   return { id: trimmed, label: displayLabel, description: "Custom", cloned: true };
 }
 
@@ -120,6 +191,8 @@ export function deleteCustomVoice(voiceId: string): boolean {
   const filtered = records.filter((r) => r.voiceId !== trimmed);
   if (filtered.length === records.length) return false;
   writeClonedVoices(filtered);
+  localClonedVoiceIds = new Set(filtered.map((record) => record.voiceId));
+  localClonedVoiceIdsLoaded = true;
   return true;
 }
 
@@ -274,7 +347,9 @@ export async function verifyKey(key: string): Promise<VerifyResult> {
       body: JSON.stringify({ voice_type: "all" }),
       signal: AbortSignal.timeout(20_000),
     });
-    const body = (await safeJson(res)) as VoiceListResponse | null;
+    const raw = await safeJson(res);
+    const parsed = voiceListResponseSchema.safeParse(raw);
+    const body = parsed.success ? parsed.data : null;
     if (res.ok && body?.base_resp?.status_code === 0) return { ok: true };
     return { ok: false, message: upstreamMessage(res.status, "checking that key", body) };
   } catch {
@@ -282,18 +357,34 @@ export async function verifyKey(key: string): Promise<VerifyResult> {
   }
 }
 
-interface VoiceListItem {
-  voice_id?: string;
-  voice_name?: string;
-  description?: string[];
-}
+/** One voice as MiniMax lists it. */
+const voiceListItemSchema = z
+  .object({
+    voice_id: z.string().optional(),
+    voice_name: z.string().optional(),
+    description: z.array(z.string()).optional(),
+  })
+  .passthrough();
 
-interface VoiceListResponse {
-  system_voice?: VoiceListItem[];
-  voice_cloning?: VoiceListItem[];
-  voice_generation?: VoiceListItem[];
-  base_resp?: BaseResponse;
-}
+/** The voice listing as MiniMax returns it.
+ *
+ *  The list is upstream output, so it is parsed before anything reads it:  a
+ *  malformed entry drops itself and never reaches the clone classification
+ *  or the picker. */
+const voiceListResponseSchema = z
+  .object({
+    system_voice: z.array(voiceListItemSchema).optional().catch([]),
+    voice_cloning: z.array(voiceListItemSchema).optional().catch([]),
+    voice_generation: z.array(voiceListItemSchema).optional().catch([]),
+    base_resp: z
+      .object({
+        status_code: z.number().optional(),
+        status_msg: z.string().optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough();
 
 /** Get Voice accepts POST /v1/get_voice with voice_type: all. Recently cloned
  * voices may not be listed upstream until first synthesis, so merge local
@@ -305,8 +396,10 @@ export async function listVoices(key: string): Promise<Voice[]> {
     body: JSON.stringify({ voice_type: "all" }),
     signal: AbortSignal.timeout(20_000),
   });
-  const body = (await safeJson(res)) as VoiceListResponse | null;
-  if (!res.ok || body?.base_resp?.status_code !== 0) {
+  const raw = await safeJson(res);
+  const parsed = voiceListResponseSchema.safeParse(raw);
+  const body = parsed.success ? parsed.data : null;
+  if (!res.ok || !body || body.base_resp?.status_code !== 0) {
     throw new Error(upstreamMessage(res.status, "listing voices", body));
   }
   // Only the cloning list holds clones:  a system voice and a generated
@@ -326,7 +419,7 @@ export async function listVoices(key: string): Promise<Voice[]> {
     if (cloned) listed.cloned = true;
     return listed;
   }).filter((v) => v.id);
-  upstreamClonedVoiceIds = new Set(upstream.filter((v) => v.cloned).map((v) => v.id));
+  rememberUpstreamClones(upstream.filter((v) => v.cloned));
   const catalog = [...listClonedVoices(), ...upstream, ...CANNED_VOICES];
   return catalog.filter((voice, index) => catalog.findIndex((other) => other.id === voice.id) === index);
 }
