@@ -553,6 +553,11 @@ describe("Muse Code model selection over ACP", () => {
     // And the turn is not reported as the model that was picked.
     const started = recorder!.events.find((event) => event.type === "session.started");
     expect(started?.model ?? null).not.toBe("muse-spark-1.2");
+    // The session's own model is reported instead of nothing:  the turn ran
+    // on it, so the turn identity and the cost estimate name the model that
+    // actually answered.
+    expect(started?.model).toBe("fake-acp-model");
+    expect(notice?.message).toContain("fake-acp-model");
   });
 
   it("leaves an older adapter's session running when the turn picked no model", async () => {

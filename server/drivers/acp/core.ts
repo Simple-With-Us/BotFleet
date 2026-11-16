@@ -2230,7 +2230,17 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 ranAnotherModel =
                   mappedValue === null && support.selectModel?.skippedSwitchRunsAnotherModel === true;
                 if (ranAnotherModel) {
-                  const running = modelForValue?.(selectedValue) ?? null;
+                  // The model the turn actually ran on.  The reported config
+                  // value maps to nothing when the session never advertised a
+                  // model option, so the session's own model is read from the
+                  // initialize result or the session's model state.  A turn
+                  // that ran a known model is priced and recorded as that
+                  // model, not as the one that could not be chosen.
+                  const running =
+                    modelForValue?.(selectedValue)
+                    ?? init?._meta?.modelState?.currentModelId
+                    ?? sessionModelsState?.currentModelId
+                    ?? null;
                   selectedModel = running;
                   console.warn(
                     `${DRIVER_KIND} could not switch to ${cliTurn.model}; the turn ran ${running ?? "the session's own model"}`,
