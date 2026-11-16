@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 
 import { ensureDirs } from "../../config.ts";
 import type { ProviderInstance } from "../../contracts.ts";
@@ -350,20 +351,16 @@ describe("Muse Code model selection", () => {
     expect(museModelOptionValue("muse-spark-1.2", advertised([{ value: "muse-spark-1.2" }]))).toBe("muse-spark-1.2");
   });
 
-  it("refuses plainly when the session advertises no model option", () => {
+  it("skips the switch when the session advertises no model option", () => {
     // An adapter older than the one that added the config options cannot
-    // switch, and the reason has to be a sentence a person can act on
-    // rather than a generic error the caller has to decode.
-    expect(() => museModelOptionValue("muse-spark-1.2", [])).toThrow(/cannot switch models/);
-    expect(() => museModelOptionValue("muse-spark-1.2", undefined)).toThrow(/advertises no model option/);
-    expect(() => museModelOptionValue("muse-spark-1.2", [])).toThrow(
-      /runs the account's startup model/,
-    );
+    // switch.  That is not a failure:  the session keeps the model it already
+    // runs, which is what every turn did before this switch existed, and a
+    // turn that cannot run is the worse outcome.
+    expect(museModelOptionValue("muse-spark-1.2", [])).toBe(null);
+    expect(museModelOptionValue("muse-spark-1.2", undefined)).toBe(null);
     // A session that advertises the option but no choice for it is the same
-    // refusal, said the same way.
-    expect(() =>
-      museModelOptionValue("muse-spark-1.2", advertised([])),
-    ).toThrow(/cannot switch models/);
+    // answer.
+    expect(museModelOptionValue("muse-spark-1.2", advertised([]))).toBe(null);
   });
 
   it("refuses a model the session does not offer, and names what it does offer", () => {
@@ -397,10 +394,47 @@ describe("Muse Code model selection", () => {
     ).toThrow(/named profile/);
   });
 
+  it("keeps the unprofiled choice when a profile-routed one names the same model", () => {
+    // A profile-routed choice is not a candidate to switch to, so it must not
+    // count toward the ambiguity check either.
+    expect(
+      museModelOptionValue(
+        "muse-spark-1.2",
+        advertised([{ value: SPARK_12, name: "Muse Spark 1.2" }, { value: NAMED_PROFILE }]),
+      ),
+    ).toBe(SPARK_12);
+  });
+
+  it("treats the same value advertised twice as one choice", () => {
+    // The same wire value twice is one choice, not an ambiguous one.
+    expect(
+      museModelOptionValue(
+        "muse-spark-1.2",
+        advertised([{ value: SPARK_12, name: "Muse Spark 1.2" }, { value: SPARK_12 }]),
+      ),
+    ).toBe(SPARK_12);
+  });
+
+  it("keeps the good entries when one advertised entry is malformed", () => {
+    // The list is agent output, so one unreadable entry drops itself and the
+    // rest of the list survives.  A session that offers the model must not
+    // lose it because something else in the list was malformed.
+    const parsed = museAdvertisedConfigOptionsSchema.parse([
+      "garbage",
+      { id: MUSE_MODEL_CONFIG_ID, currentValue: SPARK_13, options: [{ value: SPARK_12, name: "Muse Spark 1.2" }] },
+    ]);
+    expect(museModelOptionValue("muse-spark-1.2", parsed)).toBe(SPARK_12);
+  });
+
   it("reads the picker id back out of an advertised value", () => {
     expect(museModelIdForValue(SPARK_12)).toBe("muse-spark-1.2");
     expect(museModelIdForValue("muse-spark-1.2")).toBe("muse-spark-1.2");
     expect(museModelIdForValue("   ")).toBe(null);
+    // A value that carries the wire prefix but does not decode is not a model
+    // id:  reporting it as one would persist the wire format as the session's
+    // model identity.
+    expect(museModelIdForValue("muse-model:not-json")).toBe(null);
+    expect(museModelIdForValue("muse-model:%7B%22bad%22%3A1%7D")).toBe(null);
     expect(parseMuseModelValue(SPARK_12)).toEqual({
       providerId: "meta",
       profileId: null,
@@ -442,18 +476,33 @@ describe("Muse Code model selection over ACP", () => {
     recorder = recordEvents(instance.adapter);
   };
 
-  interface ConfigCall {
-    method: string;
-    params: { sessionId: string; configId: string; value: string };
-  }
+  // The dump is written by a child process, so it is validated before it is
+  // read:  a malformed record fails the test instead of reaching the
+  // assertion as trusted data.
+  const configCallSchema = z
+    .object({
+      method: z.string(),
+      params: z
+        .object({
+          sessionId: z.string(),
+          configId: z.string(),
+          value: z.string(),
+        })
+        .strict(),
+    })
+    .strict();
+  type ConfigCall = z.infer<typeof configCallSchema>;
 
   const configCalls = (dump: string): ConfigCall[] => {
     const file = `${dump}.config.json`;
-    return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : [];
+    if (!existsSync(file)) return [];
+    return z.array(configCallSchema).parse(JSON.parse(readFileSync(file, "utf8")));
   };
 
-  const rpcMethods = (dump: string): string[] =>
-    existsSync(dump) ? JSON.parse(readFileSync(dump, "utf8")) : [];
+  const rpcMethods = (dump: string): string[] => {
+    if (!existsSync(dump)) return [];
+    return z.array(z.string()).parse(JSON.parse(readFileSync(dump, "utf8")));
+  };
 
   const runTurn = async (threadId: string, model?: string) => {
     await instance!.adapter.sendTurn({ threadId, text: "hello", model });
@@ -461,9 +510,6 @@ describe("Muse Code model selection over ACP", () => {
       (event) => event.type === "turn.completed" && event.threadId === threadId,
     );
   };
-
-  const errorMessage = () =>
-    recorder!.events.find((event) => event.type === "runtime.error")?.message;
 
   it("sends the switch when the session advertises the model option", async () => {
     const SPARK_12 = museWireValue("meta", null, "muse-spark-1.2");
@@ -486,18 +532,19 @@ describe("Muse Code model selection over ACP", () => {
     ]);
   });
 
-  it("refuses plainly, and sends nothing, when the session advertises no model option", async () => {
+  it("runs the turn on the session's own model when the session advertises no model option", async () => {
     // No advertised models at all:  the adapter is older than the one that
-    // added the config options.  The request must never reach it, because a
-    // request it cannot answer is a generic `-32602` nobody can act on.
+    // added the config options.  The switch must never reach it, because a
+    // request it cannot answer is a generic `-32602` nobody can act on, and
+    // the turn runs on the model the session already has.
     const rpcDump = join(scratch(), "rpc-refused.json");
     process.env.FAKE_ACP_RPC_DUMP = rpcDump;
     await create();
 
     const done = await runTurn("muse-model-refused", "muse-spark-1.2");
 
-    expect(done).toMatchObject({ ok: false });
-    expect(errorMessage()).toMatch(/cannot switch models/);
+    expect(done).toMatchObject({ ok: true });
+    expect(rpcMethods(rpcDump)).toContain("session/prompt");
     expect(rpcMethods(rpcDump)).not.toContain("session/set_config_option");
   });
 

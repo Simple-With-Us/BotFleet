@@ -148,7 +148,9 @@ export const museAdvertisedConfigOptionsSchema = z
           .optional()
           .catch(undefined),
       })
-      .passthrough(),
+      .passthrough()
+      .optional()
+      .catch(undefined),
   )
   .catch([]);
 
@@ -158,14 +160,16 @@ export const museAdvertisedConfigOptionsSchema = z
  *  JSON `[providerId, profileId|null, modelId]` (`modelChoice` in
  *  `dist/config-options.js`);  a model with no provider is advertised as its
  *  plain id instead, so both spellings reach the wire. */
-export type MuseModelChoice = {
-  providerId: string;
-  profileId: string | null;
-  modelId: string;
-};
+export const museModelChoiceSchema = z.object({
+  providerId: z.string().min(1),
+  profileId: z.string().min(1).nullable(),
+  modelId: z.string().min(1),
+});
+
+export type MuseModelChoice = z.infer<typeof museModelChoiceSchema>;
 
 /** The three fields of a qualified choice, in the adapter's own order. */
-const museModelChoiceSchema = z.tuple([
+const museModelChoiceTupleSchema = z.tuple([
   z.string().min(1),
   z.string().min(1).nullable(),
   z.string().min(1),
@@ -190,10 +194,11 @@ export function parseMuseModelValue(value: string): MuseModelChoice | null {
   } catch {
     return null;
   }
-  const tuple = museModelChoiceSchema.safeParse(raw);
+  const tuple = museModelChoiceTupleSchema.safeParse(raw);
   if (!tuple.success) return null;
   const [providerId, profileId, modelId] = tuple.data;
-  return { providerId, profileId, modelId };
+  const choice = museModelChoiceSchema.safeParse({ providerId, profileId, modelId });
+  return choice.success ? choice.data : null;
 }
 
 /** The picker id an advertised model choice names:  the model id out of a
@@ -201,6 +206,10 @@ export function parseMuseModelValue(value: string): MuseModelChoice | null {
 export function museModelIdForValue(value: string): string | null {
   const decoded = parseMuseModelValue(value);
   if (decoded) return decoded.modelId;
+  // A value that carries the wire prefix but does not decode is not a model
+  // id.  Reporting it as one would persist the wire format as the session's
+  // model identity;  a plain id is passed through as it stands.
+  if (value.startsWith(MUSE_MODEL_VALUE_PREFIX)) return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
 }
@@ -215,36 +224,46 @@ export function museModelIdForValue(value: string): string | null {
  *  the caller reports it instead of retrying a request the adapter would
  *  answer with `-32602`.
  *
- *  This throws rather than returning null on purpose:  a null means "keep the
- *  session's default", and running the account's startup model under a picker
- *  that names another one is the overclaim this driver exists to avoid. */
+ *  A session that cannot switch at all — an adapter that advertises no model
+ *  option, or one that advertises the option with no choices — answers null,
+ *  which the ACP contract reads as "skip the switch, the session keeps its
+ *  default".  That is what every turn did before this switch existed, and a
+ *  turn that fails instead of running is the worse outcome.
+ *
+ *  A session that CAN switch but does not offer the picked model still
+ *  throws:  running the account's startup model under a picker that names
+ *  another one is the overclaim this driver exists to avoid. */
 export function museModelOptionValue(
   model: string,
   advertised: z.infer<typeof museAdvertisedConfigOptionsSchema> | undefined,
-): string {
-  const modelOption = advertised?.find((option) => option.id === MUSE_MODEL_CONFIG_ID);
-  if (!modelOption) {
-    throw new Error(
-      "This Muse session cannot switch models: the adapter advertises no model option, so the turn runs the account's startup model",
-    );
-  }
+): string | null {
+  const options = (advertised ?? []).filter(
+    (option): option is NonNullable<typeof option> => option !== undefined,
+  );
+  const modelOption = options.find((option) => option.id === MUSE_MODEL_CONFIG_ID);
+  if (!modelOption) return null;
   const choices = (modelOption.options ?? []).flatMap((option) =>
     option === undefined || option.value === undefined
       ? []
       : [{ value: option.value, name: option.name ?? option.value }],
   );
-  if (choices.length === 0) {
-    throw new Error(
-      "This Muse session cannot switch models: the adapter advertises a model option with no choices",
-    );
-  }
+  if (choices.length === 0) return null;
   const wanted = model.trim();
   let match: { value: string; name: string } | null = null;
+  let profileMatch: { value: string; name: string } | null = null;
   for (const choice of choices) {
     const decoded = parseMuseModelValue(choice.value);
     const hit = decoded ? decoded.modelId === wanted : choice.value === wanted;
     if (!hit) continue;
+    if (decoded && decoded.profileId) {
+      // A profile-routed choice is not a candidate to switch to, so it never
+      // counts toward the ambiguity check below.
+      if (!profileMatch) profileMatch = choice;
+      continue;
+    }
     if (match) {
+      // The same value advertised twice is one choice, not two.
+      if (match.value === choice.value) continue;
       throw new Error(
         `Muse offers ${wanted} more than once for this session, so BotFleet cannot choose one`,
       );
@@ -252,17 +271,16 @@ export function museModelOptionValue(
     match = choice;
   }
   if (!match) {
+    if (profileMatch) {
+      // The adapter refuses named-profile routing itself ("Named model profile
+      // routing is unverified on supported Muse hosts"), so this says it here
+      // instead of letting the switch come back as an invalid-params error.
+      throw new Error(
+        `Muse routes ${wanted} through a named profile, which this adapter refuses to switch to`,
+      );
+    }
     const names = choices.map((choice) => choice.name).join(", ") || "none";
     throw new Error(`Muse does not offer ${wanted} for this session — available: ${names}`);
-  }
-  const decoded = parseMuseModelValue(match.value);
-  if (decoded && decoded.profileId) {
-    // The adapter refuses named-profile routing itself ("Named model profile
-    // routing is unverified on supported Muse hosts"), so this says it here
-    // instead of letting the switch come back as an invalid-params error.
-    throw new Error(
-      `Muse routes ${wanted} through a named profile, which this adapter refuses to switch to`,
-    );
   }
   return match.value;
 }
@@ -469,8 +487,9 @@ const support: AcpSupport = {
   // value is sent back unchanged, because the provider and the profile inside
   // it belong to the user's own account and are never constructed here.  A
   // session that advertises no model option — an adapter older than the one
-  // that added them — cannot switch, and the hook says so plainly instead of
-  // sending a request the adapter would answer with `-32602`.
+  // that added them — cannot switch, and the hook answers null so the session
+  // keeps the model it already runs instead of sending a request the adapter
+  // would answer with `-32602`.
   selectModel: {
     configId: MUSE_MODEL_CONFIG_ID,
     valueForModel: (model, advertised) =>
