@@ -93,6 +93,8 @@ export function describeVoice(cfg: AppConfig) {
     ready: voiceConfigured(cfg),
     enabled: voiceMasterEnabled(cfg.tts),
     voice: cfg.tts?.voice || "",
+    /** Whether the workspace lets a cloned voice be the default voice. */
+    useClonedVoice: cfg.tts?.useClonedVoice === true,
     provider: voiceProvider(cfg),
     optimizedSummary: cfg.tts?.optimizedSummary === true,
     audioRetentionDays: cfg.tts?.audioRetentionDays ?? DEFAULT_AUDIO_RETENTION_DAYS,
@@ -130,6 +132,11 @@ export async function listVoices(cfg: AppConfig, run?: systemVoices.Runner): Pro
     voices.unshift({ id: defaultVoiceId, label: readableVoiceId(defaultVoiceId), description: "Workspace default" });
   }
   return voices;
+}
+
+/** True when this id names one of the workspace's cloned voices. */
+export function isClonedVoice(voiceId: string | null | undefined): boolean {
+  return minimax.isClonedVoiceId(voiceId);
 }
 
 export function addCustomVoice(voiceId: string, label?: string) {

@@ -435,6 +435,10 @@ const appConfigSchema = z.object({
     provider: z.enum(TTS_PROVIDERS).optional(),
     ladder: z.array(z.enum(HOSTED_TTS_PROVIDERS)).max(HOSTED_TTS_PROVIDERS.length).optional(),
     enabled: z.boolean().optional(),
+    /** Whether a cloned voice may be the workspace default voice.  Absent or
+     * false keeps cloned voices out of the default slot; a bot's own voice
+     * is never affected by this. */
+    useClonedVoice: z.boolean().optional(),
     optimizedSummary: z.boolean().optional(),
     audioRetentionDays: z.number().int().min(0).max(3650).optional(),
     pronunciations: pronunciationListSchema.optional(),
@@ -779,6 +783,7 @@ export interface AppConfig {
     /** Absent or true keeps voice on (existing behavior).  False gates
      *  auto-speak, calls, and the TTS / STS routes. */
     enabled?: boolean;
+    useClonedVoice?: boolean;
     optimizedSummary?: boolean;
     audioRetentionDays?: number;
     pronunciations?: Pronunciation[];

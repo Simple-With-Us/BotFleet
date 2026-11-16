@@ -542,7 +542,7 @@ import {
   spokenReply,
   resolveVoiceSummaryMode,
 } from "../shared/voice-summary.ts";
-import { isPersonalVoiceId, MAX_DEFAULT_VOICE_ID_LENGTH, PERSONAL_VOICE_NOT_DEFAULT } from "../shared/bot-voice.ts";
+import { CLONED_VOICE_NOT_DEFAULT, isPersonalVoiceId, MAX_DEFAULT_VOICE_ID_LENGTH, PERSONAL_VOICE_NOT_DEFAULT } from "../shared/bot-voice.ts";
 import { mintStsToken, type StsProvider } from "../shared/sts-tokens.ts";
 import {
   StsMintThrottle,
@@ -19216,6 +19216,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // A Personal Voice belongs to the device that made it, so it cannot be
       // what every bot on every device falls back to.
       if (isPersonalVoiceId(voice)) return json(res, 400, { error: PERSONAL_VOICE_NOT_DEFAULT });
+      // A cloned voice is the workspace's own voice, and it only speaks for
+      // every bot while the workspace's cloned-voice switch is on.
+      if (tts.isClonedVoice(voice) && cfg.tts?.useClonedVoice !== true) {
+        return json(res, 400, { error: CLONED_VOICE_NOT_DEFAULT });
+      }
       let patch;
       try {
         patch = parseConfigPatch({ tts: { voice } });
@@ -19852,6 +19857,20 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (newTts?.key?.trim()) {
         const check = await tts.verifyKey(newTts.key.trim(), { tts: { ...cfg.tts, ...newTts } });
         if (!check.ok) return json(res, 400, { error: check.message });
+      }
+      // A cloned voice is only the workspace default while the workspace's
+      // cloned-voice switch is on.  Both write paths check it: the Mac saves
+      // the default voice here, and the phone saves it through the narrow
+      // route beside this one, so a clone cannot become the default by
+      // choosing the other door.
+      if (patch.tts?.voice && tts.isClonedVoice(patch.tts.voice) && cfg.tts?.useClonedVoice !== true) {
+        return json(res, 400, { error: CLONED_VOICE_NOT_DEFAULT });
+      }
+      // Turning the switch off while a cloned voice is the workspace default
+      // clears that default: the switch has to mean off, or a clone keeps
+      // speaking for every bot that has no voice of its own.
+      if (patch.tts?.useClonedVoice === false && cfg.tts?.voice && tts.isClonedVoice(cfg.tts.voice)) {
+        patch.tts = { ...patch.tts, voice: "" };
       }
       // The secret store is canonical for the names it holds, so a save of one
       // of those names is never quietly accepted and then reverted by the next

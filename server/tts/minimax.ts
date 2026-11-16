@@ -78,7 +78,15 @@ function writeClonedVoices(records: ClonedVoiceRecord[]): void {
 export function listClonedVoices(): Voice[] {
   return readClonedVoices()
     .sort((a, b) => b.createdAt - a.createdAt)
-    .map((r) => ({ id: r.voiceId, label: r.label, description: "Custom" }));
+    .map((r) => ({ id: r.voiceId, label: r.label, description: "Custom", cloned: true }));
+}
+
+/** True when this id names one of the workspace's cloned voices.  Voice
+ * clone is MiniMax-only, so this store is the only place a clone can be. */
+export function isClonedVoiceId(voiceId: string | null | undefined): boolean {
+  const id = voiceId?.trim();
+  if (!id) return false;
+  return readClonedVoices().some((record) => record.voiceId === id);
 }
 
 /** Add a custom voice record by identifier/label. */
@@ -89,7 +97,7 @@ export function addCustomVoice(voiceId: string, label?: string): Voice {
   const records = readClonedVoices().filter((r) => r.voiceId !== trimmed);
   records.push({ voiceId: trimmed, label: displayLabel, createdAt: Date.now() });
   writeClonedVoices(records);
-  return { id: trimmed, label: displayLabel, description: "Custom" };
+  return { id: trimmed, label: displayLabel, description: "Custom", cloned: true };
 }
 
 /** Delete a custom voice record by identifier. */

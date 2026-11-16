@@ -47,7 +47,7 @@ import {
   VOICE_CLONE_MIN_SECONDS,
   type MicRecorder,
 } from "@/lib/voice-clone-recording";
-import { AudioRetentionPicker, DefaultVoicePicker, PronunciationSettings, VoiceMasterSwitch } from "./WorkspaceVoiceSettings";
+import { AudioRetentionPicker, ClonedVoiceSwitch, DefaultVoicePicker, PronunciationSettings, VoiceMasterSwitch } from "./WorkspaceVoiceSettings";
 
 const SAMPLE = "Morning.  Overnight the tests went green, and I left two notes for you in the thread.";
 
@@ -695,6 +695,12 @@ export function VoiceSettings({
         tts={tts}
         voices={voices}
         loading={loadingVoices}
+        onConfig={(config) => dispatch({ type: "configStatus", config })}
+      />
+
+      {/* ── Use My Cloned Voice (workspace) ── */}
+      <ClonedVoiceSwitch
+        tts={tts}
         onConfig={(config) => dispatch({ type: "configStatus", config })}
       />
 

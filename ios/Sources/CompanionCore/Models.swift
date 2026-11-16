@@ -957,6 +957,10 @@ public struct ConfigFlag: Codable, Hashable, Sendable {
     /// it through `ConfigStatus.voiceProvider`, which applies the server's own
     /// fallback; nothing should compare this string directly.
     public var provider: String?
+    /// On the `tts` section: whether a cloned voice may be the workspace
+    /// default voice.  Absent or false keeps cloned voices out of the
+    /// default slot, exactly as on the Mac.
+    public var useClonedVoice: Bool?
 }
 
 public struct Profile: Codable, Hashable, Sendable {
@@ -1387,12 +1391,16 @@ public struct Voice: Codable, Hashable, Identifiable, Sendable {
     public var label: String
     public var description: String?
     public var isPersonalVoice: Bool?
+    /// True for a voice the owner cloned.  A cloned voice is only the
+    /// workspace default while the workspace's cloned-voice switch is on.
+    public var cloned: Bool?
 
-    public init(id: String, label: String, description: String? = nil, isPersonalVoice: Bool? = nil) {
+    public init(id: String, label: String, description: String? = nil, isPersonalVoice: Bool? = nil, cloned: Bool? = nil) {
         self.id = id
         self.label = label
         self.description = description
         self.isPersonalVoice = isPersonalVoice
+        self.cloned = cloned
     }
 }
 

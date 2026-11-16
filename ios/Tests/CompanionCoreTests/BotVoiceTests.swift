@@ -252,6 +252,27 @@ final class BotVoiceTests: XCTestCase {
         }
     }
 
+    func testAClonedVoiceIsMarkedAsOneAndTheDefaultIsKeptOutUntilTheSwitchAsks() throws {
+        // The harness marks the voices the owner cloned, and the phone reads
+        // the workspace's cloned-voice switch off the same config.
+        let voice = try JSONDecoder().decode(Voice.self, from: Data(#"{"id":"jay-clone-001","label":"Jay Clone","cloned":true}"#.utf8))
+        XCTAssertEqual(voice.cloned, true)
+        let plain = try JSONDecoder().decode(Voice.self, from: Data(#"{"id":"English_Graceful_Lady","label":"Graceful Lady"}"#.utf8))
+        XCTAssertNil(plain.cloned)
+
+        let flag = try JSONDecoder().decode(ConfigFlag.self, from: Data(#"{"configured":true,"ready":true,"voice":"jay-clone-001","useClonedVoice":true}"#.utf8))
+        XCTAssertEqual(flag.useClonedVoice, true)
+        let off = try JSONDecoder().decode(ConfigFlag.self, from: Data(#"{"configured":true,"ready":true,"voice":""}"#.utf8))
+        XCTAssertNil(off.useClonedVoice)
+
+        // The refusal the harness answers with, the same words as
+        // `CLONED_VOICE_NOT_DEFAULT` in `shared/bot-voice.ts`.
+        XCTAssertEqual(
+            BotVoice.clonedVoiceNotDefault,
+            "Turn on Use My Cloned Voice to make your cloned voice the workspace default."
+        )
+    }
+
     func testTheFallbackSavesTheIphoneChoiceAsTheSharedVoice() {
         // What this app wrote before per-device voices: the iPhone's pick.
         XCTAssertEqual(BotVoiceEdit.sharedVoiceFallback(sharedVoice: "va", voices: nil, iphone: "vb", mac: "va"), "vb")

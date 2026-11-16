@@ -8579,6 +8579,37 @@ describe("workspace voice settings", () => {
     expect(exact.body.tts.voice).toBe("jay-wedgeworth-001");
   });
 
+  it("keeps a cloned voice out of the workspace default until the switch asks for it", async () => {
+    const cloned = await api("POST", "/api/tts/custom-voice", { voiceId: "jay-clone-001", label: "Jay Clone" });
+    expect(cloned.status).toBe(200);
+    // Off by default: a clone is not the workspace default, on either door.
+    const phone = await api("PATCH", "/api/tts/default-voice", { voice: "jay-clone-001" });
+    expect(phone.status).toBe(400);
+    expect(phone.body.error).toContain("Use My Cloned Voice");
+    const mac = await api("PUT", "/api/config", { tts: { voice: "jay-clone-001" } });
+    expect(mac.status).toBe(400);
+    expect(mac.body.error).toContain("Use My Cloned Voice");
+    // A bot's own voice is not the workspace default, so the switch never
+    // touches it: the clone still works for the bot that was given it.
+    const bot = (await api("POST", "/api/bots", { name: "Clone Voice Bot" })).body.bot;
+    const own = await api("PATCH", `/api/bots/${bot.id}/profile`, { voice: "jay-clone-001" });
+    expect(own.status).toBe(200);
+    expect(own.body.bot.voice).toBe("jay-clone-001");
+    // The switch turns it on, and then the clone can be the default.
+    const on = await api("PUT", "/api/config", { tts: { useClonedVoice: true } });
+    expect(on.status).toBe(200);
+    expect(on.body.tts.useClonedVoice).toBe(true);
+    const picked = await api("PATCH", "/api/tts/default-voice", { voice: "jay-clone-001" });
+    expect(picked.status).toBe(200);
+    expect(picked.body.tts.voice).toBe("jay-clone-001");
+    // Turning the switch off clears a cloned default, so off means off.
+    const off = await api("PUT", "/api/config", { tts: { useClonedVoice: false } });
+    expect(off.status).toBe(200);
+    expect(off.body.tts.useClonedVoice).toBe(false);
+    expect(off.body.tts.voice).toBe("");
+    expect((await api("GET", "/api/config")).body.tts.voice).toBe("");
+  });
+
   it("lets the phone's narrow route replace the pronunciation list, with a plain-language refusal", async () => {
     const list = [{ term: "JSON", say: "Jason" }, { term: "kubectl", say: "cube control" }];
     const res = await api("PATCH", "/api/tts/pronunciations", { pronunciations: list, tts: { voice: "Side_Door" } });

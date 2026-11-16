@@ -599,6 +599,8 @@ export interface ConfigStatus {
     /** Absent or true means voice is on. */
     enabled?: boolean;
     voice: string;
+    /** Whether a cloned voice may be the workspace default voice. */
+    useClonedVoice?: boolean;
     provider?: "minimax" | "system" | "xai" | "azure";
     optimizedSummary?: boolean;
     audioRetentionDays?: number;
