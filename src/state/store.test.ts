@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   configStatusFromFrame,
+  countConnectedApps,
   MessagePostResponseSchema,
   TaskSwitchResponseSchema,
   getRoomTerminology,
@@ -20,6 +21,49 @@ import {
   type Group,
   type Message,
 } from "./store";
+
+describe("the connected-apps inventory", () => {
+  it("counts the usable apps across every service", () => {
+    expect(
+      countConnectedApps({
+        gmail: { connected: true, accounts: [{ id: "a", status: "active" }, { id: "b", status: "active" }] },
+        slack: { connected: true, accounts: [{ id: "c", status: "active" }] },
+        drive: { connected: false, accounts: [] },
+      }),
+    ).toBe(3);
+  });
+
+  it("counts a toolkit that needs no sign-in as one usable app", () => {
+    // A no-auth toolkit reports itself connected with no accounts of its own,
+    // so it is an app a bot can use.
+    expect(countConnectedApps({ notion: { connected: true, accounts: [] } })).toBe(1);
+  });
+
+  it("does not count a pending or expired account as usable", () => {
+    // Composio keeps the record of an OAuth flow that is still waiting in the
+    // browser, and one that expired.  Neither is an app to use.
+    expect(
+      countConnectedApps({
+        gmail: { connected: false, accounts: [{ id: "a", status: "pending" }] },
+        slack: { connected: false, accounts: [{ id: "b", status: "expired" }] },
+      }),
+    ).toBe(0);
+  });
+
+  it("counts an absent inventory as zero usable apps", () => {
+    expect(countConnectedApps(null)).toBe(0);
+    expect(countConnectedApps({})).toBe(0);
+    // A service whose accounts cannot be read is not counted:  the count
+    // would be a guess, and it is shown to a person.
+    expect(countConnectedApps({ gmail: { connected: true } })).toBe(0);
+  });
+
+  it("keeps the inventory in the store", () => {
+    const inventory = { configured: true, apps: 0, authoritative: true };
+    const next = reducer(initialState, { type: "connectedApps", inventory });
+    expect(next.connectedApps).toEqual(inventory);
+  });
+});
 
 describe("API response contracts", () => {
   const bot = {

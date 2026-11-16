@@ -16,6 +16,15 @@ import {
   verifyReleaseAgainstCommit,
 } from "./release-provenance.mjs";
 
+// Root bypasses the file-mode checks this fixture is built on: as root the
+// dependency root is readable, so the case would fail for the wrong reason.
+// The reason rides in the skip, which node:test prints, so a skipped run says
+// why.  The same wording lives in `server/testing/privilege.ts` for the
+// TypeScript suites, which cannot import this file.
+const ROOT_BYPASSES_THE_FIXTURE =
+  "needs an unprivileged uid: root bypasses the file-mode and link-ownership checks this fixture is built on";
+const ROOT_IS_ROOT = process.getuid?.() === 0;
+
 /**
  * A real repository and a real exported tree: the verifier's whole claim is
  * byte-equality with git's objects, so faking either side would test the fake.
@@ -564,7 +573,7 @@ test("a trusted fingerprint verifies the dependency scope, and a wrong one is dr
   assert.equal(wrong.driftScope, "deps");
 });
 
-test("an unreadable dependency root is unverifiable, never absent", (t) => {
+test("an unreadable dependency root is unverifiable, never absent", { skip: ROOT_IS_ROOT ? ROOT_BYPASSES_THE_FIXTURE : false }, (t) => {
   const { dir, git } = makeRepo(t);
   const commit = commitTree(git, dir, { "a.txt": "one\n" });
   const root = exportTree(git, dir, commit);
@@ -577,6 +586,27 @@ test("an unreadable dependency root is unverifiable, never absent", (t) => {
   } finally {
     chmodSync(join(root, "node_modules"), 0o755);
   }
+  assert.equal(verdict.ok, false);
+  assert.equal(verdict.reason, "unverifiable");
+});
+
+// The same verdict, reached through a path no privilege can bypass:  a
+// dependency reference inside the tree it would vouch for proves nothing,
+// and reading the tree is not what decides it.  So the "unverifiable, never
+// absent or drift" property is asserted on every host, root included, and the
+// case above stays the one that shows an unreadable root says so.
+test("a dependency reference inside the release tree is unverifiable, never absent", (t) => {
+  const { dir, git } = makeRepo(t);
+  const commit = commitTree(git, dir, { "a.txt": "one\n" });
+  const root = exportTree(git, dir, commit);
+  mkdirSync(join(root, "node_modules", "dep"), { recursive: true });
+  writeFileSync(join(root, "node_modules", "dep", "index.js"), "module.exports = 1;\n");
+  const verdict = verifyReleaseAgainstCommit({
+    releaseRoot: root,
+    commit,
+    repo: dir,
+    referenceDeps: join(root, "node_modules"),
+  });
   assert.equal(verdict.ok, false);
   assert.equal(verdict.reason, "unverifiable");
 });

@@ -6,6 +6,7 @@ import { Check, Copy, Download, ExternalLink, KeyRound, Loader2, LogIn, Terminal
 import type { EngineInstall, InstanceInfo } from "@/state/store";
 import { cn } from "@/lib/cn";
 import { isCheckingEngine } from "@/lib/engine-status";
+import { openCodeModelProbeSentence } from "@/lib/opencode-engine-status";
 
 type Platform = "darwin" | "win32" | "linux";
 
@@ -38,12 +39,17 @@ export function needsCli(instance: InstanceInfo | undefined): boolean {
 
 /** Title and body for an engine whose last probe gave no answer. */
 export function engineCheckingCopy(instance: InstanceInfo) {
-  const reason = instance.snapshot.reason?.replace(/\.$/, "") || `${instance.displayName} did not answer in time`;
+  const probe = openCodeModelProbeSentence(instance);
+  const reason = probe
+    ?? instance.snapshot.reason?.replace(/\.$/, "")
+    ?? `${instance.displayName} did not answer in time`;
   return {
     title: `Checking ${instance.displayName}`,
     // U+00A0 + space: the two-space sentence gap survives HTML whitespace
     // collapsing.
-    description: `${reason}.\u00a0 BotFleet is checking again and will update this on its own.`,
+    description: probe
+      ? `${reason}\u00a0 BotFleet is checking again and will update this on its own.`
+      : `${reason}.\u00a0 BotFleet is checking again and will update this on its own.`,
   };
 }
 
@@ -73,9 +79,11 @@ export function engineSetupCopy(instance: InstanceInfo, intent: "cloud" | "injec
     };
   }
   if (signInOnly) {
+    const probe = openCodeModelProbeSentence(instance);
     return {
-      title: `Sign in to ${instance.displayName}`,
-      description: "Finish the account sign-in in Terminal. Reopen this menu afterward and we’ll check again.",
+      title: probe ? `${instance.displayName} needs setup` : `Sign in to ${instance.displayName}`,
+      description: probe
+        ?? "Finish the account sign-in in Terminal. Reopen this menu afterward and we’ll check again.",
     };
   }
   if (intent === "inject") {

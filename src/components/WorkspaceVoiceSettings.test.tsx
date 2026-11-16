@@ -65,6 +65,7 @@ const baseTts = (): Tts => ({
 
 import {
   AudioRetentionPicker,
+  ClonedVoiceSwitch,
   DefaultVoicePicker,
   NO_DEFAULT_VOICE_HELP,
   PronunciationSettings,
@@ -97,6 +98,7 @@ const VOICES = [
   { id: "jay-wedgeworth-001", label: "jay-wedgeworth-001", description: "Custom" },
   { id: "English_Graceful_Lady", label: "Graceful Lady", description: "Standard · Female" },
   { id: "personal:Jay", label: "Jay's Personal Voice", description: "Apple Personal Voice" },
+  { id: "jay-clone-001", label: "Jay Clone", description: "Custom", cloned: true },
 ];
 
 describe("workspace voice settings", () => {
@@ -216,6 +218,32 @@ describe("workspace voice settings", () => {
     await mount(list_({ ...baseTts(), pronunciations: undefined }));
     expect(container.textContent).toContain("Update BotFleet on this computer to edit pronunciations.");
     expect(rows()).toHaveLength(0);
+  });
+
+  it("leaves a cloned voice out of the default picker until the workspace asks for it", async () => {
+    await mount(picker_(baseTts()));
+    expect(optionTexts().join(" ")).not.toContain("Jay Clone");
+    await mount(picker_({ ...baseTts(), useClonedVoice: true }));
+    expect(optionTexts().join(" ")).toContain("Jay Clone");
+  });
+
+  it("saves the cloned-voice switch off by default and on when it is turned on", async () => {
+    // SAFETY: the fixture sets the tts section the switch reads back, which is all this card uses.
+    const saved = { tts: { ...baseTts(), useClonedVoice: true } } as ConfigStatus;
+    saveAnswer = async () => saved;
+    const toggle = () => container.querySelector<HTMLButtonElement>('button[aria-label="Use my cloned voice"]')!;
+    await mount(createElement(ClonedVoiceSwitch, { tts: baseTts(), onConfig, deps }));
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
+    await act(async () => toggle().click());
+    await flush();
+    expect(saveCalls).toEqual([{ tts: { useClonedVoice: true } }]);
+    expect(configs).toEqual([saved]);
+    saveCalls.splice(0);
+    await mount(createElement(ClonedVoiceSwitch, { tts: { ...baseTts(), useClonedVoice: true }, onConfig, deps }));
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+    await act(async () => toggle().click());
+    await flush();
+    expect(saveCalls).toEqual([{ tts: { useClonedVoice: false } }]);
   });
 
   it("defaults audio retention to 7 days (1 week) and saves a new retention choice", async () => {

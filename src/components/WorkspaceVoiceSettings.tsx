@@ -24,7 +24,7 @@ import {
 } from "../../shared/bot-voice";
 import { checkPronunciations, PRONUNCIATION_SAY_MAX, PRONUNCIATION_TERM_MAX, PRONUNCIATIONS_MAX, type Pronunciation } from "../../shared/pronunciations";
 
-export type WorkspaceVoiceOption = { id: string; label: string; description?: string };
+export type WorkspaceVoiceOption = { id: string; label: string; description?: string; cloned?: boolean };
 
 type WorkspaceTts = NonNullable<ConfigStatus["tts"]>;
 
@@ -36,7 +36,9 @@ export interface WorkspaceVoiceDeps {
     patch:
       | { tts: { voice: string } }
       | { tts: { pronunciations: Pronunciation[] } }
-      | { tts: { audioRetentionDays: number } },
+      | { tts: { audioRetentionDays: number } }
+      | { tts: { enabled: boolean } }
+      | { tts: { useClonedVoice: boolean } },
   ): Promise<ConfigStatus>;
   speak(text: string, voiceId: string): void;
 }
@@ -77,8 +79,12 @@ export function DefaultVoicePicker({
   const [error, setError] = useState<string | null>(null);
 
   const current = tts.voice ?? "";
-  // Hosted and built-in voices only: a Personal Voice speaks on one device.
-  const options = voices.filter((voice) => !isPersonalVoiceId(voice.id));
+  // Hosted and built-in voices only: a Personal Voice speaks on one device,
+  // and a cloned voice is only the workspace default while the workspace's
+  // cloned-voice switch is on.
+  const options = voices.filter(
+    (voice) => !isPersonalVoiceId(voice.id) && (tts.useClonedVoice === true || !voice.cloned),
+  );
   const listed = options.some((voice) => voice.id === current);
   const currentIsPersonal = isPersonalVoiceId(current);
 
@@ -382,6 +388,134 @@ export function AudioRetentionPicker({
       </select>
       <p className="mt-1.5 text-[12px] text-ink-secondary">{AUDIO_RETENTION_HELP}</p>
       {error && <div role="alert" className="mt-1.5 text-[12px] text-danger">{error}</div>}
+    </div>
+  );
+}
+
+export const CLONED_VOICE_HELP =
+  "Turn this on to let your cloned voice be the workspace default, the voice every bot without a voice of its own speaks with.\u00A0 A bot you gave a voice of its own keeps it.";
+
+export function ClonedVoiceSwitch({
+  tts,
+  onConfig,
+  deps = defaultWorkspaceVoiceDeps,
+}: {
+  tts: WorkspaceTts;
+  onConfig: (config: ConfigStatus) => void;
+  deps?: WorkspaceVoiceDeps;
+}) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const enabled = tts.useClonedVoice === true;
+
+  async function save(next: boolean) {
+    setSaving(true);
+    setError(null);
+    try {
+      onConfig(await deps.saveConfig({ tts: { useClonedVoice: next } }));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not save the cloned voice switch.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="mt-4 border-t border-hairline/40 pt-4" data-testid="cloned-voice">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-[13px] font-medium text-ink">Use My Cloned Voice</div>
+          <p className="mt-0.5 text-[12px] text-ink-secondary">{CLONED_VOICE_HELP}</p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={enabled}
+          aria-label="Use my cloned voice"
+          disabled={saving}
+          onClick={() => {
+            void save(!enabled).catch(logVoiceSwitchSaveError);
+          }}
+          className={cn(
+            "relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+            enabled ? "bg-success" : "bg-raised-hover",
+          )}
+        >
+          <span
+            className={cn(
+              "absolute top-0.5 size-5 rounded-full bg-white shadow transition-transform",
+              enabled ? "translate-x-5" : "translate-x-0.5",
+            )}
+          />
+        </button>
+      </div>
+      {error && <div className="text-[12px] text-danger">{error}</div>}
+    </div>
+  );
+}
+
+export const VOICE_MASTER_HELP =
+  "Turns auto-speak, calls, and hosted speech on or off for this workspace.  Existing replies stay on screen; nothing is spoken and new calls will not start while this is off.";
+
+function logVoiceSwitchSaveError(error: Error): void {
+  console.error(error instanceof Error ? error.message : "Could not save the voice switch.");
+}
+
+export function VoiceMasterSwitch({
+  tts,
+  onConfig,
+  deps = defaultWorkspaceVoiceDeps,
+}: {
+  tts?: WorkspaceTts;
+  onConfig: (config: ConfigStatus) => void;
+  deps?: WorkspaceVoiceDeps;
+}) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const enabled = tts?.enabled !== false;
+
+  async function save(next: boolean) {
+    setSaving(true);
+    setError(null);
+    try {
+      onConfig(await deps.saveConfig({ tts: { enabled: next } }));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not save the voice switch.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="mt-3 flex flex-col gap-1.5">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-[13px] font-medium text-ink">Voice</div>
+          <p className="mt-0.5 text-[12px] text-ink-secondary">{VOICE_MASTER_HELP}</p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={enabled}
+          aria-label="Voice on"
+          disabled={saving}
+          onClick={() => {
+            void save(!enabled).catch(logVoiceSwitchSaveError);
+          }}
+          className={cn(
+            "relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+            enabled ? "bg-success" : "bg-raised-hover",
+          )}
+        >
+          <span
+            className={cn(
+              "absolute top-0.5 size-5 rounded-full bg-white shadow transition-transform",
+              enabled ? "translate-x-5" : "translate-x-0.5",
+            )}
+          />
+        </button>
+      </div>
+      {error && <div className="text-[12px] text-danger">{error}</div>}
     </div>
   );
 }

@@ -12,7 +12,7 @@ import {
 describe("voice provider ladders", () => {
   it("defaults match the research ordering", () => {
     expect(DEFAULT_TTS_LADDER).toEqual(["xai", "azure", "minimax"]);
-    expect(DEFAULT_CLOUD_STT_LADDER).toEqual(["meta", "xai", "assemblyai", "azure", "groq"]);
+    expect(DEFAULT_CLOUD_STT_LADDER).toEqual(["xai", "assemblyai", "meta", "azure", "groq"]);
   });
 
   it("filters the TTS ladder to providers with credentials", () => {
@@ -49,7 +49,7 @@ describe("voice provider ladders", () => {
       assemblyai: { key: "aai" },
       callStt: { provider: "xai" },
     };
-    expect(resolveCloudSttLadder(cfg)).toEqual(["xai", "meta", "assemblyai"]);
+    expect(resolveCloudSttLadder(cfg)).toEqual(["xai", "assemblyai", "meta"]);
   });
 
   it("reports per-provider cloud STT capability", () => {

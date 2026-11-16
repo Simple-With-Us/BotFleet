@@ -362,6 +362,7 @@ import { modelEffortLevels } from "../src/lib/model-effort.ts";
 import type { LineageContext } from "../shared/model-lineage.ts";
 import {
   checkLineageWrite,
+  customModelSkip,
   gateLineageByCliVersion,
   lineageContextFor,
   modelNameFor,
@@ -535,12 +536,13 @@ import {
 } from "./store.ts";
 import * as tts from "./tts/index.ts";
 import { speechUsageTotals } from "./tts/usage.ts";
+import { handleXaiSttRoutes, voiceIsOff, VOICE_OFF_ERROR } from "./stt/routes.ts";
 import {
   VOICE_SUMMARY_PROMPT,
   spokenReply,
   resolveVoiceSummaryMode,
 } from "../shared/voice-summary.ts";
-import { isPersonalVoiceId, MAX_DEFAULT_VOICE_ID_LENGTH, PERSONAL_VOICE_NOT_DEFAULT } from "../shared/bot-voice.ts";
+import { CLONED_VOICE_NOT_DEFAULT, isPersonalVoiceId, MAX_DEFAULT_VOICE_ID_LENGTH, PERSONAL_VOICE_NOT_DEFAULT } from "../shared/bot-voice.ts";
 import { mintStsToken, type StsProvider } from "../shared/sts-tokens.ts";
 import {
   StsMintThrottle,
@@ -1857,7 +1859,7 @@ function executionInstanceFor(
     const boxCloud = registry.instances().find((candidate) => candidate.driverKind === "boxAgent");
     if (boxCloud) return boxCloud.instanceId;
   }
-  return quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId;
+  return quotaCooldowns.resolveModel(bot.id, policy, undefined, { skipRetiredModel: skipCustomModels }).selection.instanceId;
 }
 
 /** Engines this bot's queued runs would actually execute on.
@@ -1914,7 +1916,9 @@ function dispatchHoldFor(
   const boxCloud = cloudRunUsesBoxAgent(runOn, bot.cloudBackend ?? undefined, cfg.botDefaults?.cloudBackend)
     ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent")
     : undefined;
-  const modelRoute = boxCloud ? undefined : quotaCooldowns.resolveModel(bot.id, policy);
+  const modelRoute = boxCloud
+    ? undefined
+    : quotaCooldowns.resolveModel(bot.id, policy, undefined, { skipRetiredModel: skipCustomModels });
   // A Box-backed cloud run does NOT execute on the bot's model engine:
   // `startTurn` switches it to the boxAgent instance. Judging the hold against
   // the local engine queued healthy cloud work whenever the local engine was
@@ -2442,6 +2446,8 @@ function lineageContextForInstance(instanceId: string): LineageContext | undefin
   return gateLineageByCliVersion(context, cliVersionByInstance.get(instanceId));
 }
 
+const skipCustomModels = customModelSkip(lineageContextForInstance, { skipUnloaded: true });
+
 /** Reconcile saved selections against the engines' current catalogs.  The
  *  store posts one notice per bot it moved and emits the bot frames. */
 function reconcileModelLineage(opts: { botIds?: readonly string[]; ownerDirective?: boolean; skipBusy?: boolean } = {}) {
@@ -2600,7 +2606,7 @@ function checkedModelSelection(
   // checks so a PATCH cannot re-introduce them.  model-lineage deliberately
   // omits those engines; Claude/Grok retired ids still move via lineage below.
   {
-    const rewritten = rewriteModelSelection(selection);
+    const rewritten = rewriteModelSelection(selection, skipCustomModels);
     if (rewritten.changed) {
       selection.model = rewritten.selection.model;
       if (rewritten.selection.fallbacks) selection.fallbacks = rewritten.selection.fallbacks;
@@ -5338,6 +5344,7 @@ async function launchFallbackTurn(input: {
             botId,
             isCooling: (candidateBotId, instanceId, model, now) =>
               Boolean(quotaCooldowns.get(candidateBotId, instanceId, model, now)) || Boolean(transientRouteHealth.get(instanceId, model, now)),
+            skipRetiredModel: skipCustomModels,
           });
       if (!following) {
         fallbackAttemptByTurn.delete(key);
@@ -5720,7 +5727,7 @@ bus.subscribe((event: RuntimeEvent) => {
             unattended: unattended || undefined,
           });
           if (buzz) {
-            if (asker.busy) store.setActivity(asker.id, "waiting-on-you");
+            if (asker.busy) store.setWaiting(asker.id, event.threadId);
             notify(
               buildNotification("approval", asker, event.threadId, summary, {
                 requestId,
@@ -5872,7 +5879,9 @@ bus.subscribe((event: RuntimeEvent) => {
                 : verdict?.source === "sensitive-guard"
                   ? "This touched sensitive files or credentials, so auto mode stopped to ask."
                   : verdict?.source === "system-guard"
-                    ? "This reaches outside the bot's folders or changes the computer, so auto mode stopped to ask."
+                    ? verdict.rule === "file-write:hard-link"
+                      ? "That file is hard linked to another file, so auto mode stopped to ask."
+                      : "This reaches outside the bot's folders or changes the computer, so auto mode stopped to ask."
                     : "Approval needed, so auto mode stopped to ask."
               : undefined,
           approvalScope: event.approvalScope,
@@ -5937,7 +5946,7 @@ bus.subscribe((event: RuntimeEvent) => {
         const card = store.messagesFor(event.threadId).find((candidate) => candidate.id === message.id)?.card;
         if (!card || card.answered) return;
         // the bot is not working now — it is waiting on a person
-        if (asker.busy) store.setActivity(asker.id, "waiting-on-you");
+        if (asker.busy) store.setWaiting(asker.id, event.threadId);
         // The request id travels with the frame so a phone can answer THIS
         // card from a lock screen rather than looking for whatever is
         // pending on the thread — which is the wrong card as soon as two
@@ -6320,6 +6329,7 @@ bus.subscribe((event: RuntimeEvent) => {
           botId: fallbackBot.id,
           isCooling: (candidateBotId, instanceId, model, now) =>
             Boolean(quotaCooldowns.get(candidateBotId, instanceId, model, now)) || Boolean(transientRouteHealth.get(instanceId, model, now)),
+          skipRetiredModel: skipCustomModels,
         });
         // Receipt now that the failover decision exists: while a fallback is
         // launching the run stays open and receipts on the fallback's own
@@ -7080,7 +7090,14 @@ function restoreHeldWork(work: HeldWork, context: string) {
     };
     if (round.cardContinuation !== undefined) restored.cardContinuation = round.cardContinuation;
     if (round.turnSelection) {
-      restored.turnSelection = { instanceId: round.turnSelection.instanceId, model: round.turnSelection.model };
+      const turnContext = lineageContextForInstance(round.turnSelection.instanceId);
+      const model = turnContext?.customIds?.includes(round.turnSelection.model)
+        ? round.turnSelection.model
+        : rewriteRetiredModelId(round.turnSelection.model);
+      restored.turnSelection = {
+        instanceId: round.turnSelection.instanceId,
+        model,
+      };
       if (isEffortLevel(round.turnSelection.effort)) restored.turnSelection.effort = round.turnSelection.effort;
       if (round.turnSelection.latest) restored.turnSelection.latest = round.turnSelection.latest;
     }
@@ -7301,9 +7318,13 @@ async function startTurn(
   let selection = opts?.modelSelection
     ?? (opts?.command
       ? { instanceId: fallbackPolicy.instanceId, model: fallbackPolicy.model, effort: fallbackPolicy.effort }
-      : quotaCooldowns.resolveModel(bot.id, fallbackPolicy).selection);
+      : quotaCooldowns.resolveModel(bot.id, fallbackPolicy, undefined, { skipRetiredModel: skipCustomModels }).selection);
   if (opts?.modelSelection) {
-    const override = reconcileTurnOverride(selection, lineageContextForInstance(selection.instanceId));
+    const override = reconcileTurnOverride(
+      selection,
+      lineageContextForInstance(selection.instanceId),
+      lineageContextForInstance,
+    );
     // A Codex thread keeps the model it started with, so an override the
     // reconcile moved must not resume this task's old thread there.
     if (override.freshSession) store.setResumeCursor(bot.id, selection.instanceId, undefined, threadId);
@@ -9668,7 +9689,10 @@ function threadExternalCredentialPending(bot: NonNullable<ReturnType<typeof stor
   // only caller re-checked by catching `startTurn`'s refusal, and wrong now
   // that the recovery PLAN has to know before it decides anything.
   const policy = store.taskByThread(bot.id, threadId)?.modelSelection ?? bot.modelSelection;
-  return turnExternalCredentialPending(bot, quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId);
+  return turnExternalCredentialPending(
+    bot,
+    quotaCooldowns.resolveModel(bot.id, policy, undefined, { skipRetiredModel: skipCustomModels }).selection.instanceId,
+  );
 }
 
 // ── one recovery coordinator ─────────────────────────────────────────────
@@ -10079,7 +10103,11 @@ async function runGroupMemberTurn(
   // Room turns pass no resume cursor, so only the reconciled selection is
   // used here.
   const selection = turnSelection
-    ? reconcileTurnOverride(turnSelection, lineageContextForInstance(turnSelection.instanceId)).selection
+    ? reconcileTurnOverride(
+        turnSelection,
+        lineageContextForInstance(turnSelection.instanceId),
+        lineageContextForInstance,
+      ).selection
     : bot.modelSelection;
   if (turnExternalCredentialPending(bot, selection.instanceId)) {
     const queued = queueRoomRound(
@@ -12417,10 +12445,21 @@ function readBody(req: IncomingMessage, maxBytes = 1_000_000): Promise<any> {
 // parsed any content type, so a page anywhere could drive them.
 //
 // Bodyless mutating requests (a stop, a cancel) are exempt — there is no
-// content type to check.  The binary upload is exempt by name, because it is
-// the one route whose body is not JSON, and the phone sends its own type
+// content type to check.  Binary uploads are exempt by name or pattern,
+// because their bodies are not JSON, and the phone sends its own type
 // through `companion/src/proxy.ts`, which forwards it verbatim.
 const NON_JSON_BODY_ROUTES = new Set(["/api/attachments"]);
+const NON_JSON_BODY_ROUTE_PATTERN = /^\/api\/stt\/xai\/sessions\/[^/]+\/audio$/;
+
+function isNonJsonBodyRoute(path: string, req: IncomingMessage): boolean {
+  if (NON_JSON_BODY_ROUTES.has(path)) return true;
+  if (!NON_JSON_BODY_ROUTE_PATTERN.test(path)) return false;
+  // Only raw PCM may skip the JSON content-type gate.  A CORS-simple
+  // text/plain POST must still receive a 415 so a cross-origin page cannot
+  // append attacker-controlled bytes to a live dictation session.
+  const type = String(req.headers["content-type"] ?? "").split(";")[0]!.trim().toLowerCase();
+  return type === "application/octet-stream";
+}
 
 /** The 415 a mutating request gets when it carries a body the harness will
  *  not parse.  One string for one condition: the shared gate and the per-route
@@ -13702,7 +13741,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         path !== "/api/health" && path !== "/api/update/status") {
       return json(res, 503, { error: controlShutdownPending ? "server shutdown is in progress" : "BotFleet is quiescing for an update" });
     }
-    if (mutatingApiRequest && !NON_JSON_BODY_ROUTES.has(path) && hasRequestBody(req) && !isJsonContentType(req)) {
+    if (mutatingApiRequest && !isNonJsonBodyRoute(path, req) && hasRequestBody(req) && !isJsonContentType(req)) {
       // the commands route names its code so a client can branch on it
       return json(res, 415, /^\/api\/bots\/[\w-]+\/commands$/.test(path)
         ? { error: UNSUPPORTED_JSON_BODY, code: "unsupported_media_type" }
@@ -19083,6 +19122,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // token and nothing else.  The policy -- which provider, why not, how
     // often -- lives in server/sts-access.ts and the minting itself in
     // shared/sts-tokens.ts, so a phone and the desktop cannot disagree.
+    if (await handleXaiSttRoutes({ method, path, req, res, cfg, json, readBody })) return;
+
     if (method === "GET" && path === "/api/sts/status") {
       // Booleans only.  Reading that a provider is set up is not reading its
       // key, which is the same line /api/config draws.
@@ -19098,6 +19139,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, 200, stsStatusBody(keys, preference));
     }
     if (method === "POST" && path === "/api/sts/token") {
+      if (voiceIsOff(cfg)) return json(res, 409, { error: VOICE_OFF_ERROR });
       // Parsed here, at the door: everything below works on a provider, not
       // on whatever a device put in the body.
       const parsed = stsTokenRequest.safeParse(await readBody(req));
@@ -19176,6 +19218,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // A Personal Voice belongs to the device that made it, so it cannot be
       // what every bot on every device falls back to.
       if (isPersonalVoiceId(voice)) return json(res, 400, { error: PERSONAL_VOICE_NOT_DEFAULT });
+      // A cloned voice is the workspace's own voice, and it only speaks for
+      // every bot while the workspace's cloned-voice switch is on.
+      if (tts.isClonedVoice(voice) && cfg.tts?.useClonedVoice !== true) {
+        return json(res, 400, { error: CLONED_VOICE_NOT_DEFAULT });
+      }
       let patch;
       try {
         patch = parseConfigPatch({ tts: { voice } });
@@ -19813,6 +19860,32 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const check = await tts.verifyKey(newTts.key.trim(), { tts: { ...cfg.tts, ...newTts } });
         if (!check.ok) return json(res, 400, { error: check.message });
       }
+      // A cloned voice is only the workspace default while the workspace's
+      // cloned-voice switch is on.  Both write paths check it: the Mac saves
+      // the default voice here, and the phone saves it through the narrow
+      // route beside this one, so a clone cannot become the default by
+      // choosing the other door.
+      // The switch and the voice are read as one request, because a save can
+      // carry both:  a save that turns the switch on and names a cloned voice
+      // is allowed, and a save that turns it off and names a cloned voice is
+      // not.
+      const clonedVoiceAllowed = patch.tts?.useClonedVoice ?? cfg.tts?.useClonedVoice ?? false;
+      if (patch.tts?.voice && tts.isClonedVoice(patch.tts.voice) && !clonedVoiceAllowed) {
+        return json(res, 400, { error: CLONED_VOICE_NOT_DEFAULT });
+      }
+      // Turning the switch off while a cloned voice is the workspace default
+      // clears that default: the switch has to mean off, or a clone keeps
+      // speaking for every bot that has no voice of its own.  A voice named
+      // in the same request is the user's own choice and is kept.
+      if (
+        patch.tts
+        && patch.tts.useClonedVoice === false
+        && !Object.hasOwn(patch.tts, "voice")
+        && cfg.tts?.voice
+        && tts.isClonedVoice(cfg.tts.voice)
+      ) {
+        patch.tts = { ...patch.tts, voice: "" };
+      }
       // The secret store is canonical for the names it holds, so a save of one
       // of those names is never quietly accepted and then reverted by the next
       // resolution.  With Write Through off the request is refused whole and
@@ -20182,6 +20255,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return res.end(result.bytes ? Buffer.from(result.bytes) : undefined);
       }
       if (clipIndex !== undefined) return json(res, 405, { error: "POST the message audio route" });
+      if (voiceIsOff(cfg)) return json(res, 409, { error: VOICE_OFF_ERROR });
       if (!owner) return json(res, 404, { error: "no voice owner" });
       const body = await readBody(req);
       const result = await messageAudio.post({ threadId, messageId, owner, body, startedAt });
@@ -20214,6 +20288,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
     }
     if (method === "POST" && path === "/api/tts/speak") {
+      if (voiceIsOff(cfg)) return json(res, 409, { error: VOICE_OFF_ERROR });
       if (cfg.tts?.provider !== "system" && workspaceCredentialPending(cfg, "ttsKey")) {
         return json(res, 409, { error: "Voice synthesis is waiting for its encrypted credential" });
       }
@@ -20243,6 +20318,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // Uses the same authenticated workspace-settings boundary as key changes.
     // Never treat an arbitrary nonce as proof of ownership.
     if (method === "POST" && path === "/api/tts/voice-clone") {
+      if (voiceIsOff(cfg)) return json(res, 409, { error: VOICE_OFF_ERROR });
       // The clone clip is up to 20 MB; base64 expands it to ~27 MB.
       // Only this route accepts the larger body, after the normal host/origin gate.
       const body = await readBody(req, 28_000_000);

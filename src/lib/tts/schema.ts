@@ -63,6 +63,8 @@ const TtsVoicesResponseSchema = z.object({
     id: z.string(),
     label: z.string(),
     description: z.string().optional(),
+    /** True for a voice the owner cloned. */
+    cloned: z.boolean().optional(),
   }).strict()).optional(),
   error: z.string().optional(),
 });
@@ -84,6 +86,8 @@ const CustomVoiceVoiceSchema = z.object({
   id: z.string().min(1),
   label: z.string().min(1),
   description: z.string().optional(),
+  /** True for a voice the owner cloned. */
+  cloned: z.boolean().optional(),
 }).strict();
 
 const CustomVoiceSuccessResponseSchema = z.object({

@@ -399,6 +399,30 @@ export function clampPlacementWindow(value: PlacementWindow): PlacementWindow {
   return value;
 }
 
+/** The workspace voice settings:  credentials, the workspace default voice
+ *  id, and the pronunciation list.
+ *
+ *  The `AppConfig` member is derived from this, so the shape the validator
+ *  accepts and the shape the code reads are one contract and cannot drift
+ *  apart. */
+export const ttsConfigSchema = z.object({
+  key: optionalText,
+  voice: optionalText,
+  provider: z.enum(TTS_PROVIDERS).optional(),
+  ladder: z.array(z.enum(HOSTED_TTS_PROVIDERS)).max(HOSTED_TTS_PROVIDERS.length).optional(),
+  enabled: z.boolean().optional(),
+  /** Whether a cloned voice may be the workspace default voice.  Absent or
+   * false keeps cloned voices out of the default slot; a bot's own voice
+   * is never affected by this. */
+  useClonedVoice: z.boolean().optional(),
+  optimizedSummary: z.boolean().optional(),
+  audioRetentionDays: z.number().int().min(0).max(3650).optional(),
+  pronunciations: pronunciationListSchema.optional(),
+  credentialStorage: externalCredentialStorage,
+}).strict();
+
+export type TtsConfig = z.infer<typeof ttsConfigSchema>;
+
 const appConfigSchema = z.object({
   deleteInstance: optionalText,
   xai: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
@@ -429,16 +453,7 @@ const appConfigSchema = z.object({
   /** Voice credentials, the workspace default voice id (what every bot
    * without a voice of its own speaks with), and the pronunciation list.
    * `provider` picks the engine; `ladder` overrides hosted fallback order. */
-  tts: z.object({
-    key: optionalText,
-    voice: optionalText,
-    provider: z.enum(TTS_PROVIDERS).optional(),
-    ladder: z.array(z.enum(HOSTED_TTS_PROVIDERS)).max(HOSTED_TTS_PROVIDERS.length).optional(),
-    optimizedSummary: z.boolean().optional(),
-    audioRetentionDays: z.number().int().min(0).max(3650).optional(),
-    pronunciations: pronunciationListSchema.optional(),
-    credentialStorage: externalCredentialStorage,
-  }).strict().optional(),
+  tts: ttsConfigSchema.optional(),
   callStt: z.object({
     provider: z.enum(CALL_STT_PROVIDERS).nullable().optional(),
     ladder: z.array(z.enum(CLOUD_STT_PROVIDERS)).max(CLOUD_STT_PROVIDERS.length).optional(),
@@ -770,16 +785,7 @@ export interface AppConfig {
   /** `voice` is the workspace default voice; `pronunciations` is the
    *  workspace list of terms and how to say them (shared/pronunciations.ts),
    *  absent until first saved, which means the seeded defaults. */
-  tts?: {
-    key?: string;
-    voice?: string;
-    provider?: (typeof TTS_PROVIDERS)[number];
-    ladder?: Array<(typeof HOSTED_TTS_PROVIDERS)[number]>;
-    optimizedSummary?: boolean;
-    audioRetentionDays?: number;
-    pronunciations?: Pronunciation[];
-    credentialStorage?: "external";
-  };
+  tts?: TtsConfig;
   /** Call-mode dictation. The picker in `src/lib/transcription-provider.ts`
    *  falls back to platform defaults when `provider` is absent (Apple on
    *  macOS without a cloud key, cloud providers when keys land).

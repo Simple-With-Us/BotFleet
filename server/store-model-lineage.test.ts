@@ -515,4 +515,93 @@ describe("Store load: one flat fallback chain", () => {
       "store: nested (nested) task thread-nested modelSelection dropped 1 nested fallback entry that never ran",
     ]);
   });
+
+  it("preserves custom catalog rows matching retired spellings across load and reconcileModelLineage", () => {
+    seedBots([
+      {
+        id: "custom-bot",
+        modelSelection: {
+          instanceId: "dshCustom",
+          model: "MiniMax-M3",
+          fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3" }],
+        },
+        tasks: [
+          {
+            threadId: "thread-custom",
+            title: "Main",
+            createdAt: 1_000,
+            resumeCursors: {},
+            modelSelection: { instanceId: "dshCustom", model: "MiniMax-M3" },
+          },
+        ],
+      },
+    ]);
+    const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
+    // Load alone does not rename before instance catalogs load.
+    expect(store.bot("custom-bot")!.modelSelection).toEqual({
+      instanceId: "dshCustom",
+      model: "MiniMax-M3",
+      fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3" }],
+    });
+    store.reconcileModelLineage({
+      contextFor: (instanceId: string) => {
+        if (instanceId === "dshCustom") {
+          return {
+            driverKind: "dshAgent",
+            offeredIds: ["MiniMax-M3"],
+            customIds: ["MiniMax-M3"],
+            authoritative: true,
+          };
+        }
+        if (instanceId === "minimax") {
+          return {
+            driverKind: "minimax",
+            offeredIds: ["MiniMax-M3.1-Flash"],
+            customIds: [],
+            authoritative: true,
+          };
+        }
+        return undefined;
+      },
+      nameFor: (_instanceId: string, model: string) => model,
+    });
+    expect(store.bot("custom-bot")!.modelSelection).toEqual({
+      instanceId: "dshCustom",
+      model: "MiniMax-M3",
+      fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3.1-Flash" }],
+    });
+    expect(store.bot("custom-bot")!.tasks![0]!.modelSelection).toEqual({
+      instanceId: "dshCustom",
+      model: "MiniMax-M3",
+    });
+  });
+
+  it("leaves retired-spelling ids untouched while an engine is shadowed (catalogPending)", () => {
+    seedBots([
+      {
+        id: "shadow-custom-bot",
+        modelSelection: {
+          instanceId: "dshShadow",
+          model: "MiniMax-M3",
+        },
+      },
+    ]);
+    const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
+    store.reconcileModelLineage({
+      contextFor: (instanceId: string) =>
+        instanceId === "dshShadow"
+          ? {
+              driverKind: "dshAgent",
+              offeredIds: [],
+              authoritative: false,
+              catalogPending: true,
+            }
+          : undefined,
+      nameFor: (_instanceId: string, model: string) => model,
+    });
+    expect(store.bot("shadow-custom-bot")!.modelSelection).toEqual({
+      instanceId: "dshShadow",
+      model: "MiniMax-M3",
+    });
+  });
 });

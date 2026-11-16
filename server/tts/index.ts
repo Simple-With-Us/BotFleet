@@ -4,7 +4,8 @@
 // ~/.botfleet/config.json, picks the engine, and decides whether there
 // is a voice at all.
 import { isPersonalVoiceId, readableVoiceId } from "../../shared/bot-voice.ts";
-import { applyPronunciations, effectivePronunciations, type Pronunciation } from "../../shared/pronunciations.ts";
+import { voiceMasterEnabled } from "../../shared/voice-master.ts";
+import { applyPronunciations, applySpokenYears, effectivePronunciations, type Pronunciation } from "../../shared/pronunciations.ts";
 import { stripPauseTags } from "../../shared/spoken-script.ts";
 import type { AppConfig } from "../config.ts";
 import * as azure from "./azure.ts";
@@ -20,6 +21,7 @@ import {
   resolveHostedTtsLadder,
 } from "../../shared/voice-providers.ts";
 import { speakWithFallback } from "./provider-ladder.ts";
+import { clonedVoiceAllowed, defaultVoice } from "./voice-default.ts";
 
 export type VoiceProvider = TtsProvider;
 export { NoVoiceConfigured } from "./errors.ts";
@@ -48,10 +50,14 @@ export function providerConfigured(cfg: AppConfig): boolean {
 
 export function voiceConfigured(cfg: AppConfig): boolean {
   if (isPersonalVoice(cfg.tts?.voice)) return true;
+  // The default voice is the gated one:  a clone that is the stored default
+  // while the switch is off is not a voice the workspace can speak with, so
+  // readiness has to say so.
+  const voice = defaultVoice(cfg);
   if (voiceProvider(cfg) === "system") {
-    return systemVoices.systemVoicesAvailable() && Boolean(cfg.tts?.voice);
+    return systemVoices.systemVoicesAvailable() && Boolean(voice);
   }
-  return Boolean(cfg.tts?.key && cfg.tts?.voice);
+  return Boolean(cfg.tts?.key && voice);
 }
 
 /** The prefix rule lives in shared/bot-voice.ts so the clients and the
@@ -68,9 +74,9 @@ export function voiceReady(cfg: AppConfig, voiceId?: string): boolean {
     return true;
   }
   if (voiceProvider(cfg) === "system") {
-    return systemVoices.systemVoicesAvailable() && Boolean(voiceId || cfg.tts?.voice);
+    return systemVoices.systemVoicesAvailable() && Boolean(voiceId || defaultVoice(cfg));
   }
-  return Boolean(cfg.tts?.key && (voiceId || cfg.tts?.voice));
+  return Boolean(cfg.tts?.key && (voiceId || defaultVoice(cfg)));
 }
 
 /** The pronunciation list in force: the saved one, or the seeded defaults
@@ -90,7 +96,10 @@ export function describeVoice(cfg: AppConfig) {
   return {
     configured: providerConfigured(cfg),
     ready: voiceConfigured(cfg),
-    voice: cfg.tts?.voice || "",
+    enabled: voiceMasterEnabled(cfg.tts),
+    voice: defaultVoice(cfg),
+    /** Whether the workspace lets a cloned voice be the default voice. */
+    useClonedVoice: clonedVoiceAllowed(cfg),
     provider: voiceProvider(cfg),
     optimizedSummary: cfg.tts?.optimizedSummary === true,
     audioRetentionDays: cfg.tts?.audioRetentionDays ?? DEFAULT_AUDIO_RETENTION_DAYS,
@@ -123,11 +132,16 @@ export async function listVoices(cfg: AppConfig, run?: systemVoices.Runner): Pro
   } else {
     voices = [...minimax.listClonedVoices(), ...minimax.CANNED_VOICES];
   }
-  if (cfg.tts?.voice && !voices.some((v) => v.id === cfg.tts?.voice)) {
-    const defaultVoiceId = cfg.tts.voice;
-    voices.unshift({ id: defaultVoiceId, label: readableVoiceId(defaultVoiceId), description: "Workspace default" });
+  const workspaceDefault = defaultVoice(cfg);
+  if (workspaceDefault && !voices.some((v) => v.id === workspaceDefault)) {
+    voices.unshift({ id: workspaceDefault, label: readableVoiceId(workspaceDefault), description: "Workspace default" });
   }
   return voices;
+}
+
+/** True when this id names one of the workspace's cloned voices. */
+export function isClonedVoice(voiceId: string | null | undefined): boolean {
+  return minimax.isClonedVoiceId(voiceId);
 }
 
 export function addCustomVoice(voiceId: string, label?: string) {
@@ -153,7 +167,7 @@ export function listCustomVoices() {
  * is left as it is. */
 export function speak(cfg: AppConfig, rawText: string, voiceId?: string, run?: systemVoices.Runner) {
   const provider = voiceProvider(cfg);
-  let text = applyPronunciations(rawText, pronunciations(cfg));
+  let text = applySpokenYears(applyPronunciations(rawText, pronunciations(cfg)));
   // MiniMax pause tags are for that engine only; macOS `say` reads them aloud
   // or truncates the utterance after the first marker.
   if (provider === "system") text = stripPauseTags(text);

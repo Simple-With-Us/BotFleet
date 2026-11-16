@@ -260,7 +260,7 @@ const AGENT_NAME_DENY = new RegExp(`(?:\\b(?:${AGENT_NAMES})\\b|\\[\\s*ag\\s*\\]
 
 export function centralTimestamp(now = new Date()) {
   // TestFlight "Released:" line: owner's clock in America/Chicago, 12-hour
-  // lowercase am/pm, zone never named (Usage-Monitor #1693).
+  // spaced uppercase AM/PM, zone never named (current owner rule).
   const d = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/Chicago",
     weekday: "short", month: "short", day: "numeric", year: "numeric"
@@ -269,7 +269,7 @@ export function centralTimestamp(now = new Date()) {
     timeZone: "America/Chicago",
     hour: "numeric", minute: "2-digit", hour12: true
   }).format(now);
-  t = t.replace(/\u202F/g, "").replace(/\s*(AM|PM)\s*$/i, (_, ap) => ap.toLowerCase());
+  t = t.replace(/[\t \u00A0\u202F]*(AM|PM)[\t \u00A0\u202F]*$/i, (_, ap) => ` ${ap.toUpperCase()}`);
   return `${d} at ${t}`;
 }
 

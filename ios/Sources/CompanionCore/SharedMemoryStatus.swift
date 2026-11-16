@@ -84,7 +84,7 @@ public struct SharedMemoryStatus: Decodable, Hashable, Sendable {
         }
     }
 
-    /// "Oct 9, 2026, 3:15pm", or "None recorded".
+    /// "Oct 9, 2026, 3:15 PM", or "None recorded".
     public var lastSuccessLabel: String {
         guard let lastSuccessAt else { return "None recorded" }
         return OwnerClock.stamp(ms: lastSuccessAt)

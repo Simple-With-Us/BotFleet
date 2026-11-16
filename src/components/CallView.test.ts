@@ -37,7 +37,7 @@ describe("CallTargetButton visibility", () => {
     // An STS call brings its own dictation and its own voice, so the dictation and
     // voice gates describe a path it is not taking.  Pinning the shape keeps a
     // later edit from re-gating the button behind a chained requirement.
-    expect(SRC).toMatch(/const unavailable = !active && \(!capabilitiesReady \|\| \(!stsCall && \(!supported \|\| !voiceReady\)\)\);/);
+    expect(SRC).toMatch(/const unavailable = !active && \(voiceOff \|\| !capabilitiesReady \|\| \(!stsCall && \(!supported \|\| !voiceReady\)\)\);/);
     expect(SRC).toMatch(/const voiceSetupRequired = capabilitiesReady && !stsCall && supported && !voiceReady;/);
     expect(SRC).toMatch(/const stsCall = stsDecision\?\.mode === "sts";/);
   });
@@ -63,7 +63,7 @@ describe("CallTargetButton visibility", () => {
     // remaining unavailable reasons (no STT provider, capabilities loading, no voice picked).
     expect(SRC).toMatch(/Pick a voice in a bot profile to make calls/);
     expect(SRC).toMatch(/Set up dictation to make calls/);
-    expect(SRC).toMatch(/Add an AssemblyAI API key in Settings to make calls on this computer/);
+    expect(SRC).toMatch(/Add an xAI or AssemblyAI API key in Settings to make calls on this computer/);
   });
 });
 

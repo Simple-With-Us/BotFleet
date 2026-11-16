@@ -82,6 +82,7 @@ import { fileURLToPath } from "node:url";
 import { backup, DatabaseSync } from "node:sqlite";
 import { redactSecrets, redactSecretsInText } from "../shared/redact.ts";
 import { EvidenceBundleSchema } from "./decommission-evidence-bundle.mjs";
+import { z } from "zod";
 
 /** The marker every archive manifest this script writes carries. */
 export const ARCHIVE_MARKER = "botfleet-node-store-archive";
@@ -1002,6 +1003,170 @@ export function checkExitCode(reportPath, readVerdict) {
 }
 
 /**
+ * The count pairs the import parity verdict is computed from.
+ *
+ * Each pair is the source count and the target count of one surface, named
+ * the way `StoreImportParityReport` names them on the Swift side.  The list
+ * is the whole of the surfaces the importer compares:  a surface that is not
+ * on it is a surface the verdict says nothing about, so the verdict is
+ * computed over exactly these and nothing else.
+ */
+const IMPORT_PARITY_COUNT_PAIRS = [
+  ["bot", "sourceBotCount", "targetBotCount"],
+  ["thread", "sourceThreadCount", "targetThreadCount"],
+  ["message", "sourceMessageCount", "targetMessageCount"],
+  ["routine", "sourceRoutineCount", "targetRoutineCount"],
+  ["routine run", "sourceRoutineRunCount", "targetRoutineRunCount"],
+  ["routine request receipt", "sourceRoutineRequestReceiptCount", "targetRoutineRequestReceiptCount"],
+  ["webhook", "sourceWebhookCount", "targetWebhookCount"],
+  ["webhook delivery", "sourceWebhookDeliveryCount", "targetWebhookDeliveryCount"],
+  ["webhook delivery ledger", "sourceWebhookDeliveryLedgerCount", "targetWebhookDeliveryLedgerCount"],
+];
+
+/**
+ * The import parity report, as the receipt reads it.
+ *
+ * The report is external data, so it is decoded at the boundary rather than
+ * narrowed as it is used:  a field the verdict is computed from that is
+ * missing or the wrong shape fails the decode, and a report that does not
+ * decode does not hold.  The two flags are part of the contract, because the
+ * report's own summary is one of the things the verdict checks.
+ */
+const importParityCount = z.number().int().nonnegative();
+const ImportParityReportSchema = z.looseObject({
+  ...Object.fromEntries(
+    IMPORT_PARITY_COUNT_PAIRS.flatMap(([, source, target]) => [
+      [source, importParityCount],
+      [target, importParityCount],
+    ]),
+  ),
+  orphanedMessageCount: importParityCount,
+  perThreadMessageCountsMatch: z.boolean(),
+  // The importer writes a SHA-256 as 64 hexadecimal characters, so a report
+  // whose digest is anything else did not come from the importer, and a
+  // report whose two digests are the same string is not evidence that the
+  // bodies matched.
+  sourceBodyDigestSHA256: z.string().regex(/^[0-9a-f]{64}$/i),
+  targetBodyDigestSHA256: z.string().regex(/^[0-9a-f]{64}$/i),
+  // The mismatch and warning lists are external input, so both the number of
+  // entries and the length of each one are bounded:  a report carrying a
+  // million of them, or one enormous entry, is not a report the importer
+  // wrote.  The bound on an entry is generous on purpose, because the
+  // importer joins the user-controlled metadata key names into one warning
+  // and a report whose warning is long is still a report the importer wrote.
+  // Nothing here copies an entry into the problem list:  a problem names how
+  // many there are, so a long entry costs a long string in the report and
+  // nothing more.
+  mismatches: z.array(z.string().max(16384)).max(1000),
+  warnings: z.array(z.string().max(16384)).max(1000),
+  // The importer always writes this count, so a report that does not carry
+  // it did not come from the importer, and without it the dropped-metadata
+  // contradiction below cannot be checked at all.
+  sourceMessageMetadataDroppedCount: importParityCount,
+  isParityVerified: z.boolean(),
+  isFullyVerified: z.boolean(),
+});
+
+/**
+ * The import parity verdict, computed out of the report's own details.
+ *
+ * The importer's report carries its verdict as two booleans, and the receipt
+ * used to read one of them and nothing else:  `isFullyVerified === true`.  A
+ * report that says it was verified while its own counts, digests, per-thread
+ * match or orphan count disagreed earned a passing `parity` check, and the
+ * bundle would have certified a parity that was never measured.  The receipt
+ * is the last thing between a doctored report and a decommissioned store, so
+ * it cannot take the report's word for it.
+ *
+ * So the verdict is computed here the way `StoreImportParityReport`
+ * computes it on the Swift side:  every source and target count pair equal,
+ * the per-thread counts matching, no orphaned messages, the two body digests
+ * equal, no mismatches and no warnings.  A report that does not carry the
+ * fields the verdict is computed from is not a report that passed:  it fails
+ * closed, because a missing field is not evidence of anything.
+ *
+ * The report's own flags are then checked against the computed verdict,
+ * because a report that disagrees with itself is not evidence of anything
+ * either.  The flags do not decide the verdict;  they have to agree with it.
+ *
+ * The problems are returned as well, so a caller can say what disagreed
+ * rather than only that something did.
+ */
+export function importParityVerdict(report) {
+  const parsed = ImportParityReportSchema.safeParse(report);
+  if (!parsed.success) {
+    const problems = parsed.error.issues.map(
+      (issue) => `${issue.path.join(".") || "report"}: ${issue.message}`,
+    );
+    return { isParityVerified: false, isFullyVerified: false, problems };
+  }
+  const data = parsed.data;
+  const problems = [];
+
+  // The verdict itself, the way the Swift side computes it.
+  let parityHolds = true;
+  for (const [name, source, target] of IMPORT_PARITY_COUNT_PAIRS) {
+    if (data[source] !== data[target]) {
+      parityHolds = false;
+      problems.push(`the ${name} counts do not match: ${source} is ${data[source]} and ${target} is ${data[target]}`);
+    }
+  }
+  if (!data.perThreadMessageCountsMatch) {
+    parityHolds = false;
+    problems.push("the per-thread message counts do not match");
+  }
+  if (data.orphanedMessageCount !== 0) {
+    parityHolds = false;
+    problems.push(`the report names ${data.orphanedMessageCount} orphaned message(s)`);
+  }
+  if (data.sourceBodyDigestSHA256 !== data.targetBodyDigestSHA256) {
+    parityHolds = false;
+    problems.push("the source and target body digests differ");
+  }
+  if (data.mismatches.length > 0) {
+    parityHolds = false;
+    problems.push(`the report names ${data.mismatches.length} mismatch(es)`);
+  }
+
+  // A warning is a known gap:  the migration carried every byte it could and
+  // named what it could not, so a report with a warning is parity-verified
+  // but not fully verified.
+  let fullyHolds = parityHolds && data.warnings.length === 0;
+  if (data.warnings.length > 0) {
+    problems.push(`the report names ${data.warnings.length} warning(s), so it is not fully verified`);
+  }
+
+  // Metadata the importer could not preserve is a warning, so a report that
+  // dropped metadata and named no warning contradicts itself.
+  const dropped = data.sourceMessageMetadataDroppedCount;
+  if (dropped !== undefined && dropped > 0 && data.warnings.length === 0) {
+    fullyHolds = false;
+    problems.push(`the report names ${dropped} dropped message(s) but no warning`);
+  }
+
+  // The report's own flags have to agree with the details they summarize,
+  // and with each other:  a report that is fully verified is parity
+  // verified, so the two flags cannot disagree in that direction.
+  if (data.isParityVerified !== parityHolds) {
+    problems.push(`the report says isParityVerified is ${data.isParityVerified} and its details say ${parityHolds}`);
+  }
+  if (data.isFullyVerified !== fullyHolds) {
+    problems.push(`the report says isFullyVerified is ${data.isFullyVerified} and its details say ${fullyHolds}`);
+  }
+  const flagsConsistent = !(data.isFullyVerified === true && data.isParityVerified === false);
+  if (!flagsConsistent) {
+    problems.push("the report says it is fully verified while it is not parity verified");
+  }
+  const parityAgrees = data.isParityVerified === parityHolds && flagsConsistent;
+  const fullyAgrees = data.isFullyVerified === fullyHolds && flagsConsistent;
+  return {
+    isParityVerified: parityHolds && parityAgrees,
+    isFullyVerified: fullyHolds && fullyAgrees,
+    problems,
+  };
+}
+
+/**
  * Validate a bundle request against the bundle's own schema.
  *
  * The request is untrusted input:  it is a file on disk, and an unvalidated
@@ -1064,7 +1229,11 @@ export function emitReceipts({ captureDir, request, provenance, parityReportPath
   const importChecks = [
     {
       name: "parity",
-      exitCode: checkExitCode(parityReportPath, (report) => report.isFullyVerified === true),
+      // The verdict is computed out of the report's own details, and a
+      // report whose summary disagrees with them fails closed, so a report
+      // that says it was verified while a surface disagrees cannot earn a
+      // passing check here.
+      exitCode: checkExitCode(parityReportPath, (report) => importParityVerdict(report).isFullyVerified === true),
       artifact: parity,
     },
     {

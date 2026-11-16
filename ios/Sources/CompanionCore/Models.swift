@@ -749,6 +749,8 @@ public struct ProviderSnapshot: Codable, Hashable, Sendable {
     /// The probe gave no answer yet (a slow CLI on a busy Mac) and nothing
     /// definitive stood in: the engine is being checked, not missing or signed out.
     public var transient: Bool?
+    /// OpenCode only: why the last model catalog probe failed, in plain language.
+    public var modelProbeProblem: String?
     /// How the engine bills: `metered` (a charge to an API key) or
     /// `subscription` (a flat plan, so a cost figure is an equivalent, not a
     /// charge).  A raw string so a new mode from a newer harness still decodes.
@@ -762,11 +764,28 @@ public struct ProviderSnapshot: Codable, Hashable, Sendable {
     /// Phone Settings strip labels.  Mac owns setup, so these never deep-link
     /// into key entry or a CLI path — they only say what is true right now.
     public var engineStatusLabel: String {
+        if let problem = modelProbeProblem?.trimmingCharacters(in: .whitespacesAndNewlines), !problem.isEmpty {
+            if problem.localizedCaseInsensitiveContains("timed out") { return "Timed out under load" }
+            if problem.localizedCaseInsensitiveContains("listed no models")
+                || problem.localizedCaseInsensitiveContains("answered but listed no models") {
+                return "No models listed"
+            }
+            if problem.localizedCaseInsensitiveContains("stopped by") { return "Probe stopped" }
+            return "Needs attention"
+        }
         // A probe still in flight is neither "Unavailable" nor "Sign in": say so.
         if isChecking { return "Checking" }
         if isAvailable, authenticated == false { return "Sign in" }
         if !isAvailable { return "Unavailable" }
         return "Ready"
+    }
+
+    /// Full catalog probe sentence for the engine sheet, when the harness sent one.
+    public var engineProblemDetail: String? {
+        guard let problem = modelProbeProblem?.trimmingCharacters(in: .whitespacesAndNewlines), !problem.isEmpty else {
+            return nil
+        }
+        return problem
     }
 
     /// Reserved for a structured missing-binary signal on `ProviderSnapshot`.
@@ -938,6 +957,10 @@ public struct ConfigFlag: Codable, Hashable, Sendable {
     /// it through `ConfigStatus.voiceProvider`, which applies the server's own
     /// fallback; nothing should compare this string directly.
     public var provider: String?
+    /// On the `tts` section: whether a cloned voice may be the workspace
+    /// default voice.  Absent or false keeps cloned voices out of the
+    /// default slot, exactly as on the Mac.
+    public var useClonedVoice: Bool?
 }
 
 public struct Profile: Codable, Hashable, Sendable {
@@ -1104,7 +1127,7 @@ public struct ConfigStatus: Codable, Sendable {
     }
 
     /// Whether synthesis is available on the paired computer. Deliberately
-    /// provider-neutral: under ElevenLabs this is a key on file, while under
+    /// provider-neutral: under a hosted engine this is a key on file, while under
     /// the built-in engine `providerConfigured` in `server/tts/index.ts`
     /// reports whether the computer has voices it can use and no credential
     /// exists at all. Only the reason behind the flag changes — so anything
@@ -1368,12 +1391,16 @@ public struct Voice: Codable, Hashable, Identifiable, Sendable {
     public var label: String
     public var description: String?
     public var isPersonalVoice: Bool?
+    /// True for a voice the owner cloned.  A cloned voice is only the
+    /// workspace default while the workspace's cloned-voice switch is on.
+    public var cloned: Bool?
 
-    public init(id: String, label: String, description: String? = nil, isPersonalVoice: Bool? = nil) {
+    public init(id: String, label: String, description: String? = nil, isPersonalVoice: Bool? = nil, cloned: Bool? = nil) {
         self.id = id
         self.label = label
         self.description = description
         self.isPersonalVoice = isPersonalVoice
+        self.cloned = cloned
     }
 }
 

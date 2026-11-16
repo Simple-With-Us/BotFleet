@@ -29,11 +29,18 @@ const ANTIGRAVITY_FLASH_BY_TIER: Record<string, string> = {
   low: "gemini-3.8-flash-low",
 };
 
+const LEGACY_ANTIGRAVITY_PRO_IDS = new Set([
+  "gemini-3.1-pro-high",
+  "gemini-3.1-pro-low",
+  "gemini-2.5-pro",
+]);
+
 function antigravityFlashModel(model: string): string {
-  // Only built-in catalog routes are swapped.  A custom or local-inject
-  // model the operator configured (any id outside the static catalog, even
-  // one containing "-pro") is their chosen route and stays as configured.
-  if (!STATIC_ANTIGRAVITY_MODELS.options.some((option) => option.id === model)) return model;
+  // Only built-in catalog routes (and known legacy Pro ids for saved bots)
+  // are swapped.  A custom or local-inject model the operator configured
+  // (any id outside the catalog, even one containing "-pro") stays as-is.
+  const isCatalog = STATIC_ANTIGRAVITY_MODELS.options.some((option) => option.id === model);
+  if (!isCatalog && !LEGACY_ANTIGRAVITY_PRO_IDS.has(model)) return model;
   const candidate = model.replace("-pro", "-flash");
   if (candidate === model) return model;
   if (STATIC_ANTIGRAVITY_MODELS.options.some((option) => option.id === candidate)) {
@@ -771,6 +778,8 @@ export function selectTurnFallback(input: {
   isModelRejected?: ModelRejectionGate;
   /** Skips a fallback whose exact (bot, engine, model) route is cooling down. */
   isCooling?: (botId: string, instanceId: string, model: string, now: number) => boolean;
+  /** Skips retired-id rewriting for operator-defined custom catalog rows. */
+  skipRetiredModel?: (entry: Pick<ModelSelection, "instanceId" | "model">) => boolean;
   now?: number;
 }): TurnFallbackPick | undefined {
   if (input.ok) return undefined;
@@ -795,7 +804,7 @@ export function selectTurnFallback(input: {
     // Heal retired picker ids before same-engine / rejection checks so a
     // saved MiniMax-M3 entry cannot loop against a live Flash
     // primary or burn another unknown-model spawn.
-    const model = rewriteRetiredModelId(next.model);
+    const model = input.skipRetiredModel?.(next) ? next.model : rewriteRetiredModelId(next.model);
     if (input.current && sameEngine({ instanceId: next.instanceId, model }, input.current)) continue;
     // Skip in place, never re-order: the remaining entries are still the
     // owner's saved preference order, and nextUsed still points past the
@@ -1261,11 +1270,15 @@ export class QuotaCooldownRegistry {
     botId: string,
     primary: ModelSelection,
     now = Date.now(),
-    opts: { isDoomed?: DoomedEngineGate; isModelRejected?: ModelRejectionGate } = {},
+    opts: {
+      isDoomed?: DoomedEngineGate;
+      isModelRejected?: ModelRejectionGate;
+      skipRetiredModel?: (entry: Pick<ModelSelection, "instanceId" | "model">) => boolean;
+    } = {},
   ): ModelRouteResolution {
     // Heal retired picker ids before cooldown / rejection lookups so a
     // bots.json still naming MiniMax-M3 never reaches the engine.
-    const rewrittenPrimary = rewriteModelSelection(primary).selection;
+    const rewrittenPrimary = rewriteModelSelection(primary, opts.skipRetiredModel).selection;
     const cd = this.get(botId, rewrittenPrimary.instanceId, rewrittenPrimary.model, now);
     const transientCapacity = transientRouteHealth.get(rewrittenPrimary.instanceId, rewrittenPrimary.model, now);
     const isRejected = rejectionGate(opts.isModelRejected);
@@ -1287,7 +1300,7 @@ export class QuotaCooldownRegistry {
     if (fallbacks && fallbacks.length > 0) {
       const isDoomed = doomedGate(opts.isDoomed);
       for (const fb of fallbacks) {
-        const next = rewriteModelSelection(fb).selection;
+        const next = rewriteModelSelection(fb, opts.skipRetiredModel).selection;
         if (this.get(botId, next.instanceId, next.model, now)) continue;
         if (transientRouteHealth.get(next.instanceId, next.model, now)) continue;
         if (isDoomed(botId, next.instanceId, now)) continue;

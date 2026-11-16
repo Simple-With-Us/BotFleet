@@ -19,6 +19,7 @@ import {
 import { PluginCardResultSchema } from "./plugin-sandbox-protocol.ts";
 import type { PluginEventEnvelope } from "../shared/plugin-events.ts";
 import { removeDirSafe } from "./plugin-registry.ts";
+import { runningAsRoot, titledForPrivilege } from "./testing/privilege.ts";
 import type { PluginListing } from "./plugin-types.ts";
 
 const SECRET_ENV = "BOTFLEET_SANDBOX_TEST_SECRET";
@@ -107,6 +108,14 @@ afterEach(async () => {
   await removeDirSafe(outsideDir);
 });
 
+// The sandbox denies what the plugin must not reach, and root is not denied the
+// things a plugin must not reach.  The suite says so instead of failing on a
+// root host or passing without isolating anything.
+// The sandbox denies what the plugin must not reach, and root is not denied the
+// things a plugin must not reach.  Only the case below needs that refusal, so
+// only that case skips itself:  the out-of-process, environment, protocol and
+// deadline assertions around it are privilege-independent and keep running as
+// root, where a skipped suite would have dropped them.
 describe("plugin sandbox isolation", () => {
   it("runs handlers out of process and answers host calls from the snapshot", async () => {
     writePlugin("ok", `
@@ -138,7 +147,10 @@ describe("plugin sandbox isolation", () => {
     expect(result).toMatchObject({ secret: null });
   });
 
-  it("denies filesystem reads outside the plugin folder, writes, and subprocesses", async () => {
+  // This case asserts refusals the operating system makes, and root is not
+  // refused the things a plugin must not reach.  It says so rather than
+  // failing on a root host or passing without isolating anything.
+  it.skipIf(runningAsRoot())(titledForPrivilege("denies filesystem reads outside the plugin folder, writes, and subprocesses"), async () => {
     const outside = JSON.stringify(join(outsideDir, "secret.txt"));
     writePlugin("fs", `
       import fs from "node:fs";

@@ -1863,13 +1863,13 @@ describe("unattendedModelDowngrade", () => {
         { unattended: true },
       ).model,
     ).toBe("gemini-3.8-flash-low");
-    // Same-family Flash exists for 2.5, so keep it.
+    // The 2.5 line is retired, so a saved 2.5-pro falls to the catalog default.
     expect(
       unattendedModelDowngrade(
         { instanceId: "antigravity", model: "gemini-2.5-pro" },
         { unattended: true },
       ).model,
-    ).toBe("gemini-2.5-flash");
+    ).toBe("gemini-3.8-flash-high");
     // Custom / local-inject routes outside the static catalog keep the
     // configured model, even with "-pro" in the id.
     for (const model of ["my-proxy-gemini-pro-high", "gemini-3.9-pro-high", "local-qwen-pro"]) {
@@ -2611,6 +2611,45 @@ describe("retired MiniMax-M3 ids are rewritten before failover", () => {
       instanceId: "dsh",
       model: "MiniMax-M3.1-Flash",
       fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3.1-Flash" }],
+    });
+  });
+
+  it("resolveModel and selectTurnFallback preserve custom catalog ids when skipRetiredModel matches", () => {
+    const skipRetiredModel = (entry: { instanceId: string; model: string }) =>
+      entry.instanceId === "dshCustom" && entry.model === "MiniMax-M3";
+
+    const registry = new QuotaCooldownRegistry();
+    const resolved = registry.resolveModel(
+      "director",
+      {
+        instanceId: "dshCustom",
+        model: "MiniMax-M3",
+        fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3" }],
+      },
+      undefined,
+      { skipRetiredModel },
+    );
+    expect(resolved.selection).toEqual({
+      instanceId: "dshCustom",
+      model: "MiniMax-M3",
+      fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3.1-Flash" }],
+    });
+
+    const next = selectTurnFallback({
+      ok: false,
+      produced: false,
+      fallbacks: [
+        { instanceId: "dshCustom", model: "MiniMax-M3" },
+        { instanceId: "minimax", model: "MiniMax-M3" },
+      ],
+      used: 0,
+      current: { instanceId: "grok", model: "grok-4.7" },
+      skipRetiredModel,
+    });
+    expect(next).toEqual({
+      instanceId: "dshCustom",
+      model: "MiniMax-M3",
+      nextUsed: 1,
     });
   });
 });

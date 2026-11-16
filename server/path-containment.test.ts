@@ -4,7 +4,7 @@
 // the fake temp root are siblings under one scratch folder rather than the
 // real temp dir, so a test that should be refused cannot pass by accident
 // just because everything happens to sit under os.tmpdir().
-import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -48,6 +48,7 @@ beforeAll(() => {
     mkdirSync(dir, { recursive: true });
   }
   writeFileSync(join(ws, "src", "a.ts"), "x");
+  writeFileSync(join(ws, "src", "shared.ts"), "x");
   writeFileSync(join(outside, "secret.txt"), "x");
   options = { roots: [ws, fakeTmp], home, dataDir: join(home, ".botfleet") };
 });
@@ -278,5 +279,34 @@ posixOnly("symlinks", () => {
 
   it("refuses to write below a regular file", () => {
     expect(check(join(ws, "src", "a.ts", "child"))).toMatchObject({ contained: false });
+  });
+});
+
+posixOnly("hard links", () => {
+  it("refuses a file inside the root that is hard linked to a file outside it", () => {
+    // A hard link has no target: resolving the path lands on itself, so the
+    // path still reads as inside the root while the inode is also the outside
+    // file's.  A write through it edits the outside file's bytes.
+    linkSync(join(outside, "secret.txt"), join(ws, "hardlink-secret"));
+    expect(check(join(ws, "hardlink-secret"))).toMatchObject({
+      contained: false,
+      why: "hard-link",
+      real: [join(ws, "hardlink-secret")],
+    });
+  });
+
+  it("refuses a hard link whose other name is also inside the root", () => {
+    // The other name cannot be found from the path, so the content stays
+    // reachable under a name nobody here can vouch for.
+    linkSync(join(ws, "src", "shared.ts"), join(ws, "hardlink-inside"));
+    expect(check(join(ws, "hardlink-inside"))).toMatchObject({ contained: false, why: "hard-link" });
+  });
+
+  it("still accepts a plain file, a folder and a file that does not exist yet", () => {
+    // A folder's link count counts its own subfolders, and a new file gets a
+    // fresh inode when the write creates it: neither is a shared inode.
+    expect(check(join(ws, "src", "a.ts"))).toMatchObject({ contained: true });
+    expect(check(join(ws, "src"))).toMatchObject({ contained: true });
+    expect(check(join(ws, "src", "brand-new.ts"))).toMatchObject({ contained: true });
   });
 });

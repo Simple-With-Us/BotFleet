@@ -9,6 +9,7 @@ import * as systemVoices from "./system-voices.ts";
 import * as xai from "./xai.ts";
 import type { Audio } from "./types.ts";
 import { NoVoiceConfigured } from "./errors.ts";
+import { defaultVoice } from "./voice-default.ts";
 
 function isSystemProvider(cfg: AppConfig): boolean {
   return cfg.tts?.provider === "system";
@@ -34,14 +35,14 @@ async function synthesizeWithProvider(
     case "minimax": {
       const key = cfg.tts?.key;
       if (!key) throw new NoVoiceConfigured("key", "minimax");
-      const voice = voiceId || cfg.tts?.voice;
+      const voice = voiceId || defaultVoice(cfg);
       if (!voice) throw new NoVoiceConfigured("voice", "minimax");
       return minimax.synthesize(text, voice, key);
     }
     case "xai": {
       const key = cfg.xai?.key;
       if (!key) throw new NoVoiceConfigured("key", "xai");
-      const voice = voiceId || cfg.tts?.voice || xai.CANNED_VOICES[0]?.id;
+      const voice = voiceId || defaultVoice(cfg) || xai.CANNED_VOICES[0]?.id;
       if (!voice) throw new NoVoiceConfigured("voice", "xai");
       return xai.synthesize(text, voice, key);
     }
@@ -49,7 +50,7 @@ async function synthesizeWithProvider(
       const key = cfg.azureSpeech?.key;
       const region = cfg.azureSpeech?.region;
       if (!key || !region) throw new NoVoiceConfigured("key", "azure");
-      const voice = voiceId || cfg.tts?.voice || azure.CANNED_VOICES[0]?.id;
+      const voice = voiceId || defaultVoice(cfg) || azure.CANNED_VOICES[0]?.id;
       if (!voice) throw new NoVoiceConfigured("voice", "azure");
       return azure.synthesize(text, voice, key, region);
     }
@@ -66,7 +67,7 @@ export async function speakWithFallback(
   run?: systemVoices.Runner,
 ): Promise<Audio> {
   if (isSystemProvider(cfg)) {
-    const voice = voiceId || cfg.tts?.voice;
+    const voice = voiceId || defaultVoice(cfg);
     if (!systemVoices.systemVoicesAvailable() && !run) throw new NoVoiceConfigured("key", "system");
     if (!voice) throw new NoVoiceConfigured("voice", "system");
     return systemVoices.synthesizeSystem(text, voice, run);

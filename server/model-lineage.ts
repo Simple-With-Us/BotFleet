@@ -5,6 +5,7 @@
 // Kept out of index.ts so it is testable without booting the server.
 import type { ModelSelection } from "./contracts.ts";
 import { STATIC_CODEX_MODELS } from "./drivers/codex-catalog.ts";
+import { rewriteModelSelection } from "./retired-model-ids.ts";
 import {
   anyLineageLabel,
   classifyModel,
@@ -76,13 +77,15 @@ export function lineageContextFor(
   instance: { driverKind: string; models: CatalogLike } | undefined,
   effortLevels?: (model: string) => readonly string[] | undefined,
 ): LineageContext | undefined {
-  if (!instance || !hasLineage(instance.driverKind)) {
-    return instance ? { driverKind: instance.driverKind, offeredIds: [], authoritative: false } : undefined;
+  if (!instance) return undefined;
+  const customIds = instance.models.options.filter((option) => option.custom).map((option) => option.id);
+  if (!hasLineage(instance.driverKind)) {
+    return { driverKind: instance.driverKind, offeredIds: [], customIds, authoritative: false };
   }
   return {
     driverKind: instance.driverKind,
     offeredIds: officialIds(instance.models),
-    customIds: instance.models.options.filter((option) => option.custom).map((option) => option.id),
+    customIds,
     authoritative: catalogIsAuthoritative(instance.driverKind, instance.models),
     ...(effortLevels ? { effortLevels } : {}),
   };
@@ -464,6 +467,22 @@ export function checkLineageWrite(
   return { ok: true, selection: reconciled.selection, current: reconciledCurrent, changes: reconciled.changes };
 }
 
+/** Predicate for `rewriteModelSelection` that preserves operator-defined custom
+ *  catalog rows even when their id matches a retired official spelling.
+ *  When `skipUnloaded` is true, unregistered (`undefined`) and shadowed
+ *  (`catalogPending`) engines are also left untouched because their custom rows
+ *  cannot be distinguished until a catalog loads. */
+export function customModelSkip(
+  contextFor: (instanceId: string) => LineageContext | undefined,
+  opts?: { skipUnloaded?: boolean },
+): (entry: Pick<ModelSelection, "instanceId" | "model">) => boolean {
+  return (entry) => {
+    const context = contextFor(entry.instanceId);
+    if (opts?.skipUnloaded && (!context || context.catalogPending)) return true;
+    return Boolean(context?.customIds?.includes(entry.model));
+  };
+}
+
 /** A per-turn override (a fallback or retry pick) reconciled the way a saved
  *  chain is, so a retired or superseded id is never dispatched or recorded.
  *  `freshSession` is true when the reconcile moved the model on an engine
@@ -473,8 +492,13 @@ export function checkLineageWrite(
 export function reconcileTurnOverride(
   selection: ModelSelection,
   context: LineageContext | undefined,
+  contextFor?: (instanceId: string) => LineageContext | undefined,
 ): { selection: ModelSelection; freshSession: boolean } {
-  const reconciled = reconcileEntry(selection, context).entry;
+  const rewritten = rewriteModelSelection(
+    selection,
+    customModelSkip(contextFor ?? ((instanceId) => (instanceId === selection.instanceId ? context : undefined))),
+  ).selection;
+  const reconciled = reconcileEntry(rewritten, context).entry;
   return {
     selection: reconciled,
     freshSession: reconciled.model !== selection.model && resumeKeepsStartedModel(context?.driverKind),
