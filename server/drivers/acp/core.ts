@@ -178,6 +178,13 @@ const acpSessionResultModels = z.object({
   currentModelId: z.string().optional(),
 }).passthrough();
 const acpSessionResult = z.object({ models: acpSessionResultModels.optional() }).passthrough();
+// The initialize result comes from the agent, so the model state it carries
+// is read through a schema:  an unexpected shape must not reach the turn
+// identity, the notice or the cost estimate.
+const acpInitModelState = z.object({ currentModelId: z.string().optional() }).passthrough();
+const acpInitResult = z
+  .object({ _meta: z.object({ modelState: acpInitModelState.optional() }).passthrough().optional() })
+  .passthrough();
 
 /** Stdio MCP server as ACP session/new sends it. */
 export type AcpStdioMcpServer = {
@@ -2025,6 +2032,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 ? new AcpRpcTimeoutError("initialize", describeInitDeadline(initDeadline))
                 : error;
             }
+            // The model the CLI reports as its own default.  It is the
+            // fallback of last resort:  the session's own model state is the
+            // model actually in use.
+            const initModelId = acpInitResult.safeParse(init).data?._meta?.modelState?.currentModelId;
             const initElapsedMs = Date.now() - initStartedAt;
             if (initElapsedMs >= SLOW_INIT_LOG_MS) {
               console.warn(`[acp] ${DRIVER_KIND} ${describeSlowInit(initElapsedMs, initDeadline)}`);
@@ -2191,7 +2202,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 sessionId,
                 model:
                   selectedModel
-                  ?? init?._meta?.modelState?.currentModelId
+                  ?? initModelId
                   // The picked model is not what the turn ran when the
                   // session runs another one, so it is not reported as one.
                   ?? (ranAnotherModel ? null : cliTurn.model)
@@ -2238,8 +2249,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   // model, not as the one that could not be chosen.
                   const running =
                     modelForValue?.(selectedValue)
-                    ?? init?._meta?.modelState?.currentModelId
                     ?? sessionModelsState?.currentModelId
+                    ?? initModelId
                     ?? null;
                   selectedModel = running;
                   console.warn(
