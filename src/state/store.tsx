@@ -3148,11 +3148,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let alive = true;
     let reading: Promise<void> | null = null;
+    // A trigger that arrives while a read is running is not dropped:  the
+    // answer in flight may predate the change that triggered it.
+    let pending = false;
     const read = () => {
       // One read at a time.  Two triggers in quick succession would send two
       // identical requests, and the second answer could land on top of the
       // first one, so a read that is already running is left to finish.
-      if (reading) return;
+      if (reading) {
+        pending = true;
+        return;
+      }
       reading = fetchConnectedAppsInventory()
         .then((inventory) => {
           if (!alive) return;
@@ -3173,6 +3179,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         })
         .finally(() => {
           reading = null;
+          if (pending) {
+            pending = false;
+            read();
+          }
         });
     };
     read();
