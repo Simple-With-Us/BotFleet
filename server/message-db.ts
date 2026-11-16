@@ -622,8 +622,8 @@ export interface SearchHit {
 }
 
 /** Case-insensitive substring search over text messages, newest first.
- * A LIKE scan, deliberately: local transcripts are megabytes at most, a
- * scan is milliseconds, and it needs no FTS extension to exist. */
+ * Filters on the indexed/plain `role` column before touching `text` or
+ * `json_extract` so large databases avoid per-row JSON parsing. */
 export function searchMessages(query: string, limit = 40, threadId?: string): SearchHit[] {
   const needle = query.trim().toLowerCase();
   if (!needle) return [];
@@ -635,7 +635,7 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
   const scope = threadId ? "thread_id = ? AND " : "";
   const statement = db().prepare(
     "SELECT thread_id, id, at, role, kind, text, json_extract(json, '$.content') AS content, json_extract(json, '$.tool.name') AS tool_name, json_extract(json, '$.from.name') AS from_name FROM messages " +
-      `WHERE ${scope}json_extract(json, '$.role') IN ('user', 'bot') ` +
+      `WHERE ${scope}role IN ('user', 'bot') ` +
       "  AND ((lower(COALESCE(text, json_extract(json, '$.content'), '')) LIKE ? ESCAPE '\\') " +
       "   OR (kind = 'activity' AND tool_name IS NOT NULL AND lower(tool_name) LIKE ? ESCAPE '\\')) " +
       "ORDER BY at DESC LIMIT ?",
@@ -678,6 +678,30 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
       ...(row.from_name ? { from: row.from_name } : {}),
     };
   });
+}
+
+/** Message IDs on a thread's active branch (root → active_leaf_id), read via
+ * recursive CTE over the `(thread_id, id)` primary key without loading or
+ * parsing the full thread. */
+export function activePathIds(threadId: string): Set<string> {
+  const database = db();
+  // SAFETY: `active_leaf_id` is a nullable TEXT column on `thread_state`.
+  const state = database
+    .prepare("SELECT active_leaf_id FROM thread_state WHERE thread_id = ?")
+    .get(threadId) as { active_leaf_id: string | null } | undefined;
+  if (!state?.active_leaf_id) return new Set();
+  // SAFETY: recursive CTE projects only `id` (TEXT NOT NULL) using `UNION` to
+  // guard against any parentId cycle.
+  const rows = database
+    .prepare(
+      "WITH RECURSIVE branch(id, parent_id) AS (" +
+        "  SELECT id, json_extract(json, '$.parentId') FROM messages WHERE thread_id = ? AND id = ? " +
+        "  UNION " +
+        "  SELECT m.id, json_extract(m.json, '$.parentId') FROM messages m JOIN branch b ON m.id = b.parent_id WHERE m.thread_id = ?" +
+        ") SELECT id FROM branch",
+    )
+    .all(threadId, state.active_leaf_id, threadId) as Array<{ id: string }>;
+  return new Set(rows.map((row) => row.id));
 }
 
 /** Test/shutdown hook — closes the handle so a wiped DATA_DIR starts clean. */

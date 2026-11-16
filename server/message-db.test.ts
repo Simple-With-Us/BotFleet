@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
 import {
+  activePathIds,
   closeMessageDb,
   deleteThread,
   firstUserText,
@@ -500,5 +501,15 @@ describe("message-db", () => {
     // User and bot messages match; system messages are filtered out in SQL
     const hits = searchMessages("special keyword");
     expect(hits.map((h) => h.messageId).sort()).toEqual(["bot-1", "user-1"]);
+  });
+
+  it("activePathIds returns only the active branch without loading the full thread", () => {
+    insertMessage("branch-test", msg("root", "first", { parentId: null }));
+    insertMessage("branch-test", msg("old-leaf", "abandoned branch", { parentId: "root" }));
+    insertMessage("branch-test", msg("new-leaf", "active branch", { parentId: "root" }));
+    setActiveLeaf("branch-test", "new-leaf");
+
+    expect(Array.from(activePathIds("branch-test")).sort()).toEqual(["new-leaf", "root"]);
+    expect(activePathIds("missing-thread").size).toBe(0);
   });
 });
