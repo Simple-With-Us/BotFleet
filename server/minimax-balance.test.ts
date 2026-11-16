@@ -720,6 +720,8 @@ describe("applyMiniMaxBalanceToRegistry", () => {
       source: ACCOUNT_CAP_SOURCE,
     });
     const unknown = { ...accountBalanceSnapshot(12.34), status: "unknown", error: "HTTP 503" };
+    // SAFETY: the account-balance snapshot shape with only `status` and `error`
+    // changed to what a failed read reports; every field the function reads is present.
     const applied = mod.applyMiniMaxBalanceToRegistry(unknown as any, registry);
     expect(applied.capped).toBe(false);
     expect(registry.get("any-bot", "minimax", "MiniMax-M3")?.source).toBe(ACCOUNT_CAP_SOURCE);
