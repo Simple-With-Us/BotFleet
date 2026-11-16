@@ -226,8 +226,10 @@ function CustomIngressFields() {
         if (active) {
           // The URL is set on every poll, not only when there is one:  a
           // tunnel that stopped must take its URL off the screen, or the
-          // stopped tunnel stays visible and copyable.
-          setTunnelUrl(url ?? "");
+          // stopped tunnel stays visible and copyable.  Only the free
+          // tunnel's own hostname is shown here, because this card labels
+          // the value a free, temporary URL.
+          setTunnelUrl(isFreeTunnelUrl(url) ? url ?? "" : "");
         }
       } catch {}
       if (active) setTimeout(poll, 2000);
@@ -1224,6 +1226,17 @@ function BuildInfoRow() {
       </button>
     </div>
   );
+}
+
+/** Whether this address is the free tunnel's own, and not the permanent
+ *  hosted endpoint. */
+function isFreeTunnelUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    return /\.trycloudflare\.com$/i.test(new URL(url).hostname);
+  } catch {
+    return false;
+  }
 }
 
 export function SettingsModal() {
