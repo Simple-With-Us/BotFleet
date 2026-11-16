@@ -18,7 +18,7 @@
   "engines": {
     "node": ">=24"
   },
-  "packageManager": "pnpm@12.18.0",
+  "packageManager": "pnpm@12.19.0",
   "scripts": {
     "clean": "node scripts/clean.mjs",
     "vendor:tv-face-gif": "node scripts/vendor-tv-face-gif-decoder.mjs",
@@ -135,7 +135,7 @@
     "@assistant-ui/react-markdown": "^0.14.20",
     "@assistant-ui/react-ui": "^0.2.1",
     "@assistant-ui/store": "^0.3.21",
-    "@oxlint/plugins": "1.92.0",
+    "@oxlint/plugins": "1.93.0",
     "@playwright/test": "^1.62.0",
     "@sentry/vite-plugin": "^11.0.0",
     "@tailwindcss/vite": "^4.1.11",
@@ -151,12 +151,12 @@
     "esbuild": "^0.28.2",
     "gifuct-js": "2.1.2",
     "happy-dom": "^21.0.0",
-    "oxlint": "1.92.0",
+    "oxlint": "1.93.0",
     "tailwindcss": "^4.1.11",
-    "typebox": "1.4.5",
+    "typebox": "1.4.6",
     "typescript": "^7.0.0",
     "vite": "^8.0.0",
     "vitest": "^5.0.0",
-    "wrangler": "4.158.0"
+    "wrangler": "4.160.0"
   }
 }

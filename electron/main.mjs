@@ -814,14 +814,23 @@ function publicManagedCompanionState() {
       configured: status.configured,
       ready: status.ready,
     };
+    // The free tunnel and the hosted endpoint are different things:  one
+    // changes every time the app restarts, the other does not.  A caller
+    // that labels the value a free, temporary URL must only ever be handed
+    // the free one, so the hosted address has its own field.
     if (status.tryCloudflareUrl) publicState.url = status.tryCloudflareUrl;
-    else if (status.endpoint && status.endpoint !== "TRYCLOUDFLARE") publicState.url = status.endpoint;
+    else if (status.endpoint && status.endpoint !== "TRYCLOUDFLARE") publicState.endpoint = status.endpoint;
     if (status.retryInMs) publicState.retryInMs = status.retryInMs;
     if (status.error) publicState.error = status.error;
     return publicState;
   }
   return access
-    ? { status: "stopped", configured: true, ready: false, url: access.endpoint !== "TRYCLOUDFLARE" ? access.endpoint : undefined }
+    ? {
+        status: "stopped",
+        configured: true,
+        ready: false,
+        endpoint: access.endpoint !== "TRYCLOUDFLARE" ? access.endpoint : undefined,
+      }
     : { status: "unconfigured", configured: false, ready: false };
 }
 
@@ -2485,13 +2494,32 @@ function reportStsSession(provider) {
   }).catch(() => {});
 }
 
+function isConfigObject(value) {
+  return value !== null && value !== undefined && !Array.isArray(value) && value === Object(value);
+}
+
+function desktopVoiceIsOff() {
+  // Same default-on rule as shared/voice-master.ts: absent or true means on.
+  // readConfigFile returns a boundary object from disk, so validate the
+  // nested tts object before treating voice as off.  Only the boolean
+  // `false` turns voice off; any other enabled value keeps the default on.
+  const config = readConfigFile(desktopConfigPath());
+  if (!isConfigObject(config)) return false;
+  const tts = config.tts;
+  if (tts === undefined) return false;
+  if (!isConfigObject(tts)) return false;
+  return tts.enabled === false;
+}
+
 ipcMain.handle("sts:xai-token", async () => {
+  if (desktopVoiceIsOff()) throw new Error("Voice is turned off in Settings.");
   const minted = await mintXaiRealtimeToken(xaiCredential(secureCredentials));
   reportStsSession("xai");
   return minted;
 });
 
 ipcMain.handle("sts:gemini-token", async () => {
+  if (desktopVoiceIsOff()) throw new Error("Voice is turned off in Settings.");
   const minted = await mintGeminiLiveToken(geminiCredential(secureCredentials));
   reportStsSession("gemini");
   return minted;

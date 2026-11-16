@@ -103,3 +103,9 @@ export const MAX_DEFAULT_VOICE_ID_LENGTH = 200;
  * harness answers when one is sent anyway. */
 export const PERSONAL_VOICE_NOT_DEFAULT =
   "Personal Voices stay on the device that made them, so they cannot be the default.";
+
+/** Why the Default Voice picker leaves a cloned voice out until the
+ * workspace's cloned-voice switch is on, and what the harness answers when
+ * one is sent anyway. */
+export const CLONED_VOICE_NOT_DEFAULT =
+  "Turn on Use My Cloned Voice to make your cloned voice the workspace default.";

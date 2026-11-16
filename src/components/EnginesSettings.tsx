@@ -20,6 +20,7 @@ import {
   instanceAutonomousModeApplies,
 } from "../../shared/bypass-coverage";
 import { cn } from "@/lib/cn";
+import { openCodeModelProbeSentence } from "@/lib/opencode-engine-status";
 import { ConfirmDialog } from "./ConfirmDialog";
 import {
   ADD_ENGINE_DRIVERS,
@@ -391,6 +392,7 @@ export function EngineRow({
   // because a separately-disabled wildcard cooldown on an otherwise available
   // engine is the wrong gate (we want settings, not quotas, to block the row).
   const enabled = isEngineEnabled(instance);
+  const catalogProbeProblem = openCodeModelProbeSentence(instance);
   const isBusy = busyInstanceId !== null;
   const isThisBusy = busyInstanceId === instance.instanceId;
   const hasCli = instance.cli !== undefined || instance.cliDefault !== undefined;
@@ -598,6 +600,9 @@ export function EngineRow({
       </div>
       {reason && (
         <p className="mt-1 text-[11px] leading-relaxed text-ink-secondary/70">{reason}</p>
+      )}
+      {enabled && catalogProbeProblem && (
+        <p className="mt-1 text-[11px] leading-relaxed text-ink-secondary/70">{catalogProbeProblem}</p>
       )}
       {!instanceAutonomousModeApplies(instance.driverKind) && (
         <p className="mt-1 text-[11px] leading-relaxed text-ink-secondary/70">{INSTANCE_AUTONOMOUS_MODE_NO_OP_NOTE}</p>

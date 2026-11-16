@@ -794,7 +794,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       headline: "Meta's coding CLI, over a 1M-token window with no long-context premium.",
       prose: [
         "Muse Code runs inside BotFleet through Meta's Muse Spark models.  Files, terminal, this computer, computer use, image attachments, and long context are available.",
-        "The model a turn actually uses is your account's startup model, which the engine does not control yet; the matrix names Muse Spark 1.2 because that is the one this driver can point at.  Fleet accounts report muse-spark-1.3-contributor as that startup model.  Meta's docs verify the Contributor tier takes reasoning effort minimal, low, medium, high, and xhigh — never none, and not max, which is Standard-tier only (https://dev.meta.ai/docs/models, https://dev.meta.ai/docs/reasoning).  This driver exposes low through xhigh:  minimal is a docs-verified rung this build does not expose yet, because the shared effort union has no member for it.",
+        "The model a turn runs is the one the picker names, whenever the session can switch:  BotFleet matches the picked id against the model options the adapter advertises and sends that option's own value, so the provider and profile inside it stay the account's own.  A turn that asks for a model the session cannot switch to is refused with the reason rather than run on a different model:  a session that advertises no model option — an adapter older than the one that added them — cannot switch at all, and a session that offers other models but not the one you picked is refused by name.  The matrix names Muse Spark 1.2 because that is the id this driver can point at.  Fleet accounts report muse-spark-1.3-contributor as their startup model.  Meta's docs verify the Contributor tier takes reasoning effort minimal, low, medium, high, and xhigh — never none, and not max, which is Standard-tier only (https://dev.meta.ai/docs/models, https://dev.meta.ai/docs/reasoning).  This driver exposes low through xhigh:  minimal is a docs-verified rung this build does not expose yet, because the shared effort union has no member for it.",
         "Connected apps, cross-bot coordination, and rooms are available through the adapter.  Web access, live research, and voice chat are not available on this engine.",
         "Voice chat is not available on this engine.  BotFleet drives Muse Code through a community ACP adapter, because Muse Code speaks its own session protocol rather than ACP.",
         "Signing in needs an API key:  a browser session stored in the Mac keychain is not readable by the adapter, so a keychain-only account cannot run a turn.",
@@ -803,9 +803,11 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     defaultModels: [
       // The CLI's own documented default, not the best model on the card:
       // muse-spark-1.3 is "tuned for agentic workflows" and is the Model API
-      // default, but the CLI defaults to 1.2, and no model switch is wired
-      // yet.  Listing 1.3 would put a row in the picker a user can select and
-      // cannot get.  See `server/drivers/acp/muse.ts`.
+      // default, but the CLI defaults to 1.2, and this catalog is static while
+      // the account's own catalog decides which ids the session advertises.
+      // Listing 1.3 would put a row in the picker a user can select and
+      // cannot get on an account that does not offer it.  See
+      // `server/drivers/acp/muse.ts`.
       { id: "muse-spark-1.2", display: "Muse Spark 1.2", ctxTokens: 1_048_576 },
     ],
   },

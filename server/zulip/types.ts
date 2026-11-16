@@ -58,6 +58,11 @@ export interface ZulipWorkUnit {
   attempts: number;
   /** Earliest ms the next attempt may run. */
   notBefore: number;
+  /** The peer-budget refusal holding this unit (topic_budget or
+   *  peer_budget); its wake is charged when it actually dispatches. */
+  held?: string;
+  /** Items dropped at the queue cap before any turn saw them. */
+  dropped?: number;
 }
 
 export interface ZulipCredentialFieldSource {

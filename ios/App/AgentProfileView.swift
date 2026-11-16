@@ -134,7 +134,7 @@ struct AgentProfileView: View {
     private var unavailableVoiceLabel: String {
         switch voiceProvider {
         case .minimax: return "MiniMax voice is not configured"
-        case .elevenlabs: return "ElevenLabs is not configured"
+        case .elevenlabs: return "Voice is not configured"
         case .system: return "Built-in Mac voices are unavailable"
         case .personal: return "Apple Personal Voice is not configured"
         case .unknown: return "Voice is not configured"
@@ -146,7 +146,7 @@ struct AgentProfileView: View {
         case .minimax:
             return "Add the shared MiniMax key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
         case .elevenlabs:
-            return "Add the shared ElevenLabs key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
+            return "Add the shared voice key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
         case .system:
             return "Built-in Mac voices need no key, and this computer has none available.\u{00A0} Switch the voice provider in a bot's Voice settings on the computer to keep using voice."
         case .personal:
@@ -161,7 +161,7 @@ struct AgentProfileView: View {
         case .minimax:
             return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the shared MiniMax key on your computer."
         case .elevenlabs:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the shared ElevenLabs key on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the shared voice key on your computer."
         case .system:
             return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the built-in Mac voices on your computer."
         case .personal:

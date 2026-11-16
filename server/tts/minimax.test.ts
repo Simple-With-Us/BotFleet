@@ -4,8 +4,13 @@
 // through a local HTTP server, the API base is overridden, and the timeout
 // path is hit by swapping fetch for a rejecting stub.
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
+
+import { dataDir } from "../data-dir.ts";
 
 let server: ReturnType<typeof import("node:http").createServer>;
 const seen: Array<{ method: string; url: string; headers: Record<string, string>; body: string }> = [];
@@ -140,6 +145,34 @@ describe("listVoices", () => {
     expect(call.method).toBe("POST");
     expect(call.url.split("?")[0]).toBe("/v1/get_voice");
     expect(call.headers["authorization"]).toBe("Bearer sk");
+  });
+
+  it("marks the upstream cloning list as cloned voices", async () => {
+    refuse = {
+      status: 200,
+      body: {
+        system_voice: [{ voice_id: "English_Graceful_Lady", voice_name: "Graceful Lady" }],
+        voice_cloning: [{ voice_id: "jay-upstream-clone", voice_name: "Jay Upstream Clone" }],
+        base_resp: { status_code: 0, status_msg: "success" },
+      },
+    };
+    const { listVoices, isClonedVoiceId } = await driver();
+    const voices = await listVoices("sk");
+    refuse = null;
+    expect(voices.find((v) => v.id === "jay-upstream-clone")?.cloned).toBe(true);
+    // A system voice is not a clone, and must not be treated as one.
+    expect(voices.find((v) => v.id === "English_Graceful_Lady")?.cloned).toBeUndefined();
+    // A clone the workspace never made is still a clone, so the gate that
+    // keeps clones out of the default slot knows about it.
+    expect(isClonedVoiceId("jay-upstream-clone")).toBe(true);
+    expect(isClonedVoiceId("English_Graceful_Lady")).toBe(false);
+    // And it is kept, so the answer survives the process that listed it:  a
+    // fresh process must not classify an upstream clone as a plain voice.
+    // The path comes from the same helper the driver writes to, so the
+    // assertion cannot read a different place than the driver wrote when
+    // the data directory is configured.
+    const kept = readFileSync(join(dataDir(), "tts-upstream-clones.json"), "utf8");
+    expect(z.array(z.string()).parse(JSON.parse(kept))).toContain("jay-upstream-clone");
   });
 
   it("throws when the upstream returns a non-zero base_resp", async () => {

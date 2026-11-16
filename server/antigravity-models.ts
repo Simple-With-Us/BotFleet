@@ -8,8 +8,8 @@ import type { ModelCatalog } from "./contracts.ts";
 // Aligned 2026-09-24 with the `agy` build the driver itself documents and was
 // measured against, 1.1.26 (see the header of drivers/antigravity.ts).  The
 // list below is every model id the driver and its tests name today: the
-// `gemini-3.8-flash-high` default, the `gemini-3.6-flash-low` the snapshot
-// probe spawns, and the ids antigravityQuotaCatalogId() has to resolve back
+// `gemini-3.8-flash-high` default, the `gemini-3.8-flash-low` the utility
+// path spawns, and the ids antigravityQuotaCatalogId() has to resolve back
 // to catalog identities.  The September 18 refresh (PR #485) updated four
 // driver catalogs and missed this one, which is how the header came to claim
 // 1.1.23 — whoever refreshes the fleet's catalogs next, this file is the
@@ -34,28 +34,31 @@ export const STATIC_ANTIGRAVITY_MODELS: ModelCatalog = {
     { id: "claude-sonnet-5-5-medium", label: "Claude Sonnet 5.5 (Medium)" },
     { id: "claude-sonnet-5-5-low", label: "Claude Sonnet 5.5 (Low)" },
     { id: "gpt-oss-120b-medium", label: "GPT-OSS 120B (Medium)" },
-    { id: "gemini-3.7-flash-high", label: "Gemini 3.7 Flash (High)" },
-    { id: "gemini-3.7-flash-medium", label: "Gemini 3.7 Flash (Medium)" },
-    { id: "gemini-3.7-flash-low", label: "Gemini 3.7 Flash (Low)" },
-    { id: "gemini-3.6-flash-high", label: "Gemini 3.6 Flash (High)" },
-    { id: "gemini-3.6-flash-medium", label: "Gemini 3.6 Flash (Medium)" },
-    { id: "gemini-3.6-flash-low", label: "Gemini 3.6 Flash (Low)" },
-    { id: "gemini-3.1-pro-high", label: "Gemini 3.1 Pro (High)" },
-    { id: "gemini-3.1-pro-low", label: "Gemini 3.1 Pro (Low)" },
-    { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
-    { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
-    { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6 (Thinking)" },
-    { id: "claude-opus-4-6-thinking", label: "Claude Opus 4.6 (Thinking)" },
   ],
 };
 
 
 /** Match reported names to catalog identities; opaque upstream IDs are not routes. */
+/** Utility calls (titles, summaries) ride the catalog's low Flash. */
+export const ANTIGRAVITY_UTILITY_MODEL = "gemini-3.8-flash-low";
+
+/** Retired ids kept only so quota cooldown reports for them still resolve to
+ *  themselves; the active catalog above stays the dispatch set. */
+export const LEGACY_ANTIGRAVITY_QUOTA_IDS: ReadonlySet<string> = new Set([
+  "gemini-2.5-pro",
+  "gemini-2.5-flash",
+  "gemini-3.1-pro-high",
+  "gemini-3.1-pro-low",
+  "gemini-3.6-flash-low",
+]);
+
 export function antigravityQuotaCatalogId(model: { modelId: string; label: string }): string | undefined {
   const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
   const id = normalize(model.modelId);
   const label = normalize(model.label);
-  return STATIC_ANTIGRAVITY_MODELS.options.find((option) =>
+  const hit = STATIC_ANTIGRAVITY_MODELS.options.find((option) =>
     normalize(option.id) === id || normalize(option.label) === label || normalize(option.id) === label
   )?.id;
+  if (hit) return hit;
+  return LEGACY_ANTIGRAVITY_QUOTA_IDS.has(model.modelId) ? model.modelId : undefined;
 }

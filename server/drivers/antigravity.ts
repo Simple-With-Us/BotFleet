@@ -146,7 +146,7 @@ export function antigravityHostPolicyRefusal(reported: string | null): string {
 }
 
 export { STATIC_ANTIGRAVITY_MODELS } from "../antigravity-models.ts";
-import { STATIC_ANTIGRAVITY_MODELS } from "../antigravity-models.ts";
+import { ANTIGRAVITY_UTILITY_MODEL, STATIC_ANTIGRAVITY_MODELS } from "../antigravity-models.ts";
 
 function antigravityEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, PATH: augmentedPath(), ...overrides };
@@ -1622,7 +1622,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         new Promise((resolve, reject) => {
           execCli(
             config.cli,
-            ["-p", prompt, "--output-format", "text", "--model", "gemini-3.6-flash-low"],
+            ["-p", prompt, "--output-format", "text", "--model", ANTIGRAVITY_UTILITY_MODEL],
             { timeout: 60_000, env },
             (err, stdout) => (err ? reject(err) : resolve(stdout.trim())),
           );

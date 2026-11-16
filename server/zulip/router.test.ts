@@ -127,6 +127,13 @@ describe("followed topics", () => {
     expect(fverdict(watch({ content: "@**BF-Plumber** look", flags: ["mentioned"] }))).toEqual({ wake: "peer", via: "mention" });
   });
 
+  it("a no-wake marker wakes nobody, even in a followed topic", () => {
+    // courtesy notes carry the eyes marker so they never spend a wake
+    expect(fverdict(watch({ content: "\u{1F440} noted, no reply needed" }))).toEqual({ wake: null, reason: "no_wake" });
+    // the marker is checked first: it wins over a mention there too
+    expect(fverdict(watch({ content: "\u{1F440} @**BF-Plumber** noted", flags: ["mentioned"] }))).toEqual({ wake: null, reason: "no_wake" });
+  });
+
   it("never wakes on its own post, an incoming-webhook bot, Jay's account from an API client, or a stale peer there", () => {
     expect(fverdict(watch({ sender_id: 101 }))).toEqual({ wake: null, reason: "own" });
     expect(fverdict(watch({ sender_id: 60 }))).toEqual({ wake: null, reason: "webhook_sender" });

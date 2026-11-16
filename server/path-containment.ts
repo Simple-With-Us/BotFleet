@@ -17,9 +17,19 @@
 // error, a NUL byte.  A file that does not exist yet is judged by its nearest
 // existing parent.
 //
+// A hard link is the other half of the same problem, and a path walk cannot
+// see it: a hard link has no target, so resolving one lands on itself.  The
+// path still reads as inside the root while the inode it names is also the
+// inode of a file somewhere else, and a write through that link edits the
+// other file's bytes.  Nothing in the path says where the other names are, so
+// a target that already exists and carries more than one link is refused: its
+// content is reachable under a name nobody here can vouch for.  This is the
+// rule the ACP allowlist already applies to a hard-linked file it is asked to
+// read or write (`server/drivers/acp/allowlist.ts`, `resolvedLocation`).
+//
 // Like the rest of the guard this is not a security boundary: a link planted
 // between this check and the write is not seen.
-import { lstatSync, realpathSync } from "node:fs";
+import { lstatSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, parse, resolve } from "node:path";
 
@@ -114,10 +124,28 @@ function judge(
   for (const reading of readings) {
     if (reading === null) continue;
     real.add(reading);
-    if (cwdConfinementError(reading, confinement) === null) continue;
-    why ??= confinement.protectedDirs.some((dir) => isInside(reading, realOrResolved(dir))) ? "protected-dir" : "outside-roots";
+    if (cwdConfinementError(reading, confinement) !== null) {
+      why ??= confinement.protectedDirs.some((dir) => isInside(reading, realOrResolved(dir))) ? "protected-dir" : "outside-roots";
+      continue;
+    }
+    // Inside a root, but the file it names may be shared with a name outside
+    // it, which the path cannot show.
+    if (sharesItsInode(reading)) why ??= "hard-link";
   }
   return why;
+}
+
+/** Whether the file at `path` is one link of several: a hard link names an
+ *  inode that another path names too.  A directory is never one of them (its
+ *  link count counts its own subfolders), and a file that does not exist yet
+ *  is not one either (a write creates a fresh inode). */
+function sharesItsInode(path: string): boolean {
+  try {
+    const stat = statSync(path);
+    return stat.isFile() && stat.nlink > 1;
+  } catch {
+    return false;
+  }
 }
 
 /** Whether every path of a file-writing ask lands inside the roots.  `real`

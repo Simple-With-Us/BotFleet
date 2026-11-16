@@ -387,6 +387,11 @@ export interface Bot {
   activityStartedAt?: number;
   /** what the bot is doing, as the harness sees it; busy is derived from it */
   activity?: "working" | "waiting-on-you" | "idle" | "no-signal" | "dead";
+  /** The turn currently dispatched, if any (server wireBot spread). */
+  inflightThreadId?: string | null;
+  /** The thread holding the open approval or question while waiting
+   * (server wireBot spread). Attributed to its room by the attention index. */
+  waitingThreadId?: string | null;
   modelSelection: ModelSelection;
   /** Active engine actually in use (including fallback rollover). */
   activeModelSelection?: ModelSelection;
@@ -591,7 +596,11 @@ export interface ConfigStatus {
   tts?: {
     configured: boolean;
     ready: boolean;
+    /** Absent or true means voice is on. */
+    enabled?: boolean;
     voice: string;
+    /** Whether a cloned voice may be the workspace default voice. */
+    useClonedVoice?: boolean;
     provider?: "minimax" | "system" | "xai" | "azure";
     optimizedSummary?: boolean;
     audioRetentionDays?: number;
@@ -823,6 +832,8 @@ export interface InstanceInfo {
     hidden?: boolean;
     /** Undefined when the auth probe could not tell. */
     authenticated?: boolean;
+    /** OpenCode only: why the last model catalog probe failed. */
+    modelProbeProblem?: string;
     version?: string | null;
     /** a reported cost on a subscription is notional; the UI says so */
     billing?: "metered" | "subscription";
@@ -961,6 +972,10 @@ export interface AppState {
    *  push, a PATCH response — never replaces a newer one. */
   instancesDescribedAt: number;
   config: ConfigStatus | null;
+  /** The Composio apps actually usable, or null until the inventory
+   *  has been read.  The per-bot Connected Apps card reads this, so it can
+   *  tell "Composio is set up" from "there is an app to use". */
+  connectedApps: ConnectedAppsInventory | null;
   /** selected chat — a bot id OR a group id */
   selectedId: string;
   /** Counts the times the person picked something to look at: every `select`,
@@ -1102,6 +1117,8 @@ export type Action =
       botEpochAtFetch?: Record<string, number>;
       groupEpochAtFetch?: Record<string, number>;
     }
+  /** The Composio account inventory, read from `GET /api/connectors/connected`. */
+  | { type: "connectedApps"; inventory: ConnectedAppsInventory }
   | { type: "loadEarlier"; threadId: string }
   | { type: "earlierLoading"; threadId: string }
   | { type: "earlierLoaded"; threadId: string; messages: Message[]; hasMore: boolean }
@@ -1733,6 +1750,8 @@ export function reducer(state: AppState, action: Action): AppState {
             ? "chat"
             : state.activeView,
       };
+    case "connectedApps":
+      return { ...state, connectedApps: action.inventory };
     case "select": {
       if (state.groups.some((g) => g.id === action.id)) {
         const wasUnread = state.groups.find((g) => g.id === action.id)?.unread;
@@ -1888,8 +1907,14 @@ export function reducer(state: AppState, action: Action): AppState {
       }
       // every server-side append chains onto (and becomes) the active leaf
       const next = updateBot(state, bot.id, (b) => {
+        // An edit's fork (or any message) can reach the client twice — once
+        // as the POST response, once as the canonical SSE frame — in either
+        // order, and a reconnect can redeliver an already-known message
+        // too. Reverting the active leaf back to a repeat would hide a
+        // newer reply that already won that race and became the active
+        // leaf; a duplicate must be a no-op (upstream OpenMausBot #1387).
         if (b.messages.some((m) => m.id === action.message.id)) {
-          return { ...b, activeLeafId: action.message.id };
+          return b;
         }
         let messages = [...b.messages, action.message];
         // base64 screen frames are big; a long computer-use session would
@@ -2564,6 +2589,7 @@ export const initialState: AppState = {
   instances: [],
   instancesDescribedAt: 0,
   config: null,
+  connectedApps: null,
   selectedId: "",
   selectionNonce: 0,
   viewedThreadId: null,
@@ -2722,6 +2748,128 @@ export class ApiError extends Error {
     this.name = "ApiError";
     this.body = body;
     this.status = status;
+  }
+}
+
+/** One service in the inventory, as `GET /api/connectors/connected` returns
+ *  it:  the accounts it holds, if any. */
+export const ConnectedAppsServiceSchema = z
+  .object({
+    connected: z.boolean().optional(),
+    pending: z.boolean().optional(),
+    status: z.string().optional(),
+    accounts: z
+      .array(
+        z
+          .object({
+            id: z.string().optional(),
+            status: z.string().optional(),
+          })
+          .passthrough()
+          .optional()
+          .catch(undefined),
+      )
+      .optional()
+      .catch(undefined),
+  })
+  .passthrough();
+
+export type ConnectorServiceInventory = z.infer<typeof ConnectedAppsServiceSchema>;
+
+/** Raised when an account is connected or disconnected, so the per-bot card
+ *  reads the connected-apps inventory again.
+ *
+ *  The panel that connects an account and the store that shows the count are
+ *  two different places, and the count is read by the store.  An event is how
+ *  one tells the other without either owning the other. */
+export const CONNECTED_APPS_CHANGED = "botfleet:connected-apps-changed";
+
+/** The connected-apps response, as `GET /api/connectors/connected` returns
+ *  it:  the services it holds and whether the inventory could be read.
+ *
+ *  The route is server output, so it is parsed before anything reads it.  A
+ *  malformed payload must not be counted as a number of connected apps, and
+ *  an unreadable inventory is not a count of zero.
+ *
+ *  The unknown keys are kept on purpose.  The payload belongs to Composio
+ *  and to the server that shapes it, and either may add a field this client
+ *  does not read yet;  a new field is not a malformed response, so it is
+ *  passed through rather than refused.  Every field this client reads is
+ *  still validated. */
+export const ConnectedAppsResponseSchema = z
+  .object({
+    configured: z.boolean().optional(),
+    services: z.record(z.string(), ConnectedAppsServiceSchema.optional().catch(undefined)),
+    authoritative: z.boolean().optional(),
+    credentialStore: z.enum(["ok", "pending", "unavailable"]).optional(),
+    readiness: z.unknown().optional(),
+  })
+  .passthrough();
+
+export type ConnectedAppsResponse = z.infer<typeof ConnectedAppsResponseSchema>;
+
+/** The Composio account inventory, as `GET /api/connectors/connected`
+ *  reports it.
+ *
+ *  A Composio credential on file is not a connected account:  a workspace
+ *  with a key and nothing connected has no app for a bot to use, and the
+ *  per-bot card used to claim otherwise.  `apps` is what is actually usable,
+ *  and `authoritative` says whether the inventory could be read at all, so an
+ *  unreachable service is never counted as zero. */
+export interface ConnectedAppsInventory {
+  /** A Composio service is set up for this workspace. */
+  configured: boolean;
+  /** Apps a bot can actually use:  an active account, or a toolkit that
+   *  needs no sign-in of its own. */
+  apps: number;
+  /** False when the inventory could not be read, so the count is unknown. */
+  authoritative: boolean;
+}
+
+/** How many apps are usable across every service in the inventory.
+ *
+ *  A usable app is an account Composio reports as active, or a service with
+ *  no accounts of its own that reports itself connected (a toolkit that
+ *  needs no sign-in).  A pending, expired or failed OAuth record is not
+ *  usable, and counting it would put a number in front of the user that the
+ *  app cannot be used through. */
+export function countConnectedApps(
+  services: Record<string, ConnectorServiceInventory | undefined> | null | undefined,
+): number {
+  let total = 0;
+  for (const service of Object.values(services ?? {})) {
+    const accounts = service?.accounts;
+    // A service whose accounts cannot be read is not counted either way:  the
+    // count would be a guess, and this count is shown to a person.
+    if (!Array.isArray(accounts)) continue;
+    // The status is Composio's own, and the server reads it the same way.
+    const active = accounts.filter((account) => /^active$/i.test(account?.status ?? "")).length;
+    if (active > 0) {
+      total += active;
+      continue;
+    }
+    // A service with no accounts of its own is a toolkit that needs no
+    // sign-in, and it is usable on its own when it reports itself connected.
+    if (accounts.length === 0 && service?.connected === true) total += 1;
+  }
+  return total;
+}
+
+/** Read the connected-apps inventory.
+ *
+ *  A workspace that cannot be read is not a workspace with no connected
+ *  apps, so an unreadable inventory comes back un-authoritative rather than
+ *  empty. */
+export async function fetchConnectedAppsInventory(): Promise<ConnectedAppsInventory> {
+  try {
+    const response = ConnectedAppsResponseSchema.parse(await api("/api/connectors/connected"));
+    const services = response.services ?? {};
+    const configured = response.configured === true;
+    const authoritative = response.authoritative ?? (response.credentialStore !== "unavailable");
+    if (!authoritative) return { configured, apps: 0, authoritative: false };
+    return { configured, apps: countConnectedApps(services), authoritative: true };
+  } catch {
+    return { configured: false, apps: 0, authoritative: false };
   }
 }
 
@@ -2992,6 +3140,69 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     botPatchQueue.revive();
     return () => botPatchQueue.dispose();
   }, [botPatchQueue]);
+
+  // The Composio account inventory, read once at start, again whenever the
+  // workspace's Composio credential changes, and again when the window comes
+  // back to the front.  Connecting or disconnecting an account changes
+  // neither the credential nor the config, so a card that says what is
+  // connected would otherwise keep saying it about the accounts that were
+  // connected when the page loaded.
+  useEffect(() => {
+    let alive = true;
+    let reading: Promise<void> | null = null;
+    // A trigger that arrives while a read is running is not dropped:  the
+    // answer in flight may predate the change that triggered it.
+    let pending = false;
+    const read = () => {
+      // One read at a time.  Two triggers in quick succession would send two
+      // identical requests, and the second answer could land on top of the
+      // first one, so a read that is already running is left to finish.
+      if (reading) {
+        pending = true;
+        return;
+      }
+      reading = fetchConnectedAppsInventory()
+        .then((inventory) => {
+          if (!alive) return;
+          // The card only re-renders when the inventory actually changed, so
+          // a read that finds the same thing says nothing.
+          const current = stateRef.current.connectedApps;
+          if (
+            current
+            && current.configured === inventory.configured
+            && current.apps === inventory.apps
+            && current.authoritative === inventory.authoritative
+          ) return;
+          rawDispatch({ type: "connectedApps", inventory });
+        })
+        .catch(() => {
+          // The read already reports an unreadable inventory as such;  a
+          // rejection here must not escape as an unhandled rejection.
+        })
+        .finally(() => {
+          reading = null;
+          // A follow-up read only makes sense while the effect is alive.
+          // After the teardown the answer would be discarded, so the extra
+          // request would only spend the endpoint's budget.
+          if (!alive) return;
+          if (pending) {
+            pending = false;
+            read();
+          }
+        });
+    };
+    read();
+    // One browser trigger, not two:  the window coming back to the front is
+    // the moment the user has been somewhere else, which is where a
+    // connection was made or broken.
+    window.addEventListener("focus", read);
+    window.addEventListener(CONNECTED_APPS_CHANGED, read);
+    return () => {
+      alive = false;
+      window.removeEventListener("focus", read);
+      window.removeEventListener(CONNECTED_APPS_CHANGED, read);
+    };
+  }, [state.config?.composio?.configured]);
 
   const groupPatchGen = useRef<Record<string, number>>({});
 
@@ -3816,7 +4027,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             // Auto-speak is disabled during any call. Call mode owns both the
             // singleton speaker and microphone ordering for its whole lifetime.
             const owner = stateRef.current.bots.find((b) => b.threadId === frame.threadId || b.tasks?.some((t) => t.threadId === frame.threadId));
-            if (owner && (owner.speechDevices ? owner.speechDevices.includes("mac") : owner.speakReplies) && currentCall() === null && frame.message.text?.trim()) {
+            if (owner && stateRef.current.config?.tts?.enabled !== false && (owner.speechDevices ? owner.speechDevices.includes("mac") : owner.speakReplies) && currentCall() === null && frame.message.text?.trim()) {
               // The reply as stored: the harness owns what is read, and the
               // speaker's local fallback picks the written or voice half
               // by the bot's mode.

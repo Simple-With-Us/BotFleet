@@ -4,7 +4,7 @@
 // logo → favicon → monogram.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Loader2, RefreshCw, Search, TriangleAlert, X } from "lucide-react";
-import { api, useStore } from "@/state/store";
+import { api, CONNECTED_APPS_CHANGED, useStore } from "@/state/store";
 import { cn } from "@/lib/cn";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { productErrorHeadline } from "@/lib/product-error";
@@ -361,15 +361,22 @@ export function PluginsPanel() {
           statusGenerations.current,
           requestGenerations,
         ));
+        let connected = false;
         for (const [slug, state] of Object.entries(services)) {
           const isCurrent = (statusGenerations.current.get(slug) ?? 0) === (requestGenerations.get(slug) ?? 0);
-          if (isCurrent && state.connected && !state.pending) setPendingUrls((current) => {
-            if (!current[slug]) return current;
-            const next = { ...current };
-            delete next[slug];
-            return next;
-          });
+          if (isCurrent && state.connected && !state.pending) {
+            connected = true;
+            setPendingUrls((current) => {
+              if (!current[slug]) return current;
+              const next = { ...current };
+              delete next[slug];
+              return next;
+            });
+          }
         }
+        // An account was connected, so the per-bot card has to read the
+        // inventory again instead of keeping the count it had.
+        if (connected) window.dispatchEvent(new Event(CONNECTED_APPS_CHANGED));
         return services;
       })
       .catch(() => ({}));
@@ -574,7 +581,10 @@ export function PluginsPanel() {
   const disconnectAccount = (slug: string, accountId: string) => {
     setBusySlug(slug);
     api(`/api/connectors/${slug}/accounts/${encodeURIComponent(accountId)}`, { method: "DELETE" })
-      .then(() => refreshStatus([slug]))
+      .then(() => {
+        window.dispatchEvent(new Event(CONNECTED_APPS_CHANGED));
+        return refreshStatus([slug]);
+      })
       .catch((e) => setError(e.message))
       .finally(() => setBusySlug(null));
   };

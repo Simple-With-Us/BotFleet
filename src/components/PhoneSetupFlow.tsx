@@ -24,7 +24,6 @@ import {
   companionPairingRoute,
   companionPairingRoutePin,
   companionPairingRoutePinAvailable,
-  type CompanionEndpoint,
   type CompanionPairingRoutePin,
   type CompanionPairingRouteMode,
 } from "../lib/companion-pairing";
@@ -53,43 +52,18 @@ import {
   type PhonePairingAttemptLock,
   type PhonePairingAttemptQueue,
 } from "../lib/phone-setup";
-import type { CompanionAccountState } from "../types/ogb";
+import type { CompanionAccountState, CompanionPhoneDevice } from "../types/ogb";
 import { ConnectionDetail } from "./ConnectionDetail";
 
-export interface PhoneDevice {
-  id: string;
-  name: string;
-  createdAt: number;
-  lastSeenAt: number;
-  cloudDesktopAccess: boolean;
-}
+/** The phone device and the companion state, as the preload hands them
+ *  over.  Both live in `src/types/ogb.d.ts` so the preload's contract is
+ *  stated in one place. */
+export type PhoneDevice = CompanionPhoneDevice;
 
-export interface CompanionState {
-  enabled: boolean;
-  keepAwake: boolean;
-  port: number;
-  devices: PhoneDevice[];
-  connectedDeviceIds?: string[];
-  pairing: { code: string; token: string; expiresAt: number } | null;
-  addresses?: string[];
-  tailscale?: string;
-  tailnetName?: string;
-  lan?: string | null;
-  hosts?: string[];
-  endpoints?: CompanionEndpoint[];
-  discovery?: { advertising: boolean; name: string };
-  error?: string;
-}
+export type CompanionState = import("../types/ogb").CompanionState;
 
-export type CompanionBridge = {
-  state: () => Promise<CompanionState>;
-  start: () => Promise<CompanionState>;
-  stop: () => Promise<CompanionState>;
-  keepAwake: (enabled: boolean) => Promise<CompanionState>;
-  pairing: (open: boolean, expectedToken?: string) => Promise<CompanionState>;
-  cloudDesktop: (deviceId: string, allowed: boolean) => Promise<CompanionState>;
-  revoke: (deviceId: string) => Promise<CompanionState>;
-};
+/** The preload's companion bridge, and the account bridge beside it. */
+export type CompanionBridge = NonNullable<NonNullable<Window["ogb"]>["companion"]>;
 
 type AccountBridge = NonNullable<NonNullable<Window["ogb"]>["companionAccount"]>;
 type StateBridge<T> = { state: () => Promise<T> };
@@ -111,13 +85,12 @@ interface PhonePairingRequest {
   generation: number;
 }
 
-export const companionBridge = (): CompanionBridge | null =>
-  // SAFETY: the preload owns this narrow bridge; browser builds are guarded by the optional lookup.
-  (globalThis as { ogb?: { companion?: CompanionBridge } }).ogb?.companion ?? null;
+export const companionBridge = (): CompanionBridge | null => globalThis.window?.ogb?.companion ?? null;
 
 export const companionAccountBridge = (): AccountBridge | null =>
-  // SAFETY: Electron exposes only these account operations and never sends credentials to the renderer.
-  (globalThis as { ogb?: { companionAccount?: AccountBridge } }).ogb?.companionAccount ?? null;
+  // Electron exposes only these account operations and never sends credentials
+  // to the renderer.
+  globalThis.window?.ogb?.companionAccount ?? null;
 
 export const loadCompanionBridgeState = async (
   companion: StateBridge<CompanionState> | null,

@@ -3,6 +3,9 @@ export interface Voice {
   id: string;
   label: string;
   description?: string;
+  /** True for a voice the owner cloned.  A cloned voice is only the
+   * workspace default while the workspace's cloned-voice switch is on. */
+  cloned?: boolean;
 }
 
 export interface Audio {

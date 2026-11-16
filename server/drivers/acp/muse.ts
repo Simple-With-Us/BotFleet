@@ -47,7 +47,8 @@ import { createAcpDriver, type AcpSupport } from "./core.ts";
  *      why).  Advertising a rung no reachable model takes is the overclaim
  *      this whole driver is written to avoid — the picker would offer `max`
  *      and the request would come back refused.  It is the one omission that
- *      the engine could take back by adding 1.3 and a `selectModel` hook.
+ *      the engine could take back by adding 1.3 to the catalog, once a
+ *      session advertises a choice for it.
  *    - `none` is excluded because the Meta provider rejects it outright
  *      ("The Meta provider does not accept `none`", HTTP 400), so offering it
  *      would be a level that always fails.
@@ -68,13 +69,19 @@ export const MUSE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh"] as const;
  *  all on a 1,048,576-token window.  Two separate things stopped this listing
  *  more than one model.
  *
- *  **We cannot switch.**  The adapter is verified to support model switching at
- *  idle, but its documented ACP config-option ids are `mode`,
- *  `nativeApprovalPolicy`, `sandbox`, `sandboxNetwork`, `workspaceWrite`, and
- *  `shell` — there is no `model` among them, and BotFleet's `selectModel` hook
- *  negotiates through exactly that `session/set_config_option` channel.  So no
- *  model switch is wired, and listing `1.3` would put a row in the picker a
- *  user can select and cannot get.
+ *  **The switch is wired, but only to what the session advertises.**  The
+ *  community adapter does serve a `model` config option:  `dist/config-options.js`
+ *  exports `MODEL_CONFIG_ID = "model"` beside `EFFORT_CONFIG_ID =
+ *  "reasoningEffort"`, and `applyConfigSelection` handles
+ *  `session/set_config_option` for both — which is the channel BotFleet's
+ *  `selectModel` hook negotiates through.  What the account can switch TO is
+ *  the account's own catalog, so the hook matches the picker id against the
+ *  options the session advertises and sends the advertised value back
+ *  unchanged, and refuses plainly when the session advertises no model option
+ *  at all (an adapter older than the one that added them) or does not offer
+ *  the picked id.  A row the session cannot offer is still a row a user can
+ *  select and cannot get, so `1.3` stays out of this list:  the catalog is
+ *  static, and the account decides which ids exist.
  *
  *  **And the model that actually runs is the account's choice, not ours.**
  *  A live run on 2026-10-05 reported `run.model.configured` with `model_id:
@@ -82,10 +89,10 @@ export const MUSE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh"] as const;
  *  `source: "startup"` — so the runtime model came from the account's startup
  *  profile, and on that account it was a 1.3 *Contributor* tier rather than the
  *  1.2 the docs describe as the CLI default.  This entry therefore names the
- *  model we can point at, while the matrix row says plainly that the model a
- *  turn actually uses is the account's startup default until a switch is
- *  wired.  Reporting one confident model id when the engine may run a
- *  different tier would be the same overclaim as the `max` effort rung, one
+ *  model we can point at, while the matrix row says plainly that a turn runs
+ *  the account's startup model unless the session advertises a choice for the
+ *  model named here.  Reporting one confident model id when the engine may run
+ *  a different tier would be the same overclaim as the `max` effort rung, one
  *  level up. */
 export const STATIC_MUSE_MODELS: ModelCatalog = {
   default: "muse-spark-1.2",
@@ -102,6 +109,181 @@ export const STATIC_MUSE_MODELS: ModelCatalog = {
     },
   ],
 };
+
+/** The ACP config-option id the community adapter serves for the model.
+ *
+ *  `dist/config-options.js` in `@bex-co/muse-code-acp` exports
+ *  `MODEL_CONFIG_ID = "model"` beside `EFFORT_CONFIG_ID = "reasoningEffort"`,
+ *  and `applyConfigSelection` handles `session/set_config_option` for both.
+ *  The iOS path already drove this same option (see
+ *  `ios/Tests/CompanionCoreTests/NativeMuseModelSelectionTests.swift`), so
+ *  the Mac server and the native client now switch the model the same way. */
+export const MUSE_MODEL_CONFIG_ID = "model";
+
+/** The prefix the adapter puts on a provider-qualified model choice. */
+const MUSE_MODEL_VALUE_PREFIX = "muse-model:";
+
+/** The session's advertised config options, decoded at the boundary.
+ *
+ *  The list is verbatim agent output, so every field this driver reads off it
+ *  is parsed before it is branched on:  one malformed entry drops itself
+ *  rather than the whole list, and unknown fields pass through. */
+export const museAdvertisedConfigOptionsSchema = z
+  .array(
+    z
+      .object({
+        id: z.string().optional().catch(undefined),
+        currentValue: z.string().optional().catch(undefined),
+        options: z
+          .array(
+            z
+              .object({
+                value: z.string().optional().catch(undefined),
+                name: z.string().optional().catch(undefined),
+              })
+              .passthrough()
+              .optional()
+              .catch(undefined),
+          )
+          .optional()
+          .catch(undefined),
+      })
+      .passthrough()
+      .optional()
+      .catch(undefined),
+  )
+  .catch([]);
+
+/** One advertised Muse model selection, decoded from its ACP wire value.
+ *
+ *  A provider-qualified choice is `muse-model:` followed by the URI-encoded
+ *  JSON `[providerId, profileId|null, modelId]` (`modelChoice` in
+ *  `dist/config-options.js`);  a model with no provider is advertised as its
+ *  plain id instead, so both spellings reach the wire. */
+export const museModelChoiceSchema = z.object({
+  providerId: z.string().min(1),
+  profileId: z.string().min(1).nullable(),
+  modelId: z.string().min(1),
+});
+
+export type MuseModelChoice = z.infer<typeof museModelChoiceSchema>;
+
+/** The three fields of a qualified choice, in the adapter's own order. */
+const museModelChoiceTupleSchema = z.tuple([
+  z.string().min(1),
+  z.string().min(1).nullable(),
+  z.string().min(1),
+]);
+
+/** Decode one advertised model choice, or null when the value is not one.
+ *
+ *  The payload is opaque at the ACP boundary, so it is decoded rather than
+ *  compared as a string:  the picker id lives inside it, next to the provider
+ *  and the profile that belong to the user's own account. */
+export function parseMuseModelValue(value: string): MuseModelChoice | null {
+  if (!value.startsWith(MUSE_MODEL_VALUE_PREFIX)) return null;
+  let payload: string;
+  try {
+    payload = decodeURIComponent(value.slice(MUSE_MODEL_VALUE_PREFIX.length));
+  } catch {
+    return null;
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(payload);
+  } catch {
+    return null;
+  }
+  const tuple = museModelChoiceTupleSchema.safeParse(raw);
+  if (!tuple.success) return null;
+  const [providerId, profileId, modelId] = tuple.data;
+  const choice = museModelChoiceSchema.safeParse({ providerId, profileId, modelId });
+  return choice.success ? choice.data : null;
+}
+
+/** The picker id an advertised model choice names:  the model id out of a
+ *  qualified value, or the plain id an unqualified choice carries. */
+export function museModelIdForValue(value: string): string | null {
+  const decoded = parseMuseModelValue(value);
+  if (decoded) return decoded.modelId;
+  // A value that carries the wire prefix but does not decode is not a model
+  // id.  Reporting it as one would persist the wire format as the session's
+  // model identity;  a plain id is passed through as it stands.
+  if (value.startsWith(MUSE_MODEL_VALUE_PREFIX)) return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/** Match the picker model against the session's advertised model options and
+ *  return the advertised wire value verbatim.
+ *
+ *  The value is never constructed here:  the provider and the profile inside
+ *  it belong to the user's own account, so the only safe thing to send is the
+ *  exact string the session advertised.  A model the session does not offer is
+ *  refused rather than sent, and every refusal says plainly what is wrong, so
+ *  the caller reports it instead of retrying a request the adapter would
+ *  answer with `-32602`.
+ *
+ *  A session that cannot switch at all — an adapter that advertises no model
+ *  option, or one that advertises the option with no choices — answers null,
+ *  which the ACP contract reads as "skip the switch, the session keeps its
+ *  default".  That is what every turn did before this switch existed, and a
+ *  turn that fails instead of running is the worse outcome.
+ *
+ *  A session that CAN switch but does not offer the picked model still
+ *  throws:  running the account's startup model under a picker that names
+ *  another one is the overclaim this driver exists to avoid. */
+export function museModelOptionValue(
+  model: string,
+  advertised: z.infer<typeof museAdvertisedConfigOptionsSchema> | undefined,
+): string | null {
+  const options = (advertised ?? []).filter(
+    (option): option is NonNullable<typeof option> => option !== undefined,
+  );
+  const modelOption = options.find((option) => option.id === MUSE_MODEL_CONFIG_ID);
+  if (!modelOption) return null;
+  const choices = (modelOption.options ?? []).flatMap((option) =>
+    option === undefined || option.value === undefined
+      ? []
+      : [{ value: option.value, name: option.name ?? option.value }],
+  );
+  if (choices.length === 0) return null;
+  const wanted = model.trim();
+  let match: { value: string; name: string } | null = null;
+  let profileMatch: { value: string; name: string } | null = null;
+  for (const choice of choices) {
+    const decoded = parseMuseModelValue(choice.value);
+    const hit = decoded ? decoded.modelId === wanted : choice.value === wanted;
+    if (!hit) continue;
+    if (decoded && decoded.profileId) {
+      // A profile-routed choice is not a candidate to switch to, so it never
+      // counts toward the ambiguity check below.
+      if (!profileMatch) profileMatch = choice;
+      continue;
+    }
+    if (match) {
+      // The same value advertised twice is one choice, not two.
+      if (match.value === choice.value) continue;
+      throw new Error(
+        `Muse offers ${wanted} more than once for this session, so BotFleet cannot choose one`,
+      );
+    }
+    match = choice;
+  }
+  if (!match) {
+    if (profileMatch) {
+      // The adapter refuses named-profile routing itself ("Named model profile
+      // routing is unverified on supported Muse hosts"), so this says it here
+      // instead of letting the switch come back as an invalid-params error.
+      throw new Error(
+        `Muse routes ${wanted} through a named profile, which this adapter refuses to switch to`,
+      );
+    }
+    const names = choices.map((choice) => choice.name).join(", ") || "none";
+    throw new Error(`Muse does not offer ${wanted} for this session — available: ${names}`);
+  }
+  return match.value;
+}
 
 /** Where the launcher keeps its credential index, when one has been stored.
  *
@@ -296,9 +478,31 @@ const support: AcpSupport = {
   // No argv.  The adapter takes no run-time flags on this path (its only
   // documented flags are the `--cli` login/logout pair), and `muse`'s own
   // flags belong to `muse exec`, which is not how this engine runs.  Model
-  // and effort selection are not passed here for the reasons recorded at
-  // `STATIC_MUSE_MODELS` and `MUSE_EFFORT_LEVELS`.
+  // selection is not passed here either:  it travels over the wire through
+  // the `selectModel` hook below, because the adapter serves the model as a
+  // session config option and not as a flag.
   spawnArgs: () => [],
+  // The model switch, over the adapter's own config option.  The picker id is
+  // matched against the options the session advertises and the advertised
+  // value is sent back unchanged, because the provider and the profile inside
+  // it belong to the user's own account and are never constructed here.  A
+  // session that advertises no model option — an adapter older than the one
+  // that added them — cannot switch, and the hook answers null so the session
+  // keeps the model it already runs instead of sending a request the adapter
+  // would answer with `-32602`.
+  selectModel: {
+    configId: MUSE_MODEL_CONFIG_ID,
+    // A Muse session that cannot switch runs its own startup model, which is
+    // not the model the picker named, so the turn must not be reported as
+    // the pick.
+    skippedSwitchRunsAnotherModel: true,
+    valueForModel: (model, advertised) =>
+      museModelOptionValue(model, museAdvertisedConfigOptionsSchema.parse(advertised ?? [])),
+    modelForValue: (value) => {
+      const text = z.string().safeParse(value);
+      return text.success ? museModelIdForValue(text.data) : null;
+    },
+  },
   // The adapter's ACP auth is a terminal sign-in it performs itself, so there
   // is no auth method for BotFleet to drive from inside the handshake — same
   // shape as mcode.  `authFailure: "continue"` then rides on the ambient

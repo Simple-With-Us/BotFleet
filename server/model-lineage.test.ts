@@ -7,6 +7,7 @@ import {
   catalogIsLive,
   checkLineageWrite,
   claudeModelsTooNewFor,
+  customModelSkip,
   gateLineageByCliVersion,
   lineageContextFor,
   matchesStaticFallback,
@@ -235,6 +236,104 @@ describe("reconcileTurnOverride", () => {
     const moved = reconcileTurnOverride({ instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" }, contextFor("claude"));
     expect(moved.selection.model).toBe("claude-sonnet-5-5");
     expect(moved.freshSession).toBe(false);
+  });
+
+  it("rewrites retired ids on lineage-less engines while preserving optional fields and custom rows", () => {
+    expect(
+      reconcileTurnOverride(
+        { instanceId: "minimax", model: "MiniMax-M3", effort: "high", contextCap: 262_144, maxOutputTokens: 8192 },
+        contextFor("minimax"),
+      ),
+    ).toEqual({
+      selection: {
+        instanceId: "minimax",
+        model: "MiniMax-M3.1-Flash",
+        effort: "high",
+        contextCap: 262_144,
+        maxOutputTokens: 8192,
+      },
+      freshSession: false,
+    });
+    expect(
+      reconcileTurnOverride({ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" }, { driverKind: "dshAgent", offeredIds: [], authoritative: false }),
+    ).toEqual({
+      selection: { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
+      freshSession: false,
+    });
+    expect(
+      reconcileTurnOverride({ instanceId: "mcode", model: "MiniMax-M3.1-Flash-Preview-thinking" }, undefined),
+    ).toEqual({
+      selection: { instanceId: "mcode", model: "MiniMax-M3.1-Flash-thinking" },
+      freshSession: false,
+    });
+    expect(
+      reconcileTurnOverride({ instanceId: "dsh", model: "DeepSeek-V4.1-Pro" }, { driverKind: "dshAgent", offeredIds: [], authoritative: false }),
+    ).toEqual({
+      selection: { instanceId: "dsh", model: "DeepSeek-V4-Pro" },
+      freshSession: false,
+    });
+    expect(
+      reconcileTurnOverride({ instanceId: "dsh", model: "deepseek-v4-flash" }, { driverKind: "dshAgent", offeredIds: [], authoritative: false }),
+    ).toEqual({
+      selection: { instanceId: "dsh", model: "DeepSeek-V4.1-Flash" },
+      freshSession: false,
+    });
+    // An operator custom row keeps its exact id, including via lineageContextFor on lineage-less engines.
+    const dshCustom = lineageContextFor({
+      driverKind: "dshAgent",
+      models: {
+        default: "DeepSeek-V4.1-Flash",
+        options: [
+          { id: "DeepSeek-V4.1-Flash", label: "DeepSeek V4.1 Flash" },
+          { id: "MiniMax-M3", label: "Custom M3", custom: true },
+        ],
+      },
+    });
+    expect(dshCustom?.customIds).toEqual(["MiniMax-M3"]);
+    expect(
+      reconcileTurnOverride({ instanceId: "dshCustom", model: "MiniMax-M3" }, dshCustom),
+    ).toEqual({
+      selection: { instanceId: "dshCustom", model: "MiniMax-M3" },
+      freshSession: false,
+    });
+    // Nested fallbacks resolve customIds per entry via contextFor.
+    expect(
+      reconcileTurnOverride(
+        {
+          instanceId: "claude",
+          model: "claude-sonnet-5-5",
+          fallbacks: [
+            { instanceId: "dshCustom", model: "MiniMax-M3" },
+            { instanceId: "minimax", model: "MiniMax-M3" },
+          ],
+        },
+        contextFor("claude"),
+        (id) => (id === "dshCustom" ? dshCustom : contextFor(id)),
+      ),
+    ).toEqual({
+      selection: {
+        instanceId: "claude",
+        model: "claude-sonnet-5-5",
+        fallbacks: [
+          { instanceId: "dshCustom", model: "MiniMax-M3" },
+          { instanceId: "minimax", model: "MiniMax-M3.1-Flash" },
+        ],
+      },
+      freshSession: false,
+    });
+  });
+
+  it("customModelSkip skips unregistered and catalogPending engines when skipUnloaded is set", () => {
+    const contextById = new Map<string, LineageContext>([
+      ["shadow", { driverKind: "dshAgent", offeredIds: [], authoritative: false, catalogPending: true }],
+      ["custom", { driverKind: "dshAgent", offeredIds: ["MiniMax-M3"], customIds: ["MiniMax-M3"], authoritative: true }],
+      ["loaded", { driverKind: "minimax", offeredIds: ["MiniMax-M3.1-Flash"], customIds: [], authoritative: true }],
+    ]);
+    const skip = customModelSkip((id) => contextById.get(id), { skipUnloaded: true });
+    expect(skip({ instanceId: "missing", model: "MiniMax-M3" })).toBe(true);
+    expect(skip({ instanceId: "shadow", model: "MiniMax-M3" })).toBe(true);
+    expect(skip({ instanceId: "custom", model: "MiniMax-M3" })).toBe(true);
+    expect(skip({ instanceId: "loaded", model: "MiniMax-M3" })).toBe(false);
   });
 });
 

@@ -12,7 +12,7 @@
 //      an ordinary command next to it is still approved
 import { createHash } from "node:crypto";
 import type { ChildProcess } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -195,6 +195,10 @@ posixOnly("auto mode guards are wired from the Claude driver to the card", () =>
     mkdirSync(elsewhere, { recursive: true });
     // a link inside the bot's folder that leads out of it
     symlinkSync(elsewhere, join(folder, "escape"));
+    // a hard link inside the bot's folder that shares the inode of a file
+    // outside it: the path reads as inside, the content does not
+    writeFileSync(join(elsewhere, "outside.txt"), "x");
+    linkSync(join(elsewhere, "outside.txt"), join(folder, "hardlink.txt"));
     writeFileSync(
       join(home, ".botfleet", "config.json"),
       JSON.stringify({
@@ -264,6 +268,15 @@ posixOnly("auto mode guards are wired from the Claude driver to the card", () =>
       // a relative path and a `~` spelling mean nothing to this check
       const relative = await expectCard("w-relative", "Write", { file_path: "src/notes.txt", content: "x" });
       expect(relative.row).toMatchObject({ source: "system-guard", rule: "file-write:relative-path" });
+
+      // a hard link inside the folder that shares an inode with a file outside it
+      const hardlink = await expectCard("w-hardlink", "Write", {
+        file_path: join(folder, "hardlink.txt"),
+        content: "x",
+      });
+      expect(hardlink.row).toMatchObject({ source: "system-guard", rule: "file-write:hard-link" });
+      expect(hardlink.card.held).toContain("hard linked");
+      expect(hardlink.card.allowKey).toBeUndefined();
 
       // a shell startup file, even inside the folder
       const rc = await expectCard("w-rc", "Write", { file_path: join(folder, ".zshrc"), content: "x" });

@@ -93,6 +93,10 @@ public enum BotVoice {
     public static let personalVoiceNotDefault =
         "Personal Voices stay on the device that made them, so they cannot be the default."
 
+    /// `CLONED_VOICE_NOT_DEFAULT` in `shared/bot-voice.ts`.
+    public static let clonedVoiceNotDefault =
+        "Turn on Use My Cloned Voice to make your cloned voice the workspace default."
+
     /// `readableVoiceId`: the Personal Voice prefix dropped, `-` and `_`
     /// read as spaces, each word starting with a capital.
     public static func readableVoiceId(_ voiceId: String) -> String {
