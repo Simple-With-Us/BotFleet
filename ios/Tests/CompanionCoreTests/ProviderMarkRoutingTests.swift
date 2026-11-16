@@ -42,6 +42,61 @@ final class ProviderMarkRoutingTests: XCTestCase {
         )
     }
 
+    func testTheAnnouncedIdentityStaysWithTheHarness() {
+        // The artwork names the engine that answers and the name names the
+        // harness that carries it.  A MiniMax model under the DeepSeek
+        // Harness wears the MiniMax mark, but it is still a Clutch session,
+        // and the web surface announces the engine's registered name and only
+        // swaps the mark.
+        XCTAssertEqual(
+            ProviderMarkRouting.resolvedLabelDriverKind(for: "dshAgent", model: "MiniMax-M3.1-Flash"),
+            "dshAgent"
+        )
+        XCTAssertEqual(
+            ProviderMarkRouting.resolvedLabelDriverKind(for: "dsh", model: "minimax-m2"),
+            "dsh"
+        )
+        // A DeepSeek model on the same harness names the same thing.
+        XCTAssertEqual(
+            ProviderMarkRouting.resolvedLabelDriverKind(for: "dshAgent", model: "deepseek-chat"),
+            "dshAgent"
+        )
+        // Every other driver keeps the model routing for both halves:  there
+        // the engine itself is the identity, and nothing splits.
+        XCTAssertEqual(
+            ProviderMarkRouting.resolvedLabelDriverKind(for: "grok", model: "claude-sonnet-5"),
+            "claude"
+        )
+        XCTAssertEqual(
+            ProviderMarkRouting.resolvedLabelDriverKind(for: "codex", model: nil),
+            "codex"
+        )
+    }
+
+    func testTheAnnouncedNameStaysWithTheHarness() {
+        // The name is what a person hears, so it is the harness:  a MiniMax
+        // model under the DeepSeek Harness wears the MiniMax mark and is
+        // announced as Clutch, exactly as the web surface announces the
+        // engine's registered name and only swaps the mark.
+        XCTAssertEqual(
+            ProviderMarkRouting.displayName(for: "dshAgent", model: "MiniMax-M3.1-Flash"),
+            "Clutch"
+        )
+        XCTAssertEqual(
+            ProviderMarkRouting.displayName(for: "dsh", model: "minimax-m2"),
+            "Clutch"
+        )
+        // A MiniMax session on MiniMax still announces as MiniMax.
+        XCTAssertEqual(
+            ProviderMarkRouting.displayName(for: "minimax", model: "MiniMax-M2"),
+            "MiniMax"
+        )
+        XCTAssertEqual(
+            ProviderMarkRouting.displayName(for: "mcodeAgent", model: nil),
+            "MiniMax Code"
+        )
+    }
+
     func testModelNameRoutesWhenDriverIsGeneric() {
         XCTAssertEqual(
             ProviderMarkRouting.resolvedDriverKind(for: "grok", model: "claude-sonnet-5"),
