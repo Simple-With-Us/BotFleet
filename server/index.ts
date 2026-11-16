@@ -205,6 +205,7 @@ import {
   inheritedUnattended,
   dshVisionSelection,
   isDshVisionlessModel,
+  isAccountLevelCapChip,
   lastTurnStartIndex,
   parseQuotaResetTime,
   providerErrorCodeFromStopReason,
@@ -6250,15 +6251,35 @@ bus.subscribe((event: RuntimeEvent) => {
           );
         }
         if (quotaOrCap && textIsCandidateForQuota) {
-          quotaCooldowns.record({
-            botId: fallbackBot.id,
-            instanceId: actualSelection.instanceId,
-            model: actualSelection.model,
-            resetsAt: quotaInfo.resetsAt,
-            error: quotaText || "quota exceeded",
-            recordedAt: Date.now(),
-            source: quotaEvidence?.source ?? (structuredQuotaOrCap === true ? "provider-error-code" : undefined),
+          // An account-level cap is not one bot's problem.  Every bot on
+          // that account and that model is out at the same moment, so the
+          // cooldown is recorded against the instance and every bot on it
+          // falls back in the same describe cycle, instead of each one
+          // spending a turn to hear the same refusal.
+          const accountCap = isAccountLevelCapChip({
+            text: quotaText,
+            driverKind: actualSelection.instanceId
+              ? registry.get(actualSelection.instanceId)?.driverKind
+              : undefined,
+            structuredQuotaOrCap,
           });
+          if (accountCap) {
+            quotaCooldowns.recordInstanceCap(actualSelection.instanceId, actualSelection.model, {
+              resetsAt: quotaInfo.resetsAt,
+              error: quotaText || "account cap",
+              source: "account-quota",
+            });
+          } else {
+            quotaCooldowns.record({
+              botId: fallbackBot.id,
+              instanceId: actualSelection.instanceId,
+              model: actualSelection.model,
+              resetsAt: quotaInfo.resetsAt,
+              error: quotaText || "quota exceeded",
+              recordedAt: Date.now(),
+              source: quotaEvidence?.source ?? (structuredQuotaOrCap === true ? "provider-error-code" : undefined),
+            });
+          }
         }
         // Remember the rejection so the next turn, and the next fail-over,
         // skip this entry instead of spending a spawn to hear it again.  Not

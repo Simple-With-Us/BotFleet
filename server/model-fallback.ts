@@ -312,6 +312,58 @@ export function isTransientCapacityChip(text: string): boolean {
   return isTransientCapacityText(text) && TRANSIENT_CAPACITY_CHIP.test(text.trim());
 }
 
+/**
+ * The account-level cap text, matched narrowly.
+ *
+ * A 402 that names the account's balance or its plan is an account-level
+ * cap:  every bot on that account and that model is out at the same moment,
+ * so the cooldown belongs to the instance and not to the one bot that spent
+ * first.  The matcher is deliberately narrow, because a chip that reads like
+ * a cap also covers refusals that are not the account's:  a rate limit, a
+ * concurrency limit, a session limit and an enforced spend limit all say
+ * "limit" and are not an account cap.  Cooling the whole instance for those
+ * would take every healthy bot down with one unlucky turn.
+ */
+export const ACCOUNT_LEVEL_CAP_MATCHER =
+  /\b(?:insufficient[_ .-]?balance|payment required|zero balance|out of credits?|plan limit|tier limit|usage limit (?:has been |was )?reached)\b/i;
+
+/**
+ * The drivers whose account is shared by every bot that runs on them.
+ *
+ * A MiniMax key, a Grok account and an OpenAI-compatible endpoint are one
+ * account behind any number of bots, so a cap on one of them is a cap on all
+ * of them.  The per-session CLI drivers are not:  each one runs under its
+ * own account, so a cap there says nothing about the next bot.
+ */
+export const ACCOUNT_LEVEL_CAP_DRIVER_KINDS: ReadonlySet<string> = new Set([
+  "minimax",
+  "grok",
+  "openai-compat",
+]);
+
+/** Whether a refusal is an account-level cap on the instance it came from.
+ *
+ *  The provider's own structured error code is the gate, because it is the
+ *  one signal that says the provider refused the request rather than
+ *  describing one in prose.  The prose matcher is narrow on top of that, and
+ *  the driver has to be one whose account the bots share.
+ */
+export function isAccountLevelCapChip({
+  text,
+  driverKind,
+  structuredQuotaOrCap,
+}: {
+  text: string;
+  driverKind: string | undefined;
+  structuredQuotaOrCap: boolean | undefined;
+}): boolean {
+  if (structuredQuotaOrCap !== true) return false;
+  if (!driverKind || !ACCOUNT_LEVEL_CAP_DRIVER_KINDS.has(driverKind)) return false;
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length >= QUOTA_TEXT_MAX) return false;
+  return ACCOUNT_LEVEL_CAP_MATCHER.test(trimmed);
+}
+
 const LEGACY_PROVIDER_ERROR_PREFIX = /^(?:api request failed|provider error|request failed|http error):\s*/i;
 
 const QUOTA_TEXT_MAX = 500;

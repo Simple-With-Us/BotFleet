@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { EffortLevel, ModelSelection } from "./contracts.ts";
 import {
+  ACCOUNT_LEVEL_CAP_MATCHER,
   AUTO_FALLBACK_PRIORITY,
   DEFAULT_QUOTA_COOLDOWN_TTL_MS,
   bootRecoveryTurnOpts,
@@ -34,6 +35,7 @@ import {
   TransientRouteHealthRegistry,
   transientRouteHealth,
   inheritedUnattended,
+  isAccountLevelCapChip,
   dshVisionSelection,
   type FallbackScanMessage,
   unattendedModelDowngrade,
@@ -2651,5 +2653,91 @@ describe("retired MiniMax-M3 ids are rewritten before failover", () => {
       model: "MiniMax-M3",
       nextUsed: 1,
     });
+  });
+});
+
+describe("the account-level cap chip", () => {
+  it("matches the account-level cap text and nothing that merely reads like a cap", () => {
+    // The account-level phrases.  Each of them names the account's balance
+    // or the account's plan, so every bot behind that account is out at the
+    // same moment.
+    for (const text of [
+      "insufficient_balance",
+      "Insufficient balance.",
+      "payment required",
+      "Your zero balance is empty.",
+      "You are out of credits.",
+      "out of credit",
+      "plan limit reached",
+      "tier limit reached",
+      "usage limit has been reached",
+      "usage limit reached",
+    ]) {
+      expect(ACCOUNT_LEVEL_CAP_MATCHER.test(text)).toBe(true);
+    }
+    // The refusals that read like a cap and are not the account's.  A
+    // session limit, a rate limit and an enforced spend limit are one bot's
+    // or one request's, and cooling the whole instance for them would take
+    // every healthy bot down with one unlucky turn.
+    for (const text of [
+      "rate limit exceeded",
+      "too many requests",
+      "session limit reached",
+      "enforced_spend_limit reached",
+      "Your subscription is active; this thread hit a concurrency limit.",
+    ]) {
+      expect(ACCOUNT_LEVEL_CAP_MATCHER.test(text)).toBe(false);
+    }
+  });
+
+  it("fires only on a structured provider refusal and on a driver whose account the bots share", () => {
+    const chip = {
+      text: "insufficient_balance",
+      driverKind: "minimax",
+      structuredQuotaOrCap: true as boolean | undefined,
+    };
+    expect(isAccountLevelCapChip(chip)).toBe(true);
+
+    // The provider has to have refused the request, not described one.
+    expect(isAccountLevelCapChip({ ...chip, structuredQuotaOrCap: false })).toBe(false);
+    expect(isAccountLevelCapChip({ ...chip, structuredQuotaOrCap: undefined })).toBe(false);
+
+    // The driver has to be one whose account every bot shares.
+    expect(isAccountLevelCapChip({ ...chip, driverKind: "claudeAgent" })).toBe(false);
+    expect(isAccountLevelCapChip({ ...chip, driverKind: "dshAgent" })).toBe(false);
+    expect(isAccountLevelCapChip({ ...chip, driverKind: undefined })).toBe(false);
+
+    // The account-backed drivers are the ones that answer.
+    for (const driverKind of ["minimax", "grok", "openai-compat"]) {
+      expect(isAccountLevelCapChip({ ...chip, driverKind })).toBe(true);
+    }
+  });
+
+  it("broadcasts the cap to every bot on the instance instead of the one that spent first", () => {
+    const registry = new QuotaCooldownRegistry();
+    const primary: ModelSelection = {
+      instanceId: "minimax",
+      model: "MiniMax-M2",
+      fallbacks: [{ instanceId: "grok", model: "grok-4.6" }],
+    };
+
+    // The bot that spent first records an account-level cap.
+    registry.recordInstanceCap("minimax", "MiniMax-M2", {
+      error: "insufficient_balance",
+      source: "account-quota",
+    });
+
+    // A different bot on the same account and model falls back in the same
+    // describe cycle instead of spending a turn to hear the same refusal.
+    const resolved = registry.resolveModel("another-bot", primary);
+    expect(resolved.isFallback).toBe(true);
+    expect(resolved.selection.instanceId).toBe("grok");
+    expect(resolved.selection.model).toBe("grok-4.6");
+
+    // The cap belongs to the instance, not to the bot that hit it.
+    const instanceCap = registry.forInstance("minimax");
+    expect(instanceCap?.botId).toBe("*");
+    expect(instanceCap?.source).toBe("account-quota");
+    expect(instanceCap?.error).toBe("insufficient_balance");
   });
 });
