@@ -970,6 +970,10 @@ export interface AppState {
    *  push, a PATCH response — never replaces a newer one. */
   instancesDescribedAt: number;
   config: ConfigStatus | null;
+  /** The Composio accounts actually connected, or null until the inventory
+   *  has been read.  The per-bot Connected Apps card reads this, so it can
+   *  tell "Composio is set up" from "there is an app to use". */
+  connectedApps: ConnectedAppsInventory | null;
   /** selected chat — a bot id OR a group id */
   selectedId: string;
   /** Counts the times the person picked something to look at: every `select`,
@@ -1111,6 +1115,8 @@ export type Action =
       botEpochAtFetch?: Record<string, number>;
       groupEpochAtFetch?: Record<string, number>;
     }
+  /** The Composio account inventory, read from `GET /api/connectors/connected`. */
+  | { type: "connectedApps"; inventory: ConnectedAppsInventory }
   | { type: "loadEarlier"; threadId: string }
   | { type: "earlierLoading"; threadId: string }
   | { type: "earlierLoaded"; threadId: string; messages: Message[]; hasMore: boolean }
@@ -1742,6 +1748,8 @@ export function reducer(state: AppState, action: Action): AppState {
             ? "chat"
             : state.activeView,
       };
+    case "connectedApps":
+      return { ...state, connectedApps: action.inventory };
     case "select": {
       if (state.groups.some((g) => g.id === action.id)) {
         const wasUnread = state.groups.find((g) => g.id === action.id)?.unread;
@@ -2579,6 +2587,7 @@ export const initialState: AppState = {
   instances: [],
   instancesDescribedAt: 0,
   config: null,
+  connectedApps: null,
   selectedId: "",
   selectionNonce: 0,
   viewedThreadId: null,
@@ -2737,6 +2746,59 @@ export class ApiError extends Error {
     this.name = "ApiError";
     this.body = body;
     this.status = status;
+  }
+}
+
+/** The Composio account inventory, as `GET /api/connectors/connected`
+ *  reports it.
+ *
+ *  A Composio credential on file is not a connected account:  a workspace
+ *  with a key and nothing connected has no app for a bot to use, and the
+ *  per-bot card used to claim otherwise.  `accounts` is what is actually
+ *  connected, and `authoritative` says whether the inventory could be read
+ *  at all, so an unreachable service is never counted as zero. */
+export interface ConnectedAppsInventory {
+  /** A Composio service is set up for this workspace. */
+  configured: boolean;
+  /** Accounts connected across every service. */
+  accounts: number;
+  /** False when the inventory could not be read, so the count is unknown. */
+  authoritative: boolean;
+}
+
+/** One service in the inventory, as `GET /api/connectors/connected` returns
+ *  it:  the accounts it holds, if any. */
+export interface ConnectorServiceInventory {
+  connected?: boolean;
+  accounts?: unknown[];
+}
+
+/** How many accounts are connected across every service in the inventory. */
+export function countConnectedAccounts(
+  services: Record<string, ConnectorServiceInventory> | null | undefined,
+): number {
+  let total = 0;
+  for (const service of Object.values(services ?? {})) {
+    if (Array.isArray(service?.accounts)) total += service.accounts.length;
+  }
+  return total;
+}
+
+/** Read the connected-apps inventory.
+ *
+ *  A workspace that cannot be read is not a workspace with zero accounts, so
+ *  an unreadable inventory comes back un-authoritative rather than empty. */
+export async function fetchConnectedAppsInventory(): Promise<ConnectedAppsInventory> {
+  try {
+    const response = await api("/api/connectors/connected");
+    // SAFETY: the route returns the services map it parsed at its own boundary, and every field read here is optional.
+    const services = (response?.services ?? {}) as Record<string, ConnectorServiceInventory>;
+    const configured = response?.configured === true;
+    const authoritative = response?.authoritative ?? (response?.credentialStore !== "unavailable");
+    if (!authoritative) return { configured, accounts: 0, authoritative: false };
+    return { configured, accounts: countConnectedAccounts(services), authoritative: true };
+  } catch {
+    return { configured: false, accounts: 0, authoritative: false };
   }
 }
 
@@ -3007,6 +3069,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     botPatchQueue.revive();
     return () => botPatchQueue.dispose();
   }, [botPatchQueue]);
+
+  // The Composio account inventory, read once at start and again whenever the
+  // workspace's Composio credential changes, so a card that says what is
+  // connected says it about the accounts that are connected now.
+  useEffect(() => {
+    let alive = true;
+    const read = () => {
+      void fetchConnectedAppsInventory().then((inventory) => {
+        if (alive) rawDispatch({ type: "connectedApps", inventory });
+      });
+    };
+    read();
+    return () => {
+      alive = false;
+    };
+  }, [state.config?.composio?.configured]);
 
   const groupPatchGen = useRef<Record<string, number>>({});
 

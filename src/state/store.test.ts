@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   configStatusFromFrame,
+  countConnectedAccounts,
   MessagePostResponseSchema,
   TaskSwitchResponseSchema,
   getRoomTerminology,
@@ -20,6 +21,30 @@ import {
   type Group,
   type Message,
 } from "./store";
+
+describe("the connected-apps inventory", () => {
+  it("counts the accounts connected across every service", () => {
+    expect(
+      countConnectedAccounts({
+        gmail: { connected: true, accounts: [{ id: "a" }, { id: "b" }] },
+        slack: { connected: true, accounts: [{ id: "c" }] },
+        drive: { connected: false, accounts: [] },
+      }),
+    ).toBe(3);
+  });
+
+  it("counts an absent inventory as zero accounts", () => {
+    expect(countConnectedAccounts(null)).toBe(0);
+    expect(countConnectedAccounts({})).toBe(0);
+    expect(countConnectedAccounts({ gmail: { connected: true } })).toBe(0);
+  });
+
+  it("keeps the inventory in the store", () => {
+    const inventory = { configured: true, accounts: 0, authoritative: true };
+    const next = reducer(initialState, { type: "connectedApps", inventory });
+    expect(next.connectedApps).toEqual(inventory);
+  });
+});
 
 describe("API response contracts", () => {
   const bot = {

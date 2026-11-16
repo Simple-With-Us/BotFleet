@@ -21,14 +21,33 @@ export interface ConnectedAppsBlurbInput {
   canUse: boolean;
   /** The per-bot `composio` grant. Defaults on, so absent means enabled. */
   enabled: boolean;
+  /** Accounts connected across every service.  Unknown when the inventory
+   *  could not be read, so the copy never claims zero on a guess. */
+  accounts?: number | null;
+  /** False when the inventory could not be read at all. */
+  authoritative?: boolean;
 }
 
-export function connectedAppsBlurb({ configured, canUse, enabled }: ConnectedAppsBlurbInput): string {
+export function connectedAppsBlurb({
+  configured,
+  canUse,
+  enabled,
+  accounts = null,
+  authoritative = true,
+}: ConnectedAppsBlurbInput): string {
   if (!configured) {
     return "Composio is not set up for this workspace, so this bot has no apps to use.  Set it up in App Settings → Connections.";
   }
   if (!canUse) {
     return "This bot's engine cannot call Composio tools, so no connected app is reachable.";
+  }
+  // A service with no account connected is not an app a bot can use, and
+  // saying otherwise was the claim this copy got wrong.  An inventory that
+  // could not be read is not a count of zero, so it keeps the old wording.
+  if (authoritative && accounts === 0) {
+    return enabled
+      ? "Composio is set up for this workspace, but no account is connected yet, so this bot has no app to use.  Connect one in App Settings → Connections."
+      : "Keep every connected Composio account off limits to this bot.  No account is connected yet.";
   }
   return enabled
     ? "Let this bot use the Gmail, Calendar, Slack, and other accounts you connected through Composio."

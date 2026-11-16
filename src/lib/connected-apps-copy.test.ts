@@ -31,6 +31,25 @@ describe("connectedAppsBlurb", () => {
     expect(blurb).toContain("App Settings → Connections");
   });
 
+  it("does not claim Composio access when no account is connected", () => {
+    // A service with a key and nothing connected has no app for a bot to
+    // use, and the card used to say otherwise.
+    const blurb = state({ accounts: 0, authoritative: true });
+    expect(blurb).toContain("no account is connected");
+    expect(blurb).toContain("no app to use");
+    expect(blurb).not.toContain("Gmail, Calendar, Slack");
+  });
+
+  it("keeps the claim when the inventory could not be read", () => {
+    // An unreadable inventory is not a count of zero, so the card does not
+    // claim there are no accounts either.
+    expect(state({ accounts: 0, authoritative: false })).toContain("through Composio");
+  });
+
+  it("claims the accounts it can see", () => {
+    expect(state({ accounts: 3, authoritative: true })).toContain("through Composio");
+  });
+
   it("reads the off state as withholding, matching every other switch in the panel", () => {
     expect(state({ enabled: false })).toBe(
       "Keep every connected Composio account off limits to this bot.",
