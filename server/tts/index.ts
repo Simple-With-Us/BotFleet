@@ -21,6 +21,7 @@ import {
   resolveHostedTtsLadder,
 } from "../../shared/voice-providers.ts";
 import { speakWithFallback } from "./provider-ladder.ts";
+import { clonedVoiceAllowed, defaultVoice } from "./voice-default.ts";
 
 export type VoiceProvider = TtsProvider;
 export { NoVoiceConfigured } from "./errors.ts";
@@ -69,9 +70,9 @@ export function voiceReady(cfg: AppConfig, voiceId?: string): boolean {
     return true;
   }
   if (voiceProvider(cfg) === "system") {
-    return systemVoices.systemVoicesAvailable() && Boolean(voiceId || cfg.tts?.voice);
+    return systemVoices.systemVoicesAvailable() && Boolean(voiceId || defaultVoice(cfg));
   }
-  return Boolean(cfg.tts?.key && (voiceId || cfg.tts?.voice));
+  return Boolean(cfg.tts?.key && (voiceId || defaultVoice(cfg)));
 }
 
 /** The pronunciation list in force: the saved one, or the seeded defaults
@@ -92,9 +93,9 @@ export function describeVoice(cfg: AppConfig) {
     configured: providerConfigured(cfg),
     ready: voiceConfigured(cfg),
     enabled: voiceMasterEnabled(cfg.tts),
-    voice: cfg.tts?.voice || "",
+    voice: defaultVoice(cfg),
     /** Whether the workspace lets a cloned voice be the default voice. */
-    useClonedVoice: cfg.tts?.useClonedVoice === true,
+    useClonedVoice: clonedVoiceAllowed(cfg),
     provider: voiceProvider(cfg),
     optimizedSummary: cfg.tts?.optimizedSummary === true,
     audioRetentionDays: cfg.tts?.audioRetentionDays ?? DEFAULT_AUDIO_RETENTION_DAYS,
@@ -127,9 +128,9 @@ export async function listVoices(cfg: AppConfig, run?: systemVoices.Runner): Pro
   } else {
     voices = [...minimax.listClonedVoices(), ...minimax.CANNED_VOICES];
   }
-  if (cfg.tts?.voice && !voices.some((v) => v.id === cfg.tts?.voice)) {
-    const defaultVoiceId = cfg.tts.voice;
-    voices.unshift({ id: defaultVoiceId, label: readableVoiceId(defaultVoiceId), description: "Workspace default" });
+  const workspaceDefault = defaultVoice(cfg);
+  if (workspaceDefault && !voices.some((v) => v.id === workspaceDefault)) {
+    voices.unshift({ id: workspaceDefault, label: readableVoiceId(workspaceDefault), description: "Workspace default" });
   }
   return voices;
 }

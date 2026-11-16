@@ -19863,13 +19863,25 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // the default voice here, and the phone saves it through the narrow
       // route beside this one, so a clone cannot become the default by
       // choosing the other door.
-      if (patch.tts?.voice && tts.isClonedVoice(patch.tts.voice) && cfg.tts?.useClonedVoice !== true) {
+      // The switch and the voice are read as one request, because a save can
+      // carry both:  a save that turns the switch on and names a cloned voice
+      // is allowed, and a save that turns it off and names a cloned voice is
+      // not.
+      const clonedVoiceAllowed = patch.tts?.useClonedVoice ?? cfg.tts?.useClonedVoice ?? false;
+      if (patch.tts?.voice && tts.isClonedVoice(patch.tts.voice) && !clonedVoiceAllowed) {
         return json(res, 400, { error: CLONED_VOICE_NOT_DEFAULT });
       }
       // Turning the switch off while a cloned voice is the workspace default
       // clears that default: the switch has to mean off, or a clone keeps
-      // speaking for every bot that has no voice of its own.
-      if (patch.tts?.useClonedVoice === false && cfg.tts?.voice && tts.isClonedVoice(cfg.tts.voice)) {
+      // speaking for every bot that has no voice of its own.  A voice named
+      // in the same request is the user's own choice and is kept.
+      if (
+        patch.tts
+        && patch.tts.useClonedVoice === false
+        && !Object.hasOwn(patch.tts, "voice")
+        && cfg.tts?.voice
+        && tts.isClonedVoice(cfg.tts.voice)
+      ) {
         patch.tts = { ...patch.tts, voice: "" };
       }
       // The secret store is canonical for the names it holds, so a save of one

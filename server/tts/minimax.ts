@@ -81,11 +81,24 @@ export function listClonedVoices(): Voice[] {
     .map((r) => ({ id: r.voiceId, label: r.label, description: "Custom", cloned: true }));
 }
 
-/** True when this id names one of the workspace's cloned voices.  Voice
- * clone is MiniMax-only, so this store is the only place a clone can be. */
+/** The cloned voices MiniMax knows about, as the last listing reported
+ *  them.
+ *
+ *  A clone made elsewhere — in another machine, or before this workspace
+ *  existed — is not in the local store, so the store alone cannot answer
+ *  "is this id a clone".  The last upstream listing is kept for that, and it
+ *  is read whenever the voice list is read, which is before the settings
+ *  panel lets anyone pick a default. */
+let upstreamClonedVoiceIds = new Set<string>();
+
+/** True when this id names one of the workspace's cloned voices.
+ *
+ *  Voice clone is MiniMax-only, so the local store and the upstream listing
+ *  are the only places a clone can be. */
 export function isClonedVoiceId(voiceId: string | null | undefined): boolean {
   const id = voiceId?.trim();
   if (!id) return false;
+  if (upstreamClonedVoiceIds.has(id)) return true;
   return readClonedVoices().some((record) => record.voiceId === id);
 }
 
@@ -296,15 +309,19 @@ export async function listVoices(key: string): Promise<Voice[]> {
   if (!res.ok || body?.base_resp?.status_code !== 0) {
     throw new Error(upstreamMessage(res.status, "listing voices", body));
   }
+  // Only the cloning list holds clones:  a system voice and a generated
+  // voice are not one, and the clone gate has to tell them apart.
   const upstream = [
-    ...(body?.system_voice ?? []),
-    ...(body?.voice_cloning ?? []),
-    ...(body?.voice_generation ?? []),
-  ].map((v): Voice => ({
+    ...(body?.system_voice ?? []).map((v) => ({ voice: v, cloned: false })),
+    ...(body?.voice_cloning ?? []).map((v) => ({ voice: v, cloned: true })),
+    ...(body?.voice_generation ?? []).map((v) => ({ voice: v, cloned: false })),
+  ].map(({ voice: v, cloned }): Voice => ({
     id: String(v.voice_id ?? ""),
     label: String(v.voice_name ?? v.voice_id ?? "Voice"),
     description: v.description?.join(" · ") || undefined,
+    ...(cloned ? { cloned: true } : {}),
   })).filter((v) => v.id);
+  upstreamClonedVoiceIds = new Set(upstream.filter((v) => v.cloned).map((v) => v.id));
   const catalog = [...listClonedVoices(), ...upstream, ...CANNED_VOICES];
   return catalog.filter((voice, index) => catalog.findIndex((other) => other.id === voice.id) === index);
 }

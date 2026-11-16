@@ -142,6 +142,27 @@ describe("listVoices", () => {
     expect(call.headers["authorization"]).toBe("Bearer sk");
   });
 
+  it("marks the upstream cloning list as cloned voices", async () => {
+    refuse = {
+      status: 200,
+      body: {
+        system_voice: [{ voice_id: "English_Graceful_Lady", voice_name: "Graceful Lady" }],
+        voice_cloning: [{ voice_id: "jay-upstream-clone", voice_name: "Jay Upstream Clone" }],
+        base_resp: { status_code: 0, status_msg: "success" },
+      },
+    };
+    const { listVoices, isClonedVoiceId } = await driver();
+    const voices = await listVoices("sk");
+    refuse = null;
+    expect(voices.find((v) => v.id === "jay-upstream-clone")?.cloned).toBe(true);
+    // A system voice is not a clone, and must not be treated as one.
+    expect(voices.find((v) => v.id === "English_Graceful_Lady")?.cloned).toBeUndefined();
+    // A clone the workspace never made is still a clone, so the gate that
+    // keeps clones out of the default slot knows about it.
+    expect(isClonedVoiceId("jay-upstream-clone")).toBe(true);
+    expect(isClonedVoiceId("English_Graceful_Lady")).toBe(false);
+  });
+
   it("throws when the upstream returns a non-zero base_resp", async () => {
     refuse = { status: 200, body: { system_voice: [], base_resp: { status_code: 1001, status_msg: "auth failed" } } };
     const { listVoices } = await driver();

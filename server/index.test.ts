@@ -8595,6 +8595,20 @@ describe("workspace voice settings", () => {
     const own = await api("PATCH", `/api/bots/${bot.id}/profile`, { voice: "jay-clone-001" });
     expect(own.status).toBe(200);
     expect(own.body.bot.voice).toBe("jay-clone-001");
+    // One save that turns the switch on and names the clone is allowed:  the
+    // switch and the voice are read as one request, not two.
+    const both = await api("PUT", "/api/config", { tts: { useClonedVoice: true, voice: "jay-clone-001" } });
+    expect(both.status).toBe(200);
+    expect(both.body.tts.voice).toBe("jay-clone-001");
+    // And one save that turns the switch off and names the clone is not.
+    const offWithClone = await api("PUT", "/api/config", { tts: { useClonedVoice: false, voice: "jay-clone-001" } });
+    expect(offWithClone.status).toBe(400);
+    expect(offWithClone.body.error).toContain("Use My Cloned Voice");
+    // Turning the switch off keeps a voice named in the same request:  it is
+    // the user's own choice, and it is not a clone.
+    const offWithVoice = await api("PUT", "/api/config", { tts: { useClonedVoice: false, voice: "English_Graceful_Lady" } });
+    expect(offWithVoice.status).toBe(200);
+    expect(offWithVoice.body.tts.voice).toBe("English_Graceful_Lady");
     // The switch turns it on, and then the clone can be the default.
     const on = await api("PUT", "/api/config", { tts: { useClonedVoice: true } });
     expect(on.status).toBe(200);
