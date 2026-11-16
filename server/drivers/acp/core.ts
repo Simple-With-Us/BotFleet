@@ -334,6 +334,15 @@ export interface AcpSupport {
     /** Translate a confirmed opaque ACP value back to the picker model id
      * when the caller accepts the session default. */
     modelForValue?(value: unknown): string | null;
+    /** Whether a skipped switch means the turn ran a model other than the
+     *  one that was picked.
+     *
+     *  A driver that says yes is telling the core that the picked model is
+     *  not what the session runs, so the turn must not be reported as the
+     *  picked model and the cost must not be priced as it.  A driver whose
+     *  session default is the user's own model choice leaves it out, and the
+     *  picked model stays the closest known model. */
+    skippedSwitchRunsAnotherModel?: boolean;
   };
   /** Mutate the child env in place: strip a key, inject a policy. Receives the
    *  instance config so a support can vary with fullAuto. */
@@ -2167,6 +2176,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               if (support.promptPrefix !== undefined) firstReplyLedger.record(sessionId);
             }
             let selectedModel: string | null = null;
+            // Whether the turn ran a model other than the one that was
+            // picked.  A support that asked to skip the switch and says the
+            // session runs something else makes this true, and the turn is
+            // then reported as what it ran rather than as the pick.
+            let ranAnotherModel = false;
             let sessionStarted = false;
             const emitSessionStarted = () => {
               if (sessionStarted) return;
@@ -2175,7 +2189,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 ...base(threadId, turnId),
                 type: "session.started",
                 sessionId,
-                model: selectedModel ?? init?._meta?.modelState?.currentModelId ?? cliTurn.model ?? null,
+                model:
+                  selectedModel
+                  ?? init?._meta?.modelState?.currentModelId
+                  // The picked model is not what the turn ran when the
+                  // session runs another one, so it is not reported as one.
+                  ?? (ranAnotherModel ? null : cliTurn.model)
+                  ?? null,
                 ...(poisonedRebuild?.replayed ? { rebuilt: true } : {}),
               });
             };
@@ -2202,6 +2222,36 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 const mappedValue = cliTurn.model && valueForModel
                   ? valueForModel(cliTurn.model, sessionResult?.configOptions)
                   : undefined;
+                // A support that asked to skip the switch could not run the
+                // model the picker named.  When the support says the session
+                // runs another model, the turn is reported as that model and
+                // the person is told, so it is not read as the one they
+                // chose.
+                ranAnotherModel =
+                  mappedValue === null && support.selectModel?.skippedSwitchRunsAnotherModel === true;
+                if (ranAnotherModel) {
+                  const running = modelForValue?.(selectedValue) ?? null;
+                  selectedModel = running;
+                  console.warn(
+                    `${DRIVER_KIND} could not switch to ${cliTurn.model}; the turn ran ${running ?? "the session's own model"}`,
+                  );
+                  const noticeKey = `skipped-model-switch:${cliTurn.model}`;
+                  let heard = runtimeNoticesByThread.get(threadId);
+                  if (!heard) {
+                    heard = new Set();
+                    runtimeNoticesByThread.set(threadId, heard);
+                  }
+                  if (!heard.has(noticeKey)) {
+                    heard.add(noticeKey);
+                    emit({
+                      ...base(threadId, turnId),
+                      type: "runtime.notice",
+                      message: running
+                        ? `This session cannot switch models, so this turn ran ${running} rather than ${cliTurn.model}.`
+                        : `This session cannot switch models, so this turn ran the session's own model rather than ${cliTurn.model}.`,
+                    });
+                  }
+                }
                 const requestedValue = cliTurn.model
                   ? mappedValue === null
                     ? null // the support asked to skip the switch: the session keeps its default
@@ -2233,10 +2283,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 }
                 // Opaque option values are protocol details.  Persist the
                 // picker id in the task so resume and usage attribution keep
-                // the same model identity the user selected.
-                selectedModel = cliTurn.model ?? modelForValue?.(selectedValue) ?? (
-                  valueForModel === undefined && typeof selectedValue === "string" ? selectedValue : null
-                );
+                // the same model identity the user selected.  A turn that ran
+                // another model keeps the model's own answer instead:  the
+                // picker id would name a model this turn did not run.
+                if (!ranAnotherModel) {
+                  selectedModel = cliTurn.model ?? modelForValue?.(selectedValue) ?? (
+                    valueForModel === undefined && typeof selectedValue === "string" ? selectedValue : null
+                  );
+                }
               }
 
               if (support.configureSession) {
@@ -2273,7 +2327,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 // initialize's currentModelId is the CLI default (grok-4.7),
                 // not the model this turn asked for. After a successful pin,
                 // report the slug we set so the UI does not claim otherwise.
-                if (!selectedModel && cliTurn.model) selectedModel = cliTurn.model;
+                if (!selectedModel && cliTurn.model && !ranAnotherModel) selectedModel = cliTurn.model;
               }
             } catch (error) {
               // session.started is the only place the resume cursor is recorded,
