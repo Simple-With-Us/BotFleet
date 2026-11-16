@@ -2016,6 +2016,14 @@ export class Store {
     return path.reverse();
   }
 
+  /** IDs on the active branch without loading uncached threads into `ThreadCache`. */
+  activePathIds(threadId: string): Set<string> {
+    if (this.threads.has(threadId)) {
+      return new Set(this.activePath(threadId).map((m) => m.id));
+    }
+    return mdb.activePathIds(threadId);
+  }
+
   appendMessage(threadId: string, message: Omit<Message, "id" | "at"> & { at?: number }): Message {
     const t = this.thread(threadId);
     const full: Message = { id: newId(), at: Date.now(), parentId: t.activeLeafId, ...redactBotAuthored(message) };

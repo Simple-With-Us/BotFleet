@@ -14678,7 +14678,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const activePaths = new Map<string, Set<string>>();
       const onActivePath = (threadId: string, messageId: string) => {
         let ids = activePaths.get(threadId);
-        if (!ids) activePaths.set(threadId, (ids = new Set(store.activePath(threadId).map((m) => m.id))));
+        if (!ids) activePaths.set(threadId, (ids = store.activePathIds(threadId)));
         return ids.has(messageId);
       };
       const hits = searchMessages(q, limit, threadId)
