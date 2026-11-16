@@ -14,7 +14,7 @@ import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import { removeTempDir } from "../../testing/cleanup.ts";
 import { sanitizeToolPolicy, type ToolPolicy } from "../../tool-policy.ts";
 import { openedFileIsListed } from "./allowlist.ts";
-import { runningAsRoot } from "../../testing/privilege.ts";
+import { runningAsRoot, titledForPrivilege } from "../../testing/privilege.ts";
 import { GrokAgentDriver, grokAllowlistProblem } from "./grok.ts";
 import { McodeAgentDriver } from "./mcode.ts";
 
@@ -127,9 +127,12 @@ afterEach(async () => {
 // policy refuses to follow a link it does not own.  Root owns every link it
 // creates, so as root the policy follows them and the suite cannot test what
 // it means to test.  It says so here rather than depending on the host.
-const posix = describe.skipIf(process.platform === "win32" || runningAsRoot());
+// The skip is on that suite alone, so the driver-level suites below, whose
+// fixtures are argv and capabilities rather than links, keep running as root.
+const posix = describe.skipIf(process.platform === "win32");
+const unprivilegedUid = describe.skipIf(process.platform === "win32" || runningAsRoot());
 
-posix("an allowlist turn on Grok", () => {
+unprivilegedUid(titledForPrivilege("an allowlist turn on Grok"), () => {
   it("spawns in an asking mode, offers a terminal and files, registers the hook, and mounts no MCP", async () => {
     await grok(true);
     const { done, dump: seen } = await runTurn([]);

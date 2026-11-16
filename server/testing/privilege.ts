@@ -15,3 +15,13 @@ export function runningAsRoot(): boolean {
 /** Why a suite whose fixture needs a refusal cannot run as root. */
 export const ROOT_BYPASSES_THE_FIXTURE =
   "needs an unprivileged uid: root bypasses the file-mode and link-ownership checks this fixture is built on";
+
+/** The title a root-skipped suite carries.
+ *
+ *  Vitest's reporter prints a skipped suite as skipped and nothing more, so
+ *  a skip that does not say why reads like a platform skip.  The reason
+ *  rides in the suite title instead:  a run that skipped the suite says why
+ *  in its own output, on every host that runs it. */
+export function titledForPrivilege(title: string): string {
+  return runningAsRoot() ? `${title} (${ROOT_BYPASSES_THE_FIXTURE})` : title;
+}
