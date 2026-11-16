@@ -223,8 +223,11 @@ function CustomIngressFields() {
       try {
         const state = await bridge.state();
         const url = state?.managedConnection?.url;
-        if (active && url) {
-          setTunnelUrl(url);
+        if (active) {
+          // The URL is set on every poll, not only when there is one:  a
+          // tunnel that stopped must take its URL off the screen, or the
+          // stopped tunnel stays visible and copyable.
+          setTunnelUrl(url ?? "");
         }
       } catch {}
       if (active) setTimeout(poll, 2000);

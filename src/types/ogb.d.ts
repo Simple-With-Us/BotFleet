@@ -386,6 +386,15 @@ export interface CompanionState {
   port: number;
   devices: CompanionPhoneDevice[];
   connectedDeviceIds?: string[];
+  /** The open pairing, if there is one.
+   *
+   *  `code` is the six digits the user reads to their phone.  `token` is the
+   *  high-entropy half of the pairing link the phone scans, so it is in the
+   *  renderer's hands on purpose:  the renderer builds that link and draws
+   *  it as a QR code for the user to scan with their own phone.  It is a
+   *  short-lived, single-use handoff credential and not a stored secret, and
+   *  moving it to the main process would not keep it out of the renderer,
+   *  because the renderer draws the link that carries it. */
   pairing: { code: string; token: string; expiresAt: number } | null;
   addresses?: string[];
   tailscale?: string;
@@ -404,7 +413,12 @@ export interface CompanionManagedConnection {
   status: string;
   configured: boolean;
   ready: boolean;
+  /** The free, temporary tunnel URL.  It changes every time the app
+   *  restarts, and it is absent while the tunnel is not up. */
   url?: string;
+  /** The permanent hosted address.  It is not a free URL and does not
+   *  change on restart, so it never belongs under the free one. */
+  endpoint?: string;
   retryInMs?: number;
   error?: string;
 }
