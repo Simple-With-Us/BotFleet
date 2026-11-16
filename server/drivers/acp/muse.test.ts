@@ -446,7 +446,13 @@ describe("Muse Code model selection", () => {
 });
 
 describe("Muse Code model selection over ACP", () => {
-  const ENV_KEYS = ["FAKE_ACP_DUMP", "FAKE_ACP_RPC_DUMP", "FAKE_ACP_MODELS_JSON"];
+  const ENV_KEYS = [
+    "FAKE_ACP_DUMP",
+    "FAKE_ACP_RPC_DUMP",
+    "FAKE_ACP_MODELS_JSON",
+    "FAKE_ACP_SESSION_MODELS",
+    "FAKE_ACP_OMIT_INIT_MODEL_STATE",
+  ];
   let instance: ProviderInstance | undefined;
   let recorder: EventRecorder | undefined;
 

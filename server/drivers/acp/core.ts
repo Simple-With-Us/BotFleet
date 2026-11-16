@@ -181,10 +181,19 @@ const acpSessionResult = z.object({ models: acpSessionResultModels.optional() })
 // The initialize result comes from the agent, so the model state it carries
 // is read through a schema:  an unexpected shape must not reach the turn
 // identity, the notice or the cost estimate.
-const acpInitModelState = z.object({ currentModelId: z.string().optional() }).passthrough();
-const acpInitResult = z
+//
+// Both schemas are lenient on purpose.  ACP is an open protocol and an agent
+// is free to add its own metadata beside the model state, so a payload that
+// carries fields this driver does not read is still a payload the driver
+// understands;  only the fields it reads are checked.  A strict schema here
+// would reject a vendor's metadata instead of ignoring it, which is the
+// opposite of what a compatibility boundary wants.
+export const acpInitModelState = z.object({ currentModelId: z.string().optional() }).passthrough();
+export const acpInitResult = z
   .object({ _meta: z.object({ modelState: acpInitModelState.optional() }).passthrough().optional() })
   .passthrough();
+export type AcpInitModelState = z.infer<typeof acpInitModelState>;
+export type AcpInitResult = z.infer<typeof acpInitResult>;
 
 /** Stdio MCP server as ACP session/new sends it. */
 export type AcpStdioMcpServer = {
@@ -2035,7 +2044,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // The model the CLI reports as its own default.  It is the
             // fallback of last resort:  the session's own model state is the
             // model actually in use.
-            const initModelId = acpInitResult.safeParse(init).data?._meta?.modelState?.currentModelId;
+            //
+            // The parse is read through its own result, so a payload that
+            // does not validate names no model at all rather than reaching
+            // the turn identity by way of a failed parse's absent data.
+            const parsedInit = acpInitResult.safeParse(init);
+            const initModelId = parsedInit.success
+              ? parsedInit.data._meta?.modelState?.currentModelId
+              : undefined;
             const initElapsedMs = Date.now() - initStartedAt;
             if (initElapsedMs >= SLOW_INIT_LOG_MS) {
               console.warn(`[acp] ${DRIVER_KIND} ${describeSlowInit(initElapsedMs, initDeadline)}`);
