@@ -10,9 +10,20 @@ public enum ProviderMarkRouting {
         // provider is still Antigravity. Keep the driver identity for both
         // its mark and VoiceOver label instead of renaming it from model text.
         if driverKind == "antigravity" || driverKind == "antigravityAgent" { return driverKind }
-        // DeepSeek Harness and MiniMax Code also keep their distinct driver identities
-        // so that model keywords (e.g. "minimax" or "deepseek") do not clobber them.
-        if driverKind == "dsh" || driverKind == "dshAgent" { return driverKind }
+        // The DeepSeek Harness carries models from other engines too, and a
+        // MiniMax model running under it answers as MiniMax:  the mark has to
+        // name the engine that answers, not the harness that carries it, or a
+        // MiniMax bot wears the DeepSeek logo.  The web `ProviderMark` routes
+        // the same row to MiniMax, so this is where the two surfaces agreed on
+        // the model rather than on the driver.  A DeepSeek model on the same
+        // harness keeps the harness's own identity, so the "deepseek" keyword
+        // still does not clobber it.
+        if driverKind == "dsh" || driverKind == "dshAgent" {
+            if let model = model?.lowercased(), model.contains("minimax") { return "minimax" }
+            return driverKind
+        }
+        // MiniMax Code keeps its distinct driver identity so that model
+        // keywords do not clobber it.
         if driverKind == "mcode" || driverKind == "mcodeAgent" { return driverKind }
         guard let model = model?.lowercased() else { return driverKind }
         if model.contains("minimax") { return "minimax" }
