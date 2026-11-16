@@ -546,6 +546,13 @@ describe("Muse Code model selection over ACP", () => {
     expect(done).toMatchObject({ ok: true });
     expect(rpcMethods(rpcDump)).toContain("session/prompt");
     expect(rpcMethods(rpcDump)).not.toContain("session/set_config_option");
+    // The person is told the turn ran another model, so it is not read as
+    // the model the picker named.
+    const notice = recorder!.events.find((event) => event.type === "runtime.notice");
+    expect(notice?.message).toMatch(/cannot switch models/);
+    // And the turn is not reported as the model that was picked.
+    const started = recorder!.events.find((event) => event.type === "session.started");
+    expect(started?.model ?? null).not.toBe("muse-spark-1.2");
   });
 
   it("leaves an older adapter's session running when the turn picked no model", async () => {
