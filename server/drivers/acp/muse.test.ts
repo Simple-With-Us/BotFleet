@@ -446,7 +446,13 @@ describe("Muse Code model selection", () => {
 });
 
 describe("Muse Code model selection over ACP", () => {
-  const ENV_KEYS = ["FAKE_ACP_DUMP", "FAKE_ACP_RPC_DUMP", "FAKE_ACP_MODELS_JSON"];
+  const ENV_KEYS = [
+    "FAKE_ACP_DUMP",
+    "FAKE_ACP_RPC_DUMP",
+    "FAKE_ACP_MODELS_JSON",
+    "FAKE_ACP_SESSION_MODELS",
+    "FAKE_ACP_OMIT_INIT_MODEL_STATE",
+  ];
   let instance: ProviderInstance | undefined;
   let recorder: EventRecorder | undefined;
 
@@ -533,12 +539,19 @@ describe("Muse Code model selection over ACP", () => {
   });
 
   it("runs the turn on the session's own model when the session advertises no model option", async () => {
-    // No advertised models at all:  the adapter is older than the one that
-    // added the config options.  The switch must never reach it, because a
-    // request it cannot answer is a generic `-32602` nobody can act on, and
+    // No advertised model option at all:  the adapter is older than the one
+    // that added the config options.  The switch must never reach it, because
+    // a request it cannot answer is a generic `-32602` nobody can act on, and
     // the turn runs on the model the session already has.
+    //
+    // The session advertises its own model, and the CLI reports no model
+    // state of its own, so the only way the turn can be reported as running
+    // the session's model is the new resolution:  the CLI default would be a
+    // different model, and the assertion below would fail without it.
     const rpcDump = join(scratch(), "rpc-refused.json");
     process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    process.env.FAKE_ACP_SESSION_MODELS = "fake-session-model";
+    process.env.FAKE_ACP_OMIT_INIT_MODEL_STATE = "1";
     await create();
 
     const done = await runTurn("muse-model-refused", "muse-spark-1.2");
@@ -553,6 +566,11 @@ describe("Muse Code model selection over ACP", () => {
     // And the turn is not reported as the model that was picked.
     const started = recorder!.events.find((event) => event.type === "session.started");
     expect(started?.model ?? null).not.toBe("muse-spark-1.2");
+    // The session's own model is reported instead of nothing:  the turn ran
+    // on it, so the turn identity and the cost estimate name the model that
+    // actually answered.
+    expect(started?.model).toBe("fake-session-model");
+    expect(notice?.message).toContain("fake-session-model");
   });
 
   it("leaves an older adapter's session running when the turn picked no model", async () => {
