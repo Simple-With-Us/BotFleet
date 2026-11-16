@@ -516,5 +516,10 @@ describe("message-db", () => {
     insertMessage("legacy-branch", msg("leg-1", "one"));
     insertMessage("legacy-branch", msg("leg-2", "two"));
     expect(Array.from(activePathIds("legacy-branch")).sort()).toEqual(["leg-1", "leg-2"]);
+
+    // Repeated calls return the memoized Set; switching leaf invalidates it
+    expect(activePathIds("branch-test")).toBe(activePathIds("branch-test"));
+    setActiveLeaf("branch-test", "old-leaf");
+    expect(Array.from(activePathIds("branch-test")).sort()).toEqual(["old-leaf", "root"]);
   });
 });

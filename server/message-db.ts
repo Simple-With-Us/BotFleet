@@ -59,6 +59,8 @@ function open(): DatabaseSync {
       role TEXT NOT NULL,
       kind TEXT NOT NULL,
       text TEXT,
+      content TEXT,
+      tool_name TEXT,
       json TEXT NOT NULL,
       PRIMARY KEY (thread_id, id)
     );
@@ -74,9 +76,45 @@ function open(): DatabaseSync {
       PRIMARY KEY (thread_id, message_id)
     );
   `);
+  ensureSearchColumns(db);
   backfillRunningHelpers(db);
   return db;
 }
+
+/** Add `content` and `tool_name` columns to pre-existing databases once so
+ * `/api/search` predicates never parse `json` across every row. */
+function ensureSearchColumns(database: DatabaseSync): void {
+  // SAFETY: `PRAGMA table_info(messages)` returns one row per column with `name: string`.
+  const cols = new Set(
+    (database.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  let migrated = false;
+  if (!cols.has("content")) {
+    database.exec("ALTER TABLE messages ADD COLUMN content TEXT");
+    migrated = true;
+  }
+  if (!cols.has("tool_name")) {
+    database.exec("ALTER TABLE messages ADD COLUMN tool_name TEXT");
+    migrated = true;
+  }
+  if (migrated) {
+    database.exec(
+      "UPDATE messages SET " +
+        "content = json_extract(json, '$.content'), " +
+        "tool_name = CASE WHEN kind = 'activity' THEN json_extract(json, '$.tool.name') ELSE NULL END",
+    );
+  }
+}
+
+function searchColumns(message: Message): [string | null, string | null] {
+  const rawContent = (message as { content?: unknown }).content;
+  const content = typeof rawContent === "string" ? rawContent : null;
+  const toolName = message.kind === "activity" && typeof message.tool?.name === "string" ? message.tool.name : null;
+  return [content, toolName];
+}
+
+const ACTIVE_PATH_CACHE_LIMIT = 256;
+const activePathCache = new Map<string, { leafId: string; ids: Set<string> }>();
 
 /** One-time import for databases that predated the side table. */
 function backfillRunningHelpers(database: DatabaseSync): void {
@@ -294,12 +332,23 @@ function importLegacy(threadId: string, legacyFile: string): ThreadRows {
     activeLeafId = (raw as { activeLeafId?: string | null }).activeLeafId ?? null;
   }
   const insert = db().prepare(
-    "INSERT OR REPLACE INTO messages (thread_id, id, at, role, kind, text, json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    "INSERT OR REPLACE INTO messages (thread_id, id, at, role, kind, text, content, tool_name, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
   );
   db().exec("BEGIN");
   try {
     for (const message of messages) {
-      insert.run(threadId, message.id, message.at, message.role, message.kind, message.text ?? null, JSON.stringify(message));
+      const [content, toolName] = searchColumns(message);
+      insert.run(
+        threadId,
+        message.id,
+        message.at,
+        message.role,
+        message.kind,
+        message.text ?? null,
+        content,
+        toolName,
+        JSON.stringify(message),
+      );
     }
     setActiveLeaf(threadId, activeLeafId);
     db().exec("COMMIT");
@@ -336,9 +385,23 @@ export function countMessages(threadId: string): number {
 }
 
 export function insertMessage(threadId: string, message: Message): void {
+  const [content, toolName] = searchColumns(message);
   db()
-    .prepare("INSERT OR REPLACE INTO messages (thread_id, id, at, role, kind, text, json) VALUES (?, ?, ?, ?, ?, ?, ?)")
-    .run(threadId, message.id, message.at, message.role, message.kind, message.text ?? null, JSON.stringify(message));
+    .prepare(
+      "INSERT OR REPLACE INTO messages (thread_id, id, at, role, kind, text, content, tool_name, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .run(
+      threadId,
+      message.id,
+      message.at,
+      message.role,
+      message.kind,
+      message.text ?? null,
+      content,
+      toolName,
+      JSON.stringify(message),
+    );
+  activePathCache.delete(threadId);
   syncRunningHelper(threadId, message);
 }
 
@@ -444,9 +507,23 @@ export function runningHelperRows(): Array<{ threadId: string; message: Message 
 }
 
 export function updateMessage(threadId: string, message: Message): void {
+  const [content, toolName] = searchColumns(message);
   db()
-    .prepare("UPDATE messages SET at = ?, role = ?, kind = ?, text = ?, json = ? WHERE thread_id = ? AND id = ?")
-    .run(message.at, message.role, message.kind, message.text ?? null, JSON.stringify(message), threadId, message.id);
+    .prepare(
+      "UPDATE messages SET at = ?, role = ?, kind = ?, text = ?, content = ?, tool_name = ?, json = ? WHERE thread_id = ? AND id = ?",
+    )
+    .run(
+      message.at,
+      message.role,
+      message.kind,
+      message.text ?? null,
+      content,
+      toolName,
+      JSON.stringify(message),
+      threadId,
+      message.id,
+    );
+  activePathCache.delete(threadId);
   syncRunningHelper(threadId, message);
 }
 
@@ -457,12 +534,14 @@ export function setActiveLeaf(threadId: string, leafId: string | null): void {
         "ON CONFLICT(thread_id) DO UPDATE SET active_leaf_id = excluded.active_leaf_id",
     )
     .run(threadId, leafId);
+  activePathCache.delete(threadId);
 }
 
 export function deleteThread(threadId: string): void {
   db().prepare("DELETE FROM messages WHERE thread_id = ?").run(threadId);
   db().prepare("DELETE FROM thread_state WHERE thread_id = ?").run(threadId);
   db().prepare("DELETE FROM running_helpers WHERE thread_id = ?").run(threadId);
+  activePathCache.delete(threadId);
 }
 
 /** Freelist bytes above which `pruneDeadThreads` runs a full `VACUUM`
@@ -588,6 +667,7 @@ export function pruneDeadThreads(
       threadStateDeleted += Number(deleteState.run(threadId).changes ?? 0);
     }
     database.exec("COMMIT");
+    for (const threadId of dead) activePathCache.delete(threadId);
   } catch (error) {
     database.exec("ROLLBACK");
     throw error;
@@ -621,22 +701,20 @@ export interface SearchHit {
   from?: string;
 }
 
-/** Case-insensitive substring search over text messages, newest first.
- * Filters on the indexed/plain `role` column before touching `text` or
- * `json_extract` so large databases avoid per-row JSON parsing. */
+/** Case-insensitive substring search over text messages and activity tool names,
+ * newest first. Filters purely on plain columns (`role`, `text`, `content`,
+ * `kind`, `tool_name`) so large databases avoid per-row JSON parsing in the
+ * scan predicate. */
 export function searchMessages(query: string, limit = 40, threadId?: string): SearchHit[] {
   const needle = query.trim().toLowerCase();
   if (!needle) return [];
   // escape LIKE wildcards so a literal % or _ in the query stays literal
   const pattern = `%${needle.replace(/([\\%_])/g, "\\$1")}%`;
-  // text messages by their text/content; activity chips by the tool name — "which
-  // bot ran that migration" is a tool-name question. The chip's name lives
-  // in the row's json; a JSON1 extract keeps this one query.
   const scope = threadId ? "thread_id = ? AND " : "";
   const statement = db().prepare(
-    "SELECT thread_id, id, at, role, kind, text, json_extract(json, '$.content') AS content, json_extract(json, '$.tool.name') AS tool_name, json_extract(json, '$.from.name') AS from_name FROM messages " +
+    "SELECT thread_id, id, at, role, kind, text, content, tool_name, json_extract(json, '$.from.name') AS from_name FROM messages " +
       `WHERE ${scope}role IN ('user', 'bot') ` +
-      "  AND ((lower(COALESCE(text, json_extract(json, '$.content'), '')) LIKE ? ESCAPE '\\') " +
+      "  AND ((lower(COALESCE(text, content, '')) LIKE ? ESCAPE '\\') " +
       "   OR (kind = 'activity' AND tool_name IS NOT NULL AND lower(tool_name) LIKE ? ESCAPE '\\')) " +
       "ORDER BY at DESC LIMIT ?",
   );
@@ -700,6 +778,12 @@ export function activePathIds(threadId: string): Set<string> {
     leafId = tail?.id ?? null;
   }
   if (!leafId) return new Set();
+  const cached = activePathCache.get(threadId);
+  if (cached && cached.leafId === leafId) {
+    activePathCache.delete(threadId);
+    activePathCache.set(threadId, cached);
+    return cached.ids;
+  }
   // SAFETY: recursive CTE projects only `id` (TEXT NOT NULL) using `UNION` to
   // guard against any parentId cycle. When `$.parentId` is absent (legacy rows
   // where `parentId === undefined`), fall back to the preceding `rowid`,
@@ -719,11 +803,18 @@ export function activePathIds(threadId: string): Set<string> {
         ") SELECT id FROM branch",
     )
     .all(threadId, leafId, threadId) as Array<{ id: string }>;
-  return new Set(rows.map((row) => row.id));
+  const ids = new Set(rows.map((row) => row.id));
+  if (activePathCache.size >= ACTIVE_PATH_CACHE_LIMIT) {
+    const oldest = activePathCache.keys().next().value;
+    if (oldest !== undefined) activePathCache.delete(oldest);
+  }
+  activePathCache.set(threadId, { leafId, ids });
+  return ids;
 }
 
 /** Test/shutdown hook — closes the handle so a wiped DATA_DIR starts clean. */
 export function closeMessageDb(): void {
+  activePathCache.clear();
   try {
     handle?.close();
   } catch {
