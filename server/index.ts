@@ -5879,7 +5879,9 @@ bus.subscribe((event: RuntimeEvent) => {
                 : verdict?.source === "sensitive-guard"
                   ? "This touched sensitive files or credentials, so auto mode stopped to ask."
                   : verdict?.source === "system-guard"
-                    ? "This reaches outside the bot's folders or changes the computer, so auto mode stopped to ask."
+                    ? verdict.rule === "file-write:hard-link"
+                      ? "That file is hard linked to another file, so auto mode stopped to ask."
+                      : "This reaches outside the bot's folders or changes the computer, so auto mode stopped to ask."
                     : "Approval needed, so auto mode stopped to ask."
               : undefined,
           approvalScope: event.approvalScope,
