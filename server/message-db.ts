@@ -689,18 +689,36 @@ export function activePathIds(threadId: string): Set<string> {
   const state = database
     .prepare("SELECT active_leaf_id FROM thread_state WHERE thread_id = ?")
     .get(threadId) as { active_leaf_id: string | null } | undefined;
-  if (!state?.active_leaf_id) return new Set();
+  let leafId = state?.active_leaf_id ?? null;
+  if (!leafId) {
+    // Match Store.cacheThread(): a legacy thread with no active_leaf_id uses
+    // its newest row as the active leaf.
+    // SAFETY: `id` is a TEXT NOT NULL column on `messages`.
+    const tail = database
+      .prepare("SELECT id FROM messages WHERE thread_id = ? ORDER BY rowid DESC LIMIT 1")
+      .get(threadId) as { id: string } | undefined;
+    leafId = tail?.id ?? null;
+  }
+  if (!leafId) return new Set();
   // SAFETY: recursive CTE projects only `id` (TEXT NOT NULL) using `UNION` to
-  // guard against any parentId cycle.
+  // guard against any parentId cycle. When `$.parentId` is absent (legacy rows
+  // where `parentId === undefined`), fall back to the preceding `rowid`,
+  // matching `Store.cacheThread`; an explicit `parentId: null` stops at root.
   const rows = database
     .prepare(
       "WITH RECURSIVE branch(id, parent_id) AS (" +
-        "  SELECT id, json_extract(json, '$.parentId') FROM messages WHERE thread_id = ? AND id = ? " +
+        "  SELECT m.id, CASE WHEN json_type(m.json, '$.parentId') IS NULL " +
+        "    THEN (SELECT p.id FROM messages p WHERE p.thread_id = m.thread_id AND p.rowid < m.rowid ORDER BY p.rowid DESC LIMIT 1) " +
+        "    ELSE json_extract(m.json, '$.parentId') END " +
+        "  FROM messages m WHERE m.thread_id = ? AND m.id = ? " +
         "  UNION " +
-        "  SELECT m.id, json_extract(m.json, '$.parentId') FROM messages m JOIN branch b ON m.id = b.parent_id WHERE m.thread_id = ?" +
+        "  SELECT m.id, CASE WHEN json_type(m.json, '$.parentId') IS NULL " +
+        "    THEN (SELECT p.id FROM messages p WHERE p.thread_id = m.thread_id AND p.rowid < m.rowid ORDER BY p.rowid DESC LIMIT 1) " +
+        "    ELSE json_extract(m.json, '$.parentId') END " +
+        "  FROM messages m JOIN branch b ON m.id = b.parent_id WHERE m.thread_id = ?" +
         ") SELECT id FROM branch",
     )
-    .all(threadId, state.active_leaf_id, threadId) as Array<{ id: string }>;
+    .all(threadId, leafId, threadId) as Array<{ id: string }>;
   return new Set(rows.map((row) => row.id));
 }
 

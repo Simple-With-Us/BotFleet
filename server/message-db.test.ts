@@ -511,5 +511,10 @@ describe("message-db", () => {
 
     expect(Array.from(activePathIds("branch-test")).sort()).toEqual(["new-leaf", "root"]);
     expect(activePathIds("missing-thread").size).toBe(0);
+
+    // Legacy thread with no active_leaf_id and omitted parentId chains in rowid order
+    insertMessage("legacy-branch", msg("leg-1", "one"));
+    insertMessage("legacy-branch", msg("leg-2", "two"));
+    expect(Array.from(activePathIds("legacy-branch")).sort()).toEqual(["leg-1", "leg-2"]);
   });
 });
