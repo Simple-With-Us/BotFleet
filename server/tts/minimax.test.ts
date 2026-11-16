@@ -5,11 +5,12 @@
 // path is hit by swapping fetch for a rejecting stub.
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
+
+import { dataDir } from "../data-dir.ts";
 
 let server: ReturnType<typeof import("node:http").createServer>;
 const seen: Array<{ method: string; url: string; headers: Record<string, string>; body: string }> = [];
@@ -167,7 +168,10 @@ describe("listVoices", () => {
     expect(isClonedVoiceId("English_Graceful_Lady")).toBe(false);
     // And it is kept, so the answer survives the process that listed it:  a
     // fresh process must not classify an upstream clone as a plain voice.
-    const kept = readFileSync(join(homedir(), ".botfleet", "tts-upstream-clones.json"), "utf8");
+    // The path comes from the same helper the driver writes to, so the
+    // assertion cannot read a different place than the driver wrote when
+    // the data directory is configured.
+    const kept = readFileSync(join(dataDir(), "tts-upstream-clones.json"), "utf8");
     expect(z.array(z.string()).parse(JSON.parse(kept))).toContain("jay-upstream-clone");
   });
 
