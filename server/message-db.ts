@@ -106,10 +106,9 @@ function ensureSearchColumns(database: DatabaseSync): void {
   }
 }
 
-function searchColumns(message: Message): [string | null, string | null] {
-  const rawContent = (message as { content?: unknown }).content;
-  const content = typeof rawContent === "string" ? rawContent : null;
-  const toolName = message.kind === "activity" && typeof message.tool?.name === "string" ? message.tool.name : null;
+function searchColumns(message: Message & { content?: string }): [string | null, string | null] {
+  const content = message.content ?? null;
+  const toolName = message.kind === "activity" ? (message.tool?.name ?? null) : null;
   return [content, toolName];
 }
 
