@@ -535,9 +535,15 @@ export function applyMiniMaxBalanceToRegistry(
   // is the same condition seen from a turn, so a recovered balance lifts it
   // too.  Otherwise every bot on the account stays routed away from a
   // provider that is healthy again, until the row's own TTL runs out.
-  registry.clearWhere((cd) =>
-    cd.instanceId === MINIMAX_INSTANCE_ID && cd.source === ACCOUNT_CAP_SOURCE,
-  );
+  //
+  // Only a read that actually saw a healthy balance may lift it:  an
+  // unavailable or unknown snapshot says nothing about the account, and
+  // clearing on it would send the next bot straight back into the refusal.
+  if (snapshot.status === "ok" || snapshot.status === "near_cap") {
+    registry.clearWhere((cd) =>
+      cd.instanceId === MINIMAX_INSTANCE_ID && cd.source === ACCOUNT_CAP_SOURCE,
+    );
+  }
   if (!isAccountLevelCap(snapshot)) return { capped: false };
   const resetsAt = pickResetsAt(snapshot);
   registry.recordInstanceCap(MINIMAX_INSTANCE_ID, "*", {

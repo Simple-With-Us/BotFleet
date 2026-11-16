@@ -80,6 +80,15 @@ describe("the quota chip path broadcasts an account-level cap to the instance", 
     expect(capBranch).not.toMatch(/quotaCooldowns\.record\(\{/);
   });
 
+  it("does not overwrite an account row another producer owns", () => {
+    const chipBody = bracedBody(source, CHIP_ANCHOR);
+    const capBranch = bracedBody(chipBody, "if (accountCap) {");
+    // The balance producer writes the same `*:<instance>:*` row with the
+    // plan's reset window; the chip only fills it when it is empty or its own.
+    expect(capBranch).toMatch(/quotaCooldowns\.get\("\*", actualSelection\.instanceId, "\*"\)/);
+    expect(capBranch).toMatch(/existingAccountRow\.source === ACCOUNT_CAP_SOURCE/);
+  });
+
   it("leaves the ordinary per-bot cooldown exactly where it was", () => {
     const chipBody = bracedBody(source, CHIP_ANCHOR);
     const elseAt = chipBody.indexOf("} else {");

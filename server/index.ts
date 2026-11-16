@@ -6270,11 +6270,19 @@ bus.subscribe((event: RuntimeEvent) => {
             // and not one model's:  a bot on the same account with a
             // different model is out of the same balance, and the registry
             // falls back to the wildcard row for exactly this.
-            quotaCooldowns.recordInstanceCap(actualSelection.instanceId, "*", {
-              resetsAt: quotaInfo.resetsAt,
-              error: quotaText || "account cap",
-              source: ACCOUNT_CAP_SOURCE,
-            });
+            // The balance producer (server/minimax-balance.ts) owns the same
+            // `*:<instance>:*` row with the plan's own reset window.  A chip
+            // must not replace that row with its 15-minute default TTL and
+            // its own attribution; it only fills the row when no other
+            // producer holds it.
+            const existingAccountRow = quotaCooldowns.get("*", actualSelection.instanceId, "*");
+            if (!existingAccountRow || existingAccountRow.source === ACCOUNT_CAP_SOURCE) {
+              quotaCooldowns.recordInstanceCap(actualSelection.instanceId, "*", {
+                resetsAt: quotaInfo.resetsAt,
+                error: quotaText || "account cap",
+                source: ACCOUNT_CAP_SOURCE,
+              });
+            }
           } else {
             quotaCooldowns.record({
               botId: fallbackBot.id,
