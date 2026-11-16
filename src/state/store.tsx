@@ -2787,7 +2787,13 @@ export const CONNECTED_APPS_CHANGED = "botfleet:connected-apps-changed";
  *
  *  The route is server output, so it is parsed before anything reads it.  A
  *  malformed payload must not be counted as a number of connected apps, and
- *  an unreadable inventory is not a count of zero. */
+ *  an unreadable inventory is not a count of zero.
+ *
+ *  The unknown keys are kept on purpose.  The payload belongs to Composio
+ *  and to the server that shapes it, and either may add a field this client
+ *  does not read yet;  a new field is not a malformed response, so it is
+ *  passed through rather than refused.  Every field this client reads is
+ *  still validated. */
 export const ConnectedAppsResponseSchema = z
   .object({
     configured: z.boolean().optional(),
@@ -3141,28 +3147,44 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // connected when the page loaded.
   useEffect(() => {
     let alive = true;
+    let reading: Promise<void> | null = null;
     const read = () => {
-      void fetchConnectedAppsInventory()
+      // One read at a time.  Two triggers in quick succession would send two
+      // identical requests, and the second answer could land on top of the
+      // first one, so a read that is already running is left to finish.
+      if (reading) return;
+      reading = fetchConnectedAppsInventory()
         .then((inventory) => {
-          if (alive) rawDispatch({ type: "connectedApps", inventory });
+          if (!alive) return;
+          // The card only re-renders when the inventory actually changed, so
+          // a read that finds the same thing says nothing.
+          const current = stateRef.current.connectedApps;
+          if (
+            current
+            && current.configured === inventory.configured
+            && current.apps === inventory.apps
+            && current.authoritative === inventory.authoritative
+          ) return;
+          rawDispatch({ type: "connectedApps", inventory });
         })
         .catch(() => {
           // The read already reports an unreadable inventory as such;  a
           // rejection here must not escape as an unhandled rejection.
+        })
+        .finally(() => {
+          reading = null;
         });
     };
     read();
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") read();
-    };
+    // One browser trigger, not two:  the window coming back to the front is
+    // the moment the user has been somewhere else, which is where a
+    // connection was made or broken.
     window.addEventListener("focus", read);
     window.addEventListener(CONNECTED_APPS_CHANGED, read);
-    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       alive = false;
       window.removeEventListener("focus", read);
       window.removeEventListener(CONNECTED_APPS_CHANGED, read);
-      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [state.config?.composio?.configured]);
 
