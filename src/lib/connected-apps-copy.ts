@@ -21,9 +21,10 @@ export interface ConnectedAppsBlurbInput {
   canUse: boolean;
   /** The per-bot `composio` grant. Defaults on, so absent means enabled. */
   enabled: boolean;
-  /** Accounts connected across every service.  Unknown when the inventory
-   *  could not be read, so the copy never claims zero on a guess. */
-  accounts?: number | null;
+  /** Apps a bot can actually use:  an active account, or a toolkit that needs
+   *  no sign-in of its own.  Unknown when the inventory could not be read, so
+   *  the copy never claims zero on a guess. */
+  apps?: number | null;
   /** False when the inventory could not be read at all. */
   authoritative?: boolean;
 }
@@ -32,7 +33,7 @@ export function connectedAppsBlurb({
   configured,
   canUse,
   enabled,
-  accounts = null,
+  apps = null,
   authoritative = true,
 }: ConnectedAppsBlurbInput): string {
   if (!configured) {
@@ -41,13 +42,13 @@ export function connectedAppsBlurb({
   if (!canUse) {
     return "This bot's engine cannot call Composio tools, so no connected app is reachable.";
   }
-  // A service with no account connected is not an app a bot can use, and
-  // saying otherwise was the claim this copy got wrong.  An inventory that
-  // could not be read is not a count of zero, so it keeps the old wording.
-  if (authoritative && accounts === 0) {
+  // A service with nothing connected is not an app a bot can use, and saying
+  // otherwise was the claim this copy got wrong.  An inventory that could not
+  // be read is not a count of zero, so it keeps the old wording.
+  if (authoritative && apps === 0) {
     return enabled
-      ? "Composio is set up for this workspace, but no account is connected yet, so this bot has no app to use.  Connect one in App Settings → Connections."
-      : "Keep every connected Composio account off limits to this bot.  No account is connected yet.";
+      ? "Composio is set up for this workspace, but nothing is connected yet, so this bot has no app to use.  Connect one in App Settings → Connections."
+      : "Keep every connected Composio account off limits to this bot.  Nothing is connected yet.";
   }
   return enabled
     ? "Let this bot use the Gmail, Calendar, Slack, and other accounts you connected through Composio."

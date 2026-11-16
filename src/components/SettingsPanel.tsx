@@ -439,7 +439,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   // Null when the engine asks and the broker answers, which is the common case.
   const bypassNote = bypassCoverageNote(engine?.capabilities?.bypassCoverage ?? "asks");
   const connectedAppsConfigured = state.config?.composio?.configured === true;
-  // The accounts that are actually connected, so the card does not claim
+  // The apps that are actually usable, so the card does not claim
   // Composio access for a workspace that has a key and nothing connected.
   const connectedAppsInventory = state.connectedApps;
   const connectedAppsEnabled = bot.composio !== false;
@@ -618,7 +618,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                   configured: connectedAppsConfigured,
                   canUse: canUseConnectedApps,
                   enabled: connectedAppsEnabled,
-                  accounts: connectedAppsInventory?.accounts ?? null,
+                  apps: connectedAppsInventory?.apps ?? null,
                   authoritative: connectedAppsInventory?.authoritative !== false,
                 })}
               </div>
