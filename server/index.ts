@@ -200,11 +200,13 @@ import {
   startGrokQuotaPoller,
 } from "./grok-quota.ts";
 import {
+  ACCOUNT_CAP_SOURCE,
   AUTO_FALLBACK_PRIORITY,
   enableQuotaCooldownPersist,
   inheritedUnattended,
   dshVisionSelection,
   isDshVisionlessModel,
+  isAccountLevelCapChip,
   lastTurnStartIndex,
   parseQuotaResetTime,
   providerErrorCodeFromStopReason,
@@ -6194,7 +6196,8 @@ bus.subscribe((event: RuntimeEvent) => {
         // setup affordance handles that one).  A CLI engine has no such
         // code, so `structuredQuotaOrCap` is undefined there and the
         // existing chip-prose regexes decide exactly as they do today.
-        const structuredQuotaOrCap = quotaOrCapFromErrorCode(providerErrorCodeFromStopReason(event.stopReason));
+        const providerErrorCode = providerErrorCodeFromStopReason(event.stopReason);
+        const structuredQuotaOrCap = quotaOrCapFromErrorCode(providerErrorCode);
         const quotaEvidence = turnQuotaOrCapEvidence(afterUser, Boolean(event.ok));
         const capacityEvidence = turnTransientCapacityEvidence(afterUser, Boolean(event.ok));
         // HTTP 429 shares a structured code with quota failures, so explicit
@@ -6250,15 +6253,47 @@ bus.subscribe((event: RuntimeEvent) => {
           );
         }
         if (quotaOrCap && textIsCandidateForQuota) {
-          quotaCooldowns.record({
-            botId: fallbackBot.id,
-            instanceId: actualSelection.instanceId,
-            model: actualSelection.model,
-            resetsAt: quotaInfo.resetsAt,
-            error: quotaText || "quota exceeded",
-            recordedAt: Date.now(),
-            source: quotaEvidence?.source ?? (structuredQuotaOrCap === true ? "provider-error-code" : undefined),
+          // An account-level cap is not one bot's problem.  Every bot on
+          // that account and that model is out at the same moment, so the
+          // cooldown is recorded against the instance and every bot on it
+          // falls back in the same describe cycle, instead of each one
+          // spending a turn to hear the same refusal.
+          const accountCap = isAccountLevelCapChip({
+            text: quotaText,
+            driverKind: actualSelection.instanceId
+              ? registry.get(actualSelection.instanceId)?.driverKind
+              : undefined,
+            providerErrorCode,
           });
+          if (accountCap) {
+            // The wildcard model, because the condition is the account's
+            // and not one model's:  a bot on the same account with a
+            // different model is out of the same balance, and the registry
+            // falls back to the wildcard row for exactly this.
+            // The balance producer (server/minimax-balance.ts) owns the same
+            // `*:<instance>:*` row with the plan's own reset window.  A chip
+            // must not replace that row with its 15-minute default TTL and
+            // its own attribution; it only fills the row when no other
+            // producer holds it.
+            const existingAccountRow = quotaCooldowns.get("*", actualSelection.instanceId, "*");
+            if (!existingAccountRow || existingAccountRow.source === ACCOUNT_CAP_SOURCE) {
+              quotaCooldowns.recordInstanceCap(actualSelection.instanceId, "*", {
+                resetsAt: quotaInfo.resetsAt,
+                error: quotaText || "account cap",
+                source: ACCOUNT_CAP_SOURCE,
+              });
+            }
+          } else {
+            quotaCooldowns.record({
+              botId: fallbackBot.id,
+              instanceId: actualSelection.instanceId,
+              model: actualSelection.model,
+              resetsAt: quotaInfo.resetsAt,
+              error: quotaText || "quota exceeded",
+              recordedAt: Date.now(),
+              source: quotaEvidence?.source ?? (structuredQuotaOrCap === true ? "provider-error-code" : undefined),
+            });
+          }
         }
         // Remember the rejection so the next turn, and the next fail-over,
         // skip this entry instead of spending a spawn to hear it again.  Not
