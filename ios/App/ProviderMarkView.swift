@@ -19,6 +19,12 @@ struct ProviderMarkView: View {
         ProviderMarkRouting.resolvedDriverKind(for: driverKind, model: model)
     }
 
+    /// The identity the row announces, which is the harness and not the
+    /// model it carries.
+    static func resolvedLabelDriverKind(for driverKind: String, model: String?) -> String {
+        ProviderMarkRouting.resolvedLabelDriverKind(for: driverKind, model: model)
+    }
+
     private var effectiveDriverKind: String {
         Self.resolvedDriverKind(for: driverKind, model: model)
     }
@@ -82,32 +88,12 @@ struct ProviderMarkView: View {
     /// Shared so the chat-header profile button can fold the provider into
     /// its own accessibility label (SwiftUI replaces child labels on a
     /// Button with an explicit `.accessibilityLabel`).
+    ///
+    /// The mapping lives in CompanionCore next to the routing it reads, so
+    /// the announced identity can be pinned by a test:  the App target has
+    /// no test target of its own.
     static func displayName(for driverKind: String, model: String? = nil) -> String {
-        let effective = resolvedDriverKind(for: driverKind, model: model)
-        switch effective {
-        case "claude", "claudeAgent": return "Claude"
-        case "grok", "grokAgent": return "Grok"
-        case "grok-bot": return "Grok Bot"
-        case "deepseek", "deepseekAgent": return "DeepSeek"
-        case "dsh", "dshAgent": return "Clutch"
-        case "codex": return "Codex"
-        case "openai-compat", "openai": return "OpenAI"
-        case "gemini", "geminiAgent": return "Gemini"
-        case "antigravity", "antigravityAgent": return "Antigravity"
-        case "cursor", "cursorAgent": return "Cursor"
-        case "minimax", "minimaxAgent": return "MiniMax"
-        // mcode is the same subscription read as a coding CLI, so it keeps the
-        // MiniMax mark but announces as its own product name.
-        case "mcode", "mcodeAgent": return "MiniMax Code"
-        case "boxAgent": return "ASCII.dev Box"
-        case "kimi", "kimiAgent": return "Kimi"
-        case "droid", "droidAgent": return "Droid"
-        case "qwenAgent": return "Qwen"
-        case "opencodeGo": return "OpenCode"
-        case "hermesAgent": return "Hermes"
-        case "piAgent": return "Pi"
-        default: return effective
-        }
+        ProviderMarkRouting.displayName(for: driverKind, model: model)
     }
 
     /// Mirrors the web fallback exactly: `driverKind.replace(/Agent$/i, "").slice(0, 1).toUpperCase()`.
