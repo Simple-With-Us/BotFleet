@@ -492,6 +492,10 @@ const support: AcpSupport = {
   // would answer with `-32602`.
   selectModel: {
     configId: MUSE_MODEL_CONFIG_ID,
+    // A Muse session that cannot switch runs its own startup model, which is
+    // not the model the picker named, so the turn must not be reported as
+    // the pick.
+    skippedSwitchRunsAnotherModel: true,
     valueForModel: (model, advertised) =>
       museModelOptionValue(model, museAdvertisedConfigOptionsSchema.parse(advertised ?? [])),
     modelForValue: (value) => {
