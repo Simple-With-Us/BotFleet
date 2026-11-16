@@ -19,7 +19,13 @@ struct WorkspaceVoiceSection: View {
     @State private var error = ""
 
     private var defaultVoice: String { session.config?.workspaceDefaultVoice ?? "" }
-    private var hostedVoices: [Voice] { voices.filter { !BotVoice.isPersonalVoiceId($0.id) } }
+    /// Whether the workspace lets a cloned voice be the default voice.  A
+    /// Personal Voice is device-local, so it is never offered, and a cloned
+    /// voice is only offered while the workspace's cloned-voice switch is on.
+    private var usesClonedVoice: Bool { session.config?.tts?.useClonedVoice == true }
+    private var hostedVoices: [Voice] {
+        voices.filter { !BotVoice.isPersonalVoiceId($0.id) && (usesClonedVoice || $0.cloned != true) }
+    }
     private var listed: Bool { hostedVoices.contains(where: { $0.id == defaultVoice }) }
     private var defaultName: String {
         defaultVoice.isEmpty ? BotVoice.noDefaultVoice : BotVoice.displayName(defaultVoice, voices: voices)
@@ -106,6 +112,9 @@ struct WorkspaceVoiceSection: View {
             parts.append("Every bot without a voice of its own speaks with this one, on the Mac and on iPhone.")
         }
         parts.append(BotVoice.personalVoiceNotDefault)
+        if !usesClonedVoice {
+            parts.append(BotVoice.clonedVoiceNotDefault)
+        }
         if session.config?.tts != nil, !canChange {
             parts.append("Change it on the Mac, or update BotFleet on your computer to change it and the pronunciations here.")
         } else {

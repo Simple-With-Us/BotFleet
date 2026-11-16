@@ -1611,6 +1611,7 @@
     {"path":"server/tts/speech-text.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/tts/system-voices.ts","category":"runtime","reason":"Import from server/tts/index.ts"},
     {"path":"server/tts/usage.ts","category":"runtime","reason":"Import from server/index.ts"},
+    {"path":"server/tts/voice-default.ts","category":"runtime","reason":"Import from server/tts/index.ts"},
     {"path":"server/tts/xai.ts","category":"runtime","reason":"Import from server/tts/index.ts"},
     {"path":"server/turn-context.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/turn-safety.ts","category":"runtime","reason":"Import from server/index.ts"},

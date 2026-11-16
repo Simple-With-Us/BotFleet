@@ -111,6 +111,7 @@ describe("configuration", () => {
       ready: true,
       enabled: true,
       voice: "English_Graceful_Lady",
+      useClonedVoice: false,
       provider: "minimax",
       optimizedSummary: false,
       pronunciations: SEEDED,
@@ -320,10 +321,28 @@ describe("built-in macOS voices", () => {
       ready: onMac,
       enabled: true,
       voice: "Albert",
+      useClonedVoice: false,
       provider: "system", optimizedSummary: false,
       pronunciations: SEEDED,
       audioRetentionDays: 7,
     });
+  });
+
+  it("does not report a cloned voice as the default while the switch is off", async () => {
+    const { describeVoice, voiceConfigured } = await voice();
+    const { addCustomVoice } = await import("./minimax.ts");
+    addCustomVoice("jay-clone-default", "Jay Clone");
+    // Off: the clone is not the workspace default, so the panel does not show
+    // it as one and no bot without a voice of its own speaks with it.
+    expect(describeVoice(cfg({ key: "k", voice: "jay-clone-default" })).voice).toBe("");
+    // On: it is the default, and the switch says so.
+    const on = describeVoice(cfg({ key: "k", voice: "jay-clone-default", useClonedVoice: true }));
+    expect(on.voice).toBe("jay-clone-default");
+    expect(on.useClonedVoice).toBe(true);
+    // Readiness follows the gated default:  a clone the workspace may not
+    // speak with is not a ready voice.
+    expect(voiceConfigured(cfg({ key: "k", voice: "jay-clone-default" }))).toBe(false);
+    expect(voiceConfigured(cfg({ key: "k", voice: "jay-clone-default", useClonedVoice: true }))).toBe(true);
   });
 
   it("parses the say voice table, header junk and all", async () => {
