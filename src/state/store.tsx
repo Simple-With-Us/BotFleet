@@ -3179,6 +3179,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         })
         .finally(() => {
           reading = null;
+          // A follow-up read only makes sense while the effect is alive.
+          // After the teardown the answer would be discarded, so the extra
+          // request would only spend the endpoint's budget.
+          if (!alive) return;
           if (pending) {
             pending = false;
             read();
