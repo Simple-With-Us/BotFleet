@@ -814,14 +814,23 @@ function publicManagedCompanionState() {
       configured: status.configured,
       ready: status.ready,
     };
+    // The free tunnel and the hosted endpoint are different things:  one
+    // changes every time the app restarts, the other does not.  A caller
+    // that labels the value a free, temporary URL must only ever be handed
+    // the free one, so the hosted address has its own field.
     if (status.tryCloudflareUrl) publicState.url = status.tryCloudflareUrl;
-    else if (status.endpoint && status.endpoint !== "TRYCLOUDFLARE") publicState.url = status.endpoint;
+    else if (status.endpoint && status.endpoint !== "TRYCLOUDFLARE") publicState.endpoint = status.endpoint;
     if (status.retryInMs) publicState.retryInMs = status.retryInMs;
     if (status.error) publicState.error = status.error;
     return publicState;
   }
   return access
-    ? { status: "stopped", configured: true, ready: false, url: access.endpoint !== "TRYCLOUDFLARE" ? access.endpoint : undefined }
+    ? {
+        status: "stopped",
+        configured: true,
+        ready: false,
+        endpoint: access.endpoint !== "TRYCLOUDFLARE" ? access.endpoint : undefined,
+      }
     : { status: "unconfigured", configured: false, ready: false };
 }
 
