@@ -9,6 +9,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 let server: ReturnType<typeof import("node:http").createServer>;
 const seen: Array<{ method: string; url: string; headers: Record<string, string>; body: string }> = [];
@@ -167,7 +168,7 @@ describe("listVoices", () => {
     // And it is kept, so the answer survives the process that listed it:  a
     // fresh process must not classify an upstream clone as a plain voice.
     const kept = readFileSync(join(homedir(), ".botfleet", "tts-upstream-clones.json"), "utf8");
-    expect(JSON.parse(kept)).toContain("jay-upstream-clone");
+    expect(z.array(z.string()).parse(JSON.parse(kept))).toContain("jay-upstream-clone");
   });
 
   it("throws when the upstream returns a non-zero base_resp", async () => {

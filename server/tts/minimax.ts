@@ -131,13 +131,16 @@ function rememberUpstreamClones(clones: Voice[]): void {
   const ids = clones.map((clone) => clone.id);
   const known = new Set(readUpstreamClones());
   const missing = ids.filter((id) => !known.has(id));
-  const next = [...known, ...missing];
-  upstreamClonedVoiceIds = new Set(next);
+  // The learned ids are merged with what is already known and with what the
+  // file holds, never replaced by it:  a write that failed leaves the file
+  // behind, and the clone it knew about is still a clone.
+  upstreamClonedVoiceIds = new Set([...upstreamClonedVoiceIds, ...known, ...ids]);
+  upstreamClonesLoaded = true;
   if (!missing.length) return;
   try {
     mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
     const tmp = `${UPSTREAM_CLONES_FILE}.tmp`;
-    writeFileSync(tmp, JSON.stringify(next, null, 2), { mode: 0o600 });
+    writeFileSync(tmp, JSON.stringify([...upstreamClonedVoiceIds], null, 2), { mode: 0o600 });
     renameSync(tmp, UPSTREAM_CLONES_FILE);
   } catch {
     // The in-memory answer still holds for this process.
@@ -295,6 +298,10 @@ export async function cloneVoice(
   const records = readClonedVoices();
   records.push({ voiceId, label: trimmed, createdAt: Date.now() });
   writeClonedVoices(records);
+  // The cached ids follow the store, so the gate that keeps clones out of the
+  // default slot knows about this clone at once.
+  localClonedVoiceIds = new Set(records.map((record) => record.voiceId));
+  localClonedVoiceIdsLoaded = true;
 
   return { id: voiceId, label: trimmed };
 }
@@ -366,6 +373,17 @@ const voiceListItemSchema = z
   })
   .passthrough();
 
+/** The entries of one list that can be read.
+ *
+ *  A malformed entry drops itself and the rest of the list survives:  one
+ *  unreadable voice must not empty the picker. */
+function readableVoices(items: unknown[]): z.infer<typeof voiceListItemSchema>[] {
+  return items.flatMap((item) => {
+    const parsed = voiceListItemSchema.safeParse(item);
+    return parsed.success ? [parsed.data] : [];
+  });
+}
+
 /** The voice listing as MiniMax returns it.
  *
  *  The list is upstream output, so it is parsed before anything reads it:  a
@@ -373,9 +391,9 @@ const voiceListItemSchema = z
  *  or the picker. */
 const voiceListResponseSchema = z
   .object({
-    system_voice: z.array(voiceListItemSchema).optional().catch([]),
-    voice_cloning: z.array(voiceListItemSchema).optional().catch([]),
-    voice_generation: z.array(voiceListItemSchema).optional().catch([]),
+    system_voice: z.array(z.unknown()).optional().catch([]),
+    voice_cloning: z.array(z.unknown()).optional().catch([]),
+    voice_generation: z.array(z.unknown()).optional().catch([]),
     base_resp: z
       .object({
         status_code: z.number().optional(),
@@ -405,9 +423,9 @@ export async function listVoices(key: string): Promise<Voice[]> {
   // Only the cloning list holds clones:  a system voice and a generated
   // voice are not one, and the clone gate has to tell them apart.
   const upstream = [
-    ...(body?.system_voice ?? []).map((v) => ({ voice: v, cloned: false })),
-    ...(body?.voice_cloning ?? []).map((v) => ({ voice: v, cloned: true })),
-    ...(body?.voice_generation ?? []).map((v) => ({ voice: v, cloned: false })),
+    ...readableVoices(body?.system_voice ?? []).map((v) => ({ voice: v, cloned: false })),
+    ...readableVoices(body?.voice_cloning ?? []).map((v) => ({ voice: v, cloned: true })),
+    ...readableVoices(body?.voice_generation ?? []).map((v) => ({ voice: v, cloned: false })),
   ].map(({ voice: v, cloned }): Voice => {
     const listed: Voice = {
       id: String(v.voice_id ?? ""),
