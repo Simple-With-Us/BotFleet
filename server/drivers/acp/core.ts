@@ -178,6 +178,22 @@ const acpSessionResultModels = z.object({
   currentModelId: z.string().optional(),
 }).passthrough();
 const acpSessionResult = z.object({ models: acpSessionResultModels.optional() }).passthrough();
+// The initialize result comes from the agent, so the model state it carries
+// is read through a schema:  an unexpected shape must not reach the turn
+// identity, the notice or the cost estimate.
+//
+// Both schemas are lenient on purpose.  ACP is an open protocol and an agent
+// is free to add its own metadata beside the model state, so a payload that
+// carries fields this driver does not read is still a payload the driver
+// understands;  only the fields it reads are checked.  A strict schema here
+// would reject a vendor's metadata instead of ignoring it, which is the
+// opposite of what a compatibility boundary wants.
+export const acpInitModelState = z.object({ currentModelId: z.string().optional() }).passthrough();
+export const acpInitResult = z
+  .object({ _meta: z.object({ modelState: acpInitModelState.optional() }).passthrough().optional() })
+  .passthrough();
+export type AcpInitModelState = z.infer<typeof acpInitModelState>;
+export type AcpInitResult = z.infer<typeof acpInitResult>;
 
 /** Stdio MCP server as ACP session/new sends it. */
 export type AcpStdioMcpServer = {
@@ -2025,6 +2041,17 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 ? new AcpRpcTimeoutError("initialize", describeInitDeadline(initDeadline))
                 : error;
             }
+            // The model the CLI reports as its own default.  It is the
+            // fallback of last resort:  the session's own model state is the
+            // model actually in use.
+            //
+            // The parse is read through its own result, so a payload that
+            // does not validate names no model at all rather than reaching
+            // the turn identity by way of a failed parse's absent data.
+            const parsedInit = acpInitResult.safeParse(init);
+            const initModelId = parsedInit.success
+              ? parsedInit.data._meta?.modelState?.currentModelId
+              : undefined;
             const initElapsedMs = Date.now() - initStartedAt;
             if (initElapsedMs >= SLOW_INIT_LOG_MS) {
               console.warn(`[acp] ${DRIVER_KIND} ${describeSlowInit(initElapsedMs, initDeadline)}`);
@@ -2191,7 +2218,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 sessionId,
                 model:
                   selectedModel
-                  ?? init?._meta?.modelState?.currentModelId
+                  ?? initModelId
                   // The picked model is not what the turn ran when the
                   // session runs another one, so it is not reported as one.
                   ?? (ranAnotherModel ? null : cliTurn.model)
@@ -2230,7 +2257,17 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 ranAnotherModel =
                   mappedValue === null && support.selectModel?.skippedSwitchRunsAnotherModel === true;
                 if (ranAnotherModel) {
-                  const running = modelForValue?.(selectedValue) ?? null;
+                  // The model the turn actually ran on.  The reported config
+                  // value maps to nothing when the session never advertised a
+                  // model option, so the session's own model is read from the
+                  // initialize result or the session's model state.  A turn
+                  // that ran a known model is priced and recorded as that
+                  // model, not as the one that could not be chosen.
+                  const running =
+                    modelForValue?.(selectedValue)
+                    ?? sessionModelsState?.currentModelId
+                    ?? initModelId
+                    ?? null;
                   selectedModel = running;
                   console.warn(
                     `${DRIVER_KIND} could not switch to ${cliTurn.model}; the turn ran ${running ?? "the session's own model"}`,

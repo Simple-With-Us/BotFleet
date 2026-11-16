@@ -622,8 +622,20 @@ function handle(rawMsg: unknown, resumed = false) {
         process.exit(3);
       }
       const authMethods = mode === "no-auth" ? [] : [{ id: process.env.FAKE_ACP_AUTH_METHOD ?? "cached_token" }];
-      const reply = () =>
-        result(msg.id, { protocolVersion: 1, authMethods, _meta: { modelState: { currentModelId: "fake-acp-model" } } });
+      // The CLI default model, which is not the model a session runs when it
+      // advertises one of its own.  A test can leave it out to tell the two
+      // apart.
+      const initModelState =
+        process.env.FAKE_ACP_OMIT_INIT_MODEL_STATE === "1"
+          ? undefined
+          : { modelState: { currentModelId: "fake-acp-model" } };
+      const reply = () => {
+        if (initModelState) {
+          result(msg.id, { protocolVersion: 1, authMethods, _meta: initModelState });
+          return;
+        }
+        result(msg.id, { protocolVersion: 1, authMethods });
+      };
       const initDelayMs = Number(process.env.FAKE_ACP_INIT_DELAY_MS ?? "0");
       if (initDelayMs > 0) setTimeout(reply, initDelayMs);
       else reply();
