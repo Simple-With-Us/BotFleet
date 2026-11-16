@@ -4,8 +4,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
-import type { EffortLevel, ModelSelection } from "./contracts.ts";
+import type { EffortLevel, ModelSelection, ProviderErrorCode } from "./contracts.ts";
 import {
+  ACCOUNT_CAP_SOURCE,
   ACCOUNT_LEVEL_CAP_MATCHER,
   AUTO_FALLBACK_PRIORITY,
   DEFAULT_QUOTA_COOLDOWN_TTL_MS,
@@ -2664,6 +2665,10 @@ describe("the account-level cap chip", () => {
     for (const text of [
       "insufficient_balance",
       "Insufficient balance.",
+      "insufficient funds",
+      "Insufficient funds.",
+      "credits exhausted",
+      "credits depleted",
       "payment required",
       "Your zero balance is empty.",
       "You are out of credits.",
@@ -2690,17 +2695,20 @@ describe("the account-level cap chip", () => {
     }
   });
 
-  it("fires only on a structured provider refusal and on a driver whose account the bots share", () => {
+  it("fires only on the account's own 402 and on a driver whose account the bots share", () => {
     const chip = {
       text: "insufficient_balance",
       driverKind: "minimax",
-      structuredQuotaOrCap: true as boolean | undefined,
+      providerErrorCode: "account_cap" as ProviderErrorCode | undefined,
     };
     expect(isAccountLevelCapChip(chip)).toBe(true);
 
-    // The provider has to have refused the request, not described one.
-    expect(isAccountLevelCapChip({ ...chip, structuredQuotaOrCap: false })).toBe(false);
-    expect(isAccountLevelCapChip({ ...chip, structuredQuotaOrCap: undefined })).toBe(false);
+    // A 429 is a rate limit and not an account cap, and the two statuses
+    // used to share one code:  cooling the whole instance for a rate limit
+    // would take every healthy bot down with one unlucky request.
+    expect(isAccountLevelCapChip({ ...chip, providerErrorCode: "quota_or_region_restriction" })).toBe(false);
+    expect(isAccountLevelCapChip({ ...chip, providerErrorCode: "upstream_outage" })).toBe(false);
+    expect(isAccountLevelCapChip({ ...chip, providerErrorCode: undefined })).toBe(false);
 
     // The driver has to be one whose account every bot shares.
     expect(isAccountLevelCapChip({ ...chip, driverKind: "claudeAgent" })).toBe(false);
@@ -2722,13 +2730,13 @@ describe("the account-level cap chip", () => {
     };
 
     // The bot that spent first records an account-level cap.
-    registry.recordInstanceCap("minimax", "MiniMax-M2", {
+    registry.recordInstanceCap("minimax", "*", {
       error: "insufficient_balance",
-      source: "account-quota",
+      source: ACCOUNT_CAP_SOURCE,
     });
 
-    // A different bot on the same account and model falls back in the same
-    // describe cycle instead of spending a turn to hear the same refusal.
+    // A different bot on the same account falls back in the same describe
+    // cycle instead of spending a turn to hear the same refusal.
     const resolved = registry.resolveModel("another-bot", primary);
     expect(resolved.isFallback).toBe(true);
     expect(resolved.selection.instanceId).toBe("grok");
@@ -2737,7 +2745,7 @@ describe("the account-level cap chip", () => {
     // The cap belongs to the instance, not to the bot that hit it.
     const instanceCap = registry.forInstance("minimax");
     expect(instanceCap?.botId).toBe("*");
-    expect(instanceCap?.source).toBe("account-quota");
+    expect(instanceCap?.source).toBe(ACCOUNT_CAP_SOURCE);
     expect(instanceCap?.error).toBe("insufficient_balance");
   });
 });

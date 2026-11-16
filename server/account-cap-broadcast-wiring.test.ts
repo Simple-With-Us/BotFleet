@@ -57,19 +57,24 @@ describe("the quota chip path broadcasts an account-level cap to the instance", 
     // result nobody reads is the shape this whole file exists to catch.
     expect(chipBody).toMatch(/const accountCap = isAccountLevelCapChip\(/);
     expect(chipBody).toMatch(/if \(accountCap\) \{/);
-    // The gate needs the provider's own refusal code and the engine's
-    // driver kind, so a prose mention of billing is not enough.
-    expect(chipBody).toMatch(/structuredQuotaOrCap,/);
+    // The gate needs the provider's own 402 code and the engine's driver
+    // kind, so a prose mention of billing and a 429 rate limit are both
+    // refused.
+    expect(chipBody).toMatch(/providerErrorCode,/);
     expect(chipBody).toMatch(/registry\.get\(actualSelection\.instanceId\)\?\.driverKind/);
   });
 
   it("records the cap against the instance and the model, and skips the per-bot cooldown", () => {
     const chipBody = bracedBody(source, CHIP_ANCHOR);
     const capBranch = bracedBody(chipBody, "if (accountCap) {");
+    // The wildcard model, because the condition is the account's and not
+    // one model's.
     expect(capBranch).toMatch(
-      /quotaCooldowns\.recordInstanceCap\(\s*actualSelection\.instanceId,\s*actualSelection\.model,/,
+      /quotaCooldowns\.recordInstanceCap\(\s*actualSelection\.instanceId,\s*"\*",/,
     );
-    expect(capBranch).toMatch(/source: "account-quota"/);
+    expect(capBranch).not.toMatch(/recordInstanceCap\(\s*actualSelection\.instanceId,\s*actualSelection\.model,/);
+    // The source the matching recovery path clears.
+    expect(capBranch).toMatch(/source: ACCOUNT_CAP_SOURCE/);
     // A per-bot cooldown on top of the instance cap would cool one bot and
     // then hide the account-wide reason from the Usage view.
     expect(capBranch).not.toMatch(/quotaCooldowns\.record\(\{/);

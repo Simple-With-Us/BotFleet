@@ -200,6 +200,7 @@ import {
   startGrokQuotaPoller,
 } from "./grok-quota.ts";
 import {
+  ACCOUNT_CAP_SOURCE,
   AUTO_FALLBACK_PRIORITY,
   enableQuotaCooldownPersist,
   inheritedUnattended,
@@ -6195,7 +6196,8 @@ bus.subscribe((event: RuntimeEvent) => {
         // setup affordance handles that one).  A CLI engine has no such
         // code, so `structuredQuotaOrCap` is undefined there and the
         // existing chip-prose regexes decide exactly as they do today.
-        const structuredQuotaOrCap = quotaOrCapFromErrorCode(providerErrorCodeFromStopReason(event.stopReason));
+        const providerErrorCode = providerErrorCodeFromStopReason(event.stopReason);
+        const structuredQuotaOrCap = quotaOrCapFromErrorCode(providerErrorCode);
         const quotaEvidence = turnQuotaOrCapEvidence(afterUser, Boolean(event.ok));
         const capacityEvidence = turnTransientCapacityEvidence(afterUser, Boolean(event.ok));
         // HTTP 429 shares a structured code with quota failures, so explicit
@@ -6261,13 +6263,17 @@ bus.subscribe((event: RuntimeEvent) => {
             driverKind: actualSelection.instanceId
               ? registry.get(actualSelection.instanceId)?.driverKind
               : undefined,
-            structuredQuotaOrCap,
+            providerErrorCode,
           });
           if (accountCap) {
-            quotaCooldowns.recordInstanceCap(actualSelection.instanceId, actualSelection.model, {
+            // The wildcard model, because the condition is the account's
+            // and not one model's:  a bot on the same account with a
+            // different model is out of the same balance, and the registry
+            // falls back to the wildcard row for exactly this.
+            quotaCooldowns.recordInstanceCap(actualSelection.instanceId, "*", {
               resetsAt: quotaInfo.resetsAt,
               error: quotaText || "account cap",
-              source: "account-quota",
+              source: ACCOUNT_CAP_SOURCE,
             });
           } else {
             quotaCooldowns.record({

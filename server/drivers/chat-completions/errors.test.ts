@@ -16,7 +16,9 @@ describe("classifyHttpError — status-to-code mapping table", () => {
   const rows: Array<{ status: number; code?: string; setup?: boolean }> = [
     { status: 401, code: "invalid_credentials", setup: true },
     { status: 403, code: "invalid_credentials", setup: true },
-    { status: 402, code: "quota_or_region_restriction", setup: false },
+    // A 402 is the account's cap, not the account's rate limit, and the
+    // two statuses get different codes so the chip path can tell them apart.
+    { status: 402, code: "account_cap", setup: false },
     { status: 429, code: "quota_or_region_restriction", setup: false },
     { status: 404, code: "model_catalog_outage", setup: false },
     { status: 500, code: "upstream_outage", setup: false },

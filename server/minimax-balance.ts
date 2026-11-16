@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { loadLocalMiniMaxConfig } from "./drivers/minimax.ts";
-import { quotaCooldowns, type QuotaCooldownRegistry } from "./model-fallback.ts";
+import { ACCOUNT_CAP_SOURCE, quotaCooldowns, type QuotaCooldownRegistry } from "./model-fallback.ts";
 
 // Reads the user's MiniMax account balance / Token Plan quota and serves it
 // to the Settings → Usage UI. A peer of deepseek-balance.ts, same cache and
@@ -531,6 +531,13 @@ export function applyMiniMaxBalanceToRegistry(
       && cd.model === model,
     );
   }
+  // A chip-recorded account cap (the source the per-turn chip path writes)
+  // is the same condition seen from a turn, so a recovered balance lifts it
+  // too.  Otherwise every bot on the account stays routed away from a
+  // provider that is healthy again, until the row's own TTL runs out.
+  registry.clearWhere((cd) =>
+    cd.instanceId === MINIMAX_INSTANCE_ID && cd.source === ACCOUNT_CAP_SOURCE,
+  );
   if (!isAccountLevelCap(snapshot)) return { capped: false };
   const resetsAt = pickResetsAt(snapshot);
   registry.recordInstanceCap(MINIMAX_INSTANCE_ID, "*", {
