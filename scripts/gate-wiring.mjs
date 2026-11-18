@@ -19,15 +19,25 @@ const GLOB = /[*?[\]{}]/;
 const OPERATOR = /\|\||[|;\n\r]|(?<![<>])&(?!>)/;
 const STEP_BREAK = new RegExp(`&&|${OPERATOR.source}`);
 
+// A redirection (`2>&1`, `>&2`, `&>log`, `>log`, `2>/dev/null`, `<in`) changes
+// where a command's streams go and never its exit status, so a chained step
+// that carries one is still that step.  A target written after a space
+// (`2> log`) is left in place, and that step then reads as not its own.
+const REDIRECTION = /(?:\d*|&)(?:>>?|<)(?:&\d+-?|[^\s&|;<>]*)/g;
+
 /**
  * What keeps `suites` from running under `pnpm test` through `script`.
  * The script must be exactly `node --test` followed by literal test files:
  * a flag can filter cases out, a shell operator can mask a failure, and a
- * glob can pick up files nobody named.
+ * glob can pick up files nobody named.  A newline ends a command, so a file
+ * on a later line would be run as a command of its own, not as a test file.
  */
 export function gateWiringProblems(scripts, script, suites) {
   if (!Object.hasOwn(scripts, script)) return [`package.json has no ${script} script`];
   const problems = [];
+  if (/[\n\r]/.test(scripts[script])) {
+    problems.push(`${script} carries a newline, which ends the command, so a file after it is not run by \`node --test\``);
+  }
   const [runner, mode, ...files] = scripts[script].trim().split(/\s+/);
   if (runner !== "node" || mode !== "--test") problems.push(`${script} does not start with \`node --test\``);
   for (const file of files) {
@@ -37,7 +47,7 @@ export function gateWiringProblems(scripts, script, suites) {
     if (!files.includes(suite)) problems.push(`${script} does not name ${suite}, so hosted CI never runs it`);
   }
   const testCommand = String(scripts.test ?? "");
-  const chain = testCommand.split("&&").map((step) => step.trim());
+  const chain = testCommand.split("&&").map((step) => step.replace(REDIRECTION, " ").trim().replace(/\s+/g, " "));
   if (!chain.includes(`pnpm ${script}`)) {
     problems.push(`\`pnpm test\` does not chain \`pnpm ${script}\` as its own step, so hosted CI never runs it`);
   }
@@ -75,14 +85,14 @@ function leadingAssignments(tokens) {
   let index = tokens[0] === "env" || tokens[0] === "cross-env" ? 1 : 0;
   const assigned = [];
   while (index < tokens.length && /^[A-Za-z_]\w*=/.test(tokens[index])) assigned.push(tokens[index++]);
-  return assigned;
+  return { assigned, command: tokens[index] };
 }
 
 /**
  * Scripts that would run the opt-in test `file` without its switch.  Such a
  * run reports one skip, which reads as coverage that never ran.  A step
  * reaches the file by naming it anywhere (any prefix, or run directly), or by
- * a `--test` glob that covers it; the switch must be set in that step's own
+ * a glob that covers it in a `--test` or `node` run; the switch must be set in that step's own
  * environment, as a leading `NAME=value` assignment before the runner.  A step
  * ends at `&&`, `||`, `;`, `|`, a newline or a lone `&`, because each stage of
  * a pipeline has its own environment and an assignment binds to the command
@@ -94,9 +104,13 @@ export function optInProblems(scripts, file, optIn) {
   for (const [name, command] of Object.entries(scripts)) {
     for (const step of command.split(STEP_BREAK)) {
       const tokens = step.trim().split(/\s+/);
+      const { assigned, command: runner } = leadingAssignments(tokens);
       const named = tokens.some((token) => token.includes(base));
-      const globbed = tokens.includes("--test") && tokens.some((token) => globCovers(token, file));
-      if ((named || globbed) && !leadingAssignments(tokens).includes(optIn)) {
+      // A glob reaches the file when node runs it: `node --test <glob>`, or
+      // `node <glob>`, where the shell expands the glob and node runs what it
+      // matched.  The same glob given to another tool (oxlint) runs nothing.
+      const globbed = (tokens.includes("--test") || runner === "node") && tokens.some((token) => globCovers(token, file));
+      if ((named || globbed) && !assigned.includes(optIn)) {
         problems.push(`${name} reaches ${file} without ${optIn}, so it would only report a skip`);
       }
     }

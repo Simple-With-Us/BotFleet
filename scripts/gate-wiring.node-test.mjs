@@ -35,6 +35,10 @@ test("a flag, a shell operator or a glob in the script is refused even when both
   // unnamed files, or could no longer fail.
   assert.match(wired(`node --test --test-name-pattern flag ${PROVENANCE} ${RELEASE}`).join("\n"), /carries `--test-name-pattern`/);
   assert.match(wired(`node --test ${PROVENANCE} ${RELEASE} || true`).join("\n"), /carries `\|\|`/);
+  // The script is split on whitespace, which swallows a newline: the second
+  // file would then be a command of its own, not a test file.
+  assert.match(wired(`node --test ${PROVENANCE}\n${RELEASE}`).join("\n"), /test:mac-updater carries a newline/);
+  assert.match(wired(`node --test ${PROVENANCE}\r\n${RELEASE}`).join("\n"), /test:mac-updater carries a newline/);
   assert.match(wired(`node --test ${PROVENANCE} ${RELEASE} scripts/release-provenance*.node-test.mjs`).join("\n"), /carries `scripts\/release-provenance\*\.node-test\.mjs`/);
   assert.match(wired(`vitest run ${PROVENANCE} ${RELEASE}`).join("\n"), /does not start with `node --test`/);
   assert.match(wired(`node ${PROVENANCE} ${RELEASE}`).join("\n"), /does not start with `node --test`/);
@@ -61,6 +65,15 @@ test("pnpm test must chain the script as its own unmasked step", () => {
   assert.deepEqual(wired(plain, "pnpm test:mac-updater && pnpm test:ci-scope >&2"), [], ">&2");
   assert.deepEqual(wired(plain, "pnpm test:mac-updater && pnpm test:ci-scope &>gate.log"), [], "&>log");
   assert.match(masked("pnpm test:mac-updater && pnpm test:ci-scope 2>&1 &"), /carries `&`/, "a redirection does not hide a real `&`");
+  // The checked step may carry the same redirections: they change where its
+  // output goes, never its exit status, so the chain and masking checks agree.
+  for (const suffix of ["2>&1", ">&2", "&>gate.log", ">gate.log", ">>gate.log", "2>/dev/null"]) {
+    assert.deepEqual(wired(plain, `pnpm test:mac-updater ${suffix} && pnpm test:ci-scope`), [], `step with ${suffix}`);
+    assert.deepEqual(wired(plain, `node scripts/test-floor.mjs && pnpm test:mac-updater ${suffix}`), [], `last step with ${suffix}`);
+  }
+  assert.match(masked("pnpm test:mac-updater-old 2>&1 && pnpm test:ci-scope"), /does not chain `pnpm test:mac-updater`/, "a suffixed name is still another script");
+  assert.match(masked("pnpm test:mac-updater 2> gate.log && pnpm test:ci-scope"), /does not chain `pnpm test:mac-updater`/, "a target after a space is not followed");
+  assert.match(masked("pnpm test:mac-updater 2>&1 || true && pnpm test:ci-scope"), /carries `\|\|`/, "a redirection does not unmask");
   assert.deepEqual(gateWiringProblems({ "test:mac-updater": plain }, "test:mac-updater", [PROVENANCE]), [
     "`pnpm test` does not chain `pnpm test:mac-updater` as its own step, so hosted CI never runs it",
   ]);
@@ -78,6 +91,14 @@ test("an opt-in file is refused in any step that reaches it without the switch",
   assert.deepEqual(reaches("node --test scripts/release-provenance*.node-test.mjs"), refusal, "a glob that covers it");
   assert.deepEqual(reaches('node --test "scripts/*.node-test.mjs"'), refusal, "a quoted glob that covers it");
   assert.deepEqual(reaches("node --test **/*.mjs"), refusal);
+  // `node <glob>` needs no `--test`: the shell expands the glob and node runs
+  // what it matched.  The same glob given to another tool runs nothing.
+  assert.deepEqual(reaches("node scripts/*.node-test.mjs"), refusal, "a glob given to node directly");
+  assert.deepEqual(reaches(`${OPT_IN} node scripts/*.node-test.mjs`), []);
+  assert.deepEqual(reaches("oxlint scripts/*.node-test.mjs"), [], "a glob given to another tool");
+  // A directory is not a glob: `node --test <dir>` stops with an error and
+  // runs nothing, so it cannot report a skip as coverage.
+  assert.deepEqual(reaches("node --test scripts/"), []);
   // The switch belongs to the step that runs the file, not to a neighbour.
   assert.deepEqual(reaches(`${OPT_IN} node --version && node --test ${INSTALL}`), refusal);
   assert.deepEqual(reaches(`${OPT_IN}0 node --test ${INSTALL}`), refusal, "the switch is a whole token");
