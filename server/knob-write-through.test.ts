@@ -264,6 +264,37 @@ describe("writeThroughKnobs null-clear (slice 7b)", () => {
     expect(writeSecret).not.toHaveBeenCalled();
   });
 
+  it("passes file-backed minFreeDiskMb and minFreeInodes clears through and refuses them when vault-managed", async () => {
+    const writeSecret = vi.fn();
+    const patch: Partial<AppConfig> = { jobs: { admission: { minFreeDiskMb: null, minFreeInodes: null } } };
+    const cleared = await writeThroughKnobs(patch, baseDeps({ writeSecret }));
+    expect(cleared).toEqual({
+      ok: true,
+      written: [],
+      cleared: ["jobs.admission.minFreeDiskMb", "jobs.admission.minFreeInodes"],
+    });
+    expect(writeSecret).not.toHaveBeenCalled();
+    expect(patch.jobs?.admission).toEqual({ minFreeDiskMb: null, minFreeInodes: null });
+
+    const refusedDisk = await writeThroughKnobs(
+      { jobs: { admission: { minFreeDiskMb: null } } },
+      baseDeps({ knownNames: new Set(["BOTFLEET_JOBS_MIN_FREE_DISK_MB"]), writeSecret }),
+    );
+    expect(refusedDisk.ok).toBe(false);
+    if (refusedDisk.ok) throw new Error("unreachable");
+    expect(refusedDisk.status).toBe(409);
+    expect(refusedDisk.infisicalName).toBe("BOTFLEET_JOBS_MIN_FREE_DISK_MB");
+
+    const refusedInodes = await writeThroughKnobs(
+      { jobs: { admission: { minFreeInodes: null } } },
+      baseDeps({ knownNames: new Set(["BOTFLEET_JOBS_MIN_FREE_INODES"]), writeSecret }),
+    );
+    expect(refusedInodes.ok).toBe(false);
+    if (refusedInodes.ok) throw new Error("unreachable");
+    expect(refusedInodes.status).toBe(409);
+    expect(refusedInodes.infisicalName).toBe("BOTFLEET_JOBS_MIN_FREE_INODES");
+  });
+
   it("carries a value write and a clear in one patch", async () => {
     const calls = new Map<string, string>();
     const patch: Partial<AppConfig> = {

@@ -506,9 +506,25 @@ final class MacResourcesSettingsTests: XCTestCase {
     func testHeadroomEditParsesLikeTypeScript() {
         // Numbers for the non-empty boxes.
         let outcome = HostResourcesPresentation.parseHeadroomEdit(
-            HeadroomEditValues(reservedCpuCores: "2", reservedRamMb: "", minMemoryAvailablePercent: "10.5")
+            HeadroomEditValues(
+                reservedCpuCores: "2",
+                reservedRamMb: "",
+                minMemoryAvailablePercent: "10.5",
+                minFreeDiskMb: "4096",
+                minFreeInodes: "10000"
+            )
         )
-        XCTAssertEqual(outcome, .valid(HeadroomParsedEdit(reservedCpuCores: 2, minMemoryAvailablePercent: 10.5)))
+        XCTAssertEqual(
+            outcome,
+            .valid(
+                HeadroomParsedEdit(
+                    reservedCpuCores: 2,
+                    minMemoryAvailablePercent: 10.5,
+                    minFreeDiskMb: 4096,
+                    minFreeInodes: 10000
+                )
+            )
+        )
 
         // Refusals mirror the TS messages exactly.
         let bad: [(HeadroomEditValues, String)] = [
@@ -520,6 +536,11 @@ final class MacResourcesSettingsTests: XCTestCase {
             (HeadroomEditValues(reservedCpuCores: "0x10"), "Enter a number."),
             (HeadroomEditValues(reservedCpuCores: "1e3"), "Enter a number."),
             (HeadroomEditValues(reservedRamMb: "1000001"), "Enter 0–1000000."),
+            (HeadroomEditValues(minFreeDiskMb: "512"), "Below the built-in safety gate (2 GB)."),
+            (HeadroomEditValues(minFreeDiskMb: "2047"), "Below the built-in safety gate (2 GB)."),
+            (HeadroomEditValues(minFreeDiskMb: "2048.5"), "Enter a whole number."),
+            (HeadroomEditValues(minFreeInodes: "1.5"), "Enter a whole number."),
+            (HeadroomEditValues(minFreeInodes: "-1"), "Enter 0–9007199254740991."),
         ]
         for (values, message) in bad {
             let result = HostResourcesPresentation.parseHeadroomEdit(values)
@@ -536,8 +557,8 @@ final class MacResourcesSettingsTests: XCTestCase {
             .invalid([HeadroomFieldError(field: .reservedCpuCores, message: "Enter at least one number to save.")])
         )
 
-        // An all-empty edit over set knobs is a clear, not a no-op — the last
-        // set knob stays unsettable from the UI.
+        // An all-empty edit over set knobs (or custom disk floor) is a clear,
+        // not a no-op — the last set knob stays unsettable from the UI.
         let empty = HeadroomEditValues()
         XCTAssertEqual(
             HostResourcesPresentation.parseHeadroomEdit(empty, current: HeadroomCurrentKnobs(reservedCpuCores: 1)),
@@ -548,12 +569,20 @@ final class MacResourcesSettingsTests: XCTestCase {
             .valid(HeadroomParsedEdit())
         )
         XCTAssertEqual(
-            HostResourcesPresentation.headroomConfigPatch(
-                for: makeReport(admission: HostAdmissionThresholds(maxSwapPercent: 90, minFreeDiskBytes: 4 * gb, reservedCpuCores: 1)),
-                parsed: HeadroomParsedEdit()
-            )["reservedCpuCores"] is NSNull,
-            true
+            HostResourcesPresentation.parseHeadroomEdit(empty, current: HeadroomCurrentKnobs(minFreeDiskMb: 4096)),
+            .valid(HeadroomParsedEdit())
         )
+        XCTAssertEqual(
+            HostResourcesPresentation.parseHeadroomEdit(empty, current: HeadroomCurrentKnobs(minFreeInodes: 1000)),
+            .valid(HeadroomParsedEdit())
+        )
+        let clearedCustom = HostResourcesPresentation.headroomConfigPatch(
+            for: makeReport(admission: HostAdmissionThresholds(maxSwapPercent: 90, minFreeDiskBytes: 4 * gb, minFreeInodes: 1000, reservedCpuCores: 1)),
+            parsed: HeadroomParsedEdit()
+        )
+        XCTAssertTrue(clearedCustom["reservedCpuCores"] is NSNull)
+        XCTAssertTrue(clearedCustom["minFreeDiskMb"] is NSNull)
+        XCTAssertTrue(clearedCustom["minFreeInodes"] is NSNull)
     }
 
     func testHeadroomConfigPatchCarriesFullAdmissionWithNullClears() {
@@ -567,7 +596,7 @@ final class MacResourcesSettingsTests: XCTestCase {
         )
         let admission = HostResourcesPresentation.headroomConfigPatch(
             for: current,
-            parsed: HeadroomParsedEdit(reservedCpuCores: 2, reservedRamMb: 512)
+            parsed: HeadroomParsedEdit(reservedCpuCores: 2, reservedRamMb: 512, minFreeInodes: 1000)
         )
         XCTAssertEqual(admission["maxSwapPercent"] as? Double, 98)
         XCTAssertEqual(admission["minFreeDiskMb"] as? Double, 2048)
@@ -582,6 +611,7 @@ final class MacResourcesSettingsTests: XCTestCase {
             admission: HostAdmissionThresholds(
                 maxSwapPercent: 90,
                 minFreeDiskBytes: 4 * gb,
+                minFreeInodes: 1000,
                 reservedRamBytes: 256 * gb,
                 minMemoryAvailablePercent: 20
             )
@@ -591,16 +621,20 @@ final class MacResourcesSettingsTests: XCTestCase {
             parsed: HeadroomParsedEdit(reservedCpuCores: 3)
         )
         XCTAssertEqual(admission["reservedCpuCores"] as? Double, 3)
-        // Emptied over a set knob: explicit null unsets it on save.
+        // Emptied over a set knob or custom disk floor: explicit null unsets it on save.
+        XCTAssertTrue(admission["minFreeDiskMb"] is NSNull)
+        XCTAssertTrue(admission["minFreeInodes"] is NSNull)
         XCTAssertTrue(admission["reservedRamMb"] is NSNull)
         XCTAssertTrue(admission["minMemoryAvailablePercent"] is NSNull)
 
         let unset = makeReport()
         let unsetAdmission = HostResourcesPresentation.headroomConfigPatch(
             for: unset,
-            parsed: HeadroomParsedEdit(reservedCpuCores: 3)
+            parsed: HeadroomParsedEdit(reservedCpuCores: 3, minFreeDiskMb: 4096, minFreeInodes: 2500)
         )
         XCTAssertEqual(unsetAdmission["reservedCpuCores"] as? Double, 3)
+        XCTAssertEqual(unsetAdmission["minFreeDiskMb"] as? Double, 4096)
+        XCTAssertEqual(unsetAdmission["minFreeInodes"] as? Double, 2500)
         XCTAssertNil(unsetAdmission["reservedRamMb"])
         XCTAssertNil(unsetAdmission["minMemoryAvailablePercent"])
     }
@@ -611,10 +645,19 @@ final class MacResourcesSettingsTests: XCTestCase {
         )
         XCTAssertEqual(HostResourcesPresentation.headroomEditInitial(report).reservedCpuCores, "2")
         XCTAssertEqual(HostResourcesPresentation.headroomEditInitial(report).reservedRamMb, "")
-        let withRam = makeReport(
-            admission: HostAdmissionThresholds(maxSwapPercent: 98, minFreeDiskBytes: 2 * gb, reservedRamBytes: 512 * 1024 * 1024)
+        XCTAssertEqual(HostResourcesPresentation.headroomEditInitial(report).minFreeDiskMb, "2048")
+        XCTAssertEqual(HostResourcesPresentation.headroomEditInitial(report).minFreeInodes, "")
+        let withCustom = makeReport(
+            admission: HostAdmissionThresholds(
+                maxSwapPercent: 98,
+                minFreeDiskBytes: 4 * gb,
+                minFreeInodes: 5000,
+                reservedRamBytes: 512 * 1024 * 1024
+            )
         )
-        XCTAssertEqual(HostResourcesPresentation.headroomEditInitial(withRam).reservedRamMb, "512")
+        XCTAssertEqual(HostResourcesPresentation.headroomEditInitial(withCustom).reservedRamMb, "512")
+        XCTAssertEqual(HostResourcesPresentation.headroomEditInitial(withCustom).minFreeDiskMb, "4096")
+        XCTAssertEqual(HostResourcesPresentation.headroomEditInitial(withCustom).minFreeInodes, "5000")
     }
 
     private final class CapturedSave: @unchecked Sendable {

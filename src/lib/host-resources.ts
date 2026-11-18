@@ -513,6 +513,8 @@ export interface HeadroomEditValues {
   reservedCpuCores: string;
   reservedRamMb: string;
   minMemoryAvailablePercent: string;
+  minFreeDiskMb?: string;
+  minFreeInodes?: string;
 }
 
 export interface HeadroomFieldError {
@@ -520,14 +522,20 @@ export interface HeadroomFieldError {
   message: string;
 }
 
+/** Built-in disk floor in MB (2 GB) when jobs.admission.minFreeDiskMb is unset. */
+export const BUILTIN_MIN_FREE_DISK_MB = 2048;
+
 /** Bounds mirroring server/knob-map.ts (clamped there, refused here with a
  *  message so the owner sees why).  reservedRamMb is capped at 1,000,000 MB
  *  (≈1 TB): larger survives neither the MB-to-bytes conversion nor any host,
- *  and the knob table carries no max to clamp it. */
+ *  and the knob table carries no max to clamp it.  minFreeDiskMb also enforces
+ *  the 2 GB built-in safety gate (2048 MB) so UI edits cannot weaken it. */
 export const HEADROOM_BOUNDS = {
   reservedCpuCores: { min: 0, max: 64, int: true },
   reservedRamMb: { min: 0, max: 1_000_000, int: true },
   minMemoryAvailablePercent: { min: 0, max: 100, int: false },
+  minFreeDiskMb: { min: BUILTIN_MIN_FREE_DISK_MB, max: 100_000_000, int: true },
+  minFreeInodes: { min: 0, max: Number.MAX_SAFE_INTEGER, int: true },
 } as const;
 
 /** Parsed headroom numbers for the non-empty boxes, with explicit nulls for
@@ -539,10 +547,12 @@ export interface HeadroomParsed {
   reservedCpuCores?: number | null;
   reservedRamMb?: number | null;
   minMemoryAvailablePercent?: number | null;
+  minFreeDiskMb?: number | null;
+  minFreeInodes?: number | null;
 }
 
-/** The knobs a report currently has set, in parse units (RAM in MB), so
- *  validation can tell "clearing a set knob" (valid) from "editing nothing"
+/** The knobs a report currently has set, in parse units (RAM and disk in MB),
+ *  so validation can tell "clearing a set knob" (valid) from "editing nothing"
  *  (a no-op refusal).  An all-empty edit is only valid when it clears at
  *  least one set knob — otherwise an emptied box over an unset knob would
  *  save nothing and look like it did. */
@@ -550,10 +560,13 @@ export interface HeadroomCurrentKnobs {
   reservedCpuCores?: number;
   reservedRamMb?: number;
   minMemoryAvailablePercent?: number;
+  minFreeDiskMb?: number;
+  minFreeInodes?: number;
 }
 
 /** The set knobs of a report, in parse units. */
 export function currentHeadroomKnobs(admission: HostResourcesReport["admission"]): HeadroomCurrentKnobs {
+  const diskMb = Math.round(admission.minFreeDiskBytes / 1024 / 1024);
   return {
     reservedCpuCores: admission.reservedCpuCores,
     reservedRamMb:
@@ -561,6 +574,8 @@ export function currentHeadroomKnobs(admission: HostResourcesReport["admission"]
         ? undefined
         : Math.round(admission.reservedRamBytes / 1024 / 1024),
     minMemoryAvailablePercent: admission.minMemoryAvailablePercent,
+    minFreeDiskMb: diskMb !== BUILTIN_MIN_FREE_DISK_MB ? diskMb : undefined,
+    minFreeInodes: admission.minFreeInodes,
   };
 }
 
@@ -578,15 +593,19 @@ function parseHeadroomNumber(field: keyof HeadroomEditValues, raw: string): Head
   if (!Number.isFinite(num)) return { error: "Enter a number." };
   const bounds = HEADROOM_BOUNDS[field];
   if (bounds.int && !Number.isInteger(num)) return { error: "Enter a whole number." };
+  if (field === "minFreeDiskMb" && num >= 0 && num < bounds.min) {
+    return { error: "Below the built-in safety gate (2 GB)." };
+  }
   if (num < bounds.min || num > bounds.max) {
     return { error: `Enter ${bounds.min}–${bounds.max}.` };
   }
   return { value: num };
 }
 
-/** Validate the three headroom boxes.  Returns the parsed numbers for the
+/** Validate the editable headroom boxes.  Returns the parsed numbers for the
  *  non-empty boxes, or the per-field errors.  At least one number is
- *  required: an all-empty save is a no-op and is refused with a message. */
+ *  required unless the empty boxes clear a set knob: an all-empty save over
+ *  already-unset knobs is a no-op and is refused with a message. */
 export function parseHeadroomEdit(values: HeadroomEditValues, current?: HeadroomCurrentKnobs):
   | { ok: true; parsed: HeadroomParsed }
   | { ok: false; errors: HeadroomFieldError[] } {
@@ -601,12 +620,20 @@ export function parseHeadroomEdit(values: HeadroomEditValues, current?: Headroom
   const mem = parseHeadroomNumber("minMemoryAvailablePercent", values.minMemoryAvailablePercent);
   if (mem.error) errors.push({ field: "minMemoryAvailablePercent", message: mem.error });
   else if (mem.value !== undefined) parsed.minMemoryAvailablePercent = mem.value;
+  const disk = parseHeadroomNumber("minFreeDiskMb", values.minFreeDiskMb ?? "");
+  if (disk.error) errors.push({ field: "minFreeDiskMb", message: disk.error });
+  else if (disk.value !== undefined) parsed.minFreeDiskMb = disk.value;
+  const inodes = parseHeadroomNumber("minFreeInodes", values.minFreeInodes ?? "");
+  if (inodes.error) errors.push({ field: "minFreeInodes", message: inodes.error });
+  else if (inodes.value !== undefined) parsed.minFreeInodes = inodes.value;
   if (errors.length > 0) return { ok: false, errors };
   if (Object.keys(parsed).length === 0) {
     const clearsASetKnob =
       current?.reservedCpuCores !== undefined ||
       current?.reservedRamMb !== undefined ||
-      current?.minMemoryAvailablePercent !== undefined;
+      current?.minMemoryAvailablePercent !== undefined ||
+      current?.minFreeDiskMb !== undefined ||
+      current?.minFreeInodes !== undefined;
     // An all-empty edit over set knobs is a clear, not a no-op (slice 7b
     // follow-up: the last set knob must stay unsettable from the UI).
     if (clearsASetKnob) return { ok: true, parsed };
@@ -617,16 +644,15 @@ export function parseHeadroomEdit(values: HeadroomEditValues, current?: Headroom
 
 /** Full admission carried by the PUT /api/config patch.  server/config.ts
  *  merges jobs one level deep (Object.assign), so a patch carrying only the
- *  edited headroom keys would erase maxSwapPercent, minFreeDiskMb and
- *  minFreeInodes.  The client therefore sends the complete admission object:
- *  edited headroom values over the current report, with the disk floor
- *  converted back to MB.  An emptied box over a set knob sends `null`, which
+ *  edited headroom keys would erase maxSwapPercent and untouched admission
+ *  gates.  The client therefore sends the complete admission object.  An
+ *  emptied box over a set knob (or non-default disk floor) sends `null`, which
  *  the server's merge turns into the deletion that unsets it; an emptied
  *  box over an already-unset knob stays omitted, which still reads unset. */
 export interface HeadroomFullAdmission {
   maxSwapPercent: number;
-  minFreeDiskMb: number;
-  minFreeInodes?: number;
+  minFreeDiskMb: number | null;
+  minFreeInodes?: number | null;
   reservedCpuCores?: number | null;
   reservedRamMb?: number | null;
   minMemoryAvailablePercent?: number | null;
@@ -639,24 +665,23 @@ export interface HeadroomPatch {
 
 /** Build the PUT /api/config patch for the parsed headroom knobs over the
  *  current report.  Edited (non-empty) headroom values win; an emptied box
- *  over a set knob sends `null` so the save unsets it; everything else is
- *  carried forward from the report so the server's shallow jobs merge
- *  never erases an unrelated admission gate. */
+ *  over a set knob (or custom disk floor) sends `null` so the save resets it;
+ *  everything else is carried forward from the report so the server's shallow
+ *  jobs merge never erases an unrelated admission gate. */
 export function buildHeadroomPatch(current: HostResourcesReport, parsed: HeadroomParsed): HeadroomPatch {
   const currentRamMb =
     current.admission.reservedRamBytes === undefined
       ? undefined
       : Math.round(current.admission.reservedRamBytes / 1024 / 1024);
+  const currentDiskMb = Math.round(current.admission.minFreeDiskBytes / 1024 / 1024);
   const admission: HeadroomFullAdmission = {
     maxSwapPercent: current.admission.maxSwapPercent,
-    minFreeDiskMb: current.admission.minFreeDiskBytes / 1024 / 1024,
+    minFreeDiskMb: parsed.minFreeDiskMb ?? (currentDiskMb !== BUILTIN_MIN_FREE_DISK_MB ? null : currentDiskMb),
+    minFreeInodes: parsed.minFreeInodes ?? clearOrCarry(current.admission.minFreeInodes),
     reservedCpuCores: parsed.reservedCpuCores ?? clearOrCarry(current.admission.reservedCpuCores),
     reservedRamMb: parsed.reservedRamMb ?? clearOrCarry(currentRamMb),
     minMemoryAvailablePercent: parsed.minMemoryAvailablePercent ?? clearOrCarry(current.admission.minMemoryAvailablePercent),
   };
-  if (current.admission.minFreeInodes !== undefined) {
-    admission.minFreeInodes = current.admission.minFreeInodes;
-  }
   return { jobs: { admission } };
 }
 
@@ -689,5 +714,7 @@ export function headroomEditInitial(report: HostResourcesReport): HeadroomEditVa
         : String(Math.round(report.admission.reservedRamBytes / 1024 / 1024)),
     minMemoryAvailablePercent:
       report.admission.minMemoryAvailablePercent === undefined ? "" : String(report.admission.minMemoryAvailablePercent),
+    minFreeDiskMb: String(Math.round(report.admission.minFreeDiskBytes / 1024 / 1024)),
+    minFreeInodes: report.admission.minFreeInodes === undefined ? "" : String(report.admission.minFreeInodes),
   };
 }
