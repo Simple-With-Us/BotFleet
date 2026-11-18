@@ -591,14 +591,19 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
-        add("Start Server", selector: #selector(startServer), enabled: ready && startup.supportsPolicy && apiUnavailable && installedServerState == .stopped)
+        add("Start Server", selector: #selector(startServer), enabled: ready && ManagedServices.canStartServer(startupPolicySupported: startup.supportsPolicy,
+                                                                                    apiUnavailable: apiUnavailable,
+                                                                                    installedServerState: installedServerState))
         // A server older than Control cannot be asked to stop, but it can
         // still be stopped: the marker-and-bootout path is offered for it.
         add("Stop Server And Local VMs…", selector: #selector(stopServer),
             enabled: ready && ManagedServices.canStopServer(statusAvailable: status != nil, serverOutdated: serverOutdated))
         add("Start Shared VM", selector: #selector(startVM), enabled: ready && status?.canStartSharedVM == true)
-        let canCreateOffline = apiUnavailable && installedServerState == .stopped
-            && offlineVMHelper.available && helperVMs?.first(where: { $0.key == "shared" })?.state == "missing"
+        let canCreateOffline = ManagedServices.canCreateOfflineVM(
+            apiUnavailable: apiUnavailable,
+            installedServerState: installedServerState,
+            helperAvailable: offlineVMHelper.available,
+            sharedVMState: helperVMs?.first(where: { $0.key == "shared" })?.state)
         add("Create Local VM (Stopped)…", selector: #selector(createStoppedVM), enabled: ready && canCreateOffline)
         let offlineRunning = helperVMs?.contains(where: \.running) == true
         add("Stop Shared VM…", selector: #selector(stopVMs), enabled: ready && (((status?.runningVMCount ?? 0) > 0) ||
@@ -1213,7 +1218,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let urlStr = urlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let token = tokenField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token: String = tokenField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard !name.isEmpty, let url = URL(string: urlStr), url.scheme == "http" || url.scheme == "https" else {
             showError("Invalid server URL. Please provide a valid HTTP or HTTPS URL.")
