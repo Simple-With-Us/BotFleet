@@ -105,7 +105,8 @@ final class PlacementModeAvailabilityTests: XCTestCase {
         )
         XCTAssertFalse(macFirstToLocalBlocked.options[0].isSelectable)
         XCTAssertEqual(macFirstToLocalBlocked.options[0].disabledReason, "Finish or stop 1 job running on the server first")
-        XCTAssertTrue(macFirstToLocalBlocked.options[1].isSelectable)
+        XCTAssertFalse(macFirstToLocalBlocked.options[1].isSelectable)
+        XCTAssertEqual(macFirstToLocalBlocked.options[1].disabledReason, "Finish or stop 1 job running on the server first")
         XCTAssertTrue(macFirstToLocalBlocked.options[2].isSelectable)
 
         let unreachableDisallowsCleanSwitches = PlacementModeAvailability.evaluate(
