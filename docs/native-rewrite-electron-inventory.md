@@ -11,11 +11,23 @@ Surveyed at commit `ab016dcd8` (2026-11-02) against the `electron/` tree:
 72 non-test files (70 `.mjs`/`.cjs`/`.d.mts` plus 2 `*-Info.plist` build
 inputs), 34 test files excluded, `electron/vendor/**` excluded.
 
+Re-counted 2026-11-17 at commit `e23494c0`: 73 non-test files (72
+`.mjs`/`.cjs`/`.d.mts` plus the app icon image named in §6) and 60 test files
+(34 ending in .test.mjs, 26 ending in .node-test.mjs), `electron/vendor/**`
+still excluded.  Both survey counts were short at the survey commit.  Its "34
+test files" counted only the first of those two suffixes (59 test files
+then), and its 72 left out three more files in the Electron resources folder:
+the app icon image and the two helper Swift sources (75 non-test files
+then).  The two helper `*-Info.plist` files and their Swift sources moved out
+of the Electron resources folder to `native/helpers/` in #1531.  The two code
+files added since the survey are `desktop-startup-receipt.mjs` (#1567, §4)
+and `startup-enrollment.mjs` (#1588, §1).
+
 Owner keys: **BF-xxxx** = an existing issue in the *BotFleet Native macOS
 Rewrite* project. **mac-control** = the existing Swift `BotFleet Control.app`,
-which already implements part of this. **new issue** = nothing covers it
-today; the list in §9 is the file-them list. **retire** = the responsibility
-disappears with the Node stack.
+which already implements part of this.  **retire** = the responsibility
+disappears with the Node stack.  The survey's **new issue** key is gone: the
+three rows that carried it now name the issues §9 lists for them.
 
 ## 0. Shape of the problem
 
@@ -45,6 +57,7 @@ Three facts shape most rows:
 | Attach-or-spawn: `/api/health` probe, PID identity match, foreign-owner detection, build-identity compatibility | `main.mjs:1223-1289`, `server-boot-probe.mjs`, `runtime-identity.mjs` | **BF-2497** |
 | Boot budget (60 s), error page for port conflict / foreign owner / slow start, `botfleet://retry-server` | `main.mjs:1103-1289`, `:1850-1863` | **BF-2497** |
 | Resolve which server this launch talks to: Infisical vault read via the Keychain bootstrap (`local` vs `remote` + origin/token); the legacy file only earns a delete-me warning | `server-target.mjs`, `main.mjs:1291-1362` | **BF-2497** (consumes the target) + **BF-2506** (vault/Keychain) |
+| Startup choice (BF-2636): the nonsecret `local` or `remote` preference resolved before the vault read; an unreadable choice stops startup instead of reaching the vault | `startup-enrollment.mjs`, `main.mjs:1328-1351` | **BF-2506** — app settings, the same slice as the server target above (the owner the port inventory records for this file) |
 | Headless-harness UI shim: serve bundled UI, stream `/api` (incl. SSE) to an attached harness | `attached-ui-shim.mjs`, `main.mjs:1260-1277` | **retire** (BF-2485) — nothing native reproduces a static-file + SSE proxy |
 | Data-root ownership record (`harness-owner.json`, HMAC nonce proof) | `harness-ownership.mjs` | **BF-2514** — becomes the native single-writer lock at cutover |
 | Quit semantics: kill the child we spawned, or `POST /api/system/control/stop` on an attached one unless persist-on-exit says keep | `main.mjs:3232-3239`, `:3281-3330`, `server-controls.mjs:9-28` | **BF-2497** (quit policy); BF-2489 already did the server half |
@@ -105,6 +118,7 @@ serves the contract, or a slim Node companion host survives).
 | 6-hour auto-check throttle, 3-strike backoff to 24 h, bundle-fingerprint bypass | `updater-throttle.mjs:1-40` | **BF-2486** — reimplement deliberately, not inherited |
 | Persist `lastCheckMs` into the harness `config.json` under the config lock | `updater-throttle.mjs`, `updater.mjs:106-124` | **BF-2486** + **BF-2506** (it is a tunable knob, so it belongs in the knob table) |
 | Local update: spawn `~/apps/update-botfleet.sh` detached with the owner nonce | `updater.mjs:151-250` | **retire** (BF-2515) or **BF-2486** |
+| Update startup receipt (BF-2606): answer the local updater's private per-update request (`--update-startup-receipt=`) with the running build identity, PID, mode and UI port; quit when the confirmation cannot be written | `desktop-startup-receipt.mjs`, `main.mjs:142-149`, `:3203-3215` | **retire** (BF-2515) or **BF-2486** — the same owner as the local-update row above, because the only reader is the Node updater script `scripts/update-botfleet-mac.mjs` |
 | Broadcast updater state to the renderer | `updater.mjs:90-97`, `:126-151` | **BF-2486** |
 | Updater log at `~/Library/Logs/BotFleet/updater.log` | `updater.mjs:73-88` | **BF-2486** (`os_log`) |
 
@@ -120,7 +134,7 @@ serves the contract, or a slim Node companion host survives).
 | Stop the daemon, invalidate the descriptor, bounded 2.5 s cleanup before quit | `cua.mjs:303-324`, `main.mjs:3175` | **BF-2499** — "CUA safety stop" is the issue title |
 | Linux runtime, AppImage bundle staging, hash verification (~1,905 lines) | `cua-linux.cjs`, `cua-linux-runtime.cjs`, `cua-linux-bundle.cjs` | **retire** (BF-2500) |
 | Screen preview (display-media guard, source selection) | `screen-preview.cjs`, `main.mjs:2056-2070`, `:3018-3068` | **BF-2481** (ScreenCaptureKit) |
-| Embedded noVNC viewer window and split workspace panes | `desktop-viewer.cjs`, `desktop-workspace.cjs`, `main.mjs:1662-1762` | **new issue** — a sandboxed remote browser with its own partition; a native `WKWebView` with the same isolation, or a native VNC client |
+| Embedded noVNC viewer window and split workspace panes | `desktop-viewer.cjs`, `desktop-workspace.cjs`, `main.mjs:1662-1762` | **BF-2539** — a sandboxed remote browser with its own partition; a native `WKWebView` with the same isolation, or a native VNC client |
 | Android device control over USB `adb` | `android-device.mjs` | **retire** — no Mac story in Option A |
 
 ## 6. Shell, menu, and window surfaces
@@ -137,16 +151,17 @@ serves the contract, or a slim Node companion host survives).
 | Renderer trust boundary (origin check + IPC guard over every handler) | `renderer-trust.mjs`, `main.mjs:1623`, `:1871-1878` | **retire** (BF-2485) |
 | Save / open / reveal file, pick folder, open external URL | `save-file.mjs`, `open-file.mjs`, `external-url.mjs`, `main.mjs:2101-2219` | **BF-2501** (`NSOpenPanel` / `NSSavePanel`) |
 | Speech and Personal Voice lifecycle | `speech.mjs`, `main.mjs:2289-2327` | **BF-2483** |
-| Skill recorder (screen + audio capture → skill definition) | `skill-recorder.mjs`, `build-recorder-helper.mjs` | **new issue** — not named in any rewrite issue |
+| Skill recorder (screen + audio capture → skill definition) | `skill-recorder.mjs`, `build-recorder-helper.mjs` | **BF-2540** — capture to skill definition, plus the recorder helper's signing story (§9 item 3) |
 | AssemblyAI streaming token and the permanent key in the encrypted store | `assemblyai.mjs`, `main.mjs:2413-2433` | **BF-2483** (voice) + **BF-2506** (key storage) |
 | Microphone / Screen Recording permission panes, System Settings deep links | `main.mjs:2258-2287` | **BF-2499** |
 | Engine terminal launch (`engine:open-terminal`) | `terminal-launch.mjs`, `main.mjs:2089-2093` | **BF-2504** |
-| Desktop Sentry init, release SHA resolution, request scrubbing | `main.mjs:149-230` | **new issue** — Sentry Cocoa for the native app |
+| Desktop Sentry init, release SHA resolution, request scrubbing | `main.mjs:149-230` | **BF-2541** — Sentry Cocoa for the native app |
 | Desktop capability and version surface | `capabilities.cjs`, `app-info.cjs`, `main.mjs:2392-2411` | **BF-2501** — small, but it should be named so the parity harness can assert it |
 | Native version probe of a checksum-verified binary | `native-version-probe.mjs` | **BF-2486** (updater) and **BF-2510** (tunnel) |
 | Build scripts: speech helper, recorder helper, Control app | `build-speech-helper.mjs`, `build-recorder-helper.mjs`, `build-control-app.mjs` | **BF-2483** (speech), **BF-2499** (recorder signing), **mac-control** (Control app) |
 | Control bundle version and build number (pinned app/marketing versions on the ordering line, stamp-script fallback, `BOTFLEET_SKIP_VERSION_STAMP=1` bypass) | `control-build-version.mjs`, `build-control-app.mjs:72-81` | **BF-2486** (version source) + **mac-control** (Control bundle) |
-| Helper bundle identity plists (`app.botfleet.speech.macos`, `app.botfleet.recorder.macos`) | `electron/resources/*-Info.plist` | **BF-2483** / **BF-2499** |
+| Helper bundle identity plists (`app.botfleet.speech.macos`, `app.botfleet.recorder.macos`) | `native/helpers/*-Info.plist` (moved out of the Electron resources folder in #1531) | **BF-2483** / **BF-2499** |
+| App icon image for the window, the tray item and the Windows unread overlay | `electron/resources/app-icon.png`, `main.mjs:254` | **retire** (BF-2485) — an Electron-only asset; the tray surface it feeds is the **BF-2484** tray row above; the unread overlay is the Windows taskbar overlay (`setOverlayIcon`, `main.mjs:327-333`), which goes with the Windows desktop (BF-2500), and the macOS dock badge that **BF-2484** owns is a count with no image; the native Mac target sets no app icon in `ios/project.yml` at this commit, so the native icon has no owner yet (§9 item 8) |
 | `window-chrome.mjs`, `skin-overlay.cjs` (per-skin chrome table) | 12 + 40 lines | **BF-2501** |
 
 ## 7. The iOS companion path — settled by BF-2510 and BF-2511
@@ -197,8 +212,10 @@ route's implementation depends on whether the sidecar survives.
 
 ## 9. Gaps — responsibilities with no owner today
 
-These need new issues before Phase 3 can start; each is small but each is a
-real product surface.
+The survey found items 1-7 without an owner.  Items 1-4 are now filed as the
+issues named beside them, and items 5-7 fold into existing issues; each is
+small but each is a real product surface.  Item 8 came out of the 2026-11-17
+re-count and is the one item here that still has no issue.
 
 1. **Native diagnostics bundle and bug-report export.** `diagnostics.mjs`
    (redaction, the `CREDENTIAL_ENV_NAMES` mirror of the server list, log
@@ -219,6 +236,11 @@ real product surface.
    acceptance criteria.
 7. **Native version probe** — fold into **BF-2486** and **BF-2510** rather
    than leaving it unowned.
+8. **Native app icon.**  The Electron icon image retires with the shell
+   (§6).  The native Mac target (`BotFleetMac` in `ios/project.yml`) sets no
+   app icon: its settings name no app icon set, and the one asset catalog it
+   compiles holds none, while the iOS target has both.  No issue is named
+   for it yet.
 
 ## 10. Install and cutover (BF-2498's other half)
 
@@ -243,13 +265,44 @@ State of each piece, from the tree:
   The native app only has to remove `stopped.marker` on launch, which
   **BF-2497** covers.
 * `POST /api/desktop/open` lives in `server/desktop-open.ts` and runs
-  `open -a BotFleet`. Both bundles share the name `BotFleet` and the bundle
-  id `app.botfleet.macos` (the native target installs over the Electron
-  shell), so the endpoint needs no retarget: it opens whichever
-  `BotFleet.app` is installed. That is still a **BF-2514** row, because the
-  endpoint dies with the Node harness.
+  `open -a BotFleet`.  LaunchServices resolves that by name, and both bundles
+  share the name `BotFleet` and the bundle id `app.botfleet.macos` (the
+  native target installs over the Electron shell), so nothing in the endpoint
+  can prove which copy opens.  That proof is the one-copy install described
+  above.  The endpoint is still a **BF-2514** row, because it dies with the
+  Node harness.
+* The native route reports a launch it does not perform.  `handleDesktopOpen`
+  in `ios/Sources/CompanionCore/NativeCompanionServer.swift:1379-1393`
+  enforces both BF-2489 gates (a loopback caller, then the
+  `allowRemoteDesktopLaunch` setting), awaits an optional `onDesktopOpen`
+  action and returns `launched: true`.  Neither non-test construction of the
+  server passes that action (`ios/MacApp/MacSession.swift:248`, and
+  `makeServer()` at
+  `ios/Sources/CompanionCore/NativeMacCompanionRuntime.swift:168`), so the
+  answer is a success with no launch behind it.
 * The 7-day soak sign-off is Jay's, and it is gated on the native app being
   the daily driver — which is the BF-2497 deliverable.
+
+Not yet evidenced: the repo records no evidence for any item below.  That is
+a statement about the tree, not about any installed Mac, because the receipts
+that would prove these are private bundles.  For the one installed native
+copy, the Open on Mac target, the companion session without Electron and the
+seven-day observation,
+[`verification/native-final-evidence.md`](verification/native-final-evidence.md)
+holds the requirements (its `signed-release` receipt row, its `daily-driver`
+and `owner-acceptance` rows and its daily-driver observation segments), so
+they are not restated here.  It holds none for the Electron rollback archive
+or for the harness starting when the native app launches: its
+`process-inventory` and `no-mac-node-soak` rows require the Mac harness
+absent instead.  Those two are BF-2498 asks only, and no receipt in that
+bundle covers them.
+
+* A native open action wired to the route above.
+* One signed native copy at `~/Applications/BotFleet.app`, with the Electron
+  app in its rollback archive.
+* A companion session served with Electron closed.
+* The harness starting when the native app launches.
+* Jay's 7-day soak sign-off.
 
 ## 11. Sequencing
 
