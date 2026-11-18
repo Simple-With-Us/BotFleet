@@ -57,8 +57,22 @@ describe("headroom knobs (P-BF-6 B7)", () => {
       "jobs.admission.reservedCpuCores",
     ]);
     expect(
-      clearedHeadroomKnobs({ jobs: { admission: { reservedRamMb: null, minMemoryAvailablePercent: null } } }),
-    ).toEqual(["jobs.admission.reservedRamMb", "jobs.admission.minMemoryAvailablePercent"]);
+      clearedHeadroomKnobs({
+        jobs: {
+          admission: {
+            minFreeDiskMb: null,
+            minFreeInodes: null,
+            reservedRamMb: null,
+            minMemoryAvailablePercent: null,
+          },
+        },
+      }),
+    ).toEqual([
+      "jobs.admission.minFreeDiskMb",
+      "jobs.admission.minFreeInodes",
+      "jobs.admission.reservedRamMb",
+      "jobs.admission.minMemoryAvailablePercent",
+    ]);
     // A real value is not a clear, and neither is an absent key or patch.
     expect(clearedHeadroomKnobs({ jobs: { admission: { reservedCpuCores: 2 } } })).toEqual([]);
     expect(clearedHeadroomKnobs({ jobs: { admission: {} } })).toEqual([]);

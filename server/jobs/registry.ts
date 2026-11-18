@@ -130,7 +130,7 @@ export interface JobsConfigInput {
   // clears back to unset); `finite` below already reads null as absent, so
   // resolution keeps emitting `number | undefined` and every downstream
   // `!== undefined` check is unchanged.
-  admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number; reservedCpuCores?: number | null; reservedRamMb?: number | null; minMemoryAvailablePercent?: number | null };
+  admission?: { maxSwapPercent?: number; minFreeDiskMb?: number | null; minFreeInodes?: number | null; reservedCpuCores?: number | null; reservedRamMb?: number | null; minMemoryAvailablePercent?: number | null };
   cpuCores?: number;
 }
 
