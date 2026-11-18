@@ -46,6 +46,11 @@
 // it, so that receipt is written with a failing `inventory-updated` code, and
 // the bundle refuses it.
 //
+// The capture directory is trusted as the operator's own:  it is the `--capture`
+// argument, and `assertPrivateCaptureDir` checks that it is a directory with no
+// group or other access, not what its ancestors resolve to.  The receipt write
+// guards the final path component only (no link, one name, this user's file).
+//
 // What this script cannot establish:  that the verdict was taken on the Mac
 // the packet names, that it was taken after the retirement, or that the
 // captured rows are every row the inventory holds.  It reads saved files.

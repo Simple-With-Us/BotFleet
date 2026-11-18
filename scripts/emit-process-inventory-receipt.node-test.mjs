@@ -911,6 +911,32 @@ test("the receipt write sets owner-only before it empties or writes an earlier r
   assert.equal(readFileSync(receiptPath, "utf8"), "{}\n");
 });
 
+test("the receipt write leaves an earlier receipt untouched when the owner-only mode cannot be set", onPosix, () => {
+  const captureDir = temporaryDirectory("process-inventory-write-");
+  const receiptPath = join(captureDir, PROCESS_INVENTORY_RECEIPT_FILE);
+  writeFileSync(receiptPath, "an earlier receipt\n", { mode: 0o644 });
+  chmodSync(receiptPath, 0o644);
+
+  // A filesystem that refuses the mode change must stop the write:  the file
+  // may not be emptied or rewritten under the wider mode it still has.
+  const ran = [];
+  assert.throws(
+    () =>
+      writeReceiptFile(receiptPath, Buffer.from("{}\n"), {
+        chmod: () => {
+          throw new Error("the mode change was refused");
+        },
+        truncate: () => ran.push("truncate"),
+        write: () => ran.push("write"),
+      }),
+    /the mode change was refused/,
+  );
+
+  assert.deepEqual(ran, []);
+  assert.equal(readFileSync(receiptPath, "utf8"), "an earlier receipt\n");
+  assert.equal(statSync(receiptPath).mode & 0o777, 0o644);
+});
+
 /** The producer's flags with their values, for a capture directory. */
 function cliFlags(captureDir) {
   const requestPath = join(captureDir, "request.json");
