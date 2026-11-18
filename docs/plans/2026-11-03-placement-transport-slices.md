@@ -4,6 +4,8 @@ Refs BF-2559, BF-2544, BF-2634 and BF-2632.  This splits the remaining placemen
 
 It was read from the source on Nov 3, 2026, with #1565 and #1556 read as open pull requests,  and re-read against main on Nov 5, 2026, when T1, T2, T3, T4 and T6a had landed.  Nothing here was run, and "exists" means present in source, not proven working.  All sixteen placement assertions stay false, and no slice may change them.  Every row that moved names the slice that moved it, so a reader knows what a slice left behind and what is still unwired.
 
+As of Nov 18, the T5 runtime loop (BF-2662), T6b fault scenarios (BF-2670) and T7 Swift client (BF-2659) are on main.  This is a source readback, not a deployment or a recipe run.  See [Placement And Ownership Evidence](../verification/placement.md) for the candidate checklist and remaining hand runs.
+
 ## What Exists
 
 | Element | State | Where |
@@ -14,13 +16,13 @@ It was read from the source on Nov 3, 2026, with #1565 and #1556 read as open pu
 | Rollback read-only authority | Exists since #1556 | `server/placement-readonly.ts` |
 | Queue and `JobRegistry` registration | Exists since T4 | A job start in a server mode calls `enqueue` on the controller through `server/placement-controller-bridge.ts`, and a host that does not hold the controller refuses with a reason instead of queueing locally |
 | Server placement mode record | Exists since T3 | The server stores the mode beside `jobs.json` in `server/placement-mode-store.ts`, and `server/placement-controller-bridge.ts` reads it since T4 |
-| Worker client | Exists since T1, no production caller | `server/placement-worker-client.ts` speaks to the worker routes, and nothing in production constructs it;  Swift only reads identity |
-| Worker runtime | Absent | `server/placement-worker-runtime.ts` is T5's work:  the heartbeat, the assignment, the lease record before spawn, the stop, the report and the restart reconciliation are unwritten |
+| Worker client | Exists since T1, no production caller | `server/placement-worker-client.ts` speaks to the worker routes, and nothing in production constructs it;  the separate Swift applied-mode client does not activate a worker |
+| Worker runtime | T5 loop landed, not composed | `server/placement-worker-runtime.ts` implements heartbeat, assignment, pre-spawn lease recording, stop, reporting and restart reconciliation through injected dependencies.  The real job-runner adapter and production composition remain separate. |
 | Worker job discovery and payload delivery | Exists since T2, no production caller | The `assignment` intent hands the worker a job id and a lease, and the `payload` intent delivers the command, checked against the immutable digest |
 | Durable report spool | Exists since T1, no production caller | `server/placement-report-spool.ts` is the durable report spool, and no production caller wires it yet |
 | Unreachable sweep | Exists, called since T4 | `sweepUnreachable` in `server/placement-leases.ts` runs on the controller's heartbeat period, called by `server/placement-controller-bridge.ts`, and nothing is requeued |
-| Applied-mode acknowledgement | Exists on the server since T3 | `GET /api/placement/mode` returns it;  it states that the controller holds the record at the fence and never what this computer runs,  and the registry bridge reads it since T4 |
-| Two-process fixtures | Partial since T6a | `server/testing/two-process.ts` is a generic launcher that starts two caller-supplied child specs, `server/testing/fault-proxy.ts` is the fault link and `server/testing/nonce-job.mjs` is the nonce job;  the placement controller and worker child entry points and the T6b scenarios are still to come |
+| Applied-mode acknowledgement | Exists on the server since T3 | `GET /api/placement/mode` returns it;  it states that the controller holds the record at the fence and never what this computer runs,  and the registry bridge reads it since T4.  T7 adds the Swift acknowledgement consumer; this is not proof of an installed picker or a real remote mode switch. |
+| Two-process fixtures | T6a and T6b landed as fixtures | `server/testing/two-process.ts` is a generic launcher that starts two caller-supplied child specs, `server/testing/fault-proxy.ts` is the fault link and `server/testing/nonce-job.mjs` is the nonce job;  `server/placement-scenarios.test.ts` adds T6b coverage for dropped acknowledgement, disconnect and report replay, restarts, takeover and stale-epoch refusal |
 
 ## The Wire Mapping
 
@@ -47,7 +49,7 @@ Sizes are rough.  "First" names who must merge first where two slices share a f
 | T2 | Worker routes behind an optional transport argument, plus job selection and payload read.  `server/index.ts` does not pass one, so production keeps answering 503 until T9 | `server/placement-worker-auth.ts`, new `server/placement-worker-routes.ts`, `server/placement-leases.ts` | #1565 | Route tests over a real harness child, and refusals for an owner credential, a wrong host, a stale epoch and a replay | M |
 | T3 | Server mode record and the applied acknowledgement | New `server/placement-mode-store.ts`, a route in `server/index.ts` | Shares the lease service's epoch, with no second epoch | Mode and epoch survive restart, and a stale `PUT` is refused | S to M |
 | T4 | Registry bridge:  `job_start` becomes `enqueue` in a server mode, and the sweep timer starts | `server/jobs/registry.ts`, new `server/placement-controller-bridge.ts`, `server/index.ts` | T3 | `placement-queue.test.ts` still passes, and `localOnly` behavior is unchanged | L |
-| T5 | Worker runtime:  heartbeat, assignment, lease record before spawn, stop, report, restart reconciliation | New `server/placement-worker-runtime.ts`, a hook in `server/jobs/registry.ts` | T1, T2, T4 first | The T6b scenarios | L |
+| T5 | Worker runtime:  heartbeat, assignment, lease record before spawn, stop, report, restart reconciliation | New `server/placement-worker-runtime.ts`, a hook in `server/jobs/registry.ts` | T1, T2, T4 first | The T6b scenarios prove the loop in fixtures; the real job-runner spawn/stop adapter still needs source proof, and production composition stays with T9 | L |
 | T6a | Two-process launcher, TCP fault proxy and nonce job | New files under `server/testing/` | Nothing | The proxy's own tests | M |
 | T6b | Scenarios:  dropped acknowledgement, disconnect after completion, report replay, controller restart, worker restart, takeover, stale epoch | Tests only | T5, T6a | One nonce file and one spawn in each case, and stale epochs refused | M |
 | T7 | Swift acknowledgement client | New `ios/Sources/CompanionCore/PlacementModeClient.swift`, `ServersCoordinator.swift` | T3's route shape | Contract test on shared frames, run on a Mac | S to M |
