@@ -361,9 +361,12 @@ export function createPlacementWorkerJobs(deps: PlacementWorkerJobsDeps): Placem
 
   /** The leader is gone.  A kill in flight is waited out, so a stopped job
    *  settles once its whole group is gone.  Otherwise whatever the command
-   *  left running (`cmd &`) is stopped too: nothing would ever report on it. */
-  const afterLeader = (job: LeasedJob, settle: (leftRunning: boolean) => void): void => {
-    job.leaderExited = true;
+   *  left running (`cmd &`) is stopped too: nothing would ever report on it.
+   *  `leaderLive` is the adopted poll giving up its wait on a leader that
+   *  still holds its pid: that pid is not written off as ended, so the group
+   *  is judged by the leader's start time and not taken for a stranger's. */
+  const afterLeader = (job: LeasedJob, settle: (leftRunning: boolean) => void, leaderLive = false): void => {
+    if (!leaderLive) job.leaderExited = true;
     if (job.timer) clearTimeout(job.timer);
     const finish = (leftRunning: boolean): void => {
       if (jobs.get(job.jobId) === job) jobs.delete(job.jobId);
@@ -505,12 +508,11 @@ export function createPlacementWorkerJobs(deps: PlacementWorkerJobsDeps): Placem
         // The leader is held while a process with its pid lives and no
         // stranger is proved to have taken the number.
         const held = !job.leaderExited && pidAlive(pid) && !strangerHolds(job);
-        if (held && written === null) {
-          // Still running.  A stop or a run limit that could not go out is
-          // tried again here, so neither is lost to one failed `ps`.
-          if (job.owed && !job.kill && now() >= job.owed.nextAt) killJob(job, job.owed.grace, job.owed.limit).catch(() => undefined);
-          return;
-        }
+        // A stop or a run limit that could not go out is tried again here,
+        // so neither is lost to one failed `ps`, and not to the wait below.
+        if (held && job.owed && !job.kill && now() >= job.owed.nextAt) killJob(job, job.owed.grace, job.owed.limit).catch(() => undefined);
+        // Still running.
+        if (held && written === null) return;
         // The wrapper writes the exit file just before it exits, so a leader
         // that lives with its status on disk is on its way out.  Settling now
         // would call it exited while it still holds its pid, and what the
@@ -520,10 +522,12 @@ export function createPlacementWorkerJobs(deps: PlacementWorkerJobsDeps): Placem
           return;
         }
         clearInterval(poll);
+        // A leader that outlasts the wait is not written off: its pid is
+        // still its own until the start time says otherwise.
         afterLeader(job, (leftRunning) => {
           if (written !== null || job.timedOut) resolve(exitOf(job, written, null, leftRunning));
           else reject(new Error("The adopted job ended without leaving an exit status."));
-        });
+        }, held);
       }, adoptedPollMs);
       poll.unref();
     });

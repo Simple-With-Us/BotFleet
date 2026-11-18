@@ -851,6 +851,76 @@ posix("placement worker jobs: a restarted worker", () => {
     }
   });
 
+  it("stops what a leader that outlasts the wait left running, judging its group by its start time", async () => {
+    const { dataDir, workDir } = folder();
+    const lease = { jobId: "job-lingering", leaseId: "lease-lingering" };
+    // The wait for a finishing leader is three polls; this leader is still
+    // alive after them, so the poll settles with it alive and its pid held.
+    const after = adapter(dataDir, { adoptedPollMs: 20, leaderStartedNear: () => true });
+    const leader = spawn("/bin/sh", ["-c", `sleep 30 & echo $! > "${join(workDir, "left")}"; wait`], { detached: true, stdio: "ignore", cwd: workDir });
+    const pid = leader.pid!;
+    try {
+      const grandchild = await until(() => {
+        const printed = existsSync(join(workDir, "left")) ? Number(readFileSync(join(workDir, "left"), "utf8").trim()) : 0;
+        return printed > 0 ? printed : null;
+      });
+      mkdirSync(join(dataDir, "placement", "jobs"), { recursive: true });
+      writeFileSync(after.files(lease).exitPath, "0\n");
+      const watched = after.watchProcess(pid, leaseRecord(lease, { timeoutMs: 30_000, pid }));
+      // A leader that is alive and whose start time matches is the lease's own
+      // process, not a stranger's: its group is stopped and the job says so.
+      expect(await watched).toEqual({ exitCode: 0, signal: null, reason: "processes it left running were stopped" });
+      await until(() => !alive(grandchild));
+      await until(() => !alive(pid));
+    } finally {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        /* the group is already gone */
+      }
+    }
+  });
+
+  it("tries a stop it is owed again while it waits for a finishing leader", async () => {
+    const { dataDir, workDir } = folder();
+    const lease = { jobId: "job-owed-finishing", leaseId: "lease-owed-finishing" };
+    let answer: boolean | null = null;
+    let reads = 0;
+    // Slow polls, so the three-poll wait is long next to the retry's delay.
+    const after = adapter(dataDir, { adoptedPollMs: 300, leaderStartedNear: () => { reads += 1; return answer; } });
+    const leader = spawn("/bin/sh", ["-c", `sleep 30 & echo $! > "${join(workDir, "left")}"; wait`], { detached: true, stdio: "ignore", cwd: workDir });
+    const pid = leader.pid!;
+    try {
+      const grandchild = await until(() => {
+        const printed = existsSync(join(workDir, "left")) ? Number(readFileSync(join(workDir, "left"), "utf8").trim()) : 0;
+        return printed > 0 ? printed : null;
+      });
+      mkdirSync(join(dataDir, "placement", "jobs"), { recursive: true });
+      writeFileSync(after.files(lease).exitPath, "0\n");
+      const watched = after.watchProcess(pid, leaseRecord(lease, { timeoutMs: 30_000, pid }));
+      let settled = false;
+      watched.then(() => { settled = true; }, () => { settled = true; });
+      // `ps` is silent, so the stop is owed and nothing is signalled.  Its
+      // retry is due on the second poll; the wait for the leader ends only on
+      // the fourth.  The read the first poll makes and the one the stop made
+      // are two; a third before the job settles is the retry.
+      await after.stopJob(lease.jobId);
+      await until(() => reads >= 3);
+      expect(settled).toBe(false);
+      expect(alive(grandchild)).toBe(true);
+      // `ps` answers again: the group goes, whichever poll gets to it first
+      answer = true;
+      expect(await watched).toMatchObject({ exitCode: 0, signal: null });
+      await until(() => !alive(grandchild));
+    } finally {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        /* the group is already gone */
+      }
+    }
+  });
+
   it("never signals a process when passive", async () => {
     const { dataDir, workDir } = folder();
     const before = adapter(dataDir);
