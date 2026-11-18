@@ -20,6 +20,8 @@ final class PlacementModeAvailabilityTests: XCTestCase {
         )
         XCTAssertFalse(model.hasRemoteServer)
         XCTAssertFalse(model.hasVerifiedServer)
+        XCTAssertFalse(model.canTakeOverOnThisMac)
+        XCTAssertNil(model.takeOverCaption)
         XCTAssertNil(model.savedVsAppliedCaption)
         XCTAssertEqual(model.options.map(\.mode), [.localOnly, .serverFirst, .macFirst])
 
@@ -88,15 +90,46 @@ final class PlacementModeAvailabilityTests: XCTestCase {
         )
         XCTAssertEqual(serverBlocked.options[0].disabledReason, "Finish or stop 2 jobs running on the server first")
         XCTAssertTrue(serverBlocked.options[1].isSelectable)
+        XCTAssertEqual(serverBlocked.options[2].disabledReason, "Finish or stop 2 jobs running on the server first")
+        XCTAssertFalse(serverBlocked.canTakeOverOnThisMac)
 
-        let unreachableAllowed = PlacementModeAvailability.evaluate(
+        var macFirstApplied = PlacementSettings()
+        macFirstApplied.saved = PlacementSelection(mode: .macFirst, serverID: verified.id, allowOverflowToThisMac: false)
+        macFirstApplied.applied = macFirstApplied.saved
+        let macFirstToLocalBlocked = PlacementModeAvailability.evaluate(
+            hosts: [.thisMac, verified],
+            selectedServerID: verified.id,
+            placement: macFirstApplied,
+            runningServerJobsCount: 1,
+            serverReachable: true
+        )
+        XCTAssertFalse(macFirstToLocalBlocked.options[0].isSelectable)
+        XCTAssertEqual(macFirstToLocalBlocked.options[0].disabledReason, "Finish or stop 1 job running on the server first")
+        XCTAssertTrue(macFirstToLocalBlocked.options[1].isSelectable)
+        XCTAssertTrue(macFirstToLocalBlocked.options[2].isSelectable)
+
+        let unreachableDisallowsCleanSwitches = PlacementModeAvailability.evaluate(
             hosts: [.thisMac, verified],
             selectedServerID: verified.id,
             placement: serverApplied,
             runningServerJobsCount: 2,
             serverReachable: false
         )
-        XCTAssertTrue(unreachableAllowed.options[0].isSelectable)
+        XCTAssertFalse(unreachableDisallowsCleanSwitches.options[0].isSelectable)
+        XCTAssertEqual(unreachableDisallowsCleanSwitches.options[0].disabledReason, PlacementModeAvailability.takeOverAvailableCaption)
+        XCTAssertTrue(unreachableDisallowsCleanSwitches.options[1].isSelectable)
+        XCTAssertFalse(unreachableDisallowsCleanSwitches.options[2].isSelectable)
+        XCTAssertTrue(unreachableDisallowsCleanSwitches.canTakeOverOnThisMac)
+        XCTAssertEqual(unreachableDisallowsCleanSwitches.takeOverCaption, PlacementModeAvailability.takeOverAvailableCaption)
+
+        let unreachableMacFirstBlocksServerFirst = PlacementModeAvailability.evaluate(
+            hosts: [.thisMac, verified],
+            selectedServerID: verified.id,
+            placement: macFirstApplied,
+            serverReachable: false
+        )
+        XCTAssertFalse(unreachableMacFirstBlocksServerFirst.options[1].isSelectable)
+        XCTAssertFalse(unreachableMacFirstBlocksServerFirst.canTakeOverOnThisMac)
     }
 
     func testSavedVsAppliedAndUnreachableBannerCopy() throws {

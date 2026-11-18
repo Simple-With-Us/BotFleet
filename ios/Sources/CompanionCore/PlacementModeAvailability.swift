@@ -21,11 +21,15 @@ public struct PlacementModeAvailability: Equatable, Sendable {
     public static let addServerReason = "Add a server to use this mode."
     public static let testServerReason = "Test this server before using this mode."
     public static let overflowToggleTitle = "Allow Overflow To This Mac"
+    public static let takeOverActionTitle = "Take Over On This Mac…"
+    public static let takeOverAvailableCaption = "Server is unreachable.\u{00A0} Use Take Over On This Mac… to switch to This Mac Only."
     public static let unappliedSelectionCaption = "Saved selection has not been confirmed by the controller yet."
 
     public let hasRemoteServer: Bool
     public let hasVerifiedServer: Bool
     public let options: [PlacementModeOptionPresentation]
+    public let canTakeOverOnThisMac: Bool
+    public let takeOverCaption: String?
     public let savedVsAppliedCaption: String?
 
     public static func evaluate(
@@ -76,10 +80,13 @@ public struct PlacementModeAvailability: Equatable, Sendable {
         }
 
         let unappliedCaption = placement.hasUnappliedChanges ? unappliedSelectionCaption : nil
+        let allowTakeOver = appliedMode == .serverFirst && !serverReachable
         return PlacementModeAvailability(
             hasRemoteServer: hasRemote,
             hasVerifiedServer: hasVerified,
             options: options,
+            canTakeOverOnThisMac: allowTakeOver,
+            takeOverCaption: allowTakeOver ? takeOverAvailableCaption : nil,
             savedVsAppliedCaption: unappliedCaption
         )
     }
@@ -130,11 +137,21 @@ public struct PlacementModeAvailability: Equatable, Sendable {
         if targetMode == appliedMode {
             return nil
         }
+        if !serverReachable {
+            if appliedMode == .serverFirst {
+                return targetMode == .localOnly
+                    ? takeOverAvailableCaption
+                    : "Server is unreachable.\u{00A0} Wait for the server to return before switching to This Mac First."
+            }
+            if targetMode == .serverFirst {
+                return "Server is unreachable.\u{00A0} Wait for the server to return before switching to Server First."
+            }
+        }
         if runningLocalJobsCount > 0 && targetMode == .serverFirst {
             let noun = runningLocalJobsCount == 1 ? "job" : "jobs"
             return "Finish or stop \(runningLocalJobsCount) \(noun) running on this Mac first"
         }
-        if runningServerJobsCount > 0 && appliedMode == .serverFirst && serverReachable {
+        if runningServerJobsCount > 0 && appliedMode != .localOnly {
             let noun = runningServerJobsCount == 1 ? "job" : "jobs"
             return "Finish or stop \(runningServerJobsCount) \(noun) running on the server first"
         }
