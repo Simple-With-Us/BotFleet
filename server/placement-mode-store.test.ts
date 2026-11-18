@@ -249,4 +249,77 @@ describe("the placement mode route", () => {
       reason: null,
     });
   });
+
+  it("matches the shared T7 Swift/TypeScript placement-mode contract fixture", () => {
+    const shared = JSON.parse(
+      readFileSync(new URL("../ios/Tests/CompanionCoreTests/Fixtures/placement-mode-frames.json", import.meta.url), "utf8"),
+    );
+
+    // 1. Mac controller: unwritten default & localOnly write.
+    const macDir = mkdtempSync(join(tmpdir(), "bf-t7-mac-"));
+    try {
+      const macEpochs = openControllerEpochStore(macDir, shared.macHostId);
+      const macLeases = new PlacementLeaseService({
+        hostId: shared.macHostId,
+        controller: macEpochs.read(),
+        controllerStore: macEpochs,
+      });
+      const macStore = new PlacementModeStore(join(macDir, "jobs"), {
+        controller: () => macLeases.controller(),
+        hostId: shared.macHostId,
+        now: () => shared.appliedAt,
+      });
+      expect(placementModeRead(owner, macStore)).toEqual({ status: 200, body: shared.unwrittenDefault });
+      expect(placementModeWrite(owner, shared.localOnlyWrite, macStore)).toEqual({ status: 200, body: shared.localOnlyAck });
+    } finally {
+      rmSync(macDir, { recursive: true, force: true });
+    }
+
+    // 2. macFirst held by server store while Mac holds controller epoch 0.
+    const macFirstDir = mkdtempSync(join(tmpdir(), "bf-t7-macfirst-"));
+    try {
+      const macEpochs = openControllerEpochStore(macFirstDir, shared.macHostId);
+      const macLeases = new PlacementLeaseService({
+        hostId: shared.macHostId,
+        controller: macEpochs.read(),
+        controllerStore: macEpochs,
+      });
+      const macFirstStore = new PlacementModeStore(join(macFirstDir, "jobs"), {
+        controller: () => macLeases.controller(),
+        hostId: shared.serverHostId,
+        now: () => shared.appliedAt,
+      });
+      expect(placementModeWrite(owner, shared.macFirstWrite, macFirstStore)).toEqual({ status: 200, body: shared.macFirstAck });
+    } finally {
+      rmSync(macFirstDir, { recursive: true, force: true });
+    }
+
+    // 3. Server controller: serverFirst write, then epoch takeover yielding 409 and unacknowledged 200.
+    const serverDir = mkdtempSync(join(tmpdir(), "bf-t7-server-"));
+    try {
+      const serverEpochs = openControllerEpochStore(serverDir, shared.serverHostId);
+      const serverLeases = new PlacementLeaseService({
+        hostId: shared.serverHostId,
+        controller: serverEpochs.read(),
+        controllerStore: serverEpochs,
+      });
+      const serverStore = new PlacementModeStore(join(serverDir, "jobs"), {
+        controller: () => serverLeases.controller(),
+        hostId: shared.serverHostId,
+        now: () => shared.appliedAt,
+      });
+      expect(placementModeWrite(owner, shared.serverFirstWrite, serverStore)).toEqual({ status: 200, body: shared.serverFirstAck });
+      const takeover = serverLeases.takeover({
+        version: PLACEMENT_WIRE_VERSION,
+        controllerId: shared.takeoverServerHostId,
+        epoch: 1,
+        reconcile: false,
+      });
+      expect(takeover.ok && takeover.reply.accepted).toBe(true);
+      expect(placementModeWrite(owner, shared.serverFirstWrite, serverStore)).toEqual({ status: 409, body: shared.staleFence409 });
+      expect(placementModeRead(owner, serverStore)).toEqual({ status: 200, body: shared.staleAckUnacknowledged });
+    } finally {
+      rmSync(serverDir, { recursive: true, force: true });
+    }
+  });
 });
