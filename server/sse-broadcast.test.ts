@@ -4,7 +4,26 @@
 // through a real socket without genuinely stalling a client.
 import { describe, expect, it } from "vitest";
 
-import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseClient, type SseWritable } from "./sse-broadcast.ts";
+import {
+  extractSseFrameTarget,
+  parseSseFilters,
+  ReplayBuffer,
+  SLOW_CLIENT_BYTE_LIMIT,
+  SSE_BOT_ID_MAX_VALUES,
+  SSE_FILTER_MAX_VALUES,
+  SSE_FILTER_VALUE_MAX_LENGTH,
+  SseBotIdListSchema,
+  SseFilterListSchema,
+  SseFiltersQuerySchema,
+  wants,
+  wantsReplayEntry,
+  writeToClient,
+  type SseBotIdList,
+  type SseClient,
+  type SseFilterList,
+  type SseFiltersQuery,
+  type SseWritable,
+} from "./sse-broadcast.ts";
 
 /** A fake response whose write() outcome and writableLength are scripted
  * by the test, and which records every chunk actually written. */
@@ -107,6 +126,20 @@ describe("writeToClient", () => {
     }).not.toThrow();
     expect(result).toBe("error");
   });
+
+  it("filters frames by threadIds when subscribed to specific threads", () => {
+    const c = client({ screens: true, threadIds: new Set(["t-1"]) });
+    expect(writeToClient(c, "frame-1", "runtime", "bot-1", "t-2")).toBe("dropped");
+    expect(writeToClient(c, "frame-2", "runtime", "bot-1", "")).toBe("dropped");
+    expect(writeToClient(c, "frame-3", "runtime", "bot-1", "t-1")).toBe("wrote");
+  });
+
+  it("drops all frames when onlyKinds or threadIds is a non-null empty allowlist", () => {
+    const emptyKinds = client({ screens: true, onlyKinds: new Set() });
+    expect(writeToClient(emptyKinds, "frame-1", "message", "bot-1", "t-1")).toBe("dropped");
+    const emptyThreads = client({ screens: true, threadIds: new Set() });
+    expect(writeToClient(emptyThreads, "frame-1", "message", "bot-1", "t-1")).toBe("dropped");
+  });
 });
 
 describe("wants", () => {
@@ -118,6 +151,76 @@ describe("wants", () => {
   it("screen frames require opting in", () => {
     expect(wants({ screens: false }, "screen")).toBe(false);
     expect(wants({ screens: true }, "screen")).toBe(true);
+  });
+
+  it("honors onlyKinds allowlists", () => {
+    expect(wants({ screens: false, onlyKinds: new Set(["runtime"]) }, "message")).toBe(false);
+    expect(wants({ screens: false, onlyKinds: new Set(["runtime"]) }, "runtime")).toBe(true);
+    expect(wants({ screens: true, onlyKinds: new Set(["screen"]) }, "screen")).toBe(true);
+    expect(wants({ screens: true, onlyKinds: new Set(["screen"]) }, "bot")).toBe(false);
+    expect(wants({ screens: false, onlyKinds: new Set(["screen"]) }, "screen")).toBe(false);
+    expect(wants({ screens: true, onlyKinds: new Set() }, "runtime")).toBe(false);
+  });
+});
+
+describe("SSE filter validation, target extraction, and replay filtering", () => {
+  it("extracts botId and threadId across direct and nested frame envelopes", () => {
+    expect(extractSseFrameTarget({ threadId: "t-msg", botId: "b-1" })).toEqual({ botId: "b-1", threadId: "t-msg" });
+    expect(extractSseFrameTarget({ event: { threadId: "t-rt" } })).toEqual({ botId: "", threadId: "t-rt" });
+    expect(extractSseFrameTarget({ bot: { id: "b-2", threadId: "t-bot" } })).toEqual({ botId: "b-2", threadId: "t-bot" });
+    expect(extractSseFrameTarget({ group: { threadId: "t-grp" } })).toEqual({ botId: "", threadId: "t-grp" });
+  });
+
+  it("validates and bounds SSE query filter allowlists", () => {
+    const validKinds: SseFilterList = ["runtime", "bot"];
+    const validBots: SseBotIdList = Array.from({ length: 40 }, (_, i) => `bot/custom ${i}`);
+    const validQuery: SseFiltersQuery = { botId: validBots, kind: validKinds, threadId: ["t-1"] };
+    expect(SseFilterListSchema.safeParse(validKinds).success).toBe(true);
+    expect(SseBotIdListSchema.safeParse(validBots).success).toBe(true);
+    expect(SseFiltersQuerySchema.safeParse(validQuery).success).toBe(true);
+    expect(SseFilterListSchema.safeParse([""]).success).toBe(false);
+    expect(SseFilterListSchema.safeParse(["bad space"]).success).toBe(false);
+    expect(SseFilterListSchema.safeParse(["a".repeat(SSE_FILTER_VALUE_MAX_LENGTH + 1)]).success).toBe(false);
+    expect(
+      SseFilterListSchema.safeParse(Array.from({ length: SSE_FILTER_MAX_VALUES + 1 }, (_, i) => `t-${i}`)).success,
+    ).toBe(false);
+    expect(SseBotIdListSchema.safeParse([""]).success).toBe(false);
+    expect(SseBotIdListSchema.safeParse(["b".repeat(SSE_FILTER_VALUE_MAX_LENGTH + 1)]).success).toBe(false);
+    expect(
+      SseBotIdListSchema.safeParse(Array.from({ length: SSE_BOT_ID_MAX_VALUES + 1 }, (_, i) => `bot-${i}`)).success,
+    ).toBe(false);
+
+    const parsed = parseSseFilters(new URLSearchParams("kind=runtime&threadId=t-1&botId=b-1"));
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.onlyKinds).toEqual(new Set(["runtime"]));
+      expect(parsed.threadIds).toEqual(new Set(["t-1"]));
+      expect(parsed.screenBotIds).toEqual(new Set(["b-1"]));
+    }
+
+    const manyBotsParams = new URLSearchParams(validBots.map((id) => ["botId", id]));
+    const parsedMany = parseSseFilters(manyBotsParams);
+    expect(parsedMany.ok).toBe(true);
+    if (parsedMany.ok) {
+      expect(parsedMany.screenBotIds?.size).toBe(40);
+    }
+
+    expect(parseSseFilters(new URLSearchParams("botId=")).ok).toBe(false);
+    expect(parseSseFilters(new URLSearchParams("threadId=")).ok).toBe(false);
+    expect(parseSseFilters(new URLSearchParams("kind=bad%20kind")).ok).toBe(false);
+  });
+
+  it("enforces threadIds and onlyKinds on buffered replay entries", () => {
+    const buffer = new ReplayBuffer(10, 1_000_000);
+    buffer.push(1, "runtime", "rt-1", "t-1");
+    buffer.push(2, "runtime", "rt-2", "t-2");
+    buffer.push(3, "bot", "bot-1", "t-1");
+
+    const sub = client({ screens: false, onlyKinds: new Set(["runtime"]), threadIds: new Set(["t-1"]) });
+    expect(buffer.entries.filter((entry) => wantsReplayEntry(sub, entry)).map((e) => e.seq)).toEqual([1]);
+
+    const threadOnly = client({ screens: false, threadIds: new Set(["t-1"]) });
+    expect(buffer.entries.filter((entry) => wantsReplayEntry(threadOnly, entry)).map((e) => e.seq)).toEqual([1, 3]);
   });
 });
 
