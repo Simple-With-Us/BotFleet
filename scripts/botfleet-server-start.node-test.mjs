@@ -38,11 +38,31 @@ function makeFixture({ withDependencies = false } = {}) {
   return { dir, dataDir, node, serverRoot, ledger: join(dir, "ledger"), marker: join(dir, "stopped.marker"), disabled: join(dir, "startup-disabled.marker"), enabled: join(dir, "startup-enabled.marker"), session: join(dir, "startup-session"), port };
 }
 
+// The environment the launcher runs with, built from the host environment
+// and then made explicit.
+//
+// The startup answer and the Keychain reader belong to the fixture, never to
+// the machine that runs the suite: an inherited answer would change which
+// branch the launcher takes, and an inherited reader would probe the
+// developer's real login Keychain, where the desktop's enrollment item would
+// answer remote and break every "reads nothing" assertion.  The default
+// reader points at a path that does not exist, so the probe fails closed to
+// "no enrollment" until a fixture names a stub of its own.
+function launcherEnv(fixture, { processEnv = process.env, dropIdentity = false } = {}) {
+  const env = { ...processEnv };
+  for (const key of Object.keys(env)) {
+    if (dropIdentity && key.startsWith("INFISICAL_")) delete env[key];
+    if (key === "BOTFLEET_STARTUP_ENROLLMENT" || key === "BOTFLEET_SECURITY_BIN" ||
+        key === "BOTFLEET_KEYCHAIN_SERVICE" || key === "BOTFLEET_KEYCHAIN_ACCOUNT") delete env[key];
+  }
+  return { ...env, BOTFLEET_SECURITY_BIN: join(fixture.dir, "no-such-security-binary") };
+}
+
 function run(fixture, { threshold = 20, windowSeconds = 3600, args = [], node = fixture.node, xpcServiceName = "" } = {}) {
   return spawnSync("bash", [SCRIPT, ...args], {
     encoding: "utf8",
     env: {
-      ...process.env,
+      ...launcherEnv(fixture),
       BOTFLEET_SERVER_ROOT: fixture.serverRoot,
       BOTFLEET_PORT: String(fixture.port),
       BOTFLEET_NODE: node,
@@ -392,14 +412,10 @@ function installFakeFleetSecrets(fixture, script) {
 }
 
 function runIdentity(fixture, extraEnv = {}, { dataDir = fixture.dataDir } = {}) {
-  const env = { ...process.env };
-  for (const key of Object.keys(env)) {
-    if (key.startsWith("INFISICAL_")) delete env[key];
-  }
   return spawnSync("bash", [SCRIPT], {
     encoding: "utf8",
     env: {
-      ...env,
+      ...launcherEnv(fixture, { dropIdentity: true }),
       ...extraEnv,
       HOME: fixture.home,
       OMB_DATA_DIR: dataDir,
@@ -600,6 +616,80 @@ test("an explicit local choice wins over every legacy identity source", () => {
     assert.equal(existsSync(called), false);
   } finally {
     rmSync(local.dir, { recursive: true, force: true });
+  }
+});
+
+test("an explicit operator opt-in overrides a saved local choice", () => {
+  // The desktop writes the saved file after an ordinary "this Mac" choice,
+  // so an opt-in consulted only when no file existed could never be
+  // reached on a real Mac.
+  const fixture = identityFixture();
+  const called = join(fixture.dir, "helper-called");
+  try {
+    writeFileSync(join(fixture.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
+    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    const result = runIdentity(fixture, { BOTFLEET_STARTUP_ENROLLMENT: "remote" });
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /with the Infisical bootstrap/);
+    assert.equal(existsSync(called), true);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("an explicit local operator choice overrides a saved remote choice", () => {
+  const fixture = identityFixture();
+  const called = join(fixture.dir, "helper-called");
+  try {
+    writeFileSync(join(fixture.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "remote" }));
+    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    const result = runIdentity(fixture, { BOTFLEET_STARTUP_ENROLLMENT: "local" });
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /without Infisical bootstrap/);
+    assert.equal(existsSync(called), false);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("the operator opt-in marker file overrides a saved local choice", () => {
+  const fixture = identityFixture();
+  const called = join(fixture.dir, "helper-called");
+  try {
+    writeFileSync(join(fixture.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
+    writeFileSync(join(fixture.dataDir, "startup-infisical.opt-in"), "");
+    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    const result = runIdentity(fixture);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /with the Infisical bootstrap/);
+    assert.equal(existsSync(called), true);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("the fixture environment never inherits the startup answer or the Keychain reader", () => {
+  // A machine that holds the desktop's enrollment item, or an operator
+  // answer in the shell, must not be able to change what this suite
+  // measures: the launcher runs with fixture-local values only.
+  const fixture = identityFixture();
+  try {
+    const env = launcherEnv(fixture, { processEnv: {
+      PATH: "/bin",
+      INFISICAL_TOKEN: "st.inherited",
+      BOTFLEET_STARTUP_ENROLLMENT: "remote",
+      BOTFLEET_SECURITY_BIN: "/usr/bin/security",
+      BOTFLEET_KEYCHAIN_SERVICE: "inherited",
+      BOTFLEET_KEYCHAIN_ACCOUNT: "inherited",
+    }, dropIdentity: true });
+    assert.equal(env.BOTFLEET_STARTUP_ENROLLMENT, undefined);
+    assert.equal(env.BOTFLEET_SECURITY_BIN, join(fixture.dir, "no-such-security-binary"));
+    assert.equal(env.BOTFLEET_KEYCHAIN_SERVICE, undefined);
+    assert.equal(env.BOTFLEET_KEYCHAIN_ACCOUNT, undefined);
+    assert.equal(env.INFISICAL_TOKEN, undefined);
+    assert.equal(env.PATH, "/bin");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
   }
 });
 

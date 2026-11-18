@@ -580,16 +580,20 @@ keychain_enrollment_present() {
 }
 
 read_startup_enrollment() {
+  # An explicit operator answer comes FIRST, before the saved preference,
+  # and wins in both directions.  The desktop writes the saved file after an
+  # ordinary "this Mac" choice, so an opt-in that was only consulted when no
+  # file existed could never be reached on a real Mac, and an explicit local
+  # answer could never override a saved remote one.
+  local choice
+  choice="$(operator_startup_choice)"
+  if [ -n "$choice" ]; then
+    printf '%s' "$choice"
+    return 0
+  fi
   local preference="$(startup_data_dir)/startup-enrollment.json"
   if [ ! -e "$preference" ] && [ ! -L "$preference" ]; then
-    # No saved choice on this Mac.  An explicit operator answer comes first:
-    # it is the only thing that can turn the Infisical bootstrap on here.
-    local choice
-    choice="$(operator_startup_choice)"
-    if [ -n "$choice" ]; then
-      printf '%s' "$choice"
-      return 0
-    fi
+    # No saved choice on this Mac, and no explicit operator answer either.
     # An identity override in the environment is an answer the operator has
     # already given, so it keeps selecting remote exactly as it did before.
     # Nothing is read here.

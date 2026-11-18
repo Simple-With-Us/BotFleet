@@ -3,9 +3,20 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, sy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { z } from "zod";
 import { inspectHostMachO, verifyNativeHostArtifact, sha256 } from "./native-host-artifact.mjs";
 import { nativeHostNotaryCredentials, packageNativeHost } from "./package-native-host.mjs";
 import { build, identity, source, thin, universal } from "./native-host-macho.fixture.mjs";
+
+// The wiring claim is about package.json, so the file is parsed through a
+// schema instead of a bare JSON.parse: a shape that does not match is
+// refused rather than read by accident.  Only the fields this test reads are
+// described, and the rest of the file passes through untouched.
+const PackageSchema = z
+  .object({
+    scripts: z.record(z.string(), z.string()),
+  })
+  .passthrough();
 
 const signature = () => ({ codeIdentifier: "BotFleetNativeHost", teamIdentifier: "CC8UTF7ATG", adHoc: false, hardenedRuntime: true });
 function fixture(bytes = universal()) {
@@ -188,8 +199,10 @@ test("the native-release chain runs this proof, and hosted CI runs the chain", (
   // vitest does not collect *.node-test.mjs.  Hosted CI runs `pnpm test`,
   // which only reaches a node:test file that package.json names, so the
   // identity proof is only proved when both name it.
-  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-  assert.match(pkg.scripts["test:native-release"], /scripts\/native-host-artifact\.node-test\.mjs/);
+  const pkg = PackageSchema.parse(JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")));
+  const nativeRelease = pkg.scripts["test:native-release"];
+  assert.equal(typeof nativeRelease, "string", "package.json names no native-release test chain");
+  assert.match(nativeRelease, /scripts\/native-host-artifact\.node-test\.mjs/);
   assert.match(pkg.scripts.test, /pnpm test:native-release/);
   const ci = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
   assert.match(ci, /run: pnpm test$/m);
