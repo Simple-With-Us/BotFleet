@@ -463,7 +463,7 @@ private func nativeHostMainScript() -> URL {
 /// before anything is written.
 private func writeFixtureFile(_ payload: String, to url: URL) throws {
     let path = url.path
-    let components = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+    var components = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
     guard components.count >= 2 else { throw NativeHostControlError.unsafeSocket }
     let name = components.removeLast()
     var directories: [Int32] = []
