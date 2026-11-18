@@ -835,24 +835,30 @@ public enum HostResourcesPresentation {
         return host.origin.url.absoluteString
     }
 
-    // MARK: - Headroom editing (slice 7b)
+    // MARK: - Headroom editing (slice 7b / BF-2686)
+
+    /// Built-in disk floor in MB (2 GB) when `jobs.admission.minFreeDiskMb` is unset.
+    public static let builtinMinFreeDiskMb = 2048.0
 
     /// Bounds mirroring `HEADROOM_BOUNDS` in `src/lib/host-resources.ts`.
     /// Reserved RAM tops out at 1,000,000 MB (~1 TB): larger survives neither
     /// the MB-to-bytes conversion nor any host, and the knob table carries no
-    /// max to clamp it.
+    /// max to clamp it.  Minimum free disk enforces the 2 GB built-in safety
+    /// gate (2048 MB) so UI edits cannot weaken it.
     public static let headroomBoundsCpu = (min: 0.0, max: 64.0, integer: true)
     public static let headroomBoundsRamMb = (min: 0.0, max: 1_000_000.0, integer: true)
     public static let headroomBoundsMemoryPercent = (min: 0.0, max: 100.0, integer: false)
+    public static let headroomBoundsDiskMb = (min: builtinMinFreeDiskMb, max: 100_000_000.0, integer: true)
+    public static let headroomBoundsInodes = (min: 0.0, max: 9_007_199_254_740_991.0, integer: true)
 
-    /// Validates the three headroom boxes, mirroring `parseHeadroomEdit` in
+    /// Validates the editable headroom boxes, mirroring `parseHeadroomEdit` in
     /// `src/lib/host-resources.ts`: numbers for the non-empty boxes, per-field
     /// messages otherwise, and a refusal when every box is empty over unset
     /// knobs (an all-empty save is a no-op then).  An all-empty edit over set
-    /// knobs is valid — it clears them — so the last set knob stays
-    /// unsettable from the UI.  Number spelling is digits with at most one
-    /// fraction point — hex (`0x10`) and exponents (`1e3`) fail, exactly as
-    /// in TS.
+    /// knobs (or a custom disk floor) is valid — it clears them — so the last
+    /// set knob stays unsettable from the UI.  Number spelling is digits with at
+    /// most one fraction point — hex (`0x10`) and exponents (`1e3`) fail,
+    /// exactly as in TS.
     public static func parseHeadroomEdit(_ values: HeadroomEditValues, current: HeadroomCurrentKnobs? = nil) -> HeadroomEditOutcome {
         var errors: [HeadroomFieldError] = []
         var parsed = HeadroomParsedEdit()
@@ -868,6 +874,16 @@ public enum HostResourcesPresentation {
                 errors.append(HeadroomFieldError(field: field, message: "Enter a whole number."))
                 return
             }
+            if field == .minFreeDiskMb, num >= 0, num < bounds.min {
+                if let existingDiskMb = current?.minFreeDiskMb,
+                   existingDiskMb < builtinMinFreeDiskMb,
+                   num == existingDiskMb {
+                    parsed.minFreeDiskMb = num
+                    return
+                }
+                errors.append(HeadroomFieldError(field: field, message: "Below the built-in safety gate (2 GB)."))
+                return
+            }
             if num < bounds.min || num > bounds.max {
                 errors.append(HeadroomFieldError(field: field, message: "Enter \(formatNumericValue(bounds.min))–\(formatNumericValue(bounds.max))."))
                 return
@@ -876,18 +892,28 @@ public enum HostResourcesPresentation {
             case .reservedCpuCores: parsed.reservedCpuCores = num
             case .reservedRamMb: parsed.reservedRamMb = num
             case .minMemoryAvailablePercent: parsed.minMemoryAvailablePercent = num
+            case .minFreeDiskMb: parsed.minFreeDiskMb = num
+            case .minFreeInodes: parsed.minFreeInodes = num
             }
         }
 
         parseField(.reservedCpuCores, values.reservedCpuCores, bounds: headroomBoundsCpu)
         parseField(.reservedRamMb, values.reservedRamMb, bounds: headroomBoundsRamMb)
         parseField(.minMemoryAvailablePercent, values.minMemoryAvailablePercent, bounds: headroomBoundsMemoryPercent)
+        parseField(.minFreeDiskMb, values.minFreeDiskMb, bounds: headroomBoundsDiskMb)
+        parseField(.minFreeInodes, values.minFreeInodes, bounds: headroomBoundsInodes)
 
         if !errors.isEmpty { return .invalid(errors) }
-        if parsed.reservedCpuCores == nil, parsed.reservedRamMb == nil, parsed.minMemoryAvailablePercent == nil {
+        if parsed.reservedCpuCores == nil,
+           parsed.reservedRamMb == nil,
+           parsed.minMemoryAvailablePercent == nil,
+           parsed.minFreeDiskMb == nil,
+           parsed.minFreeInodes == nil {
             let clearsASetKnob = current?.reservedCpuCores != nil
                 || current?.reservedRamMb != nil
                 || current?.minMemoryAvailablePercent != nil
+                || current?.minFreeDiskMb != nil
+                || current?.minFreeInodes != nil
             // An all-empty edit over set knobs is a clear, not a no-op.
             if clearsASetKnob { return .valid(parsed) }
             return .invalid([HeadroomFieldError(field: .reservedCpuCores, message: "Enter at least one number to save.")])
@@ -895,13 +921,16 @@ public enum HostResourcesPresentation {
         return .valid(parsed)
     }
 
-    /// The set knobs of a report, in parse units (RAM in MB) — mirrors
+    /// The set knobs of a report, in parse units (RAM and disk in MB) — mirrors
     /// `currentHeadroomKnobs` in `src/lib/host-resources.ts`.
     public static func headroomCurrentKnobs(_ report: HostResourcesReport) -> HeadroomCurrentKnobs {
-        HeadroomCurrentKnobs(
+        let diskMb = (report.admission.minFreeDiskBytes / 1024.0 / 1024.0).rounded()
+        return HeadroomCurrentKnobs(
             reservedCpuCores: report.admission.reservedCpuCores,
             reservedRamMb: report.admission.reservedRamBytes.map { ($0 / 1024.0 / 1024.0).rounded() },
-            minMemoryAvailablePercent: report.admission.minMemoryAvailablePercent
+            minMemoryAvailablePercent: report.admission.minMemoryAvailablePercent,
+            minFreeDiskMb: diskMb != builtinMinFreeDiskMb ? diskMb : nil,
+            minFreeInodes: report.admission.minFreeInodes
         )
     }
 
@@ -913,17 +942,26 @@ public enum HostResourcesPresentation {
     /// parsed headroom knobs over the current report, mirroring
     /// `buildHeadroomPatch` in `src/lib/host-resources.ts` (the client wraps
     /// it as `["jobs": ["admission": …]]`, exactly the TS wire shape).
-    /// Edited values win; an emptied box over a set knob sends `NSNull` so
-    /// the save unsets it; an emptied box over an already-unset knob is
-    /// omitted.  Everything else rides along so the server's shallow jobs
-    /// merge never erases an unrelated admission gate.
+    /// Edited values win; an emptied box over a set knob (or custom disk floor)
+    /// sends `NSNull` so the save unsets it; an emptied box over an already-
+    /// unset knob is omitted.  Everything else rides along so the server's
+    /// shallow jobs merge never erases an unrelated admission gate.
     public static func headroomConfigPatch(for report: HostResourcesReport, parsed: HeadroomParsedEdit) -> [String: Any] {
+        let currentDiskMb = (report.admission.minFreeDiskBytes / 1024.0 / 1024.0).rounded()
         var admission: [String: Any] = [
             "maxSwapPercent": report.admission.maxSwapPercent,
-            "minFreeDiskMb": report.admission.minFreeDiskBytes / 1024.0 / 1024.0,
         ]
-        if let inodes = report.admission.minFreeInodes {
+        if let disk = parsed.minFreeDiskMb {
+            admission["minFreeDiskMb"] = disk
+        } else if currentDiskMb != builtinMinFreeDiskMb {
+            admission["minFreeDiskMb"] = NSNull()
+        } else {
+            admission["minFreeDiskMb"] = currentDiskMb
+        }
+        if let inodes = parsed.minFreeInodes {
             admission["minFreeInodes"] = inodes
+        } else if report.admission.minFreeInodes != nil {
+            admission["minFreeInodes"] = NSNull()
         }
         if let cpu = parsed.reservedCpuCores {
             admission["reservedCpuCores"] = cpu
@@ -950,7 +988,9 @@ public enum HostResourcesPresentation {
         HeadroomEditValues(
             reservedCpuCores: report.admission.reservedCpuCores.map(formatNumericValue) ?? "",
             reservedRamMb: report.admission.reservedRamBytes.map { "\(Int(($0 / 1024.0 / 1024.0).rounded()))" } ?? "",
-            minMemoryAvailablePercent: report.admission.minMemoryAvailablePercent.map(formatNumericValue) ?? ""
+            minMemoryAvailablePercent: report.admission.minMemoryAvailablePercent.map(formatNumericValue) ?? "",
+            minFreeDiskMb: "\(Int((report.admission.minFreeDiskBytes / 1024.0 / 1024.0).rounded()))",
+            minFreeInodes: report.admission.minFreeInodes.map(formatNumericValue) ?? ""
         )
     }
 }
@@ -961,11 +1001,21 @@ public struct HeadroomEditValues: Equatable, Sendable {
     public var reservedCpuCores: String
     public var reservedRamMb: String
     public var minMemoryAvailablePercent: String
+    public var minFreeDiskMb: String
+    public var minFreeInodes: String
 
-    public init(reservedCpuCores: String = "", reservedRamMb: String = "", minMemoryAvailablePercent: String = "") {
+    public init(
+        reservedCpuCores: String = "",
+        reservedRamMb: String = "",
+        minMemoryAvailablePercent: String = "",
+        minFreeDiskMb: String = "",
+        minFreeInodes: String = ""
+    ) {
         self.reservedCpuCores = reservedCpuCores
         self.reservedRamMb = reservedRamMb
         self.minMemoryAvailablePercent = minMemoryAvailablePercent
+        self.minFreeDiskMb = minFreeDiskMb
+        self.minFreeInodes = minFreeInodes
     }
 }
 
@@ -974,21 +1024,33 @@ public enum HeadroomEditField: String, Equatable, Sendable {
     case reservedCpuCores
     case reservedRamMb
     case minMemoryAvailablePercent
+    case minFreeDiskMb
+    case minFreeInodes
 }
 
-/// The knobs a report currently has set, in parse units (RAM in MB), so
-/// validation can tell "clearing a set knob" (valid) from "editing nothing"
+/// The knobs a report currently has set, in parse units (RAM and disk in MB),
+/// so validation can tell "clearing a set knob" (valid) from "editing nothing"
 /// (a no-op refusal) — mirrors `HeadroomCurrentKnobs` in
 /// `src/lib/host-resources.ts`.
 public struct HeadroomCurrentKnobs: Equatable, Sendable {
     public var reservedCpuCores: Double?
     public var reservedRamMb: Double?
     public var minMemoryAvailablePercent: Double?
+    public var minFreeDiskMb: Double?
+    public var minFreeInodes: Double?
 
-    public init(reservedCpuCores: Double? = nil, reservedRamMb: Double? = nil, minMemoryAvailablePercent: Double? = nil) {
+    public init(
+        reservedCpuCores: Double? = nil,
+        reservedRamMb: Double? = nil,
+        minMemoryAvailablePercent: Double? = nil,
+        minFreeDiskMb: Double? = nil,
+        minFreeInodes: Double? = nil
+    ) {
         self.reservedCpuCores = reservedCpuCores
         self.reservedRamMb = reservedRamMb
         self.minMemoryAvailablePercent = minMemoryAvailablePercent
+        self.minFreeDiskMb = minFreeDiskMb
+        self.minFreeInodes = minFreeInodes
     }
 }
 
@@ -1008,11 +1070,21 @@ public struct HeadroomParsedEdit: Equatable, Sendable {
     public var reservedCpuCores: Double?
     public var reservedRamMb: Double?
     public var minMemoryAvailablePercent: Double?
+    public var minFreeDiskMb: Double?
+    public var minFreeInodes: Double?
 
-    public init(reservedCpuCores: Double? = nil, reservedRamMb: Double? = nil, minMemoryAvailablePercent: Double? = nil) {
+    public init(
+        reservedCpuCores: Double? = nil,
+        reservedRamMb: Double? = nil,
+        minMemoryAvailablePercent: Double? = nil,
+        minFreeDiskMb: Double? = nil,
+        minFreeInodes: Double? = nil
+    ) {
         self.reservedCpuCores = reservedCpuCores
         self.reservedRamMb = reservedRamMb
         self.minMemoryAvailablePercent = minMemoryAvailablePercent
+        self.minFreeDiskMb = minFreeDiskMb
+        self.minFreeInodes = minFreeInodes
     }
 }
 
