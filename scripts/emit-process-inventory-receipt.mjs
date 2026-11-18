@@ -577,11 +577,17 @@ function assertWritableReceiptPath(receiptPath) {
  * that look and the write.  So the file is opened without following a link and
  * without truncating it, the handle is checked to be a plain single-link file
  * this user owns and to be the very file the path lists now, and only then is
- * it emptied, written and set owner-only, all through the handle.  A link or a
- * second name swapped in after the inspection is refused, and the file it
- * points at is left as it was.
+ * it set owner-only, emptied and written, all through the handle.  The mode
+ * comes first because `openSync` applies its mode only when it creates the
+ * file:  a receipt an earlier run left under a wider mode would otherwise hold
+ * the new provenance and inventory hashes under that mode until the chmod.  A
+ * link or a second name swapped in after the inspection is refused, and the
+ * file it points at is left as it was.
+ *
+ * `io` is the three operations that change the file, so a test can watch the
+ * order they run in.  The default is the real ones.
  */
-export function writeReceiptFile(receiptPath, bytes) {
+export function writeReceiptFile(receiptPath, bytes, io = { chmod: fchmodSync, truncate: ftruncateSync, write: writeFileSync }) {
   const refused = () => new Error(`the receipt path is not a plain single-link file: ${receiptPath}`);
   let fd;
   try {
@@ -601,11 +607,11 @@ export function writeReceiptFile(receiptPath, bytes) {
     const sameFile = listed.dev === opened.dev && listed.ino === opened.ino;
     const ownedHere = !process.getuid || opened.uid === process.getuid();
     if (!opened.isFile() || opened.nlink !== 1 || !sameFile || !ownedHere) throw refused();
-    ftruncateSync(fd, 0);
-    writeFileSync(fd, bytes);
-    // The mode is only applied when the open created the file, so it is set
-    // again for the case where a receipt was already there.
-    fchmodSync(fd, 0o600);
+    // Owner-only before anything is emptied or written, for the case where a
+    // receipt was already there under a wider mode.
+    io.chmod(fd, 0o600);
+    io.truncate(fd, 0);
+    io.write(fd, bytes);
   } finally {
     closeSync(fd);
   }

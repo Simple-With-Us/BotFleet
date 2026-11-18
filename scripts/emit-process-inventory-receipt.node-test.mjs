@@ -15,7 +15,7 @@
 // repository's own producer script, which starts none itself.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, fchmodSync, ftruncateSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { after } from "node:test";
@@ -876,6 +876,39 @@ test("the receipt write replaces an earlier receipt whole and leaves it owner-on
 
   assert.equal(readFileSync(receiptPath, "utf8"), "{}\n");
   assert.equal(statSync(receiptPath).mode & 0o777, 0o600);
+});
+
+test("the receipt write sets owner-only before it empties or writes an earlier receipt", onPosix, () => {
+  const captureDir = temporaryDirectory("process-inventory-write-");
+  const receiptPath = join(captureDir, PROCESS_INVENTORY_RECEIPT_FILE);
+  writeFileSync(receiptPath, "an earlier receipt\n", { mode: 0o644 });
+  chmodSync(receiptPath, 0o644);
+
+  // Each mutating step reports the file's mode as it finds it, so the order is
+  // read out of what was on disk and not out of the call sequence alone.
+  const seen = [];
+  const mode = () => statSync(receiptPath).mode & 0o777;
+  writeReceiptFile(receiptPath, Buffer.from("{}\n"), {
+    chmod: (fd, value) => {
+      seen.push(["chmod", mode()]);
+      fchmodSync(fd, value);
+    },
+    truncate: (fd, length) => {
+      seen.push(["truncate", mode()]);
+      ftruncateSync(fd, length);
+    },
+    write: (fd, bytes) => {
+      seen.push(["write", mode()]);
+      writeFileSync(fd, bytes);
+    },
+  });
+
+  assert.deepEqual(seen, [
+    ["chmod", 0o644],
+    ["truncate", 0o600],
+    ["write", 0o600],
+  ]);
+  assert.equal(readFileSync(receiptPath, "utf8"), "{}\n");
 });
 
 /** The producer's flags with their values, for a capture directory. */
