@@ -51,7 +51,16 @@ test("pnpm test must chain the script as its own unmasked step", () => {
   assert.match(masked("pnpm test:mac-updater && pnpm test:ci-scope ; true"), /carries `;`/);
   assert.match(masked("pnpm test:mac-updater && pnpm test:ci-scope | tee gate.log"), /carries `\|`/);
   assert.match(masked("pnpm test:mac-updater && pnpm test:ci-scope &"), /carries `&`/);
+  // A newline ends a command too: the trailing `true` would stand in for the
+  // exit status of `pnpm test:ci-scope`, with no operator in sight.
+  assert.match(masked("pnpm test:mac-updater && pnpm test:ci-scope\ntrue"), /carries a newline/);
+  assert.match(masked("pnpm test:mac-updater && pnpm test:ci-scope\r\ntrue"), /carries a newline/);
   assert.deepEqual(wired(plain, "pnpm test:mac-updater && pnpm test:ci-scope"), [], "`&&` alone joins steps");
+  // A `&` that belongs to a redirection joins nothing and cannot hide a failure.
+  assert.deepEqual(wired(plain, "pnpm test:mac-updater && pnpm test:ci-scope 2>&1"), [], "2>&1");
+  assert.deepEqual(wired(plain, "pnpm test:mac-updater && pnpm test:ci-scope >&2"), [], ">&2");
+  assert.deepEqual(wired(plain, "pnpm test:mac-updater && pnpm test:ci-scope &>gate.log"), [], "&>log");
+  assert.match(masked("pnpm test:mac-updater && pnpm test:ci-scope 2>&1 &"), /carries `&`/, "a redirection does not hide a real `&`");
   assert.deepEqual(gateWiringProblems({ "test:mac-updater": plain }, "test:mac-updater", [PROVENANCE]), [
     "`pnpm test` does not chain `pnpm test:mac-updater` as its own step, so hosted CI never runs it",
   ]);
@@ -75,7 +84,21 @@ test("an opt-in file is refused in any step that reaches it without the switch",
   // After the runner it is an argument to node, and the variable stays unset.
   assert.deepEqual(reaches(`node --test ${INSTALL} ${OPT_IN}`), refusal, "a trailing assignment sets nothing");
   assert.deepEqual(reaches(`node --test ${OPT_IN} ${INSTALL}`), refusal, "an assignment after the flag sets nothing");
+  // Each stage of a pipeline, and each command after `&` or a newline, has its
+  // own environment: the assignment binds to the command right after it.
+  assert.deepEqual(reaches(`env ${OPT_IN} echo ok | node --test ${INSTALL}`), refusal, "a pipeline: the switch is for echo");
+  assert.deepEqual(reaches(`${OPT_IN} echo ok & node --test ${INSTALL}`), refusal, "a background `&`");
+  assert.deepEqual(reaches(`${OPT_IN} echo ok\nnode --test ${INSTALL}`), refusal, "a newline");
+  // Contract: the switch is read off this step's own leading assignments, so a
+  // step that sets it another way reads as not wired and is rewritten, instead
+  // of the check guessing at shell semantics that could accept a step that
+  // runs the file with the switch unset.
+  assert.deepEqual(reaches(`export ${OPT_IN} && node --test ${INSTALL}`), refusal, "an export in an earlier step");
+  assert.deepEqual(reaches(`echo ${OPT_IN} && node --test ${INSTALL}`), refusal, "an assignment-shaped argument is not a setting");
+  assert.deepEqual(reaches(`env -u OTHER ${OPT_IN} node --test ${INSTALL}`), refusal, "an env option is not followed");
   assert.deepEqual(reaches(`${OPT_IN} node --test ${INSTALL}`), []);
+  assert.deepEqual(reaches(`${OPT_IN} node --test ${INSTALL} 2>&1`), [], "a redirection does not end the step");
+  assert.deepEqual(reaches(`${OPT_IN} node --test ${INSTALL} | tee run.log`), [], "the runner's own stage holds the switch");
   assert.deepEqual(reaches(`OTHER=1 ${OPT_IN} node --test ${INSTALL}`), [], "several leading assignments");
   assert.deepEqual(reaches(`env ${OPT_IN} node --test ${INSTALL}`), [], "env sets it for its command");
   assert.deepEqual(reaches(`cross-env ${OPT_IN} node --test ${INSTALL}`), [], "cross-env sets it for its command");

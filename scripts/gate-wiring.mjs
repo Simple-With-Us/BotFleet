@@ -12,6 +12,13 @@
 const TEST_FILE = /^[\w./-]+\.node-test\.mjs$/;
 const GLOB = /[*?[\]{}]/;
 
+// The shell operators, other than `&&`, that end one command and start the
+// next: `||`, `;`, `|`, a newline and a lone `&`.  Each lets a later command's
+// status stand in for an earlier failure, or runs the two apart.  A `&` that
+// belongs to a redirection (`2>&1`, `>&2`, `<&3`, `&>log`) is not one of them.
+const OPERATOR = /\|\||[|;\n\r]|(?<![<>])&(?!>)/;
+const STEP_BREAK = new RegExp(`&&|${OPERATOR.source}`);
+
 /**
  * What keeps `suites` from running under `pnpm test` through `script`.
  * The script must be exactly `node --test` followed by literal test files:
@@ -35,11 +42,13 @@ export function gateWiringProblems(scripts, script, suites) {
     problems.push(`\`pnpm test\` does not chain \`pnpm ${script}\` as its own step, so hosted CI never runs it`);
   }
   // A clean step inside a chain that something else masks still cannot fail
-  // CI: `a && b || true` exits 0 whatever b does, and `a && b | tee log` or
-  // `a && b ; c` report only the last command.  Only `&&` may join steps.
-  const masking = testCommand.replaceAll("&&", " ").match(/\|\||[|;&]/);
+  // CI: `a && b || true` exits 0 whatever b does, and `a && b | tee log`,
+  // `a && b ; c` or a newline before `c` report only the last command.  Only
+  // `&&` may join steps; a redirection such as `2>&1` joins nothing.
+  const masking = testCommand.replaceAll("&&", " ").match(OPERATOR);
   if (masking) {
-    problems.push(`\`pnpm test\` carries \`${masking[0]}\`, so a failing step in its chain would not fail hosted CI`);
+    const shown = /\s/.test(masking[0]) ? "a newline" : `\`${masking[0]}\``;
+    problems.push(`\`pnpm test\` carries ${shown}, so a failing step in its chain would not fail hosted CI`);
   }
   return problems;
 }
@@ -59,7 +68,9 @@ function globCovers(token, file) {
 
 // The environment assignments a step sets for its command: the leading
 // `NAME=value` tokens, after an optional `env` or `cross-env`.  A `NAME=value`
-// after the runner is an argument to node and leaves the variable unset.
+// after the runner is an argument to node and leaves the variable unset.  This
+// reads one command of one pipeline stage; an `env` option, or an `export` in
+// an earlier step, is not followed, so such a step reads as not wired.
 function leadingAssignments(tokens) {
   let index = tokens[0] === "env" || tokens[0] === "cross-env" ? 1 : 0;
   const assigned = [];
@@ -72,13 +83,16 @@ function leadingAssignments(tokens) {
  * run reports one skip, which reads as coverage that never ran.  A step
  * reaches the file by naming it anywhere (any prefix, or run directly), or by
  * a `--test` glob that covers it; the switch must be set in that step's own
- * environment, as a leading `NAME=value` assignment before the runner.
+ * environment, as a leading `NAME=value` assignment before the runner.  A step
+ * ends at `&&`, `||`, `;`, `|`, a newline or a lone `&`, because each stage of
+ * a pipeline has its own environment and an assignment binds to the command
+ * right after it, not to a later stage.
  */
 export function optInProblems(scripts, file, optIn) {
   const base = file.slice(file.lastIndexOf("/") + 1);
   const problems = [];
   for (const [name, command] of Object.entries(scripts)) {
-    for (const step of command.split(/&&|\|\||;/)) {
+    for (const step of command.split(STEP_BREAK)) {
       const tokens = step.trim().split(/\s+/);
       const named = tokens.some((token) => token.includes(base));
       const globbed = tokens.includes("--test") && tokens.some((token) => globCovers(token, file));
