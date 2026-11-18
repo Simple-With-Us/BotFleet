@@ -44,11 +44,24 @@ function makeFixture({ withDependencies = false } = {}) {
 // Nothing is inherited from the machine that runs the suite.  The launcher
 // finds its tools with PATH and keeps its own fixture home; every other
 // value it reads is named by the caller.  A host credential must never reach
-// the launcher through the environment, the startup answer and the Keychain
-// reader belong to the fixture, and an inherited XPC_SERVICE_NAME would even
-// change whether the run looks like launchd.
+// the launcher through the environment, the startup answer belongs to the
+// fixture, and an inherited XPC_SERVICE_NAME would even change whether the
+// run looks like launchd.
+//
+// The Keychain reader is a fixture value too.  The launcher's own default is
+// the real /usr/bin/security, and `security find-generic-password` resolves
+// the login Keychain from the account rather than from HOME, so the real
+// reader finds the desktop's enrollment item on the machine that runs the
+// suite and answers remote where the fixture expects no enrollment at all.
+// The reader therefore points at a path that does not exist, so the probe
+// fails closed, and a fixture that wants to exercise the Keychain names a
+// stub of its own.
 function launcherEnv(fixture, { home = join(fixture.dir, "home") } = {}) {
-  return { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home };
+  return {
+    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    HOME: home,
+    BOTFLEET_SECURITY_BIN: join(fixture.dir, "no-such-security-binary"),
+  };
 }
 
 function run(fixture, { threshold = 20, windowSeconds = 3600, args = [], node = fixture.node, xpcServiceName = "" } = {}) {
@@ -669,14 +682,21 @@ test("the fixture environment inherits nothing from the machine that runs the su
   const fixture = identityFixture();
   try {
     const env = launcherEnv(fixture);
-    assert.deepEqual(Object.keys(env).sort(), ["HOME", "PATH"]);
+    assert.deepEqual(Object.keys(env).sort(), ["BOTFLEET_SECURITY_BIN", "HOME", "PATH"]);
     assert.equal(env.HOME, join(fixture.dir, "home"));
+    assert.notEqual(env.HOME, process.env.HOME);
+    assert.equal(env.BOTFLEET_SECURITY_BIN, join(fixture.dir, "no-such-security-binary"));
     assert.equal(env.INFISICAL_TOKEN, undefined);
     assert.equal(env.BOTFLEET_STARTUP_ENROLLMENT, undefined);
-    assert.equal(env.BOTFLEET_SECURITY_BIN, undefined);
     assert.equal(env.BOTFLEET_KEYCHAIN_SERVICE, undefined);
     assert.equal(env.BOTFLEET_KEYCHAIN_ACCOUNT, undefined);
     assert.equal(env.XPC_SERVICE_NAME, undefined);
+    // No credential-shaped name survives into the fixture environment,
+    // whatever the host environment happened to hold when the suite ran.
+    for (const key of Object.keys(env)) {
+      assert.doesNotMatch(key, /^(INFISICAL_|AWS_|GH_)/);
+      assert.doesNotMatch(key, /_(TOKEN|KEY|SECRET|PASSWORD)$/);
+    }
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
