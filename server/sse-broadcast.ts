@@ -46,8 +46,13 @@ export interface SseFrameEnvelope {
   event?: { threadId?: string };
 }
 
+export interface SseFrameTarget {
+  botId: string;
+  threadId: string;
+}
+
 /** Derive the canonical `(botId, threadId)` target from top-level or nested SSE frame envelopes. */
-export function extractSseFrameTarget(payload: SseFrameEnvelope): { botId: string; threadId: string } {
+export function extractSseFrameTarget(payload: SseFrameEnvelope): SseFrameTarget {
   const botId = String(payload.botId ?? payload.bot?.id ?? "");
   const threadId = String(
     payload.threadId ??
@@ -63,9 +68,15 @@ export type SseFiltersParseResult =
   | { ok: true; screenBotIds: Set<string> | null; onlyKinds: Set<string> | null; threadIds: Set<string> | null }
   | { ok: false; message: string };
 
+interface SseFilterBuckets {
+  botId: Set<string> | null;
+  kind: Set<string> | null;
+  threadId: Set<string> | null;
+}
+
 /** Parse and validate all supported SSE subscription filters in one uniform pass. */
 export function parseSseFilters(searchParams: URLSearchParams): SseFiltersParseResult {
-  const parsed: Record<"botId" | "kind" | "threadId", Set<string> | null> = {
+  const parsed: SseFilterBuckets = {
     botId: null,
     kind: null,
     threadId: null,
