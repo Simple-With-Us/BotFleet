@@ -2,7 +2,26 @@
 import Foundation
 import Darwin
 
-public enum NativeHostControlError: Error { case unsafeSocket, socketUnavailable }
+public enum NativeHostControlError: Error, Equatable {
+    case unsafeSocket
+    case socketUnavailable
+    /// The host did not report a validated running state when the start was checked.
+    case startNotVerified(state: String)
+    /// The control channel did not answer, so the start could not be confirmed.
+    case controlChannelUnreachable
+}
+
+extension NativeHostControlError {
+    /// A stable, secret-free reason code for a failed control operation.
+    public var reasonCode: String {
+        switch self {
+        case .unsafeSocket: return "unsafeSocket"
+        case .socketUnavailable: return "socketUnavailable"
+        case .startNotVerified(let state): return "startNotVerified:\(state)"
+        case .controlChannelUnreachable: return "controlChannelUnreachable"
+        }
+    }
+}
 
 /// A private administrative channel; the production peer check always uses kernel credentials.
 public final class NativeHostControlServer: @unchecked Sendable {
@@ -79,6 +98,44 @@ public final class NativeHostControlServer: @unchecked Sendable {
 
     deinit { close() }
 
+    /// The start path is checked, never assumed.
+    ///
+    /// A caller may only report that the host came up after this channel has
+    /// published a real, validated running state and has answered a connection.
+    /// The published payload is the one the `status` verb serves, so the two can
+    /// never disagree, and the peer fence is untouched: the probe connects and
+    /// disconnects without ever sending a privileged request.
+    public func verifyStart() async throws -> NativeHeadlessHostState {
+        let state = await host.state
+        let payload = Self.statusPayload(state)
+        guard state == .running,
+              payload.contains("\"state\":\"\(NativeHeadlessHostState.running.rawValue)\"") else {
+            throw NativeHostControlError.startNotVerified(state: state.rawValue)
+        }
+        guard Self.channelAnswers(path: path) else {
+            throw NativeHostControlError.controlChannelUnreachable
+        }
+        return state
+    }
+
+    /// A bare connection proves the listener is live.  No request is sent, so the
+    /// root-only peer check stays exactly as strict as it is in production.
+    private static func channelAnswers(path: String) -> Bool {
+        var address: sockaddr_un
+        do { address = try Self.address(path) } catch { return false }
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { Darwin.close(fd) }
+        // A non-blocking connect can never wait on a full backlog.
+        _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+        let result = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        return result == 0
+    }
+
     private func acceptConnections(_ listener: Int32) {
         // A bounded batch lets cancellation run even if clients keep connecting.
         for _ in 0..<16 {
@@ -115,8 +172,8 @@ public final class NativeHostControlServer: @unchecked Sendable {
     private func perform(_ verb: String, fd: Int32) async {
         defer { finishConnection(fd) }
         if verb == "status" {
-            let state = await host.state.rawValue
-            await replyOffExecutor(fd, "{\"ok\":true,\"state\":\"\(state)\"}\n")
+            let state = await host.state
+            await replyOffExecutor(fd, Self.statusPayload(state) + "\n")
             return
         }
         do {
@@ -126,8 +183,16 @@ public final class NativeHostControlServer: @unchecked Sendable {
             close()
             notifyStopped()
         } catch {
-            await replyOffExecutor(fd, "{\"ok\":false,\"error\":\"shutdownFailed\"}\n")
+            // The refusal keeps the stable error code and names the reason that stopped it.
+            let reason = NativeHostFailureReason.code(for: error)
+            await replyOffExecutor(fd, "{\"ok\":false,\"error\":\"shutdownFailed\",\"reason\":\"\(reason)\"}\n")
         }
+    }
+
+    /// The exact payload the `status` verb serves, so a checked start and a status
+    /// request can never disagree about the host's state.
+    static func statusPayload(_ state: NativeHeadlessHostState) -> String {
+        "{\"ok\":true,\"state\":\"\(state.rawValue)\"}"
     }
 
     private func replyOffExecutor(_ fd: Int32, _ text: String) async {

@@ -165,14 +165,14 @@ struct NativeHostControlTests {
     func foregroundExecutable() async throws {
         let fixture = try HostFixture(shortPath: true)
         defer { fixture.remove() }
-        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let executable = root.appendingPathComponent(".build/debug/BotFleetNativeHost")
+        let executable = nativeHostExecutable()
         #expect(FileManager.default.isExecutableFile(atPath: executable.path))
         let process = Process()
         process.executableURL = executable
         process.arguments = ["--service-data", fixture.root.path]
         process.environment = ["PATH": "/usr/bin:/bin", "HOME": fixture.parent.path, "TMPDIR": fixture.parent.path]
-        process.standardOutput = Pipe()
+        let runningOutput = Pipe()
+        process.standardOutput = runningOutput
         process.standardError = Pipe()
         try process.run()
         defer { if process.isRunning { kill(process.processIdentifier, SIGKILL); process.waitUntilExit() } }
@@ -182,7 +182,10 @@ struct NativeHostControlTests {
         if geteuid() != 0 { #expect(try await controlRequest(fixture, "stop\n").contains("denied")) }
         process.terminate()
         try await controlEventually { !process.isRunning }
+        // A start is announced only after the control channel verified the host.
+        let runningStdout = String(decoding: runningOutput.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         #expect(process.terminationStatus == 0)
+        #expect(runningStdout.contains("Native host running"))
         let paths = try NativeServicePaths(serviceData: fixture.root)
         try Data("{\"stopped\":true}\n".utf8).write(to: paths.stoppedMarker)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: paths.stoppedMarker.path)
@@ -191,15 +194,100 @@ struct NativeHostControlTests {
         automatic.executableURL = executable
         automatic.arguments = ["--service-data", fixture.root.path, "--automatic"]
         automatic.environment = ["PATH": "/usr/bin:/bin", "HOME": fixture.parent.path, "TMPDIR": fixture.parent.path]
-        automatic.standardOutput = Pipe()
+        let automaticOutput = Pipe()
+        automatic.standardOutput = automaticOutput
         automatic.standardError = Pipe()
         try automatic.run()
         defer { if automatic.isRunning { kill(automatic.processIdentifier, SIGKILL); automatic.waitUntilExit() } }
         try await controlEventually { !automatic.isRunning }
+        let automaticStdout = String(decoding: automaticOutput.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         #expect(automatic.terminationStatus == 0)
+        // The host did not come up, so the start is never reported as successful.
+        #expect(!automaticStdout.contains("Native host running"))
+        #expect(automaticStdout.contains("was not started"))
         #expect(try Data(contentsOf: fixture.database) == databaseBefore)
         #expect(FileManager.default.fileExists(atPath: paths.stoppedMarker.path))
     }
+
+    @Test("A checked start verifies the host through the control channel before it is reported as started")
+    func checkedStartVerifiesTheHost() async throws {
+        let fixture = try HostFixture(shortPath: true)
+        defer { fixture.remove() }
+        let host = try await fixture.start()
+        let server = try NativeHostControlServer(host: host, peerUID: { _ in 0 })
+        defer { server.close() }
+        // The checked start and the status verb can never disagree about the state.
+        #expect(try await server.verifyStart() == .running)
+        #expect(try await controlRequest(fixture, "status\n").contains("\"state\":\"running\""))
+        // A host that did not come up is never reported as started, and the reason is named.
+        try await host.shutdown()
+        var reason: String?
+        do {
+            _ = try await server.verifyStart()
+        } catch let error as NativeHostControlError {
+            reason = error.reasonCode
+        }
+        #expect(reason == "startNotVerified:stopped")
+    }
+
+    @Test("A failed start reports the reason and is never reported as successful")
+    func failedStartReportsTheReason() async throws {
+        let fixture = try HostFixture(shortPath: true)
+        defer { fixture.remove() }
+        // The running host owns the service root, so the next start cannot take it.
+        let host = try await fixture.start()
+        let executable = nativeHostExecutable()
+        #expect(FileManager.default.isExecutableFile(atPath: executable.path))
+        let run = try runNativeHost(executable, arguments: ["--service-data", fixture.root.path], fixture: fixture)
+        #expect(run.status != 0)
+        #expect(run.error.contains("reason=ownerAlreadyRunning"))
+        #expect(!run.error.contains("type(of:"))
+        #expect(!run.output.contains("Native host running"))
+        try await host.shutdown()
+    }
+
+    @Test("Failure reasons are stable codes that never carry a message, a path or a token")
+    func stableFailureReasons() {
+        #expect(NativeHostFailureReason.code(for: NativeHeadlessHostError.ownerAlreadyRunning) == "ownerAlreadyRunning")
+        #expect(NativeHostFailureReason.code(for: NativeHeadlessHostError.stopMarkerFailed) == "stopMarkerFailed")
+        #expect(NativeHostFailureReason.code(for: NativeHostControlError.unsafeSocket) == "unsafeSocket")
+        #expect(NativeHostFailureReason.code(for: NativeHostControlError.startNotVerified(state: "stopped")) == "startNotVerified:stopped")
+        #expect(NativeHostFailureReason.code(for: DatabaseError.openFailed("/private/service-root/host.sqlite")) == "databaseOpenFailed")
+        #expect(NativeHostFailureReason.code(for: NativeHostLaunchArgumentsError.invalidArguments) == "invalidArguments")
+        let unclassified = NativeHostFailureReason.code(for: NSError(domain: "fixture", code: 7))
+        #expect(unclassified == "unclassified")
+        #expect(!unclassified.contains("fixture"))
+    }
+}
+
+private func nativeHostExecutable() -> URL {
+    let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    return root.appendingPathComponent(".build/debug/BotFleetNativeHost")
+}
+
+private struct NativeHostRun {
+    let status: Int32
+    let output: String
+    let error: String
+}
+
+/// Runs the real foreground executable to completion and keeps both streams.
+private func runNativeHost(_ executable: URL, arguments: [String], fixture: HostFixture) throws -> NativeHostRun {
+    let process = Process()
+    process.executableURL = executable
+    process.arguments = arguments
+    process.environment = ["PATH": "/usr/bin:/bin", "HOME": fixture.parent.path, "TMPDIR": fixture.parent.path]
+    let output = Pipe()
+    let error = Pipe()
+    process.standardOutput = output
+    process.standardError = error
+    try process.run()
+    let outputData = output.fileHandleForReading.readDataToEndOfFile()
+    let errorData = error.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return NativeHostRun(status: process.terminationStatus,
+                         output: String(decoding: outputData, as: UTF8.self),
+                         error: String(decoding: errorData, as: UTF8.self))
 }
 
 private func controlEventually(_ predicate: () -> Bool) async throws {
