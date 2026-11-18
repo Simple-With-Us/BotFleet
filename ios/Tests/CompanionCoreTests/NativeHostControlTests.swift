@@ -474,33 +474,32 @@ private enum FixtureWriteRefusal: Error, CustomStringConvertible {
 
 /// Writes a fixture payload through a verified handle.
 ///
-/// The payload never goes through a resolved path.  Every ancestor of the
-/// trusted directory must be a real directory, so a symlinked directory cannot
-/// redirect the write, and the trusted directory itself is opened with
-/// `O_NOFOLLOW`, so a symlinked service root is refused.  The entry is then
-/// opened relative to that directory descriptor with `O_NOFOLLOW`, the opened
-/// handle is checked with `fstat` (a regular, single-link file owned by this
-/// user), and its device and inode are compared with the listed path before
-/// anything is written.
+/// The payload never goes through a resolved path.  The trusted directory is
+/// resolved once, so no symlinked component can redirect the write, and it is
+/// then opened with `O_NOFOLLOW`, so a symlinked service root is refused, and
+/// it must be a private directory this user owns.  The entry is opened relative
+/// to that directory descriptor with `O_NOFOLLOW`, the opened handle is checked
+/// with `fstat` (a regular, single-link file owned by this user), and its
+/// device and inode are compared with the listed path before anything is
+/// written.
 private func writeFixtureFile(_ payload: String, to url: URL) throws {
     let path = url.path
-    let directoryPath = url.deletingLastPathComponent().path
     let name = url.lastPathComponent
-    var ancestor = URL(fileURLWithPath: "/")
-    for component in directoryPath.split(separator: "/", omittingEmptySubsequences: true).map(String.init) {
-        ancestor = ancestor.appendingPathComponent(component)
-        var info = stat()
-        guard lstat(ancestor.path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else {
-            throw FixtureWriteRefusal.ancestor(ancestor.path, errno)
-        }
+    let directoryPath = url.deletingLastPathComponent().path
+    // The trusted directory is resolved once, so the symlinked components of a
+    // path such as the macOS /tmp link are resolved before anything is opened.
+    var resolvedBuffer = [CChar](repeating: 0, count: 4096)
+    let resolved = resolvedBuffer.withUnsafeMutableBufferPointer { pointer -> String in
+        guard let base = pointer.baseAddress, let resolvedPath = realpath(directoryPath, base) else { return "" }
+        return String(cString: resolvedPath)
     }
-    let directory = open(directoryPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW, 0)
+    guard !resolved.isEmpty else { throw FixtureWriteRefusal.trustedDirectory(errno) }
+    let directory = open(resolved, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW, 0)
     guard directory >= 0 else { throw FixtureWriteRefusal.trustedDirectory(errno) }
     defer { Darwin.close(directory) }
     var directoryInfo = stat()
     guard fstat(directory, &directoryInfo) == 0, directoryInfo.st_mode & S_IFMT == S_IFDIR,
-          directoryInfo.st_uid == 0 || directoryInfo.st_uid == geteuid(),
-          directoryInfo.st_mode & 0o022 == 0 else {
+          directoryInfo.st_uid == geteuid(), directoryInfo.st_mode & 0o022 == 0 else {
         throw FixtureWriteRefusal.trustedDirectory(0)
     }
     let fd = name.withCString {
