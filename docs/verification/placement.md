@@ -36,6 +36,13 @@ Use temporary data directories, free ports, `BOTFLEET_DISABLE_CONTAINER_RUNTIME=
 
 The seven remaining keys are specified in [Headroom Evidence](headroom.md).  Together these are the plan's sixteen recipes; none may be replaced by a successful typecheck or a review decision.
 
+## Candidate Packet Before Hand Runs
+
+1. Pin the source SHA, shared build number and signed candidate artifact SHA-256.  Record the prior retained build and the rollback probe result separately.  A source test or static probe does not prove that a shipped rollback artifact is retained and compatible.
+2. Record distinct Mac/server host identities, their intended roles and the placement mode.  Plan the required [host inventories](host-inventory.md) without collecting them until authorized.  Use isolated stores and ports for source fixtures; do not use a real store as a fixture.
+3. For each selected recipe, capture the exact commands and expected refusal or success, relevant before/after state, counts where required and the runner's timestamp.  Mark a blocked or unrun recipe false, even if a related source test is green.  Inspect the native mode captions and applied state on the actual Mac candidate where the recipe requires them.
+4. Save the redacted artifacts in the private packet and bind them to that candidate in [Native Final Evidence Bundle](native-final-evidence.md).  Review the packet before asserting a gate.  T5/T6b fixture results, T7 Swift acknowledgement and an emitted receipt are separate from T9 permission to activate.
+
 ## Recording And Checking Evidence
 
 Start from [placement-evidence.json](placement-evidence.json), whose assertions intentionally remain false.  Copy it into a run's evidence directory and copy the inventory/log artifacts into that same bundle or its child directories.  Record only relative child paths; absolute paths, escapes, symbolic links and hard links are refused.  Set a key true only after its complete recipe passes.  Hand runs require `at` in America/Chicago written as `2026-10-30 3:15 PM`, `by` naming the runner, and `log` naming the captured output.  Machine timestamps within raw logs may remain machine timestamps.
