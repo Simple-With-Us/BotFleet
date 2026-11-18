@@ -433,11 +433,20 @@ describe("hostResourcesReportSchema", () => {
 
 describe("parseHeadroomEdit", () => {
   it("parses numbers and omits empty boxes", () => {
-    const parsed = parseHeadroomEdit({ reservedCpuCores: "2", reservedRamMb: "", minMemoryAvailablePercent: "10.5" });
-    expect(parsed).toEqual({ ok: true, parsed: { reservedCpuCores: 2, minMemoryAvailablePercent: 10.5 } });
+    const parsed = parseHeadroomEdit({
+      reservedCpuCores: "2",
+      reservedRamMb: "",
+      minMemoryAvailablePercent: "10.5",
+      minFreeDiskMb: "4096",
+      minFreeInodes: "10000",
+    });
+    expect(parsed).toEqual({
+      ok: true,
+      parsed: { reservedCpuCores: 2, minMemoryAvailablePercent: 10.5, minFreeDiskMb: 4096, minFreeInodes: 10000 },
+    });
   });
 
-  it("refuses non-numeric, fractional ints and out-of-range values", () => {
+  it("refuses non-numeric, fractional ints, out-of-range values, and disk floors under 2 GB", () => {
     expect(parseHeadroomEdit({ reservedCpuCores: "abc", reservedRamMb: "", minMemoryAvailablePercent: "" }).ok).toBe(false);
     expect(parseHeadroomEdit({ reservedCpuCores: "1.5", reservedRamMb: "", minMemoryAvailablePercent: "" }).ok).toBe(false);
     expect(parseHeadroomEdit({ reservedCpuCores: "65", reservedRamMb: "", minMemoryAvailablePercent: "" }).ok).toBe(false);
@@ -446,6 +455,56 @@ describe("parseHeadroomEdit", () => {
     expect(parseHeadroomEdit({ reservedCpuCores: "0x10", reservedRamMb: "", minMemoryAvailablePercent: "" }).ok).toBe(false);
     expect(parseHeadroomEdit({ reservedCpuCores: "1e3", reservedRamMb: "", minMemoryAvailablePercent: "" }).ok).toBe(false);
     expect(parseHeadroomEdit({ reservedCpuCores: "", reservedRamMb: "1000001", minMemoryAvailablePercent: "" }).ok).toBe(false);
+    expect(parseHeadroomEdit({ reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "", minFreeDiskMb: "512" })).toEqual({
+      ok: false,
+      errors: [{ field: "minFreeDiskMb", message: "Below the built-in safety gate (2 GB)." }],
+    });
+    expect(parseHeadroomEdit({ reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "", minFreeDiskMb: "2047" })).toEqual({
+      ok: false,
+      errors: [{ field: "minFreeDiskMb", message: "Below the built-in safety gate (2 GB)." }],
+    });
+    expect(parseHeadroomEdit({ reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "", minFreeDiskMb: "2048.5" }).ok).toBe(false);
+    expect(parseHeadroomEdit({ reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "", minFreeInodes: "1.5" }).ok).toBe(false);
+    expect(parseHeadroomEdit({ reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "", minFreeInodes: "-1" }).ok).toBe(false);
+  });
+
+  it("carries an unchanged pre-configured sub-2048 MB disk floor so saving unrelated knobs still works", () => {
+    const existingSubFloor = report({
+      admission: {
+        maxSwapPercent: 98,
+        minFreeDiskBytes: 512 * 1024 * 1024,
+        unknownReading: "admit",
+      },
+    });
+    const current = currentHeadroomKnobs(existingSubFloor.admission);
+    const initial = headroomEditInitial(existingSubFloor);
+    expect(initial.minFreeDiskMb).toBe("512");
+
+    // Unchanged prefilled "512" passes when saving CPU or inodes.
+    const unchangedSave = parseHeadroomEdit(
+      { ...initial, reservedCpuCores: "2", minFreeInodes: "5000" },
+      current,
+    );
+    expect(unchangedSave).toEqual({
+      ok: true,
+      parsed: { reservedCpuCores: 2, minFreeDiskMb: 512, minFreeInodes: 5000 },
+    });
+    if (!unchangedSave.ok) throw new Error("unreachable");
+    const carriedPatch = buildHeadroomPatch(existingSubFloor, unchangedSave.parsed);
+    expect(carriedPatch.jobs.admission.minFreeDiskMb).toBe(512);
+    expect(carriedPatch.jobs.admission.reservedCpuCores).toBe(2);
+
+    // Changing to a different sub-floor value still refuses.
+    expect(parseHeadroomEdit({ ...initial, minFreeDiskMb: "256" }, current)).toEqual({
+      ok: false,
+      errors: [{ field: "minFreeDiskMb", message: "Below the built-in safety gate (2 GB)." }],
+    });
+
+    // Clearing the prefilled sub-floor box restores the 2 GB gate via null.
+    const clearedSave = parseHeadroomEdit({ ...initial, reservedCpuCores: "2", minFreeDiskMb: "" }, current);
+    expect(clearedSave).toEqual({ ok: true, parsed: { reservedCpuCores: 2 } });
+    if (!clearedSave.ok) throw new Error("unreachable");
+    expect(buildHeadroomPatch(existingSubFloor, clearedSave.parsed).jobs.admission.minFreeDiskMb).toBeNull();
   });
 
   it("refuses an all-empty save as a no-op", () => {
@@ -454,10 +513,12 @@ describe("parseHeadroomEdit", () => {
   });
 
   it("permits an all-empty edit when it clears a set knob, so the last knob stays unsettable", () => {
-    const empty = { reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "" };
+    const empty = { reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "", minFreeDiskMb: "", minFreeInodes: "" };
     expect(parseHeadroomEdit(empty, { reservedCpuCores: 1 })).toEqual({ ok: true, parsed: {} });
     expect(parseHeadroomEdit(empty, { reservedRamMb: 512 })).toEqual({ ok: true, parsed: {} });
     expect(parseHeadroomEdit(empty, { minMemoryAvailablePercent: 20 })).toEqual({ ok: true, parsed: {} });
+    expect(parseHeadroomEdit(empty, { minFreeDiskMb: 4096 })).toEqual({ ok: true, parsed: {} });
+    expect(parseHeadroomEdit(empty, { minFreeInodes: 1000 })).toEqual({ ok: true, parsed: {} });
     expect(parseHeadroomEdit(empty, {})).toEqual({
       ok: false,
       errors: [{ field: "reservedCpuCores", message: "Enter at least one number to save." }],
@@ -473,18 +534,21 @@ describe("parseHeadroomEdit", () => {
       admission: {
         maxSwapPercent: 90,
         minFreeDiskBytes: 4 * GB,
+        minFreeInodes: 1000,
         reservedCpuCores: 1,
         unknownReading: "admit",
       },
     });
     const parsed = parseHeadroomEdit(
-      { reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "" },
+      { reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "", minFreeDiskMb: "", minFreeInodes: "" },
       currentHeadroomKnobs(current.admission),
     );
     expect(parsed).toEqual({ ok: true, parsed: {} });
     if (!parsed.ok) throw new Error("unreachable");
     const patch = buildHeadroomPatch(current, parsed.parsed);
     expect(patch.jobs.admission.reservedCpuCores).toBeNull();
+    expect(patch.jobs.admission.minFreeDiskMb).toBeNull();
+    expect(patch.jobs.admission.minFreeInodes).toBeNull();
     expect(patch.jobs.admission.reservedRamMb).toBeUndefined();
     expect(patch.jobs.admission.maxSwapPercent).toBe(90);
   });
@@ -501,7 +565,7 @@ describe("buildHeadroomPatch", () => {
         unknownReading: "admit",
       },
     });
-    expect(buildHeadroomPatch(current, { reservedCpuCores: 2, reservedRamMb: 512 })).toEqual({
+    expect(buildHeadroomPatch(current, { reservedCpuCores: 2, reservedRamMb: 512, minFreeInodes: 1000 })).toEqual({
       jobs: {
         admission: {
           maxSwapPercent: 98,
@@ -520,6 +584,7 @@ describe("buildHeadroomPatch", () => {
       admission: {
         maxSwapPercent: 90,
         minFreeDiskBytes: 4 * GB,
+        minFreeInodes: 1000,
         reservedRamBytes: 256 * 1024 * 1024,
         minMemoryAvailablePercent: 20,
         unknownReading: "admit",
@@ -527,14 +592,15 @@ describe("buildHeadroomPatch", () => {
     });
     const patch = buildHeadroomPatch(current, { reservedCpuCores: 3 });
     expect(patch.jobs.admission.maxSwapPercent).toBe(90);
-    expect(patch.jobs.admission.minFreeDiskMb).toBe(4096);
+    expect(patch.jobs.admission.minFreeDiskMb).toBeNull();
+    expect(patch.jobs.admission.minFreeInodes).toBeNull();
     expect(patch.jobs.admission.reservedCpuCores).toBe(3);
     // Emptied over a set knob: null unsets it on save.
     expect(patch.jobs.admission.reservedRamMb).toBeNull();
     expect(patch.jobs.admission.minMemoryAvailablePercent).toBeNull();
   });
 
-  it("omits emptied boxes over already-unset knobs", () => {
+  it("omits emptied boxes over already-unset knobs and preserves edited disk/inode floors", () => {
     const current = report({
       admission: {
         maxSwapPercent: 90,
@@ -542,8 +608,10 @@ describe("buildHeadroomPatch", () => {
         unknownReading: "admit",
       },
     });
-    const patch = buildHeadroomPatch(current, { reservedCpuCores: 3 });
+    const patch = buildHeadroomPatch(current, { reservedCpuCores: 3, minFreeDiskMb: 4096, minFreeInodes: 2500 });
     expect(patch.jobs.admission.reservedCpuCores).toBe(3);
+    expect(patch.jobs.admission.minFreeDiskMb).toBe(4096);
+    expect(patch.jobs.admission.minFreeInodes).toBe(2500);
     expect(patch.jobs.admission.reservedRamMb).toBeUndefined();
     expect(patch.jobs.admission.minMemoryAvailablePercent).toBeUndefined();
     // undefined keys never reach the wire: JSON.stringify drops them, so the
@@ -553,17 +621,27 @@ describe("buildHeadroomPatch", () => {
 });
 
 describe("headroomEditInitial", () => {
-  it("renders set knobs as strings and unset as empty", () => {
+  it("renders set knobs as strings and unset as empty, with current disk MB prefilled", () => {
     const initial = headroomEditInitial(
       report({ admission: { maxSwapPercent: 98, minFreeDiskBytes: 2 * GB, reservedCpuCores: 2, unknownReading: "admit" } }),
     );
     expect(initial.reservedCpuCores).toBe("2");
     expect(initial.reservedRamMb).toBe("");
-    const withRam = headroomEditInitial(
+    expect(initial.minFreeDiskMb).toBe("2048");
+    expect(initial.minFreeInodes).toBe("");
+    const withCustom = headroomEditInitial(
       report({
-        admission: { maxSwapPercent: 98, minFreeDiskBytes: 2 * GB, reservedRamBytes: 512 * 1024 * 1024, unknownReading: "admit" },
+        admission: {
+          maxSwapPercent: 98,
+          minFreeDiskBytes: 4 * GB,
+          minFreeInodes: 5000,
+          reservedRamBytes: 512 * 1024 * 1024,
+          unknownReading: "admit",
+        },
       }),
     );
-    expect(withRam.reservedRamMb).toBe("512");
+    expect(withCustom.reservedRamMb).toBe("512");
+    expect(withCustom.minFreeDiskMb).toBe("4096");
+    expect(withCustom.minFreeInodes).toBe("5000");
   });
 });

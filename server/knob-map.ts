@@ -508,8 +508,8 @@ function kindMatches(spec: KnobFieldSpec, value: unknown): value is KnobValue {
 }
 
 /** The ids of the headroom knobs the patch clears with an explicit JSON null —
- * the wire spelling of "clear this knob back to unset" (slice 7b).  Only the
- * three unset-by-default knobs admit null through the patch schema, so the
+ * the wire spelling of "clear this knob back to unset" (slice 7b / BF-2686).
+ * Only clearable admission knobs admit null through the patch schema, so the
  * check reads the typed admission object straight off the zod-validated
  * patch — the same differential `botDefaults.allowedComputers` and
  * `callStt.provider` already use — instead of walking blindly.  An absent
@@ -518,6 +518,8 @@ export function clearedHeadroomKnobs(patch: Partial<AppConfig> | undefined): str
   const admission = patch?.jobs?.admission;
   if (!admission) return [];
   const cleared: string[] = [];
+  if (admission.minFreeDiskMb === null) cleared.push("jobs.admission.minFreeDiskMb");
+  if (admission.minFreeInodes === null) cleared.push("jobs.admission.minFreeInodes");
   if (admission.reservedCpuCores === null) cleared.push("jobs.admission.reservedCpuCores");
   if (admission.reservedRamMb === null) cleared.push("jobs.admission.reservedRamMb");
   if (admission.minMemoryAvailablePercent === null) cleared.push("jobs.admission.minMemoryAvailablePercent");

@@ -1525,5 +1525,92 @@ describe("Store thread cache", () => {
     expect(store.threadIsCachedForTests(older.threadId)).toBe(false);
     expect(store.threadIsCachedForTests(active.threadId)).toBe(true);
   });
+
+  it("retains a single thread larger than threadCacheMaxMessages until the next thread arrives", () => {
+    const setup = new Store(selection);
+    const huge = setup.createBot({ name: "Huge" }, { seedMessages: false });
+    for (let i = 0; i < 6; i++) {
+      setup.appendMessage(huge.threadId, { role: "user", kind: "text", text: `m${i}` });
+    }
+    const next = setup.createBot({ name: "Next" }, { seedMessages: false });
+    setup.appendMessage(next.threadId, { role: "user", kind: "text", text: "n0" });
+
+    const store = new Store(selection, { threadCacheLimit: 8, threadCacheMaxMessages: 4 });
+    expect(store.messagesFor(huge.threadId).map((m) => m.text)).toEqual([
+      "m0", "m1", "m2", "m3", "m4", "m5",
+    ]);
+    expect(store.threadIsCachedForTests(huge.threadId)).toBe(true);
+
+    store.messagesFor(next.threadId);
+    expect(store.threadIsCachedForTests(huge.threadId)).toBe(false);
+    expect(store.threadIsCachedForTests(next.threadId)).toBe(true);
+  });
+
+  it("threadSummary reads count, startedAt, and lastMessage without caching cold threads and stays coherent across mutations", () => {
+    const setup = new Store(selection);
+    const cold = setup.createBot({ name: "Cold" }, { seedMessages: false });
+    setup.appendMessage(cold.threadId, { role: "user", kind: "text", text: "first", at: 1_000 });
+    const m2 = setup.appendMessage(cold.threadId, { role: "bot", kind: "text", text: "second", at: 2_000 });
+
+    const store = new Store(selection);
+    const initial = store.threadSummary(cold.threadId);
+    expect(initial.messageCount).toBe(2);
+    expect(initial.startedAt).toBe(1_000);
+    expect(initial.lastMessage?.id).toBe(m2.id);
+    expect(store.threadIsCachedForTests(cold.threadId)).toBe(false);
+
+    const m3 = store.appendMessage(cold.threadId, { role: "user", kind: "text", text: "third", at: 3_000 });
+    const afterAppend = store.threadSummary(cold.threadId);
+    expect(afterAppend.messageCount).toBe(3);
+    expect(afterAppend.startedAt).toBe(1_000);
+    expect(afterAppend.lastMessage?.id).toBe(m3.id);
+
+    store.patchMessage(cold.threadId, m3.id, { text: "third-edited" });
+    expect(store.threadSummary(cold.threadId).lastMessage?.text).toBe("third-edited");
+
+    store.appendMessages(cold.threadId, [{ role: "bot", kind: "text", text: "fourth", at: 4_000 }]);
+    const afterBatch = store.threadSummary(cold.threadId);
+    expect(afterBatch.messageCount).toBe(4);
+    expect(afterBatch.lastMessage?.text).toBe("fourth");
+
+    // A fresh Store still reads the updated durable summary without warming ThreadCache.
+    const reloaded = new Store(selection);
+    const reloadedSummary = reloaded.threadSummary(cold.threadId);
+    expect(reloadedSummary.messageCount).toBe(4);
+    expect(reloadedSummary.startedAt).toBe(1_000);
+    expect(reloadedSummary.lastMessage?.text).toBe("fourth");
+    expect(reloaded.threadIsCachedForTests(cold.threadId)).toBe(false);
+
+    // Oversized text/tool detail and base64 screen pixels/recordings are clipped/stripped
+    // inside both cacheThreadSummary (cold path) and Store.threadSummary (warm path).
+    const heavy = setup.createBot({ name: "Heavy" }, { seedMessages: false });
+    setup.appendMessage(heavy.threadId, {
+      role: "bot",
+      kind: "screen",
+      text: "x".repeat(800),
+      png: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk",
+      mime: "image/png",
+      recording: { path: "/tmp/rec.wav", mime: "audio/wav", transcript: "rec", engine: "apple-on-device" },
+      tool: { name: "capture", kind: "other", detail: "d".repeat(800) },
+      at: 5_000,
+    });
+    const coldHeavy = reloaded.threadSummary(heavy.threadId);
+    expect(coldHeavy.lastMessage?.png).toBeUndefined();
+    expect(coldHeavy.lastMessage?.recording).toBeUndefined();
+    expect(coldHeavy.lastMessage?.text).toHaveLength(500);
+    expect(coldHeavy.lastMessage?.tool?.detail).toHaveLength(500);
+    // Warm cache path produces the exact same clipped shape and reads cached entry on repeat.
+    const cachedHeavy = reloaded.threadSummary(heavy.threadId);
+    expect(cachedHeavy.lastMessage?.png).toBeUndefined();
+    expect(cachedHeavy.lastMessage?.recording).toBeUndefined();
+    expect(cachedHeavy.lastMessage?.text).toHaveLength(500);
+    expect(cachedHeavy.lastMessage?.tool?.detail).toHaveLength(500);
+    reloaded.messagesFor(heavy.threadId);
+    const warmHeavy = reloaded.threadSummary(heavy.threadId);
+    expect(warmHeavy.lastMessage?.png).toBeUndefined();
+    expect(warmHeavy.lastMessage?.recording).toBeUndefined();
+    expect(warmHeavy.lastMessage?.text).toHaveLength(500);
+    expect(warmHeavy.lastMessage?.tool?.detail).toHaveLength(500);
+  });
 });
 

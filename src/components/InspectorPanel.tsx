@@ -63,7 +63,7 @@ export function InspectorPanel({ bot }: { bot: Bot }) {
   // up. Own EventSource on purpose: the store folds runtime events into
   // chat state and does not re-emit them.
   useEffect(() => {
-    const es = new EventSource("/api/events?screens=off");
+    const es = new EventSource(`/api/events?screens=off&kind=runtime&threadId=${encodeURIComponent(threadId)}`);
     let settle: ReturnType<typeof setTimeout> | null = null;
     es.onmessage = (raw) => {
       let frame: { kind?: string; event?: RuntimeEvent };

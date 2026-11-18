@@ -56,6 +56,8 @@ The existing committed `placement-evidence.json` retains all sixteen false asser
 
 The collector cannot synthesize owner acceptance through a host reader; it can only package an already captured external acceptance receipt and its original provenance.
 
+The `linux-retention` receipt has a producer too: `scripts/emit-linux-retention-receipt.mjs` reads an executed result of the retained Linux fixture and the candidate and prior closure receipts that run was made from, and emits the receipt this bundle validates.  Its four exit codes are read out of the ordered steps in the result's trace, so a missing step, a refused phase or a fixture process left behind earns a failing code and this bundle refuses it.  A plan, a result whose summary disagrees with its own trace, and a result whose steps ran a source other than the one its closure receipt names are refused with nothing written.  The producer cannot authenticate the run, because a result from the source tests' toy adapters has the same shape as an actual one, and the receipt never asserts `linux-server-preservation`, which stays a separate human assertion.  The command, the phase-to-check mapping and the capture-directory rules are in [Linux Retained Closure Verification](linux-retained-closure.md#linux-retention-receipt).
+
 ## Observation Intervals
 
 The single-writer cutover runbook's Step 4 requires one full day with the Mac writer loaded but unused, health observations with no gap, nonzero inbound traffic, exactly one server run of the shared daily routine and no Mac run.

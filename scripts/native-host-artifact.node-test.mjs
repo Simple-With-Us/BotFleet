@@ -1,11 +1,28 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { z } from "zod";
 import { inspectHostMachO, verifyNativeHostArtifact, sha256 } from "./native-host-artifact.mjs";
 import { nativeHostNotaryCredentials, packageNativeHost } from "./package-native-host.mjs";
 import { build, identity, source, thin, universal } from "./native-host-macho.fixture.mjs";
+
+// The wiring claim is about package.json, so the file is parsed through a
+// schema instead of a bare JSON.parse: a shape that does not match is
+// refused rather than read by accident.
+//
+// Only the entries this test reads are declared, and the schema strips
+// everything it does not declare, at both levels: the parsed value holds the
+// two named scripts and nothing else, never a key this test has not checked.
+// The repository's other scripts and the file's other top-level keys are
+// none of this gate's business, and nothing here is written back.
+const PackageSchema = z.object({
+  scripts: z.object({
+    "test:native-release": z.string(),
+    test: z.string(),
+  }),
+});
 
 const signature = () => ({ codeIdentifier: "BotFleetNativeHost", teamIdentifier: "CC8UTF7ATG", adHoc: false, hardenedRuntime: true });
 function fixture(bytes = universal()) {
@@ -184,6 +201,19 @@ for (const product of ["Host_Core.bundle", "Core.framework", "libCore.dylib"]) {
     await assert.rejects(packageWithBinPathEntries([...swiftIntermediates, product]), /packaging refused/);
   });
 }
+test("the native-release chain runs this proof, and hosted CI runs the chain", () => {
+  // vitest does not collect *.node-test.mjs.  Hosted CI runs `pnpm test`,
+  // which only reaches a node:test file that package.json names, so the
+  // identity proof is only proved when both name it.
+  const parsed = PackageSchema.safeParse(JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")));
+  assert.ok(parsed.success, "package.json names no native-release test chain");
+  const pkg = parsed.data;
+  const nativeRelease = pkg.scripts["test:native-release"];
+  assert.match(nativeRelease, /scripts\/native-host-artifact\.node-test\.mjs/);
+  assert.match(pkg.scripts.test, /pnpm test:native-release/);
+  const ci = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+  assert.match(ci, /run: pnpm test$/m);
+});
 test("packaging refuses a symlinked output parent or dangling output before invoking a build", async () => {
   const root = mkdtempSync(join(tmpdir(), "bf-host-output-"));
   try {
