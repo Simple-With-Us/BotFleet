@@ -690,6 +690,43 @@ describe("applyMiniMaxBalanceToRegistry", () => {
     expect(registry.get("any-bot", "minimax", "MiniMax-M3")).toBeUndefined();
   });
 
+  it("lifts a chip-recorded account cap when the balance recovers", async () => {
+    // The per-turn chip path records the same condition under its own
+    // source, and it is an instance-wide row:  every bot on the account is
+    // routed away.  A recovered balance has to lift it, or the account stays
+    // unusable until the row's own TTL expires.
+    const mod = await loadModule();
+    const { ACCOUNT_CAP_SOURCE, QuotaCooldownRegistry } = await import("./model-fallback.ts");
+    const registry = new QuotaCooldownRegistry();
+    registry.recordInstanceCap("minimax", "*", {
+      error: "insufficient_balance",
+      source: ACCOUNT_CAP_SOURCE,
+    });
+    expect(registry.get("any-bot", "minimax", "MiniMax-M3")).toBeDefined();
+
+    const applied = mod.applyMiniMaxBalanceToRegistry(accountBalanceSnapshot(12.34) as any, registry);
+    expect(applied.capped).toBe(false);
+    expect(registry.get("any-bot", "minimax", "MiniMax-M3")).toBeUndefined();
+  });
+
+  it("keeps a chip-recorded account cap when the balance read is unknown", async () => {
+    // An unavailable or unknown read says nothing about the account, so it
+    // must not lift the instance-wide cap a turn just recorded.
+    const mod = await loadModule();
+    const { ACCOUNT_CAP_SOURCE, QuotaCooldownRegistry } = await import("./model-fallback.ts");
+    const registry = new QuotaCooldownRegistry();
+    registry.recordInstanceCap("minimax", "*", {
+      error: "insufficient_balance",
+      source: ACCOUNT_CAP_SOURCE,
+    });
+    const unknown = { ...accountBalanceSnapshot(12.34), status: "unknown", error: "HTTP 503" };
+    // SAFETY: the account-balance snapshot shape with only `status` and `error`
+    // changed to what a failed read reports; every field the function reads is present.
+    const applied = mod.applyMiniMaxBalanceToRegistry(unknown as any, registry);
+    expect(applied.capped).toBe(false);
+    expect(registry.get("any-bot", "minimax", "MiniMax-M3")?.source).toBe(ACCOUNT_CAP_SOURCE);
+  });
+
   it("does not touch cooldowns on a different instance", async () => {
     const mod = await loadModule();
     const { QuotaCooldownRegistry } = await import("./model-fallback.ts");
