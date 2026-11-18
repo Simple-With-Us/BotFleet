@@ -248,8 +248,8 @@ struct Phase5BotServicesTests {
         #expect(await launches.current() == 2)
     }
 
-    @Test("BF-2498: POST /api/desktop/open returns 503 after gates when no launch action is installed")
-    func desktopOpenReturns503WhenLaunchActionUnset() async throws {
+    @Test("BF-2498: POST /api/desktop/open returns 501 after gates when no launch action is installed")
+    func desktopOpenReturns501WhenLaunchActionUnset() async throws {
         let db = try DatabaseService(path: ":memory:")
         let token = "bf_tok_desktop_unset"
         let authHeaders = ["Authorization": "Bearer \(token)"]
@@ -284,7 +284,8 @@ struct Phase5BotServicesTests {
                 remoteAddress: "127.0.0.1"
             )
         )
-        #expect(unavailableResponse.statusCode == 503)
+        #expect(unavailableResponse.statusCode == 501)
+        #expect(!ConnectionAdvice.isGatewayStatusCode(unavailableResponse.statusCode))
         #expect(unavailableResponse.bodyString.contains("Opening the desktop app is not available on this Mac"))
         #expect(await enabledServer.desktopOpenCount == 0)
     }
