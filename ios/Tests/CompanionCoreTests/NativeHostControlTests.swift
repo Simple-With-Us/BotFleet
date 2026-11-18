@@ -360,10 +360,6 @@ struct NativeHostControlTests {
         // A refused or missing listener is not a live channel.
         #expect(!NativeHostChannelProbe.isReachable(connectResult: -1, connectError: ENOENT))
         #expect(!NativeHostChannelProbe.isReachable(connectResult: -1, connectError: ECONNREFUSED))
-        // A completed connection carries no socket error.
-        let pair = try fixtureSocketPair()
-        defer { Darwin.close(pair.0); Darwin.close(pair.1) }
-        #expect(NativeHostControlServer.connectionCompleted(pair.0))
         // The live channel answers the probe and a missing one does not.
         let fixture = try HostFixture(shortPath: true)
         defer { fixture.remove() }
@@ -373,6 +369,11 @@ struct NativeHostControlTests {
         let socket = fixture.root.appendingPathComponent(NativeHostControlServer.socketName).path
         #expect(NativeHostControlServer.channelAnswers(path: socket))
         #expect(!NativeHostControlServer.channelAnswers(path: fixture.root.appendingPathComponent("absent.sock").path))
+        // A completed connection carries no socket error, and the client of the
+        // live channel is a real connection, so the kernel kept no error for it.
+        let connected = try controlConnect(fixture)
+        #expect(NativeHostControlServer.connectionCompleted(connected))
+        Darwin.close(connected)
         try await host.shutdown()
     }
 
@@ -437,26 +438,19 @@ private func writeFixtureFile(_ payload: String, to url: URL) throws {
     }
     let bytes = Array(payload.utf8)
     guard !bytes.isEmpty else { return }
-    var offset = 0
-    while offset < bytes.count {
-        let written = Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
-        if written > 0 { offset += written }
-        else if written < 0, errno == EINTR { continue }
+    // The payload goes out through the verified handle, with the plain buffer
+    // API, so the fixture never hand-rolls a pointer write.
+    var written = 0
+    while written < bytes.count {
+        let offset = written
+        let count = bytes.withUnsafeBytes { raw -> Int in
+            guard let base = raw.baseAddress else { return 0 }
+            return Darwin.write(fd, base.advanced(by: offset), raw.count - offset)
+        }
+        if count > 0 { written = offset + count }
+        else if count < 0, errno == EINTR { continue }
         else { throw NativeHostControlError.unsafeSocket }
     }
-}
-
-/// A connected pair of sockets, used to read a completed connection's error.
-private func fixtureSocketPair() throws -> (Int32, Int32) {
-    var first: Int32 = 0
-    var second: Int32 = 0
-    let result = withUnsafeMutablePointer(to: &first) { firstPointer in
-        withUnsafeMutablePointer(to: &second) { secondPointer in
-            Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, firstPointer, secondPointer)
-        }
-    }
-    guard result == 0 else { throw NativeHostControlError.socketUnavailable }
-    return (first, second)
 }
 
 private func nativeHostExecutable() -> URL {
