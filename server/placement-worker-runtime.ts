@@ -70,10 +70,19 @@ const leaseRecordSchema = z.object({
 
 const leaseStoreSchema = z.record(z.string(), leaseRecordSchema);
 
+/** How a leased job's process ended, as whoever watched it saw it. */
+export interface WorkerJobExit {
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  /** Why it ended, when the status alone does not say (a run limit, say).
+   *  A controller stop and an unobserved exit keep their own reasons. */
+  reason?: string;
+}
+
 export interface WorkerSpawnResult {
   pid: number | null;
   /** Promise that resolves when the spawned process exits. */
-  done: Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>;
+  done: Promise<WorkerJobExit>;
 }
 
 export interface PlacementWorkerRuntimeDeps {
@@ -86,9 +95,26 @@ export interface PlacementWorkerRuntimeDeps {
   admissionProvider: () => AdmissionVerdict;
   spawnJob: (job: { jobId: string; leaseId: string; command: string; cwd?: string; timeoutMs?: number }) => Promise<WorkerSpawnResult>;
   stopJob: (jobId: string, signal?: NodeJS.Signals) => Promise<void>;
-  isProcessAlive?: (pid: number) => boolean;
-  /** Exit of a child that outlived the previous process. Without it, a later death is reported lost. */
-  watchProcess?: (pid: number) => Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>;
+  /** Whether `pid` is still the process a lease started.  The restart
+   *  reconciliation and the fallback poll both pass the lease record, so a
+   *  check can tell the job's own process from a stranger that was handed
+   *  the same pid since. */
+  isProcessAlive?: (pid: number, record?: WorkerLocalLeaseRecord) => boolean;
+  /** Exit of a child that outlived the previous process. Without it, a later death is reported lost.
+   *  A rejection means the exit could not be observed. */
+  watchProcess?: (pid: number, record?: WorkerLocalLeaseRecord) => Promise<WorkerJobExit>;
+  /** The exit status a leased job left on disk, or null when it left none.
+   *  With it, a job that ended while nothing watched it (the worker was
+   *  down, or its adopted process was never observed) is reported completed
+   *  or failed from that status instead of lost. */
+  readExit?: (record: WorkerLocalLeaseRecord) => { exitCode: number; signal: NodeJS.Signals | null } | null;
+  /** Set when this worker's process handling may start and signal nothing
+   *  (the read-only rollback build, #1556).  The worker then tells the
+   *  controller it admits no work, with this reason, pulls no assignment, and
+   *  acts on no stop.  A lease it pulled it could only fail for good, and a
+   *  stop it acknowledged it could not carry out: a job it adopted ends on
+   *  its own and is reported as it ended. */
+  passiveReason?: string;
   now?: () => number;
   heartbeatIntervalMs?: number;
   /** Idle assignment pull. Defaults to the heartbeat interval. */
@@ -100,7 +126,7 @@ export interface PlacementWorkerRuntimeDeps {
 
 export interface ActiveRunningJob {
   record: WorkerLocalLeaseRecord;
-  done: Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>;
+  done: Promise<WorkerJobExit>;
   settled: Promise<void>;
   stopRequested?: boolean;
 }
@@ -110,7 +136,7 @@ export class PlacementWorkerRuntime {
   private readonly leaseFilePath: string;
   private readonly activeJobs = new Map<string, ActiveRunningJob>();
   private readonly now: () => number;
-  private readonly isAlive: (pid: number) => boolean;
+  private readonly isAlive: (pid: number, record?: WorkerLocalLeaseRecord) => boolean;
   private heartbeatTimer?: NodeJS.Timeout;
   private assignmentTimer?: NodeJS.Timeout;
   private pullTail: Promise<void> = Promise.resolve();
@@ -217,23 +243,36 @@ export class PlacementWorkerRuntime {
 
   private adoptLiveLease(record: WorkerLocalLeaseRecord): void {
     if (record.pid == null || this.activeJobs.has(record.jobId)) return;
-    this.trackJob(record, this.observePid(record.pid));
+    this.trackJob(record, this.observePid(record.pid, record));
   }
 
-  private observePid(pid: number): Promise<{ exitCode: number | null; signal: NodeJS.Signals | null; observed: boolean }> {
+  /** The status a job left on disk.  An unreadable status is no status:
+   *  the job is then reported lost, never completed. */
+  private exitOnDisk(record: WorkerLocalLeaseRecord): { exitCode: number; signal: NodeJS.Signals | null } | null {
+    try {
+      return this.deps.readExit?.(record) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private observePid(pid: number, record: WorkerLocalLeaseRecord): Promise<WorkerJobExit & { observed: boolean }> {
     const watch = this.deps.watchProcess;
-    if (!watch) return this.pollUntilExit(pid);
-    return watch(pid).then(
-      (exit) => ({ exitCode: exit.exitCode, signal: exit.signal, observed: true }),
+    if (!watch) return this.pollUntilExit(pid, record);
+    return watch(pid, record).then(
+      (exit) => ({ ...exit, observed: true }),
       () => ({ exitCode: null, signal: null, observed: false }),
     );
   }
 
-  private pollUntilExit(pid: number): Promise<{ exitCode: number | null; signal: NodeJS.Signals | null; observed: boolean }> {
+  /** The liveness check gets the lease here as it does at restart: a check
+   *  that tells the job from a stranger by its lease answers false for a
+   *  bare pid, and a live job would be reported lost on the first poll. */
+  private pollUntilExit(pid: number, record: WorkerLocalLeaseRecord): Promise<WorkerJobExit & { observed: boolean }> {
     const intervalMs = this.deps.adoptedPollIntervalMs ?? 1000;
     return new Promise((resolve) => {
       const timer = setInterval(() => {
-        if (this.isAlive(pid)) return;
+        if (this.isAlive(pid, record)) return;
         clearInterval(timer);
         resolve({ exitCode: null, signal: null, observed: false });
       }, intervalMs);
@@ -243,7 +282,7 @@ export class PlacementWorkerRuntime {
 
   private trackJob(
     record: WorkerLocalLeaseRecord,
-    done: Promise<{ exitCode: number | null; signal: NodeJS.Signals | null; observed: boolean }>,
+    done: Promise<WorkerJobExit & { observed: boolean }>,
   ): void {
     let resolveSettled!: () => void;
     const settled = new Promise<void>((resolve) => {
@@ -267,9 +306,13 @@ export class PlacementWorkerRuntime {
   private async finishJob(
     record: WorkerLocalLeaseRecord,
     activeJob: ActiveRunningJob,
-    exit: { exitCode: number | null; signal: NodeJS.Signals | null; observed: boolean },
+    seen: WorkerJobExit & { observed: boolean },
   ): Promise<void> {
     this.activeJobs.delete(record.jobId);
+    // Nobody saw the process end, but the job may have written its own
+    // status before it did: that status is the result, not "lost".
+    const written = seen.observed ? null : this.exitOnDisk(record);
+    const exit: WorkerJobExit & { observed: boolean } = written ? { ...written, observed: true } : seen;
     const status = activeJob.stopRequested
       ? "killed"
       : !exit.observed
@@ -281,7 +324,7 @@ export class PlacementWorkerRuntime {
       ? "stopped by controller"
       : !exit.observed
         ? "adopted process exited without an observed status"
-        : undefined;
+        : exit.reason;
     this.spoolTerminal(record, { status, exitCode: exit.exitCode, signal: exit.signal, reason });
     this.removeLeaseRecord(record.jobId);
     await settlePendingReports(this.deps.spool, this.deps.client);
@@ -299,15 +342,26 @@ export class PlacementWorkerRuntime {
     // 2. Check for orphan leases in the local store.
     const stored = this.readStoredLeases();
     for (const [jobId, record] of stored) {
-      const alive = record.pid ? this.isAlive(record.pid) : false;
+      const alive = record.pid ? this.isAlive(record.pid, record) : false;
       if (!alive) {
-        // Process is dead; mark as lost and spool report.
-        this.spoolTerminal(record, {
-          status: "lost",
-          exitCode: null,
-          signal: null,
-          reason: "worker process restarted while lease was active",
-        });
+        // The process is gone.  A job that finished while the worker was
+        // down left its status on disk and settles from it; one that left
+        // none is lost.
+        const written = this.exitOnDisk(record);
+        if (written) {
+          this.spoolTerminal(record, {
+            status: written.exitCode === 0 ? "completed" : "failed",
+            exitCode: written.exitCode,
+            signal: written.signal,
+          });
+        } else {
+          this.spoolTerminal(record, {
+            status: "lost",
+            exitCode: null,
+            signal: null,
+            reason: "worker process restarted while lease was active",
+          });
+        }
         stored.delete(jobId);
       } else {
         this.adoptLiveLease(record);
@@ -334,18 +388,22 @@ export class PlacementWorkerRuntime {
   /** Perform one heartbeat tick: reports leases, admission, sample; handles pending stops. */
   async tickHeartbeat(): Promise<void> {
     const leases = Array.from(this.activeJobs.values()).map((j) => j.record.leaseId);
-    const admission = this.deps.admissionProvider();
+    const admission = this.admission();
     const sample = this.deps.sampleProvider();
 
     const outcome = await this.deps.client.heartbeat({ leases, admission, sample });
-    if (outcome.outcome === "accepted") {
-      const { pendingStops } = outcome.reply;
-      for (const jobId of pendingStops) {
-        const active = this.activeJobs.get(jobId);
+    // A passive worker signals nothing, so it acknowledges no stop either.
+    if (outcome.outcome === "accepted" && this.deps.passiveReason === undefined) {
+      // The controller lists the leases to stop (`stopNow` in
+      // server/placement-leases.ts adds `message.leaseId`), never job ids.
+      // A stop for an earlier lease of a job must not reach its current one.
+      for (const leaseId of outcome.reply.pendingStops) {
+        const active = [...this.activeJobs.values()].find((job) => job.record.leaseId === leaseId);
         if (active && !active.stopRequested) {
           active.stopRequested = true;
+          const { jobId } = active.record;
           // Acknowledge stop receipt to controller.
-          await this.deps.client.stopReceipt({ jobId, leaseId: active.record.leaseId });
+          await this.deps.client.stopReceipt({ jobId, leaseId });
           // Stop the active process.
           await this.deps.stopJob(jobId, "SIGTERM");
         }
@@ -365,8 +423,15 @@ export class PlacementWorkerRuntime {
     return { polled: result.polled, jobId: result.jobId };
   }
 
+  /** What this worker tells the controller, and itself, about taking work.
+   *  A passive worker admits none, whatever its capacity says. */
+  private admission(): AdmissionVerdict {
+    const held = this.deps.passiveReason;
+    return held === undefined ? this.deps.admissionProvider() : { admit: false, reason: held };
+  }
+
   private async pullOne(): Promise<{ polled: boolean; jobId?: string; keepPulling: boolean }> {
-    const admission = this.deps.admissionProvider();
+    const admission = this.admission();
     if (!admission.admit) {
       return { polled: false, keepPulling: false };
     }
@@ -381,6 +446,17 @@ export class PlacementWorkerRuntime {
     }
 
     const lease = outcome.reply.lease;
+    // The controller offers a lease again until a heartbeat reports it as
+    // held, and again after a report it never received.  A job this worker
+    // is running, or holds a durable result for under this lease, is never
+    // spawned a second time: the heartbeat and the spooled report answer it.
+    if (this.activeJobs.has(lease.jobId)) {
+      return { polled: true, jobId: lease.jobId, keepPulling: false };
+    }
+    if (this.deps.spool.pending().some((row) => row.message.jobId === lease.jobId && row.message.leaseId === lease.leaseId)) {
+      await settlePendingReports(this.deps.spool, this.deps.client);
+      return { polled: true, jobId: lease.jobId, keepPulling: false };
+    }
     // Fetch command payload from controller.
     const payloadOutcome = await this.deps.client.payload({ jobId: lease.jobId, leaseId: lease.leaseId });
     if (payloadOutcome.outcome !== "accepted" || !payloadOutcome.reply.command) {

@@ -14,6 +14,7 @@ import { PlacementReportSpool } from "./placement-report-spool.ts";
 import {
   PlacementWorkerRuntime,
   type PlacementWorkerClientLike,
+  type PlacementWorkerRuntimeDeps,
   type WorkerSpawnResult,
 } from "./placement-worker-runtime.ts";
 import type { PayloadReply, StopReceiptReply, WorkerCallOutcome } from "./placement-worker-client.ts";
@@ -130,10 +131,10 @@ describe("PlacementWorkerRuntime", () => {
     await runtime.pullAssignment();
     expect(runtime.getActiveJobs().has("job-101")).toBe(true);
 
-    // Now mock heartbeat reply with pendingStop for job-101
+    // Now mock heartbeat reply with a pending stop for the lease of job-101
     const heartbeatStop: WorkerCallOutcome<HeartbeatReply> = {
       outcome: "accepted",
-      reply: { controllerId, epoch: 1, pendingStops: ["job-101"] },
+      reply: { controllerId, epoch: 1, pendingStops: ["lease-101"] },
     };
     mockClient.heartbeat.mockResolvedValueOnce(heartbeatStop);
 
@@ -379,7 +380,7 @@ describe("PlacementWorkerRuntime", () => {
 
     mockClient.heartbeat.mockResolvedValueOnce({
       outcome: "accepted",
-      reply: { controllerId, epoch: 1, pendingStops: ["job-live"] },
+      reply: { controllerId, epoch: 1, pendingStops: ["lease-live"] },
     });
     await runtime.tickHeartbeat();
     expect(mockClient.heartbeat).toHaveBeenCalledWith(expect.objectContaining({
@@ -444,5 +445,374 @@ describe("PlacementWorkerRuntime", () => {
     });
     expect(runtime.getActiveJobs().has("job-unobserved")).toBe(false);
     expect(JSON.parse(readFileSync(leaseFile, "utf8"))["job-unobserved"]).toBeUndefined();
+  });
+
+  it("never spawns a lease again when the controller offers it a second time", async () => {
+    const { dir, spool, mockClient, now } = fixtureEnv();
+    const leaseFile = join(dir, "placement", "worker-leases.json");
+    let finishJob: ((res: { exitCode: number | null; signal: NodeJS.Signals | null }) => void) | undefined;
+    const donePromise = new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      finishJob = resolve;
+    });
+    const spawnJob = vi.fn(async () => ({ pid: 4321, done: donePromise }));
+    const runtime = new PlacementWorkerRuntime({
+      client: mockClient,
+      spool,
+      hostId: workerId,
+      capabilities: ["shell"],
+      dataDir: dir,
+      sampleProvider: () => sample,
+      admissionProvider: () => ({ admit: true }),
+      spawnJob,
+      stopJob: vi.fn(),
+      now,
+    });
+    // The controller offers the lease on every pull until it is settled.
+    mockClient.assignment.mockResolvedValue({
+      outcome: "accepted",
+      reply: {
+        controllerId, epoch: 1, accepted: true,
+        lease: { controllerId, epoch: 1, leaseId: "lease-again", jobId: "job-again", host: workerId },
+      },
+    });
+
+    expect(await runtime.pullAssignment()).toEqual({ polled: true, jobId: "job-again" });
+    // offered again while it runs: no second spawn, and the record keeps its pid
+    expect(await runtime.pullAssignment()).toEqual({ polled: true, jobId: "job-again" });
+    expect(spawnJob).toHaveBeenCalledTimes(1);
+    expect(mockClient.payload).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(readFileSync(leaseFile, "utf8"))["job-again"].pid).toBe(4321);
+
+    // it ends, and its report does not reach the controller
+    mockClient.report.mockResolvedValueOnce({ outcome: "link-failed", reason: "link down" });
+    finishJob?.({ exitCode: 0, signal: null });
+    await runtime.waitForJob("job-again");
+    expect(spool.pending().length).toBe(1);
+
+    // offered again with the report still spooled: the report is delivered, nothing is spawned
+    expect(await runtime.pullAssignment()).toEqual({ polled: true, jobId: "job-again" });
+    expect(spawnJob).toHaveBeenCalledTimes(1);
+    expect(mockClient.payload).toHaveBeenCalledTimes(1);
+    expect(spool.pending().length).toBe(0);
+    expect(mockClient.report).toHaveBeenLastCalledWith(expect.objectContaining({ jobId: "job-again", leaseId: "lease-again", status: "completed" }));
+    expect(JSON.parse(readFileSync(leaseFile, "utf8"))["job-again"]).toBeUndefined();
+  });
+
+  // A worker-leases.json exactly as the runtime wrote it before exit-file
+  // settlement existed: the record gained no field, so it must still parse.
+  function orphanLease(jobId: string, pid: number | null) {
+    return {
+      [jobId]: {
+        jobId,
+        leaseId: `lease-${jobId}`,
+        controllerId,
+        epoch: 1,
+        command: "run-something",
+        cwd: "/tmp",
+        timeoutMs: 60_000,
+        spawnedAt: 500,
+        pid,
+      },
+    };
+  }
+
+  function restartedRuntime(
+    stored: ReturnType<typeof orphanLease>,
+    processes: Pick<PlacementWorkerRuntimeDeps, "readExit" | "isProcessAlive" | "watchProcess" | "adoptedPollIntervalMs" | "passiveReason">,
+  ) {
+    const env = fixtureEnv();
+    const leaseFile = join(env.dir, "placement", "worker-leases.json");
+    mkdirSync(join(env.dir, "placement"), { recursive: true });
+    writeFileSync(leaseFile, JSON.stringify(stored), "utf8");
+    env.setNow(2000);
+    const spawnJob = vi.fn<PlacementWorkerRuntimeDeps["spawnJob"]>();
+    const stopJob = vi.fn<PlacementWorkerRuntimeDeps["stopJob"]>(async () => undefined);
+    const runtime = new PlacementWorkerRuntime({
+      client: env.mockClient,
+      spool: env.spool,
+      hostId: workerId,
+      capabilities: ["shell"],
+      dataDir: env.dir,
+      sampleProvider: () => sample,
+      admissionProvider: () => ({ admit: true }),
+      spawnJob,
+      stopJob,
+      now: env.now,
+      ...processes,
+    });
+    /** The job ids the runtime still holds a lease record for. */
+    const remaining = (): string[] => Object.keys(JSON.parse(readFileSync(leaseFile, "utf8")));
+    return { ...env, runtime, remaining, spawnJob, stopJob };
+  }
+
+  it("settles a dead lease from its exit file on restart: status 0 is completed", async () => {
+    const seen: Array<{ pid: number; jobId?: string }> = [];
+    const readExit = vi.fn(() => ({ exitCode: 0, signal: null }));
+    const { runtime, mockClient, spool, remaining } = restartedRuntime(orphanLease("job-done", 88888), {
+      readExit,
+      isProcessAlive: (pid, record) => {
+        seen.push({ pid, jobId: record?.jobId });
+        return false;
+      },
+    });
+
+    await runtime.reconcileRestart();
+
+    // the liveness check is given the lease, so it can tell a reused pid
+    expect(seen).toEqual([{ pid: 88888, jobId: "job-done" }]);
+    expect(readExit).toHaveBeenCalledWith(expect.objectContaining({ jobId: "job-done", leaseId: "lease-job-done", spawnedAt: 500 }));
+    expect(mockClient.report).toHaveBeenCalledTimes(1);
+    expect(mockClient.report).toHaveBeenCalledWith({
+      jobId: "job-done",
+      leaseId: "lease-job-done",
+      status: "completed",
+      exitCode: 0,
+      signal: null,
+      endedAt: 2000,
+      reason: undefined,
+    });
+    expect(remaining()).toEqual([]);
+    expect(spool.pending()).toEqual([]);
+  });
+
+  it("settles a dead lease from its exit file on restart: a non-zero status is failed with its code", async () => {
+    const { runtime, mockClient, remaining } = restartedRuntime(orphanLease("job-three", 88888), {
+      readExit: () => ({ exitCode: 3, signal: null }),
+      isProcessAlive: () => false,
+    });
+
+    await runtime.reconcileRestart();
+
+    expect(mockClient.report).toHaveBeenCalledTimes(1);
+    expect(mockClient.report).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "job-three",
+      status: "failed",
+      exitCode: 3,
+      signal: null,
+      reason: undefined,
+    }));
+    expect(remaining()).toEqual([]);
+  });
+
+  it("settles a lease whose spawn was never confirmed from its exit file too", async () => {
+    const isProcessAlive = vi.fn(() => true);
+    const { runtime, mockClient } = restartedRuntime(orphanLease("job-no-pid", null), {
+      readExit: () => ({ exitCode: 137, signal: "SIGKILL" }),
+      isProcessAlive,
+    });
+
+    await runtime.reconcileRestart();
+
+    expect(isProcessAlive).not.toHaveBeenCalled();
+    expect(mockClient.report).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "job-no-pid",
+      status: "failed",
+      exitCode: 137,
+      signal: "SIGKILL",
+    }));
+  });
+
+  it("reports a dead lease lost on restart when it left no exit file, or one that cannot be read", async () => {
+    for (const readExit of [() => null, () => { throw new Error("unreadable"); }]) {
+      const { runtime, mockClient, remaining } = restartedRuntime(orphanLease("job-gone", 88888), {
+        readExit,
+        isProcessAlive: () => false,
+      });
+
+      await runtime.reconcileRestart();
+
+      expect(mockClient.report).toHaveBeenCalledTimes(1);
+      expect(mockClient.report).toHaveBeenCalledWith(expect.objectContaining({
+        jobId: "job-gone",
+        status: "lost",
+        exitCode: null,
+        signal: null,
+        reason: "worker process restarted while lease was active",
+      }));
+      expect(remaining()).toEqual([]);
+    }
+  });
+
+  it("settles an adopted process nobody saw end from its exit file, and passes the watcher its lease", async () => {
+    let alive = true;
+    let written: { exitCode: number; signal: NodeJS.Signals | null } | null = null;
+    const { runtime, mockClient, remaining } = restartedRuntime(orphanLease("job-adopted", 5151), {
+      readExit: () => written,
+      isProcessAlive: () => alive,
+      adoptedPollIntervalMs: 20,
+    });
+
+    await runtime.reconcileRestart();
+    expect(runtime.getActiveJobs().has("job-adopted")).toBe(true);
+    expect(mockClient.report).not.toHaveBeenCalled();
+
+    written = { exitCode: 0, signal: null };
+    alive = false;
+    await runtime.waitForJob("job-adopted");
+    expect(mockClient.report).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "job-adopted",
+      status: "completed",
+      exitCode: 0,
+      reason: undefined,
+    }));
+    expect(remaining()).toEqual([]);
+
+    const watched: Array<{ pid: number; jobId?: string }> = [];
+    const rejected = restartedRuntime(orphanLease("job-unseen", 6161), {
+      readExit: () => ({ exitCode: 2, signal: null }),
+      isProcessAlive: () => true,
+      watchProcess: (pid, record) => {
+        watched.push({ pid, jobId: record?.jobId });
+        return Promise.reject(new Error("not observed"));
+      },
+    });
+    await rejected.runtime.reconcileRestart();
+    await vi.waitFor(() => expect(rejected.mockClient.report).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "job-unseen",
+      status: "failed",
+      exitCode: 2,
+    })));
+    expect(watched).toEqual([{ pid: 6161, jobId: "job-unseen" }]);
+  });
+
+  it("keeps a controller stop as killed whatever the exit file says, and carries a watcher's reason", async () => {
+    // the watcher has not settled yet when the stop arrives
+    let endUnobserved: (() => void) | undefined;
+    const watched = new Promise<never>((_resolve, reject) => {
+      endUnobserved = () => reject(new Error("not observed"));
+    });
+    const stopped = restartedRuntime(orphanLease("job-stopped", 7171), {
+      readExit: () => ({ exitCode: 0, signal: null }),
+      isProcessAlive: () => true,
+      watchProcess: () => watched,
+    });
+    stopped.mockClient.heartbeat.mockResolvedValueOnce({
+      outcome: "accepted",
+      reply: { controllerId, epoch: 1, pendingStops: ["lease-job-stopped"] },
+    });
+    await stopped.runtime.reconcileRestart();
+    await stopped.runtime.tickHeartbeat();
+    endUnobserved?.();
+    await stopped.runtime.waitForJob("job-stopped");
+    expect(stopped.mockClient.report).toHaveBeenCalledTimes(1);
+    expect(stopped.mockClient.report).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "job-stopped",
+      status: "killed",
+      reason: "stopped by controller",
+    }));
+
+    const limited = restartedRuntime(orphanLease("job-limited", 8181), {
+      readExit: () => null,
+      isProcessAlive: () => true,
+      watchProcess: async () => ({ exitCode: null, signal: null, reason: "run limit reached" }),
+    });
+    await limited.runtime.reconcileRestart();
+    await vi.waitFor(() => expect(limited.mockClient.report).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "job-limited",
+      status: "failed",
+      exitCode: null,
+      reason: "run limit reached",
+    })));
+  });
+
+  it("stops the job a pending stop's lease id names, and nothing a job id or another lease names", async () => {
+    // The controller's heartbeat reply lists lease ids (`stopNow` in
+    // server/placement-leases.ts), never job ids.
+    const watched = new Promise<never>(() => undefined);
+    const { runtime, mockClient, stopJob } = restartedRuntime(orphanLease("job-held", 9191), {
+      isProcessAlive: () => true,
+      watchProcess: () => watched,
+    });
+    await runtime.reconcileRestart();
+
+    // the job's own id, and a lease this worker does not hold: neither is a stop for it
+    mockClient.heartbeat.mockResolvedValueOnce({
+      outcome: "accepted",
+      reply: { controllerId, epoch: 1, pendingStops: ["job-held", "lease-of-an-earlier-run"] },
+    });
+    await runtime.tickHeartbeat();
+    expect(mockClient.stopReceipt).not.toHaveBeenCalled();
+    expect(stopJob).not.toHaveBeenCalled();
+    expect(runtime.getActiveJob("job-held")?.stopRequested).toBeUndefined();
+
+    // the lease it holds: acknowledged with both ids, and stopped by job id, once
+    mockClient.heartbeat.mockResolvedValue({
+      outcome: "accepted",
+      reply: { controllerId, epoch: 1, pendingStops: ["lease-job-held"] },
+    });
+    await runtime.tickHeartbeat();
+    await runtime.tickHeartbeat();
+    expect(mockClient.stopReceipt).toHaveBeenCalledTimes(1);
+    expect(mockClient.stopReceipt).toHaveBeenCalledWith({ jobId: "job-held", leaseId: "lease-job-held" });
+    expect(stopJob).toHaveBeenCalledTimes(1);
+    expect(stopJob).toHaveBeenCalledWith("job-held", "SIGTERM");
+    expect(runtime.getActiveJob("job-held")?.stopRequested).toBe(true);
+  });
+
+  it("gives the fallback poll the lease, so a liveness check that needs it keeps a live job", async () => {
+    // A check that tells a job from a stranger by its lease answers false
+    // for a bare pid.  No `watchProcess` here: the runtime polls on its own.
+    let alive = true;
+    const seen: Array<string | undefined> = [];
+    const { runtime, mockClient, remaining } = restartedRuntime(orphanLease("job-polled", 9292), {
+      isProcessAlive: (_pid, record) => {
+        seen.push(record?.jobId);
+        return record !== undefined && alive;
+      },
+      adoptedPollIntervalMs: 20,
+    });
+    await runtime.reconcileRestart();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(mockClient.report).not.toHaveBeenCalled();
+    expect(runtime.getActiveJobs().has("job-polled")).toBe(true);
+    expect(remaining()).toEqual(["job-polled"]);
+    expect(seen.length).toBeGreaterThan(1);
+    expect(seen.every((jobId) => jobId === "job-polled")).toBe(true);
+
+    alive = false;
+    await runtime.waitForJob("job-polled");
+    expect(mockClient.report).toHaveBeenCalledWith(expect.objectContaining({ jobId: "job-polled", status: "lost" }));
+  });
+
+  it("admits no work and acts on no stop when it is passive", async () => {
+    let end: ((exit: { exitCode: number | null; signal: NodeJS.Signals | null }) => void) | undefined;
+    const watched = new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      end = resolve;
+    });
+    const held = "this build runs nothing";
+    const { runtime, mockClient, spawnJob, stopJob } = restartedRuntime(orphanLease("job-watched", 9393), {
+      isProcessAlive: () => true,
+      watchProcess: () => watched,
+      passiveReason: held,
+    });
+    // a lease is waiting, and a stop is pending for the job it adopted
+    mockClient.assignment.mockResolvedValue({
+      outcome: "accepted",
+      reply: {
+        controllerId, epoch: 1, accepted: true,
+        lease: { controllerId, epoch: 1, leaseId: "lease-waiting", jobId: "job-waiting", host: workerId },
+      },
+    });
+    mockClient.heartbeat.mockResolvedValue({
+      outcome: "accepted",
+      reply: { controllerId, epoch: 1, pendingStops: ["lease-job-watched"] },
+    });
+    await runtime.reconcileRestart();
+
+    expect(await runtime.pullAssignment()).toEqual({ polled: false, jobId: undefined });
+    await runtime.tickHeartbeat();
+    expect(mockClient.heartbeat).toHaveBeenCalledWith(expect.objectContaining({ admission: { admit: false, reason: held } }));
+    expect(mockClient.assignment).not.toHaveBeenCalled();
+    expect(mockClient.payload).not.toHaveBeenCalled();
+    expect(spawnJob).not.toHaveBeenCalled();
+    // nothing is signalled, so no receipt says the stop arrived
+    expect(mockClient.stopReceipt).not.toHaveBeenCalled();
+    expect(stopJob).not.toHaveBeenCalled();
+
+    // the job ends on its own, and is reported as it ended, never as killed
+    end?.({ exitCode: 0, signal: null });
+    await runtime.waitForJob("job-watched");
+    expect(mockClient.report).toHaveBeenCalledTimes(1);
+    expect(mockClient.report).toHaveBeenCalledWith(expect.objectContaining({ jobId: "job-watched", status: "completed", exitCode: 0 }));
   });
 });

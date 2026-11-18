@@ -8,10 +8,14 @@
  *  - Worker restart with orphan lease reconciliation
  *  - Controller takeover
  *  - Stale epoch refusal
+ *  - Controller stop of a running job
+ *
+ *  Every job here runs through the real runner-backed adapter
+ *  (server/placement-worker-jobs.ts), so one spawn is one `spawnJobProcess`
+ *  call and one nonce file.
  */
-import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,17 +27,16 @@ import {
   type CapacitySample,
   type HostId,
 } from "../shared/placement.ts";
+import { spawnJobProcess } from "./jobs/runner.ts";
 import { PlacementLeaseService } from "./placement-leases.ts";
 import { PlacementPayloadSpool } from "./placement-payloads.ts";
 import { PlacementReportSpool, settlePendingReports } from "./placement-report-spool.ts";
 import { openPlacementStore, type PlacementStore } from "./placement-store.ts";
 import { createWorkerRequestBoundary, type WorkerAuthorization } from "./placement-worker-auth.ts";
 import { nodeHttpWorkerLink, PlacementWorkerClient } from "./placement-worker-client.ts";
+import { createPlacementWorkerJobs, type PlacementWorkerJobs } from "./placement-worker-jobs.ts";
 import { createWorkerTransport } from "./placement-worker-routes.ts";
-import {
-  PlacementWorkerRuntime,
-  type WorkerSpawnResult,
-} from "./placement-worker-runtime.ts";
+import { PlacementWorkerRuntime } from "./placement-worker-runtime.ts";
 import { startFaultProxy, type FaultProxy } from "./testing/fault-proxy.ts";
 import { nonceRuns } from "./testing/two-process.ts";
 
@@ -70,6 +73,9 @@ interface ScenarioFixture {
   proxy: FaultProxy;
   client: PlacementWorkerClient;
   spool: PlacementReportSpool;
+  jobs: PlacementWorkerJobs;
+  /** How many processes the worker's job runner has started. */
+  spawns: () => number;
   runtime: PlacementWorkerRuntime;
   secret: string;
   credentialId: string;
@@ -89,17 +95,47 @@ afterEach(async () => {
   for (const dir of cleanupDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function spawnRealNonceJob(
-  job: { jobId: string; leaseId: string; command: string; cwd?: string },
-): Promise<WorkerSpawnResult> {
-  const child = spawn("sh", ["-c", job.command], {
-    cwd: job.cwd,
-    stdio: ["ignore", "ignore", "pipe"],
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The worker's real process handling over `workerDir`, counting every
+ *  process the job runner starts.  A second call over the same folder is a
+ *  restarted worker: it shares the files and none of the memory. */
+function workerJobs(workerDir: string, counter: { spawns: number }): PlacementWorkerJobs {
+  return createPlacementWorkerJobs({
+    dataDir: workerDir,
+    cpuCores: () => 2,
+    spawn: (spec) => {
+      counter.spawns += 1;
+      return spawnJobProcess(spec);
+    },
   });
-  const done = new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-    child.on("close", (exitCode, signal) => resolve({ exitCode, signal }));
+}
+
+function workerRuntime(
+  fixture: { client: PlacementWorkerClient; spool: PlacementReportSpool; workerDir: string },
+  jobs: PlacementWorkerJobs,
+): PlacementWorkerRuntime {
+  return new PlacementWorkerRuntime({
+    client: fixture.client,
+    spool: fixture.spool,
+    hostId: workerId,
+    capabilities: ["shell"],
+    dataDir: fixture.workerDir,
+    sampleProvider: () => ({ ...sample, at: Date.now() }),
+    admissionProvider: () => ({ admit: true }),
+    spawnJob: jobs.spawnJob,
+    stopJob: jobs.stopJob,
+    watchProcess: jobs.watchProcess,
+    isProcessAlive: jobs.isProcessAlive,
+    readExit: jobs.readExit,
   });
-  return Promise.resolve({ pid: child.pid ?? null, done });
 }
 
 async function createFixture(options: { epoch?: number } = {}): Promise<ScenarioFixture> {
@@ -179,17 +215,9 @@ async function createFixture(options: { epoch?: number } = {}): Promise<Scenario
 
   const spool = new PlacementReportSpool(workerDir);
 
-  const runtime = new PlacementWorkerRuntime({
-    client,
-    spool,
-    hostId: workerId,
-    capabilities: ["shell"],
-    dataDir: workerDir,
-    sampleProvider: () => ({ ...sample, at: Date.now() }),
-    admissionProvider: () => ({ admit: true }),
-    spawnJob: (job) => spawnRealNonceJob(job),
-    stopJob: async () => {},
-  });
+  const counter = { spawns: 0 };
+  const jobs = workerJobs(workerDir, counter);
+  const runtime = workerRuntime({ client, spool, workerDir }, jobs);
 
   return {
     controllerDir,
@@ -202,6 +230,8 @@ async function createFixture(options: { epoch?: number } = {}): Promise<Scenario
     proxy,
     client,
     spool,
+    jobs,
+    spawns: () => counter.spawns,
     runtime,
     secret,
     credentialId,
@@ -210,7 +240,7 @@ async function createFixture(options: { epoch?: number } = {}): Promise<Scenario
 
 describe("Placement Transport T6b: Two-Process Fault Scenarios", () => {
   it("dropped acknowledgement: report replay settles terminal result exactly once", async () => {
-    const { leases, proxy, client, spool, runtime, nonceDir } = await createFixture();
+    const { leases, proxy, client, spool, runtime, nonceDir, spawns } = await createFixture();
     const nonce = "dropped-ack";
 
     leases.enqueue({
@@ -252,10 +282,11 @@ describe("Placement Transport T6b: Two-Process Fault Scenarios", () => {
 
     // Proves exact-once execution: still exactly one run file after replay
     expect(nonceRuns(nonceDir, nonce).length).toBe(1);
+    expect(spawns()).toBe(1);
   });
 
   it("disconnect after completion: spooled report waits for reconnect and settles cleanly", async () => {
-    const { leases, proxy, client, spool, runtime, nonceDir } = await createFixture();
+    const { leases, proxy, client, spool, runtime, nonceDir, spawns } = await createFixture();
     const nonce = "disconnect-after";
 
     leases.enqueue({
@@ -297,10 +328,86 @@ describe("Placement Transport T6b: Two-Process Fault Scenarios", () => {
 
     expect(leases.job("job-disconnect")?.status).toBe("completed");
     expect(nonceRuns(nonceDir, nonce).length).toBe(1);
+    expect(spawns()).toBe(1);
+  });
+
+  it("lease offered again before a heartbeat holds it: the running job is not spawned twice", async () => {
+    const { leases, runtime, nonceDir, spawns } = await createFixture();
+    const nonce = "offered-again";
+
+    leases.enqueue({
+      controllerId,
+      epoch: 0,
+      version: PLACEMENT_WIRE_VERSION,
+      jobId: "job-offered-again",
+      botId: "b",
+      threadId: "t",
+      cwd: nonceDir,
+      timeoutMs: 10_000,
+      command: `${process.execPath} ${nonceScript} ${nonceDir} ${nonce} 400`,
+    });
+
+    await runtime.register();
+    await runtime.tickHeartbeat();
+
+    // The controller keeps offering a lease until a heartbeat reports it as
+    // held, and the worker pulls again as soon as it has spawned.
+    const first = await runtime.pullAssignment();
+    expect(first.jobId).toBe("job-offered-again");
+    expect(leases.job("job-offered-again")?.status).toBe("dispatching");
+    const second = await runtime.pullAssignment();
+    expect(second.jobId).toBe("job-offered-again");
+    expect(runtime.getActiveJobs().size).toBe(1);
+
+    await runtime.waitForJob("job-offered-again");
+    expect(leases.job("job-offered-again")?.status).toBe("completed");
+    expect(nonceRuns(nonceDir, nonce).length).toBe(1);
+    expect(spawns()).toBe(1);
+  });
+
+  it("lease offered again after an undelivered report: the finished job is not run again", async () => {
+    const { leases, proxy, spool, runtime, nonceDir, workerDir, spawns } = await createFixture();
+    const nonce = "offered-after-report";
+
+    leases.enqueue({
+      controllerId,
+      epoch: 0,
+      version: PLACEMENT_WIRE_VERSION,
+      jobId: "job-offered-after",
+      botId: "b",
+      threadId: "t",
+      cwd: nonceDir,
+      timeoutMs: 10_000,
+      command: `${process.execPath} ${nonceScript} ${nonceDir} ${nonce}`,
+    });
+
+    await runtime.register();
+    await runtime.tickHeartbeat();
+
+    // The job runs, and its report never reaches the controller.
+    proxy.dropNext("request", (e) => e.path.includes("report"));
+    proxy.setRefusing(true);
+    const { jobId } = await runtime.pullAssignment();
+    expect(jobId).toBe("job-offered-after");
+    await runtime.waitForJob("job-offered-after");
+    expect(spool.pending().length).toBe(1);
+    expect(leases.job("job-offered-after")?.status).toBe("dispatching");
+
+    // The link returns, and the controller offers the unsettled lease again.
+    proxy.setRefusing(false);
+    const again = await runtime.pullAssignment();
+    expect(again.jobId).toBe("job-offered-after");
+
+    expect(leases.job("job-offered-after")?.status).toBe("completed");
+    expect(spool.pending().length).toBe(0);
+    expect(runtime.getActiveJobs().size).toBe(0);
+    expect(JSON.parse(readFileSync(join(workerDir, "placement", "worker-leases.json"), "utf8"))).toEqual({});
+    expect(nonceRuns(nonceDir, nonce).length).toBe(1);
+    expect(spawns()).toBe(1);
   });
 
   it("report replay: controller acknowledges duplicate terminal report idempotently", async () => {
-    const { leases, proxy, runtime, nonceDir } = await createFixture();
+    const { leases, proxy, runtime, nonceDir, spawns } = await createFixture();
     const nonce = "report-replay";
 
     leases.enqueue({
@@ -337,6 +444,7 @@ describe("Placement Transport T6b: Two-Process Fault Scenarios", () => {
 
     expect(leases.job("job-replay")?.status).toBe("completed");
     expect(nonceRuns(nonceDir, nonce).length).toBe(1);
+    expect(spawns()).toBe(1);
   });
 
   it("controller restart: state survives and restarted controller accepts completion", async () => {
@@ -435,10 +543,14 @@ describe("Placement Transport T6b: Two-Process Fault Scenarios", () => {
     });
 
     // Worker executes job and reports to the reopened controller
-    const { done } = await spawnRealNonceJob(
-      { jobId: "job-ctrl-restart", leaseId, command: `${process.execPath} ${nonceScript} ${fixture.nonceDir} ${nonce}` },
-    );
-    await done;
+    const { done } = await fixture.jobs.spawnJob({
+      jobId: "job-ctrl-restart",
+      leaseId,
+      cwd: fixture.nonceDir,
+      timeoutMs: 10_000,
+      command: `${process.execPath} ${nonceScript} ${fixture.nonceDir} ${nonce}`,
+    });
+    expect(await done).toEqual({ exitCode: 0, signal: null });
 
     const reportReply = await newClient.report({
       jobId: "job-ctrl-restart",
@@ -452,10 +564,11 @@ describe("Placement Transport T6b: Two-Process Fault Scenarios", () => {
     expect(reportReply).toMatchObject({ outcome: "accepted", reply: { accepted: true } });
     expect(reopenedLeases.job("job-ctrl-restart")?.status).toBe("completed");
     expect(nonceRuns(fixture.nonceDir, nonce).length).toBe(1);
+    expect(fixture.spawns()).toBe(1);
   });
 
   it("worker restart: orphan lease reconciled and reported cleanly on restart", async () => {
-    const { leases, client, spool, runtime, workerDir } = await createFixture();
+    const { leases, client, spool, runtime, workerDir, spawns } = await createFixture();
 
     leases.enqueue({
       controllerId,
@@ -481,7 +594,6 @@ describe("Placement Transport T6b: Two-Process Fault Scenarios", () => {
     const { lease } = claim.reply;
     const placementDir = join(workerDir, "placement");
     mkdirSync(placementDir, { recursive: true });
-    const { writeFileSync } = await import("node:fs");
     writeFileSync(
       join(placementDir, "worker-leases.json"),
       JSON.stringify({
@@ -497,19 +609,10 @@ describe("Placement Transport T6b: Two-Process Fault Scenarios", () => {
       }),
     );
 
-    // A fresh worker runtime simulates a restarted worker process on the same data directory
-    const restartedRuntime = new PlacementWorkerRuntime({
-      client,
-      spool,
-      hostId: workerId,
-      capabilities: ["shell"],
-      dataDir: workerDir,
-      sampleProvider: () => ({ ...sample, at: Date.now() }),
-      admissionProvider: () => ({ admit: true }),
-      spawnJob: async () => ({ pid: 1, done: Promise.resolve({ exitCode: 0, signal: null }) }),
-      stopJob: async () => {},
-      isProcessAlive: () => false, // Child process is dead across restart
-    });
+    // A fresh worker runtime simulates a restarted worker process on the same data directory.
+    // The lease never spawned, so it has no process and no exit file.
+    const restarted = { spawns: 0 };
+    const restartedRuntime = workerRuntime({ client, spool, workerDir }, workerJobs(workerDir, restarted));
 
     // Reconcile orphan leases and settle reports with controller
     await restartedRuntime.reconcileRestart();
@@ -517,6 +620,124 @@ describe("Placement Transport T6b: Two-Process Fault Scenarios", () => {
     // Terminal report for the dead orphan was spooled and settled
     expect(leases.job("job-worker-restart")?.status).toBe("lost");
     expect(spool.pending().length).toBe(0);
+    expect(spawns() + restarted.spawns).toBe(0);
+  });
+
+  it("worker restart after the job finished: settled completed from its exit file, never run again", async () => {
+    const { leases, client, spool, runtime, jobs, workerDir, nonceDir, spawns } = await createFixture();
+    const nonce = "finished-while-down";
+    const command = `${process.execPath} ${nonceScript} ${nonceDir} ${nonce}`;
+
+    leases.enqueue({
+      controllerId,
+      epoch: 0,
+      version: PLACEMENT_WIRE_VERSION,
+      jobId: "job-finished-down",
+      botId: "b",
+      threadId: "t",
+      cwd: nonceDir,
+      timeoutMs: 10_000,
+      command,
+    });
+
+    await runtime.register();
+    await runtime.tickHeartbeat();
+
+    const claim = await client.assignment();
+    expect(claim).toMatchObject({ outcome: "accepted", reply: { accepted: true } });
+    if (claim.outcome !== "accepted" || !claim.reply.accepted) throw new Error("not claimed");
+    const { lease } = claim.reply;
+
+    // The worker records the lease, spawns the job, and goes down before it
+    // sees the job end: the record stays, and no report is spooled.
+    const spawnedAt = Date.now();
+    const spawned = await jobs.spawnJob({ jobId: lease.jobId, leaseId: lease.leaseId, cwd: nonceDir, timeoutMs: 10_000, command });
+    mkdirSync(join(workerDir, "placement"), { recursive: true });
+    writeFileSync(
+      join(workerDir, "placement", "worker-leases.json"),
+      JSON.stringify({
+        [lease.jobId]: {
+          jobId: lease.jobId,
+          leaseId: lease.leaseId,
+          controllerId: lease.controllerId,
+          epoch: lease.epoch,
+          command,
+          cwd: nonceDir,
+          timeoutMs: 10_000,
+          spawnedAt,
+          pid: spawned.pid,
+        },
+      }),
+    );
+    await spawned.done;
+    expect(leases.job("job-finished-down")?.status).not.toBe("completed");
+    expect(spool.pending().length).toBe(0);
+
+    const restarted = { spawns: 0 };
+    const restartedRuntime = workerRuntime({ client, spool, workerDir }, workerJobs(workerDir, restarted));
+    await restartedRuntime.reconcileRestart();
+
+    expect(leases.job("job-finished-down")?.status).toBe("completed");
+    expect(spool.pending().length).toBe(0);
+    expect(restartedRuntime.getActiveJobs().size).toBe(0);
+    expect(nonceRuns(nonceDir, nonce).length).toBe(1);
+    expect(spawns()).toBe(1);
+    expect(restarted.spawns).toBe(0);
+  });
+
+  it("controller stop: the lease id on the heartbeat stops the whole process group, and the job settles killed", async () => {
+    const { leases, runtime, jobs, nonceDir, spawns } = await createFixture();
+    const jobId = "job-controller-stop";
+
+    leases.enqueue({
+      controllerId,
+      epoch: 0,
+      version: PLACEMENT_WIRE_VERSION,
+      jobId,
+      botId: "b",
+      threadId: "t",
+      cwd: nonceDir,
+      timeoutMs: 60_000,
+      // a grandchild the shell waits on: a stop has to reach the whole group
+      command: "sleep 30 & echo $!; wait",
+    });
+
+    await runtime.register();
+    await runtime.tickHeartbeat();
+    expect((await runtime.pullAssignment()).jobId).toBe(jobId);
+    const leaseId = runtime.getActiveJob(jobId)?.record.leaseId;
+    if (!leaseId) throw new Error("no lease held");
+    const leader = runtime.getActiveJob(jobId)?.record.pid;
+    if (!leader) throw new Error("no process started");
+    const logPath = jobs.files({ jobId, leaseId }).logPath;
+    const printed = (): number | null => {
+      const match = existsSync(logPath) ? /^(\d+)$/m.exec(readFileSync(logPath, "utf8")) : null;
+      return match ? Number(match[1]) : null;
+    };
+    await expect.poll(printed, { timeout: 15_000 }).not.toBeNull();
+    const grandchild = printed();
+    if (!grandchild) throw new Error("no grandchild started");
+    expect(processAlive(grandchild)).toBe(true);
+
+    // The worker's heartbeat reports the lease held, and the owner stops it.
+    await runtime.tickHeartbeat();
+    expect(leases.job(jobId)?.status).toBe("running");
+    const stop = leases.stop({ controllerId, epoch: 0, version: PLACEMENT_WIRE_VERSION, jobId, leaseId, reason: "stopped by its owner" });
+    expect(stop).toMatchObject({ ok: true, reply: { accepted: true } });
+
+    // The next heartbeat reply names the lease, and the worker acts on it.
+    // The job leaves the active set before its report is delivered, so the
+    // settlement is taken hold of first.
+    const settled = runtime.getActiveJob(jobId)?.settled;
+    await runtime.tickHeartbeat();
+    await settled;
+
+    expect(leases.job(jobId)).toMatchObject({ status: "killed", report: { status: "killed", reason: "stopped by controller" } });
+    expect(runtime.getActiveJobs().size).toBe(0);
+    await expect.poll(() => processAlive(grandchild), { timeout: 15_000 }).toBe(false);
+    expect(processAlive(leader)).toBe(false);
+    expect(jobs.running()).toBe(0);
+    expect(spawns()).toBe(1);
   });
 
   it("takeover & stale epoch refusal: old epoch rejected and worker converges to current fence", async () => {
