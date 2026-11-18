@@ -107,6 +107,13 @@ describe("writeToClient", () => {
     }).not.toThrow();
     expect(result).toBe("error");
   });
+
+  it("filters frames by threadIds when subscribed to specific threads", () => {
+    const c = client({ screens: true, threadIds: new Set(["t-1"]) });
+    expect(writeToClient(c, "frame-1", "runtime", "bot-1", "t-2")).toBe("dropped");
+    expect(writeToClient(c, "frame-2", "runtime", "bot-1", "")).toBe("dropped");
+    expect(writeToClient(c, "frame-3", "runtime", "bot-1", "t-1")).toBe("wrote");
+  });
 });
 
 describe("wants", () => {
@@ -118,6 +125,14 @@ describe("wants", () => {
   it("screen frames require opting in", () => {
     expect(wants({ screens: false }, "screen")).toBe(false);
     expect(wants({ screens: true }, "screen")).toBe(true);
+  });
+
+  it("honors onlyKinds allowlists", () => {
+    expect(wants({ screens: false, onlyKinds: new Set(["runtime"]) }, "message")).toBe(false);
+    expect(wants({ screens: false, onlyKinds: new Set(["runtime"]) }, "runtime")).toBe(true);
+    expect(wants({ screens: true, onlyKinds: new Set(["screen"]) }, "screen")).toBe(true);
+    expect(wants({ screens: true, onlyKinds: new Set(["screen"]) }, "bot")).toBe(false);
+    expect(wants({ screens: false, onlyKinds: new Set(["screen"]) }, "screen")).toBe(false);
   });
 });
 

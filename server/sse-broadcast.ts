@@ -25,14 +25,21 @@ export interface SseClient {
    * a phone on cellular, most of all — should not pay for them. */
   screens: boolean;
   screenBotIds: Set<string> | null;
+  /** Optional kind allowlist (`?kind=...`). When set, only listed frame kinds
+   * are delivered or replayed. */
+  onlyKinds?: Set<string> | null;
+  /** Optional thread allowlist (`?threadId=...`). When set, only frames bound
+   * to a listed thread are delivered. */
+  threadIds?: Set<string> | null;
   /** true once write() last signalled backpressure; cleared on the
    * response's own 'drain' event. While true, screen frames are skipped
    * for this client instead of queuing without bound (HS16). */
   slow: boolean;
 }
 
-/** Screen frames are the only kind a client can decline. */
-export const wants = (client: Pick<SseClient, "screens">, kind: string): boolean => kind !== "screen" || client.screens;
+/** Whether a client wants frames of `kind`. */
+export const wants = (client: Pick<SseClient, "screens" | "onlyKinds">, kind: string): boolean =>
+  (kind !== "screen" || client.screens) && (!client.onlyKinds || client.onlyKinds.size === 0 || client.onlyKinds.has(kind));
 
 /** A slow client's write queue past this many buffered bytes is
  * disconnected outright rather than left to grow — a phone on cellular
@@ -58,8 +65,15 @@ export type SseWriteResult = "wrote" | "dropped" | "slow-end" | "error";
  * (chat messages, tool activity, turn state) carries data with no other
  * path to the client, so it is never dropped — a client that cannot keep
  * up with those instead hits the byte ceiling and is disconnected. */
-export function writeToClient(client: SseClient, frame: string, kind: string, botId: string): SseWriteResult {
+export function writeToClient(
+  client: SseClient,
+  frame: string,
+  kind: string,
+  botId: string,
+  threadId = "",
+): SseWriteResult {
   if (!wants(client, kind)) return "dropped";
+  if (client.threadIds && client.threadIds.size > 0 && (!threadId || !client.threadIds.has(threadId))) return "dropped";
   if (kind === "screen" && client.screenBotIds && !client.screenBotIds.has(botId)) return "dropped";
   if (client.slow && kind === "screen") return "dropped";
   try {

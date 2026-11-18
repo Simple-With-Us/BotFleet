@@ -1108,9 +1108,12 @@ function broadcast(payload: Record<string, unknown>) {
   // as soon as the next one arrives. Keep their sequence slots so resume-gap
   // detection stays honest, but never retain their base64 payloads.
   replayBuffer.push(seq, kind, frame);
-  const botId = String(payload.botId);
+  // SAFETY: when callers omit top-level `botId`/`threadId`, `bot`/`event` payloads carry `.id` / `.threadId`.
+  const botId = String(payload.botId ?? (payload.bot as { id?: string } | undefined)?.id ?? "");
+  // SAFETY: runtime frames nest `threadId` inside `event` rather than repeating it at top level.
+  const threadId = String(payload.threadId ?? (payload.event as { threadId?: string } | undefined)?.threadId ?? "");
   for (const client of [...sseClients]) {
-    const result = writeToClient(client, frame, kind, botId);
+    const result = writeToClient(client, frame, kind, botId, threadId);
     if (result === "slow-end") {
       console.warn(`[sse] client exceeded ${SLOW_CLIENT_BYTE_LIMIT} buffered bytes; disconnecting so it reconnects and resumes from its cursor`);
       sseClients.delete(client);
@@ -3360,9 +3363,28 @@ setInterval(() => {
  * paired phone has even less business holding provider session identifiers
  * than the desktop window did. Stripped here rather than at each call site
  * so a new broadcast cannot forget. */
+const TASK_PREVIEW_TEXT_LIMIT = 500;
+
+function clipTaskLastMessage(message: Message | undefined): Message | undefined {
+  if (!message) return undefined;
+  const clipped: Message = { ...message };
+  delete clipped.png;
+  delete clipped.recording;
+  if (clipped.text && clipped.text.length > TASK_PREVIEW_TEXT_LIMIT) {
+    clipped.text = clipped.text.slice(0, TASK_PREVIEW_TEXT_LIMIT);
+  }
+  if (clipped.tool?.detail && clipped.tool.detail.length > TASK_PREVIEW_TEXT_LIMIT) {
+    clipped.tool = {
+      ...clipped.tool,
+      detail: clipped.tool.detail.slice(0, TASK_PREVIEW_TEXT_LIMIT),
+    };
+  }
+  return clipped;
+}
+
 const wireTask = ({ resumeCursors, lastInstanceId, snoozedUntil, ...task }: TaskRecord) => {
-  const messages = store.messagesFor(task.threadId);
-  const last = messages.at(-1);
+  const summary = store.threadSummary(task.threadId);
+  const last = clipTaskLastMessage(summary.lastMessage);
   // Time-based snoozes heal on read against the HARNESS clock, so a phone
   // whose clock is minutes off still agrees with the desktop about whether
   // a thread is asleep.  The 0 sentinel is not a time and survives every
@@ -3374,15 +3396,16 @@ const wireTask = ({ resumeCursors, lastInstanceId, snoozedUntil, ...task }: Task
     lastMessage: last,
     // How much conversation a thread holds, so a person can tell a long
     // history from a recent one before choosing what to merge into what.
-    messageCount: messages.length,
+    messageCount: summary.messageCount,
     // When the conversation first spoke.  A merge folds transcripts in the
     // order they began, and the task's own creation time can disagree with
     // that, so the client orders by this one.
-    startedAt: messages[0]?.at ?? task.createdAt,
+    startedAt: summary.startedAt ?? task.createdAt,
   };
 };
 const wireGroupTask = (task: GroupTaskRecord) => {
-  const last = store.messagesFor(task.threadId).at(-1);
+  const summary = store.threadSummary(task.threadId);
+  const last = clipTaskLastMessage(summary.lastMessage);
   return { ...task, lastActivity: last?.at ?? task.createdAt, lastMessage: last };
 };
 
@@ -3418,12 +3441,15 @@ const storedAvatarExists = (avatarUrl: string): boolean => {
   return attachmentExists(parsed.data.slice("/api/attachments/".length));
 };
 
-const publicBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => ({
-  ...wireBot(bot),
-  messages: store.messagesFor(bot.threadId),
-  activeLeafId: store.activeLeaf(bot.threadId),
-  tasks: store.tasks(bot.id).map(wireTask),
-});
+const publicBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
+  const wired = wireBot(bot);
+  return {
+    ...wired,
+    messages: store.messagesFor(bot.threadId),
+    activeLeafId: store.activeLeaf(bot.threadId),
+    tasks: wired.tasks ?? store.tasks(bot.id).map(wireTask),
+  };
+};
 
 type GroupTurnOperation = {
   id: string;
@@ -3480,12 +3506,15 @@ function cancelGroupTurnOperations(groupId: string, threadId: string) {
   }
 }
 
-const groupWithThread = (group: GroupRecord) => ({
-  ...publicGroupState(group),
-  messages: store.messagesFor(group.threadId),
-  activeLeafId: store.activeLeaf(group.threadId),
-  ...(group.dm ? {} : { tasks: store.groupTasks(group.id).map(wireGroupTask) }),
-});
+const groupWithThread = (group: GroupRecord) => {
+  const state = publicGroupState(group);
+  return {
+    ...state,
+    messages: store.messagesFor(group.threadId),
+    activeLeafId: store.activeLeaf(group.threadId),
+    ...(group.dm ? {} : { tasks: state.tasks ?? store.groupTasks(group.id).map(wireGroupTask) }),
+  };
+};
 
 // The store tells us what it wrote; this is the ONE place that turns those
 // into SSE frames. No mutation path can persist without emitting — the
@@ -4081,12 +4110,7 @@ const engineCommandTurns = new Map<
 /** A bot as a client receives it after its conversation changed: the record,
  * its messages and its tasks. */
 function botWithThreadView(bot: BotRecord) {
-  return {
-    ...wireBot(bot),
-    messages: store.messagesFor(bot.threadId),
-    activeLeafId: store.activeLeaf(bot.threadId),
-    tasks: store.tasks(bot.id).map(wireTask),
-  };
+  return publicBot(bot);
 }
 
 /** The engine a bot is configured to run, as the command menu needs it.  Reads
@@ -14492,6 +14516,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         res,
         screens: url.searchParams.get("screens") === "on",
         screenBotIds: url.searchParams.has("botId") ? new Set(url.searchParams.getAll("botId")) : null,
+        onlyKinds: url.searchParams.has("kind") ? new Set(url.searchParams.getAll("kind").filter(Boolean)) : null,
+        threadIds: url.searchParams.has("threadId") ? new Set(url.searchParams.getAll("threadId").filter(Boolean)) : null,
         slow: false,
       };
       res.writeHead(200, {
@@ -17378,12 +17404,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // The bot record answers with its messages because switching tasks
     // changes which transcript is live, and a partial patch would leave
     // the client showing the previous task's conversation.
-    const botWithThread = (bot: NonNullable<ReturnType<typeof store.bot>>) => ({
-      ...wireBot(bot),
-      messages: store.messagesFor(bot.threadId),
-      activeLeafId: store.activeLeaf(bot.threadId),
-      tasks: store.tasks(bot.id).map(wireTask),
-    });
+    const botWithThread = (bot: NonNullable<ReturnType<typeof store.bot>>) => publicBot(bot);
 
     m = path.match(/^\/api\/bots\/([\w-]+)\/tasks$/);
     if (m && method === "POST") {
@@ -17447,7 +17468,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!task) return json(res, 500, { error: "couldn't create that task" });
       const fresh = botWithThread(store.bot(bot.id)!);
       broadcast({ kind: "bot", bot: fresh });
-      return json(res, 201, { bot: fresh, task: wireTask(task) });
+      return json(res, 201, { bot: fresh, task: fresh.tasks.find((t) => t.threadId === task.threadId) ?? wireTask(task) });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/tasks\/([\w-]+)$/);
     if (m && method === "POST") {
@@ -17463,7 +17484,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const fresh = botWithThread(switched);
       broadcast({ kind: "bot", bot: fresh });
       const responseBot = url.searchParams.get("messages") === "0"
-        ? { ...wireBot(switched), tasks: store.tasks(switched.id).map(wireTask) }
+        ? (() => {
+            const wired = wireBot(switched);
+            return { ...wired, tasks: wired.tasks ?? store.tasks(switched.id).map(wireTask) };
+          })()
         : fresh;
       return json(res, 200, { bot: responseBot });
     }
