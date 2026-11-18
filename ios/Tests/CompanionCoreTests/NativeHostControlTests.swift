@@ -247,6 +247,61 @@ struct NativeHostControlTests {
         try await host.shutdown()
     }
 
+    @Test("The start is announced only after the checked start succeeded")
+    func announcementFollowsTheCheckedStart() async throws {
+        var announcements: [String] = []
+        var checks = 0
+        // A check that fails announces nothing at all.
+        var failure: String?
+        do {
+            try await NativeHostStartSequence.run(
+                verify: { checks += 1; throw NativeHostControlError.controlChannelUnreachable },
+                write: { announcements.append($0) })
+        } catch let error as NativeHostControlError {
+            failure = error.reasonCode
+        }
+        #expect(failure == "controlChannelUnreachable")
+        #expect(checks == 1)
+        #expect(announcements.isEmpty)
+        // A check that succeeds announces exactly once, and only after it ran.
+        try await NativeHostStartSequence.run(
+            verify: { checks += 1 },
+            write: { announcements.append($0) })
+        #expect(checks == 2)
+        #expect(announcements.count == 1)
+        #expect(announcements.first == NativeHostStartSequence.runningMessage)
+    }
+
+    @Test("The executable never announces a start the control channel could not back")
+    func executableNeverAnnouncesWithoutAChannel() async throws {
+        let fixture = try HostFixture(shortPath: true)
+        defer { fixture.remove() }
+        let paths = try NativeServicePaths(serviceData: fixture.root)
+        // A foreign entry at the socket path is refused, so no channel can back a start.
+        let socket = paths.root.appendingPathComponent(NativeHostControlServer.socketName)
+        try Data("foreign".utf8).write(to: socket)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: socket.path)
+        let executable = nativeHostExecutable()
+        #expect(FileManager.default.isExecutableFile(atPath: executable.path))
+        let run = try runNativeHost(executable, arguments: ["--service-data", fixture.root.path], fixture: fixture)
+        #expect(run.status != 0)
+        #expect(run.error.contains("reason=unsafeSocket"))
+        #expect(!run.output.contains("Native host running"))
+    }
+
+    @Test("The executable cannot announce a start of its own")
+    func executableAnnouncesOnlyThroughTheSequence() throws {
+        let source = try String(contentsOf: nativeHostMainScript(), encoding: .utf8)
+        // The announcement belongs to the sequence, so the executable holds no
+        // announcement of its own that could be moved ahead of the verification.
+        #expect(!source.contains("Native host running"))
+        #expect(source.contains("NativeHostStartSequence.run("))
+        // The verification is an argument of the sequence, never a separate step.
+        let sequence = try #require(source.range(of: "NativeHostStartSequence.run("))
+        let verification = try #require(source.range(of: "control.verifyStart()"))
+        #expect(sequence.lowerBound < verification.lowerBound)
+    }
+
     @Test("A failed start reports the reason and is never reported as successful")
     func failedStartReportsTheReason() async throws {
         let fixture = try HostFixture(shortPath: true)
@@ -275,6 +330,11 @@ struct NativeHostControlTests {
         #expect(unclassified == "unclassified")
         #expect(!unclassified.contains("fixture"))
     }
+}
+
+private func nativeHostMainScript() -> URL {
+    let ios = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    return ios.appendingPathComponent("Scripts/BotFleetNativeHost/main.swift")
 }
 
 private func nativeHostExecutable() -> URL {

@@ -23,6 +23,21 @@ extension NativeHostControlError {
     }
 }
 
+/// The foreground start sequence.  The announcement belongs to the sequence, so
+/// the executable holds no announcement of its own that could be moved ahead of
+/// the verification: the host is announced only after the control channel has
+/// verified it, and a failed verification writes nothing at all.
+public enum NativeHostStartSequence {
+    /// The only announcement the native host makes, and only for a verified start.
+    public static let runningMessage = "Native host running with service credential access unavailable.\n"
+
+    /// Verifies the start and announces it only when the verification succeeded.
+    public static func run(verify: () async throws -> Void, write: (String) -> Void) async throws {
+        try await verify()
+        write(runningMessage)
+    }
+}
+
 /// A private administrative channel; the production peer check always uses kernel credentials.
 public final class NativeHostControlServer: @unchecked Sendable {
     public static let socketName = "control.sock"

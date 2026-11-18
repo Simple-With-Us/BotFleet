@@ -55,9 +55,12 @@ struct BotFleetNativeHostMain {
             }
             defer { control.close() }
             do {
-                // The start path is checked, never assumed: the control channel must
-                // publish a real running state and answer before the host is announced.
-                _ = try await control.verifyStart()
+                // The start path is checked, never assumed: the sequence verifies the
+                // host through the control channel and owns the announcement, so the
+                // host can never be announced before the check that backs it.
+                try await NativeHostStartSequence.run(
+                    verify: { _ = try await control.verifyStart() },
+                    write: { text in FileHandle.standardOutput.write(Data(text.utf8)) })
             } catch {
                 // A host that did not come up releases its owner and is never reported
                 // as running; the reason travels with the refusal.
@@ -67,7 +70,6 @@ struct BotFleetNativeHostMain {
                 FileHandle.standardError.write(Data("Native host did not come up: reason=\(reason)\n".utf8))
                 exit(1)
             }
-            FileHandle.standardOutput.write(Data("Native host running with service credential access unavailable.\n".utf8))
             for await completion in completions {
                 if case .signal = completion { try await host.shutdown() }
                 break
