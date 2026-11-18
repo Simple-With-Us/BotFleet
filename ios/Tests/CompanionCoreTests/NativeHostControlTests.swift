@@ -145,7 +145,7 @@ struct NativeHostControlTests {
         defer { fixture.remove() }
         let host = try await fixture.start()
         let socket = fixture.root.appendingPathComponent(NativeHostControlServer.socketName)
-        try Data("untouched".utf8).write(to: socket)
+        try writeFixtureFile("untouched", to: socket)
         #expect(throws: (any Error).self) { _ = try NativeHostControlServer(host: host) }
         #expect(try String(contentsOf: socket, encoding: .utf8) == "untouched")
         try FileManager.default.removeItem(at: socket)
@@ -279,8 +279,7 @@ struct NativeHostControlTests {
         let paths = try NativeServicePaths(serviceData: fixture.root)
         // A foreign entry at the socket path is refused, so no channel can back a start.
         let socket = paths.root.appendingPathComponent(NativeHostControlServer.socketName)
-        try Data("foreign".utf8).write(to: socket)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: socket.path)
+        try writeFixtureFile("foreign", to: socket)
         let executable = nativeHostExecutable()
         #expect(FileManager.default.isExecutableFile(atPath: executable.path))
         let run = try runNativeHost(executable, arguments: ["--service-data", fixture.root.path], fixture: fixture)
@@ -289,17 +288,50 @@ struct NativeHostControlTests {
         #expect(!run.output.contains("Native host running"))
     }
 
-    @Test("The executable cannot announce a start of its own")
-    func executableAnnouncesOnlyThroughTheSequence() throws {
+    @Test("The executable has no announcement path of its own")
+    func theExecutableHasNoAnnouncementOfItsOwn() throws {
         let source = try String(contentsOf: nativeHostMainScript(), encoding: .utf8)
         // The announcement belongs to the sequence, so the executable holds no
-        // announcement of its own that could be moved ahead of the verification.
+        // announcement of its own that could be moved ahead of the verification:
+        // it neither carries the message nor reaches for it.
         #expect(!source.contains("Native host running"))
-        #expect(source.contains("NativeHostStartSequence.run("))
-        // The verification is an argument of the sequence, never a separate step.
+        #expect(!source.contains("runningMessage"))
+        // The channel check is the sequence's verification, and it is the only one.
+        #expect(source.components(separatedBy: "control.verifyStart()").count - 1 == 1)
         let sequence = try #require(source.range(of: "NativeHostStartSequence.run("))
         let verification = try #require(source.range(of: "control.verifyStart()"))
         #expect(sequence.lowerBound < verification.lowerBound)
+    }
+
+    @Test("The real executable announces a verified start exactly once")
+    func theExecutableAnnouncesAVerifiedStartOnce() async throws {
+        let fixture = try HostFixture(shortPath: true)
+        defer { fixture.remove() }
+        let executable = nativeHostExecutable()
+        #expect(FileManager.default.isExecutableFile(atPath: executable.path))
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["--service-data", fixture.root.path]
+        process.environment = ["PATH": "/usr/bin:/bin", "HOME": fixture.parent.path, "TMPDIR": fixture.parent.path]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = Pipe()
+        try process.run()
+        defer { if process.isRunning { kill(process.processIdentifier, SIGKILL); process.waitUntilExit() } }
+        // The channel that backs the announcement is live and answers for the host.
+        try await controlEventually {
+            FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent(NativeHostControlServer.socketName).path)
+        }
+        let status = try await controlRequest(fixture, "status\n")
+        #expect(status.contains(geteuid() == 0 ? "\"state\":\"running\"" : "denied"))
+        process.terminate()
+        try await controlEventually { !process.isRunning }
+        let stdout = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        // The verified start is announced once and only once, so an announcement
+        // that came before the verification or from a second path would show up
+        // here as a missing or a repeated message.
+        #expect(stdout.components(separatedBy: "Native host running").count - 1 == 1)
+        #expect(stdout.contains(NativeHostStartSequence.runningMessage))
     }
 
     @Test("A failed start reports the reason and is never reported as successful")
@@ -384,6 +416,34 @@ private func companionCoreSource(_ name: String) -> URL {
 
 private func nativeHostMainScript() -> URL {
     iosRoot().appendingPathComponent("Scripts/BotFleetNativeHost/main.swift")
+}
+
+/// Writes a fixture payload through a verified handle: the path is opened with
+/// O_NOFOLLOW, the handle is checked to be a regular single-link file, and its
+/// device and inode must still match the listed path before anything is written.
+private func writeFixtureFile(_ payload: String, to url: URL) throws {
+    let path = url.path
+    let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
+    guard fd >= 0 else { throw NativeHostControlError.unsafeSocket }
+    defer { Darwin.close(fd) }
+    var handle = stat()
+    guard fstat(fd, &handle) == 0, handle.st_mode & S_IFMT == S_IFREG, handle.st_nlink == 1 else {
+        throw NativeHostControlError.unsafeSocket
+    }
+    var listed = stat()
+    guard lstat(path, &listed) == 0, listed.st_mode & S_IFMT == S_IFREG,
+          listed.st_dev == handle.st_dev, listed.st_ino == handle.st_ino else {
+        throw NativeHostControlError.unsafeSocket
+    }
+    let bytes = Array(payload.utf8)
+    guard !bytes.isEmpty else { return }
+    var offset = 0
+    while offset < bytes.count {
+        let written = Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+        if written > 0 { offset += written }
+        else if written < 0, errno == EINTR { continue }
+        else { throw NativeHostControlError.unsafeSocket }
+    }
 }
 
 /// A connected pair of sockets, used to read a completed connection's error.
