@@ -20,7 +20,16 @@ import { extname, join } from "node:path";
 import { z } from "zod";
 import { InstancePatchBodySchema, InstancePatchRestoreBodySchema, instancePatchInputError } from "./instance-patch.ts";
 import { ScreenPollers } from "./screen-poller.ts";
-import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseClient } from "./sse-broadcast.ts";
+import {
+  extractSseFrameTarget,
+  parseSseFilters,
+  ReplayBuffer,
+  SLOW_CLIENT_BYTE_LIMIT,
+  wantsReplayEntry,
+  writeToClient,
+  type SseClient,
+  type SseFrameEnvelope,
+} from "./sse-broadcast.ts";
 import { BOT_AVATAR_CROPS, botAvatarRecolorableSchema, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
 import { DEFAULT_ROOM_TERMINOLOGY, lowerRoomLabels, resolveRoomLabels } from "../shared/terminology.ts";
 import { isThreadSnoozed, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
@@ -427,7 +436,7 @@ import { loadLocalMiniMaxConfig } from "./drivers/minimax.ts";
 import { fetchProviderModels, providerModelIds } from "./drivers/model-discovery.ts";
 import { flushNativeTee } from "./drivers/native.ts";
 import { mirrorActivity, mirrorReply, type CommsBus } from "./comms-visibility.ts";
-import { DEFAULT_MAX_DEAD_SHARE, pruneDeadThreads, searchMessages } from "./message-db.ts";
+import { clipTaskLastMessage, DEFAULT_MAX_DEAD_SHARE, pruneDeadThreads, searchMessages } from "./message-db.ts";
 import { exportMessageSpeaker, promptWithReply, transcriptText } from "./replies.ts";
 import { lastInterruptedChatStarter, resumedDelegationChannel } from "./update-turn-starter.ts";
 import { createJobHost, type JobHost, type JobHostBody } from "./job-host.ts";
@@ -1104,13 +1113,14 @@ function broadcast(payload: Record<string, unknown>) {
   const seq = ++lastSeq;
   const kind = String(payload.kind ?? "");
   const frame = `id: ${STREAM_ID}:${seq}\ndata: ${JSON.stringify({ ...payload, seq })}\n\n`;
+  // SAFETY: broadcast payloads follow `SseFrameEnvelope` when carrying top-level or nested bot/group/event ids.
+  const { botId, threadId } = extractSseFrameTarget(payload as SseFrameEnvelope);
   // Live desktop captures can each be hundreds of kilobytes and become stale
   // as soon as the next one arrives. Keep their sequence slots so resume-gap
   // detection stays honest, but never retain their base64 payloads.
-  replayBuffer.push(seq, kind, frame);
-  const botId = String(payload.botId);
+  replayBuffer.push(seq, kind, frame, threadId);
   for (const client of [...sseClients]) {
-    const result = writeToClient(client, frame, kind, botId);
+    const result = writeToClient(client, frame, kind, botId, threadId);
     if (result === "slow-end") {
       console.warn(`[sse] client exceeded ${SLOW_CLIENT_BYTE_LIMIT} buffered bytes; disconnecting so it reconnects and resumes from its cursor`);
       sseClients.delete(client);
@@ -3361,8 +3371,8 @@ setInterval(() => {
  * than the desktop window did. Stripped here rather than at each call site
  * so a new broadcast cannot forget. */
 const wireTask = ({ resumeCursors, lastInstanceId, snoozedUntil, ...task }: TaskRecord) => {
-  const messages = store.messagesFor(task.threadId);
-  const last = messages.at(-1);
+  const summary = store.threadSummary(task.threadId);
+  const last = clipTaskLastMessage(summary.lastMessage);
   // Time-based snoozes heal on read against the HARNESS clock, so a phone
   // whose clock is minutes off still agrees with the desktop about whether
   // a thread is asleep.  The 0 sentinel is not a time and survives every
@@ -3374,15 +3384,16 @@ const wireTask = ({ resumeCursors, lastInstanceId, snoozedUntil, ...task }: Task
     lastMessage: last,
     // How much conversation a thread holds, so a person can tell a long
     // history from a recent one before choosing what to merge into what.
-    messageCount: messages.length,
+    messageCount: summary.messageCount,
     // When the conversation first spoke.  A merge folds transcripts in the
     // order they began, and the task's own creation time can disagree with
     // that, so the client orders by this one.
-    startedAt: messages[0]?.at ?? task.createdAt,
+    startedAt: summary.startedAt ?? task.createdAt,
   };
 };
 const wireGroupTask = (task: GroupTaskRecord) => {
-  const last = store.messagesFor(task.threadId).at(-1);
+  const summary = store.threadSummary(task.threadId);
+  const last = clipTaskLastMessage(summary.lastMessage);
   return { ...task, lastActivity: last?.at ?? task.createdAt, lastMessage: last };
 };
 
@@ -3418,12 +3429,15 @@ const storedAvatarExists = (avatarUrl: string): boolean => {
   return attachmentExists(parsed.data.slice("/api/attachments/".length));
 };
 
-const publicBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => ({
-  ...wireBot(bot),
-  messages: store.messagesFor(bot.threadId),
-  activeLeafId: store.activeLeaf(bot.threadId),
-  tasks: store.tasks(bot.id).map(wireTask),
-});
+const publicBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
+  const wired = wireBot(bot);
+  return {
+    ...wired,
+    messages: store.messagesFor(bot.threadId),
+    activeLeafId: store.activeLeaf(bot.threadId),
+    tasks: wired.tasks ?? store.tasks(bot.id).map(wireTask),
+  };
+};
 
 type GroupTurnOperation = {
   id: string;
@@ -3480,12 +3494,15 @@ function cancelGroupTurnOperations(groupId: string, threadId: string) {
   }
 }
 
-const groupWithThread = (group: GroupRecord) => ({
-  ...publicGroupState(group),
-  messages: store.messagesFor(group.threadId),
-  activeLeafId: store.activeLeaf(group.threadId),
-  ...(group.dm ? {} : { tasks: store.groupTasks(group.id).map(wireGroupTask) }),
-});
+const groupWithThread = (group: GroupRecord) => {
+  const state = publicGroupState(group);
+  return {
+    ...state,
+    messages: store.messagesFor(group.threadId),
+    activeLeafId: store.activeLeaf(group.threadId),
+    ...(group.dm ? {} : { tasks: state.tasks ?? store.groupTasks(group.id).map(wireGroupTask) }),
+  };
+};
 
 // The store tells us what it wrote; this is the ONE place that turns those
 // into SSE frames. No mutation path can persist without emitting — the
@@ -4081,12 +4098,7 @@ const engineCommandTurns = new Map<
 /** A bot as a client receives it after its conversation changed: the record,
  * its messages and its tasks. */
 function botWithThreadView(bot: BotRecord) {
-  return {
-    ...wireBot(bot),
-    messages: store.messagesFor(bot.threadId),
-    activeLeafId: store.activeLeaf(bot.threadId),
-    tasks: store.tasks(bot.id).map(wireTask),
-  };
+  return publicBot(bot);
 }
 
 /** The engine a bot is configured to run, as the command menu needs it.  Reads
@@ -14488,10 +14500,17 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         validatedCursor = parsed.data;
       }
 
+      const parsedFilters = parseSseFilters(url.searchParams);
+      if (!parsedFilters.ok) {
+        return json(res, 400, { ok: false, error: "invalid_filter", message: parsedFilters.message });
+      }
+
       const client: SseClient = {
         res,
         screens: url.searchParams.get("screens") === "on",
-        screenBotIds: url.searchParams.has("botId") ? new Set(url.searchParams.getAll("botId")) : null,
+        screenBotIds: parsedFilters.screenBotIds,
+        onlyKinds: parsedFilters.onlyKinds,
+        threadIds: parsedFilters.threadIds,
         slow: false,
       };
       res.writeHead(200, {
@@ -14529,7 +14548,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       );
       if (resumed) {
         for (const buffered of replayBuffer.entries) {
-          if (buffered.seq > since && buffered.frame && wants(client, buffered.kind)) res.write(buffered.frame);
+          if (buffered.seq > since && buffered.frame && wantsReplayEntry(client, buffered)) res.write(buffered.frame);
         }
       }
 
@@ -17378,12 +17397,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // The bot record answers with its messages because switching tasks
     // changes which transcript is live, and a partial patch would leave
     // the client showing the previous task's conversation.
-    const botWithThread = (bot: NonNullable<ReturnType<typeof store.bot>>) => ({
-      ...wireBot(bot),
-      messages: store.messagesFor(bot.threadId),
-      activeLeafId: store.activeLeaf(bot.threadId),
-      tasks: store.tasks(bot.id).map(wireTask),
-    });
+    const botWithThread = (bot: NonNullable<ReturnType<typeof store.bot>>) => publicBot(bot);
 
     m = path.match(/^\/api\/bots\/([\w-]+)\/tasks$/);
     if (m && method === "POST") {
@@ -17447,7 +17461,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!task) return json(res, 500, { error: "couldn't create that task" });
       const fresh = botWithThread(store.bot(bot.id)!);
       broadcast({ kind: "bot", bot: fresh });
-      return json(res, 201, { bot: fresh, task: wireTask(task) });
+      return json(res, 201, { bot: fresh, task: fresh.tasks.find((t) => t.threadId === task.threadId) ?? wireTask(task) });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/tasks\/([\w-]+)$/);
     if (m && method === "POST") {
@@ -17463,7 +17477,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const fresh = botWithThread(switched);
       broadcast({ kind: "bot", bot: fresh });
       const responseBot = url.searchParams.get("messages") === "0"
-        ? { ...wireBot(switched), tasks: store.tasks(switched.id).map(wireTask) }
+        ? (() => {
+            const wired = wireBot(switched);
+            return { ...wired, tasks: wired.tasks ?? store.tasks(switched.id).map(wireTask) };
+          })()
         : fresh;
       return json(res, 200, { bot: responseBot });
     }
