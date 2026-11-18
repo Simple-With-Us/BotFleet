@@ -4,8 +4,9 @@ import Testing
 
 /// The Swift half of `Fixtures/import-parity-report.json` (BF-2648).
 ///
-/// `scripts/archive-node-store.node-test.mjs` reads the same file and checks
-/// it against the node `ImportParityReportSchema` and `importParityVerdict`.
+/// `scripts/import-parity-report-contract.node-test.mjs` reads the same file
+/// and checks it against the node `ImportParityReportSchema` and
+/// `importParityVerdict`.
 /// The report is the one thing the Swift importer writes and the node
 /// decommission bundle reads, and the only link between the two sides was that
 /// the key names happen to match.  This fixture is that link made a test:

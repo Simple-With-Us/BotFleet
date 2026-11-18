@@ -21,8 +21,32 @@ const GOLDEN_PARITY_REPORT_URL = new URL(
   import.meta.url,
 );
 
+/** True for a parsed JSON object, and false for null, an array or a scalar. */
+function isJsonObject(value) {
+  return Object.prototype.toString.call(value) === "[object Object]";
+}
+
+/**
+ * Parse the fixture text and refuse a shape the tests below would trip over.
+ * A fixture that is not an object, or whose receipts are not an array of
+ * objects, fails here as a named assertion rather than as a `TypeError` raised
+ * from an unrelated line of a later test.
+ */
+function parseGoldenParityReport(text) {
+  const report = JSON.parse(text);
+  assert.ok(isJsonObject(report), "the pinned parity report must be one JSON object");
+  assert.ok(
+    Array.isArray(report.routineRequestReceipts),
+    "the pinned parity report must carry routineRequestReceipts as an array",
+  );
+  for (const receipt of report.routineRequestReceipts) {
+    assert.ok(isJsonObject(receipt), "every pinned routine request receipt must be one JSON object");
+  }
+  return report;
+}
+
 function readGoldenParityReport() {
-  return JSON.parse(readFileSync(GOLDEN_PARITY_REPORT_URL, "utf8"));
+  return parseGoldenParityReport(readFileSync(GOLDEN_PARITY_REPORT_URL, "utf8"));
 }
 
 /** Every key `StoreImportParityReport` writes, as the Swift contract test pins them. */
@@ -91,6 +115,22 @@ const NODE_REQUIRED_KEYS = [
   "targetWebhookDeliveryLedgerCount",
   "warnings",
 ];
+
+test("a malformed fixture fails as a named assertion, not as a TypeError in a later test", () => {
+  for (const text of [
+    "null",
+    "[]",
+    "7",
+    "{}",
+    '{"routineRequestReceipts":null}',
+    '{"routineRequestReceipts":{}}',
+    '{"routineRequestReceipts":[null]}',
+    '{"routineRequestReceipts":[[]]}',
+  ]) {
+    assert.throws(() => parseGoldenParityReport(text), assert.AssertionError, text);
+  }
+  assert.deepEqual(parseGoldenParityReport('{"routineRequestReceipts":[]}'), { routineRequestReceipts: [] });
+});
 
 test("the report the Swift contract test pins earns a passing parity check", () => {
   const verdict = importParityVerdict(readGoldenParityReport());
