@@ -92,7 +92,7 @@ function leadingAssignments(tokens) {
  * Scripts that would run the opt-in test `file` without its switch.  Such a
  * run reports one skip, which reads as coverage that never ran.  A step
  * reaches the file by naming it anywhere (any prefix, or run directly), or by
- * a glob that covers it in a `--test` or `node` run; the switch must be set in that step's own
+ * a glob that covers it in a `--test` run; the switch must be set in that step's own
  * environment, as a leading `NAME=value` assignment before the runner.  A step
  * ends at `&&`, `||`, `;`, `|`, a newline or a lone `&`, because each stage of
  * a pipeline has its own environment and an assignment binds to the command
@@ -104,12 +104,14 @@ export function optInProblems(scripts, file, optIn) {
   for (const [name, command] of Object.entries(scripts)) {
     for (const step of command.split(STEP_BREAK)) {
       const tokens = step.trim().split(/\s+/);
-      const { assigned, command: runner } = leadingAssignments(tokens);
+      const { assigned } = leadingAssignments(tokens);
       const named = tokens.some((token) => token.includes(base));
-      // A glob reaches the file when node runs it: `node --test <glob>`, or
-      // `node <glob>`, where the shell expands the glob and node runs what it
-      // matched.  The same glob given to another tool (oxlint) runs nothing.
-      const globbed = (tokens.includes("--test") || runner === "node") && tokens.some((token) => globCovers(token, file));
+      // A glob reaches the file only under the test runner: `node --test
+      // <glob>` runs every file the shell expands it to.  Plain `node <glob>`
+      // runs the first match as the script and passes the rest as arguments,
+      // so it does not reach the others; a file it runs is one it names.  The
+      // same glob given to another tool (oxlint) runs nothing.
+      const globbed = tokens.includes("--test") && tokens.some((token) => globCovers(token, file));
       if ((named || globbed) && !assigned.includes(optIn)) {
         problems.push(`${name} reaches ${file} without ${optIn}, so it would only report a skip`);
       }

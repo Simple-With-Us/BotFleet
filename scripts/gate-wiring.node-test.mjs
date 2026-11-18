@@ -91,10 +91,16 @@ test("an opt-in file is refused in any step that reaches it without the switch",
   assert.deepEqual(reaches("node --test scripts/release-provenance*.node-test.mjs"), refusal, "a glob that covers it");
   assert.deepEqual(reaches('node --test "scripts/*.node-test.mjs"'), refusal, "a quoted glob that covers it");
   assert.deepEqual(reaches("node --test **/*.mjs"), refusal);
-  // `node <glob>` needs no `--test`: the shell expands the glob and node runs
-  // what it matched.  The same glob given to another tool runs nothing.
-  assert.deepEqual(reaches("node scripts/*.node-test.mjs"), refusal, "a glob given to node directly");
-  assert.deepEqual(reaches(`${OPT_IN} node scripts/*.node-test.mjs`), []);
+  // A glob reaches the file only under `--test`, which runs every file the
+  // shell expands it to.  Plain `node <glob>` runs the first match as the
+  // script and passes the rest as arguments, so it does not reach the others;
+  // the file it runs is one it names.  Another tool given the glob runs nothing.
+  assert.deepEqual(reaches("node scripts/*.node-test.mjs"), [], "a glob given to plain node runs only its first match");
+  assert.deepEqual(reaches('node "scripts/*.node-test.mjs"'), [], "a quoted glob given to plain node");
+  assert.deepEqual(reaches("node scripts/**/*.mjs"), [], "a recursive glob given to plain node");
+  assert.deepEqual(reaches(`node ${INSTALL} scripts/*.node-test.mjs`), refusal, "plain node still runs the file it names");
+  assert.deepEqual(reaches("node --test scripts/*.node-test.mjs"), refusal, "the same glob under --test");
+  assert.deepEqual(reaches(`${OPT_IN} node --test scripts/*.node-test.mjs`), []);
   assert.deepEqual(reaches("oxlint scripts/*.node-test.mjs"), [], "a glob given to another tool");
   // A directory is not a glob: `node --test <dir>` stops with an error and
   // runs nothing, so it cannot report a skip as coverage.
