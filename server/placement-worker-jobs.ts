@@ -40,7 +40,10 @@
  *     with `ps`.  A start time that was read and does not match is a
  *     stranger holding the pid.  A start time that could not be read proves
  *     nothing either way: the job stays adopted and watched, nothing is
- *     signalled, and a stop or a run limit that fell due is tried again.
+ *     signalled, and a stop or a run limit that fell due is tried again.  The
+ *     adopted poll reads the start time again every few polls, so a leader
+ *     that ended without an exit file, and whose pid a stranger now holds, is
+ *     settled as unobservable and not waited on until the run limit.
  *   - A passive adapter (the read-only rollback build, #1556) refuses to
  *     spawn and never signals a process.  It hands the runtime its
  *     `passiveReason`, and a runtime given it admits no work, pulls no lease
@@ -104,6 +107,17 @@ const PS_TIMEOUT_MS = 500;
 /** The longest wait between two tries of a kill that could not go out. */
 const OWED_RETRY_MAX_MS = 30_000;
 
+/** An adopted leader's start time is read again every this many polls, to
+ *  catch a pid that a stranger took over once the leader ended without an
+ *  exit file.  Each read is one synchronous `ps`, so it is not done per poll. */
+const ADOPTED_PROOF_EVERY_POLLS = 10;
+
+/** The wrapper writes the exit file just before it exits.  A poll that finds
+ *  the file while the leader still lives waits this many polls for the leader
+ *  to go, so what the command left running is judged against a leader that is
+ *  gone and not one that is only finishing. */
+const EXIT_WAIT_POLLS = 3;
+
 const FILE_NAME = /^(job-[0-9a-f]{32})\.(?:log|exit|exit\.tmp)$/;
 
 /** Why a passive adapter runs nothing.  It is the runtime's `passiveReason`
@@ -162,6 +176,10 @@ interface LeasedJob {
   /** Set for a job adopted after a restart: there is no child handle, so the
    *  leader's start time is what proves the pid is still its. */
   leaderStartedAt?: number;
+  /** The earliest the leader's start time is read again (adopted jobs). */
+  nextProofAt: number;
+  /** Polls spent waiting for a leader that left its exit status and lives. */
+  exitWaits: number;
   /** The run limit ended it. */
   timedOut: boolean;
   timer?: NodeJS.Timeout;
@@ -276,6 +294,19 @@ export function createPlacementWorkerJobs(deps: PlacementWorkerJobsDeps): Placem
   };
 
   const stillOurs = (job: LeasedJob): boolean => ownership(job) === "ours";
+
+  /** Whether a stranger now holds an adopted job's pid: the leader ended
+   *  without an exit file and its number was handed out again.  Only a start
+   *  time that was read and does not match says so, and it is read at most
+   *  every `ADOPTED_PROOF_EVERY_POLLS` polls.  A stranger's pid is the same
+   *  as an ended leader to the poll, which then settles the job. */
+  const strangerHolds = (job: LeasedJob): boolean => {
+    if (job.leaderStartedAt === undefined || now() < job.nextProofAt) return false;
+    job.nextProofAt = now() + adoptedPollMs * ADOPTED_PROOF_EVERY_POLLS;
+    if (startedNear(job.pid, job.leaderStartedAt) !== false) return false;
+    job.leaderExited = true;
+    return true;
+  };
 
   /** SIGTERM the job's whole group, then SIGKILL what is left.  One kill per
    *  job: a second caller waits on the first.  A passive adapter signals
@@ -428,7 +459,7 @@ export function createPlacementWorkerJobs(deps: PlacementWorkerJobsDeps): Placem
       throw new Error(spawned.error);
     }
 
-    const entry: LeasedJob = { jobId: job.jobId, pid: spawned.pid, stem, exitPath, leaderExited: false, timedOut: false };
+    const entry: LeasedJob = { jobId: job.jobId, pid: spawned.pid, stem, exitPath, leaderExited: false, nextProofAt: 0, exitWaits: 0, timedOut: false };
     jobs.set(job.jobId, entry);
     const done = new Promise<WorkerJobExit>((resolve) => {
       spawned.child.once("exit", (code, signal) => {
@@ -459,6 +490,8 @@ export function createPlacementWorkerJobs(deps: PlacementWorkerJobsDeps): Placem
       exitPath: files(record).exitPath,
       leaderExited: false,
       leaderStartedAt: record.spawnedAt,
+      nextProofAt: 0,
+      exitWaits: 0,
       timedOut: false,
     };
     jobs.set(record.jobId, job);
@@ -469,10 +502,21 @@ export function createPlacementWorkerJobs(deps: PlacementWorkerJobsDeps): Placem
     return new Promise<WorkerJobExit>((resolve, reject) => {
       const poll = setInterval(() => {
         const written = readExitFile(job.exitPath);
-        if (written === null && !job.leaderExited && pidAlive(pid)) {
+        // The leader is held while a process with its pid lives and no
+        // stranger is proved to have taken the number.
+        const held = !job.leaderExited && pidAlive(pid) && !strangerHolds(job);
+        if (held && written === null) {
           // Still running.  A stop or a run limit that could not go out is
           // tried again here, so neither is lost to one failed `ps`.
           if (job.owed && !job.kill && now() >= job.owed.nextAt) killJob(job, job.owed.grace, job.owed.limit).catch(() => undefined);
+          return;
+        }
+        // The wrapper writes the exit file just before it exits, so a leader
+        // that lives with its status on disk is on its way out.  Settling now
+        // would call it exited while it still holds its pid, and what the
+        // command left running would be taken for a stranger's.
+        if (held && job.exitWaits < EXIT_WAIT_POLLS) {
+          job.exitWaits += 1;
           return;
         }
         clearInterval(poll);

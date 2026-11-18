@@ -1,7 +1,7 @@
 /** The runner-backed spawn, stop and adopt adapter of the placement worker
  *  runtime (the remainder of transport slice T5, BF-2559).  Every process
  *  here is real and every file lives in a temporary folder. */
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -713,7 +713,8 @@ posix("placement worker jobs: a restarted worker", () => {
 
     // `ps` fails (it timed out, could not be started, or printed nothing).
     let answer: boolean | null = null;
-    const after = adapter(dataDir, { leaderStartedNear: () => answer });
+    let reads = 0;
+    const after = adapter(dataDir, { leaderStartedNear: () => { reads += 1; return answer; } });
     // not knowing is not proof the job is dead: it is adopted, not reported lost
     expect(after.isProcessAlive(pid, record)).toBe(true);
     let settled = false;
@@ -721,7 +722,10 @@ posix("placement worker jobs: a restarted worker", () => {
     watched.then(() => { settled = true; }, () => { settled = true; });
 
     await after.stopJob(lease.jobId);
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // The owed stop goes round again while `ps` stays silent: wait for two
+    // more tries, not for a stretch of the clock.
+    const readsAtStop = reads;
+    await until(() => reads >= readsAtStop + 2);
     // nothing was signalled, and the job is neither settled nor forgotten
     expect(alive(pid)).toBe(true);
     expect(alive(grandchild)).toBe(true);
@@ -746,11 +750,14 @@ posix("placement worker jobs: a restarted worker", () => {
     const record = leaseRecord(lease, { spawnedAt, timeoutMs: 30_000, pid });
 
     let answer: boolean | null = null;
-    const after = adapter(dataDir, { now: () => Date.now() + 60_000, leaderStartedNear: () => answer });
+    let reads = 0;
+    const after = adapter(dataDir, { now: () => Date.now() + 60_000, leaderStartedNear: () => { reads += 1; return answer; } });
     let settled = false;
     const watched = after.watchProcess(pid, record);
     watched.then(() => { settled = true; }, () => { settled = true; });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // The run limit is behind the clock, so its kill is due at once and is
+    // owed while `ps` is silent.  Wait for it to be tried three times.
+    await until(() => reads >= 3);
     expect(alive(pid)).toBe(true);
     expect(settled).toBe(false);
 
@@ -780,6 +787,70 @@ posix("placement worker jobs: a restarted worker", () => {
     expect(after.running()).toBe(0);
   });
 
+  it("settles an adopted job whose pid a stranger took over after the leader ended without a status", async () => {
+    const { dataDir, workDir } = folder();
+    const before = adapter(dataDir);
+    const lease = { jobId: "job-recycled", leaseId: "lease-recycled" };
+    const spawnedAt = Date.now();
+    const spawned = await before.spawnJob({ ...lease, cwd: workDir, timeoutMs: 30_000, command: "sleep 30" });
+    const pid = spawned.pid!;
+    const record = leaseRecord(lease, { spawnedAt, timeoutMs: 30_000, pid });
+
+    // The start time matched when the job was adopted.  Later `ps` reads
+    // another start time for the same pid: the leader ended, and its number
+    // went to someone else.  The pid is alive throughout and the run limit is
+    // half a minute away, so only the poll's own check can end the wait.
+    let answer: boolean | null = true;
+    const after = adapter(dataDir, { leaderStartedNear: () => answer });
+    expect(after.isProcessAlive(pid, record)).toBe(true);
+    const watched = after.watchProcess(pid, record);
+    watched.catch(() => undefined);
+    answer = false;
+    await expect(watched).rejects.toThrow("without leaving an exit status");
+    // nothing was signalled, and the slot is free
+    expect(alive(pid)).toBe(true);
+    expect(after.running()).toBe(0);
+  });
+
+  it("waits for a leader that left its exit status and still lives, so what it left running is stopped", async () => {
+    const { dataDir, workDir } = folder();
+    const lease = { jobId: "job-finishing", leaseId: "lease-finishing" };
+    const reads: number[] = [];
+    const after = adapter(dataDir, { adoptedPollMs: 300, leaderStartedNear: () => { reads.push(1); return true; } });
+    // The leader is a process of this test, so no other adapter reaps it.
+    const leader = spawn("/bin/sh", ["-c", `sleep 30 & echo $! > "${join(workDir, "left")}"; wait`], { detached: true, stdio: "ignore", cwd: workDir });
+    const pid = leader.pid!;
+    try {
+      const grandchild = await until(() => {
+        const printed = existsSync(join(workDir, "left")) ? Number(readFileSync(join(workDir, "left"), "utf8").trim()) : 0;
+        return printed > 0 ? printed : null;
+      });
+      // The wrapper writes its status and then exits.  This is the moment
+      // between: the status is on disk and the leader is alive.
+      mkdirSync(join(dataDir, "placement", "jobs"), { recursive: true });
+      writeFileSync(after.files(lease).exitPath, "0\n");
+      const watched = after.watchProcess(pid, leaseRecord(lease, { timeoutMs: 30_000, pid }));
+      let settled = false;
+      watched.then(() => { settled = true; }, () => { settled = true; });
+
+      // the first poll has run, saw the status with the leader alive, and waited
+      await until(() => reads.length > 0);
+      expect(settled).toBe(false);
+      expect(alive(grandchild)).toBe(true);
+
+      // the leader exits (alone: its group is left standing)
+      process.kill(pid, "SIGKILL");
+      expect(await watched).toEqual({ exitCode: 0, signal: null, reason: "processes it left running were stopped" });
+      await until(() => !alive(grandchild));
+    } finally {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        /* the group is already gone */
+      }
+    }
+  });
+
   it("never signals a process when passive", async () => {
     const { dataDir, workDir } = folder();
     const before = adapter(dataDir);
@@ -790,12 +861,15 @@ posix("placement worker jobs: a restarted worker", () => {
     // a record whose limit is long past: a passive adapter still leaves it alone
     const record = leaseRecord(lease, { spawnedAt, timeoutMs: 1, pid });
 
-    const passive = adapter(dataDir, { passive: true, now: () => Date.now() + 60_000 });
+    // A passive adapter has no kill to wait on, so the polls are what is
+    // counted: each one reads the clock once.
+    let ticks = 0;
+    const passive = adapter(dataDir, { passive: true, now: () => { ticks += 1; return Date.now() + 60_000; } });
     const watched = passive.watchProcess(pid, record);
     watched.catch(() => undefined);
     await passive.stopJob(lease.jobId);
     await passive.stopJob(lease.jobId, "SIGKILL");
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await until(() => ticks >= 5);
     expect(alive(pid)).toBe(true);
 
     await before.stopJob(lease.jobId);
