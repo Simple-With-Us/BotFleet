@@ -986,6 +986,10 @@ class ThreadCache {
     this.maxMessages = maxMessages;
   }
 
+  peek(threadId: string): ThreadState | undefined {
+    return this.map.get(threadId);
+  }
+
   get(threadId: string): ThreadState | undefined {
     const state = this.map.get(threadId);
     if (state) {
@@ -1009,7 +1013,7 @@ class ThreadCache {
    * inside `set` would return `undefined` to a caller expecting the state
    * it just wrote — but it is the first thing the next `set` evicts. */
   private evict(): void {
-    while (this.map.size > this.limit || this.retained > this.maxMessages) {
+    while (this.map.size > 1 && (this.map.size > this.limit || this.retained > this.maxMessages)) {
       const oldest = this.map.keys().next().value;
       if (oldest === undefined) break;
       const victim = this.map.get(oldest);
@@ -1018,9 +1022,9 @@ class ThreadCache {
     }
   }
 
-  recordAppend(threadId: string): void {
+  recordAppend(threadId: string, count = 1): void {
     if (!this.map.has(threadId)) return;
-    this.retained += 1;
+    this.retained += count;
     while (this.map.size > 1 && (this.map.size > this.limit || this.retained > this.maxMessages)) {
       const oldest = this.map.keys().next().value;
       if (oldest === undefined || oldest === threadId) break;
@@ -1933,6 +1937,20 @@ export class Store {
     return this.thread(threadId).messages;
   }
 
+  /** Lightweight thread summary (`lastMessage`, `messageCount`, `startedAt`)
+   * without hydrating or caching cold transcripts in `ThreadCache`. */
+  threadSummary(threadId: string): mdb.ThreadSummary {
+    const warm = this.threads.peek(threadId);
+    if (warm) {
+      return {
+        lastMessage: mdb.clipTaskLastMessage(warm.messages.at(-1)),
+        messageCount: warm.messages.length,
+        startedAt: warm.messages[0]?.at,
+      };
+    }
+    return mdb.readThreadSummary(threadId, messagesFile(threadId));
+  }
+
   /** The full transcript for a read-only response, WITHOUT pinning the thread
    *  in the LRU. `messagesFor` caches every thread it hydrates, and
    *  GET /api/bots without `?messages=` calls it for every bot AND every
@@ -2016,6 +2034,14 @@ export class Store {
     return path.reverse();
   }
 
+  /** IDs on the active branch without loading uncached threads into `ThreadCache`. */
+  activePathIds(threadId: string): Set<string> {
+    if (this.threads.has(threadId)) {
+      return new Set(this.activePath(threadId).map((m) => m.id));
+    }
+    return mdb.activePathIds(threadId);
+  }
+
   appendMessage(threadId: string, message: Omit<Message, "id" | "at"> & { at?: number }): Message {
     const t = this.thread(threadId);
     const full: Message = { id: newId(), at: Date.now(), parentId: t.activeLeafId, ...redactBotAuthored(message) };
@@ -2075,7 +2101,7 @@ export class Store {
     if (full.length === 0) return full;
     mdb.appendMessages(threadId, full);
     t.messages.push(...full);
-    this.threads.recordAppend(threadId);
+    this.threads.recordAppend(threadId, full.length);
     t.activeLeafId = full[full.length - 1]!.id;
     // The first-run quiz is not a live ask, and talking past it hides it.
     // A bulk copy carries the same user or system text a single message

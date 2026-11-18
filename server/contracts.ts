@@ -25,6 +25,12 @@ export type ProviderErrorCode =
   | "invalid_credentials"
   | "inactive_subscription"
   | "quota_or_region_restriction"
+  // A 402 that names the account's balance or its plan.  A 429 names the
+  // account's rate limit instead, and the two are different failures:  a
+  // rate limit is this request's, and an account cap is every bot's behind
+  // that key.  The two statuses used to share one code, so nothing could
+  // tell them apart once the status was gone.
+  | "account_cap"
   | "upstream_outage"
   | "model_catalog_outage";
 

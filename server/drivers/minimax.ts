@@ -1106,7 +1106,8 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           reason: `MiniMax key rejected (HTTP ${probe.status}) — ${rejectedRemedy}`,
         };
       }
-      if (probe.classification?.code === "quota_or_region_restriction") {
+      if (probe.classification?.code === "quota_or_region_restriction"
+        || probe.classification?.code === "account_cap") {
         const capped: ProviderSnapshot = {
           state: "available",
           authenticated: true,

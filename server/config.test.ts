@@ -1151,31 +1151,72 @@ describe("operator-level computer allowlist", () => {
 });
 
 describe("headroom null-clear (slice 7b)", () => {
-  it("accepts null for the three headroom knobs and rejects it elsewhere in admission", () => {
-    expect(parseConfigPatch({ jobs: { admission: { reservedCpuCores: null, reservedRamMb: null, minMemoryAvailablePercent: null } } })).toEqual({
-      jobs: { admission: { reservedCpuCores: null, reservedRamMb: null, minMemoryAvailablePercent: null } },
+  it("accepts null for clearable headroom knobs and rejects it on maxSwapPercent", () => {
+    expect(
+      parseConfigPatch({
+        jobs: {
+          admission: {
+            minFreeDiskMb: null,
+            minFreeInodes: null,
+            reservedCpuCores: null,
+            reservedRamMb: null,
+            minMemoryAvailablePercent: null,
+          },
+        },
+      }),
+    ).toEqual({
+      jobs: {
+        admission: {
+          minFreeDiskMb: null,
+          minFreeInodes: null,
+          reservedCpuCores: null,
+          reservedRamMb: null,
+          minMemoryAvailablePercent: null,
+        },
+      },
     });
     expect(() => parseConfigPatch({ jobs: { admission: { maxSwapPercent: null } } })).toThrow();
-    expect(() => parseConfigPatch({ jobs: { admission: { minFreeInodes: null } } })).toThrow();
   });
 
   it("deletes a stored headroom knob on null instead of persisting the null", () => {
     mkdirSync(DATA_DIR, { recursive: true });
     rmSync(join(DATA_DIR, "config.json"), { force: true });
     try {
-      saveConfig({ jobs: { admission: { maxSwapPercent: 98, minFreeDiskMb: 2048, reservedCpuCores: 2, reservedRamMb: 512 } } });
+      saveConfig({
+        jobs: {
+          admission: { maxSwapPercent: 98, minFreeDiskMb: 4096, minFreeInodes: 1500, reservedCpuCores: 2, reservedRamMb: 512 },
+        },
+      });
       expect(loadConfig().jobs?.admission?.reservedCpuCores).toBe(2);
+      expect(loadConfig().jobs?.admission?.minFreeDiskMb).toBe(4096);
+      expect(loadConfig().jobs?.admission?.minFreeInodes).toBe(1500);
 
       // The headroom clients always send the complete admission object (the
       // shallow jobs merge replaces it wholesale — see buildHeadroomPatch),
       // so the clear rides with the carried-forward siblings.
-      saveConfig(parseConfigPatch({ jobs: { admission: { maxSwapPercent: 98, minFreeDiskMb: 2048, reservedCpuCores: null, reservedRamMb: 512 } } }));
+      saveConfig(
+        parseConfigPatch({
+          jobs: {
+            admission: {
+              maxSwapPercent: 98,
+              minFreeDiskMb: null,
+              minFreeInodes: null,
+              reservedCpuCores: null,
+              reservedRamMb: 512,
+            },
+          },
+        }),
+      );
       const after = loadConfig();
       expect(after.jobs?.admission?.reservedCpuCores).toBeUndefined();
-      // and only that knob is cleared — the sibling knobs and gates stand.
+      expect(after.jobs?.admission?.minFreeDiskMb).toBeUndefined();
+      expect(after.jobs?.admission?.minFreeInodes).toBeUndefined();
+      // and only the cleared knobs are deleted — the sibling knobs and gates stand.
       expect(after.jobs?.admission?.reservedRamMb).toBe(512);
       expect(after.jobs?.admission?.maxSwapPercent).toBe(98);
       expect("reservedCpuCores" in (after.jobs?.admission ?? {})).toBe(false);
+      expect("minFreeDiskMb" in (after.jobs?.admission ?? {})).toBe(false);
+      expect("minFreeInodes" in (after.jobs?.admission ?? {})).toBe(false);
     } finally {
       rmSync(join(DATA_DIR, "config.json"), { force: true });
     }

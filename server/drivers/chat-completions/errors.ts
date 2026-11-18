@@ -26,7 +26,13 @@ export interface HttpErrorClassification {
  *  today's generic "error" exit rather than being force-fit into a code. */
 export function classifyHttpError(status: number): HttpErrorClassification | undefined {
   if (status === 401 || status === 403) return { code: "invalid_credentials", setup: true };
-  if (status === 402 || status === 429) return { code: "quota_or_region_restriction", setup: false };
+  // A 402 and a 429 are different failures and get different codes.  A 402
+  // names the account's balance or its plan, which is every bot's problem
+  // behind that key;  a 429 names the account's rate limit, which is this
+  // request's.  Sharing one code lost the status before anything could
+  // read it.
+  if (status === 402) return { code: "account_cap", setup: false };
+  if (status === 429) return { code: "quota_or_region_restriction", setup: false };
   if (status === 404) return { code: "model_catalog_outage", setup: false };
   if (status >= 500 && status <= 599) return { code: "upstream_outage", setup: false };
   return undefined;

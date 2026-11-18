@@ -59,6 +59,8 @@ function open(): DatabaseSync {
       role TEXT NOT NULL,
       kind TEXT NOT NULL,
       text TEXT,
+      content TEXT,
+      tool_name TEXT,
       json TEXT NOT NULL,
       PRIMARY KEY (thread_id, id)
     );
@@ -74,8 +76,89 @@ function open(): DatabaseSync {
       PRIMARY KEY (thread_id, message_id)
     );
   `);
+  ensureSearchColumns(db);
   backfillRunningHelpers(db);
   return db;
+}
+
+/** Add `content` and `tool_name` columns to pre-existing databases once so
+ * `/api/search` predicates never parse `json` across every row. */
+function ensureSearchColumns(database: DatabaseSync): void {
+  // SAFETY: `PRAGMA table_info(messages)` returns one row per column with `name: string`.
+  const cols = new Set(
+    (database.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  let migrated = false;
+  if (!cols.has("content")) {
+    database.exec("ALTER TABLE messages ADD COLUMN content TEXT");
+    migrated = true;
+  }
+  if (!cols.has("tool_name")) {
+    database.exec("ALTER TABLE messages ADD COLUMN tool_name TEXT");
+    migrated = true;
+  }
+  if (migrated) {
+    database.exec(
+      "UPDATE messages SET " +
+        "content = json_extract(json, '$.content'), " +
+        "tool_name = CASE WHEN kind = 'activity' THEN json_extract(json, '$.tool.name') ELSE NULL END",
+    );
+  }
+}
+
+function searchColumns(message: Message & { content?: string }): [string | null, string | null] {
+  const content = message.content ?? null;
+  const toolName = message.kind === "activity" ? (message.tool?.name ?? null) : null;
+  return [content, toolName];
+}
+
+const ACTIVE_PATH_CACHE_LIMIT = 256;
+const activePathCache = new Map<string, { leafId: string; ids: Set<string> }>();
+
+export interface ThreadSummary {
+  lastMessage: Message | undefined;
+  messageCount: number;
+  startedAt: number | undefined;
+}
+
+export const TASK_PREVIEW_TEXT_LIMIT = 500;
+
+/** Clip a message for lightweight summary storage and wire previews so neither
+ * `threadSummaryCache` nor `wireTask` retains base64 screen captures, audio
+ * recordings, or multi-kilobyte text blobs. */
+export function clipTaskLastMessage(message: Message | undefined): Message | undefined {
+  if (!message) return undefined;
+  const clipped: Message = { ...message };
+  delete clipped.png;
+  delete clipped.recording;
+  if (clipped.text && clipped.text.length > TASK_PREVIEW_TEXT_LIMIT) {
+    clipped.text = clipped.text.slice(0, TASK_PREVIEW_TEXT_LIMIT);
+  }
+  if (clipped.tool?.detail && clipped.tool.detail.length > TASK_PREVIEW_TEXT_LIMIT) {
+    clipped.tool = {
+      ...clipped.tool,
+      detail: clipped.tool.detail.slice(0, TASK_PREVIEW_TEXT_LIMIT),
+    };
+  }
+  return clipped;
+}
+
+const THREAD_SUMMARY_CACHE_LIMIT = 512;
+const threadSummaryCache = new Map<string, ThreadSummary>();
+
+function cacheThreadSummary(threadId: string, summary: ThreadSummary): ThreadSummary {
+  const clipped: ThreadSummary = {
+    ...summary,
+    lastMessage: clipTaskLastMessage(summary.lastMessage),
+  };
+  if (threadSummaryCache.has(threadId)) {
+    threadSummaryCache.delete(threadId);
+  } else if (threadSummaryCache.size >= THREAD_SUMMARY_CACHE_LIMIT) {
+    const oldest = threadSummaryCache.keys().next().value;
+    if (oldest !== undefined) threadSummaryCache.delete(oldest);
+  }
+  threadSummaryCache.set(threadId, clipped);
+  return { ...clipped };
 }
 
 /** One-time import for databases that predated the side table. */
@@ -132,6 +215,8 @@ function db(): DatabaseSync {
   } catch (error) {
     console.error("[message-db] closing the previous database handle before reopen failed", error);
   }
+  activePathCache.clear();
+  threadSummaryCache.clear();
   handle = open();
   handlePath = DB_FILE();
   return handle;
@@ -159,9 +244,60 @@ export function readThread(threadId: string, legacyFile: string): ThreadRows {
     const state = db()
       .prepare("SELECT active_leaf_id FROM thread_state WHERE thread_id = ?")
       .get(threadId) as { active_leaf_id: string | null } | undefined;
+    cacheThreadSummary(threadId, {
+      lastMessage: messages.at(-1),
+      messageCount: messages.length,
+      startedAt: messages[0]?.at,
+    });
     return { messages, activeLeafId: state?.active_leaf_id ?? null };
   }
   return importLegacy(threadId, legacyFile);
+}
+
+/** Read a thread's count, start timestamp, and last message without hydrating
+ * the full transcript. Uses an indexed bounded LRU summary cache so repeated
+ * `wireTask` / `wireBot` serializations do not re-query SQLite. */
+export function readThreadSummary(threadId: string, legacyFile?: string): ThreadSummary {
+  const database = db();
+  const cached = threadSummaryCache.get(threadId);
+  if (cached) {
+    threadSummaryCache.delete(threadId);
+    threadSummaryCache.set(threadId, cached);
+    return { ...cached };
+  }
+  // SAFETY: `COUNT(*)` always returns one `{ n: number }` row.
+  const countRow = database
+    .prepare("SELECT COUNT(*) AS n FROM messages WHERE thread_id = ?")
+    .get(threadId) as { n: number };
+  if (countRow.n === 0) {
+    if (legacyFile && existsSync(legacyFile)) {
+      const imported = importLegacy(threadId, legacyFile);
+      return cacheThreadSummary(threadId, {
+        lastMessage: imported.messages.at(-1),
+        messageCount: imported.messages.length,
+        startedAt: imported.messages[0]?.at,
+      });
+    }
+    return cacheThreadSummary(threadId, {
+      lastMessage: undefined,
+      messageCount: 0,
+      startedAt: undefined,
+    });
+  }
+  // SAFETY: `ORDER BY rowid ASC LIMIT 1` returns at most one `{ at: number }` row for the earliest message.
+  const firstRow = database
+    .prepare("SELECT at FROM messages WHERE thread_id = ? ORDER BY rowid ASC LIMIT 1")
+    .get(threadId) as { at: number } | undefined;
+  // SAFETY: `ORDER BY rowid DESC LIMIT 1` returns at most one `{ json: string }` row for the latest message.
+  const lastRow = database
+    .prepare("SELECT json FROM messages WHERE thread_id = ? ORDER BY rowid DESC LIMIT 1")
+    .get(threadId) as { json: string } | undefined;
+  const lastMessage = lastRow ? rowToMessage(lastRow) : undefined;
+  return cacheThreadSummary(threadId, {
+    lastMessage,
+    messageCount: countRow.n,
+    startedAt: firstRow?.at,
+  });
 }
 
 /** One message by id, without hydrating its thread — the boot helper sweep
@@ -283,7 +419,13 @@ function importLegacy(threadId: string, legacyFile: string): ThreadRows {
     // ENOENT is a fresh thread with no legacy file yet; anything else means a
     // real transcript failed to read and is about to masquerade as empty.
     // SAFETY: a failed `readFileSync` throws an errno exception carrying `code`.
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      cacheThreadSummary(threadId, {
+        lastMessage: undefined,
+        messageCount: 0,
+        startedAt: undefined,
+      });
+    } else {
       console.error(`[message-db] could not read legacy thread file ${legacyFile}; treating the thread as empty`, error);
     }
     return { messages, activeLeafId }; // fresh thread
@@ -294,15 +436,31 @@ function importLegacy(threadId: string, legacyFile: string): ThreadRows {
     activeLeafId = (raw as { activeLeafId?: string | null }).activeLeafId ?? null;
   }
   const insert = db().prepare(
-    "INSERT OR REPLACE INTO messages (thread_id, id, at, role, kind, text, json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    "INSERT OR REPLACE INTO messages (thread_id, id, at, role, kind, text, content, tool_name, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
   );
   db().exec("BEGIN");
   try {
     for (const message of messages) {
-      insert.run(threadId, message.id, message.at, message.role, message.kind, message.text ?? null, JSON.stringify(message));
+      const [content, toolName] = searchColumns(message);
+      insert.run(
+        threadId,
+        message.id,
+        message.at,
+        message.role,
+        message.kind,
+        message.text ?? null,
+        content,
+        toolName,
+        JSON.stringify(message),
+      );
     }
     setActiveLeaf(threadId, activeLeafId);
     db().exec("COMMIT");
+    cacheThreadSummary(threadId, {
+      lastMessage: messages.at(-1),
+      messageCount: messages.length,
+      startedAt: messages[0]?.at,
+    });
   } catch (error) {
     db().exec("ROLLBACK");
     throw error;
@@ -336,20 +494,43 @@ export function countMessages(threadId: string): number {
 }
 
 export function insertMessage(threadId: string, message: Message): void {
+  const [content, toolName] = searchColumns(message);
   db()
-    .prepare("INSERT OR REPLACE INTO messages (thread_id, id, at, role, kind, text, json) VALUES (?, ?, ?, ?, ?, ?, ?)")
-    .run(threadId, message.id, message.at, message.role, message.kind, message.text ?? null, JSON.stringify(message));
+    .prepare(
+      "INSERT OR REPLACE INTO messages (thread_id, id, at, role, kind, text, content, tool_name, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .run(
+      threadId,
+      message.id,
+      message.at,
+      message.role,
+      message.kind,
+      message.text ?? null,
+      content,
+      toolName,
+      JSON.stringify(message),
+    );
+  activePathCache.delete(threadId);
+  threadSummaryCache.delete(threadId);
   syncRunningHelper(threadId, message);
 }
 
 /** Persist a new message and the branch head as one crash-safe mutation. */
 export function appendMessage(threadId: string, message: Message): void {
   const database = db();
+  const previousSummary = threadSummaryCache.get(threadId);
   database.exec("BEGIN IMMEDIATE");
   try {
     insertMessage(threadId, message);
     setActiveLeaf(threadId, message.id);
     database.exec("COMMIT");
+    if (previousSummary) {
+      cacheThreadSummary(threadId, {
+        lastMessage: message,
+        messageCount: previousSummary.messageCount + 1,
+        startedAt: previousSummary.startedAt ?? message.at,
+      });
+    }
   } catch (error) {
     database.exec("ROLLBACK");
     throw error;
@@ -444,9 +625,24 @@ export function runningHelperRows(): Array<{ threadId: string; message: Message 
 }
 
 export function updateMessage(threadId: string, message: Message): void {
+  const [content, toolName] = searchColumns(message);
   db()
-    .prepare("UPDATE messages SET at = ?, role = ?, kind = ?, text = ?, json = ? WHERE thread_id = ? AND id = ?")
-    .run(message.at, message.role, message.kind, message.text ?? null, JSON.stringify(message), threadId, message.id);
+    .prepare(
+      "UPDATE messages SET at = ?, role = ?, kind = ?, text = ?, content = ?, tool_name = ?, json = ? WHERE thread_id = ? AND id = ?",
+    )
+    .run(
+      message.at,
+      message.role,
+      message.kind,
+      message.text ?? null,
+      content,
+      toolName,
+      JSON.stringify(message),
+      threadId,
+      message.id,
+    );
+  activePathCache.delete(threadId);
+  threadSummaryCache.delete(threadId);
   syncRunningHelper(threadId, message);
 }
 
@@ -457,12 +653,15 @@ export function setActiveLeaf(threadId: string, leafId: string | null): void {
         "ON CONFLICT(thread_id) DO UPDATE SET active_leaf_id = excluded.active_leaf_id",
     )
     .run(threadId, leafId);
+  activePathCache.delete(threadId);
 }
 
 export function deleteThread(threadId: string): void {
   db().prepare("DELETE FROM messages WHERE thread_id = ?").run(threadId);
   db().prepare("DELETE FROM thread_state WHERE thread_id = ?").run(threadId);
   db().prepare("DELETE FROM running_helpers WHERE thread_id = ?").run(threadId);
+  activePathCache.delete(threadId);
+  threadSummaryCache.delete(threadId);
 }
 
 /** Freelist bytes above which `pruneDeadThreads` runs a full `VACUUM`
@@ -588,6 +787,10 @@ export function pruneDeadThreads(
       threadStateDeleted += Number(deleteState.run(threadId).changes ?? 0);
     }
     database.exec("COMMIT");
+    for (const threadId of dead) {
+      activePathCache.delete(threadId);
+      threadSummaryCache.delete(threadId);
+    }
   } catch (error) {
     database.exec("ROLLBACK");
     throw error;
@@ -621,22 +824,20 @@ export interface SearchHit {
   from?: string;
 }
 
-/** Case-insensitive substring search over text messages, newest first.
- * A LIKE scan, deliberately: local transcripts are megabytes at most, a
- * scan is milliseconds, and it needs no FTS extension to exist. */
+/** Case-insensitive substring search over text messages and activity tool names,
+ * newest first. Filters purely on plain columns (`role`, `text`, `content`,
+ * `kind`, `tool_name`) so large databases avoid per-row JSON parsing in the
+ * scan predicate. */
 export function searchMessages(query: string, limit = 40, threadId?: string): SearchHit[] {
   const needle = query.trim().toLowerCase();
   if (!needle) return [];
   // escape LIKE wildcards so a literal % or _ in the query stays literal
   const pattern = `%${needle.replace(/([\\%_])/g, "\\$1")}%`;
-  // text messages by their text/content; activity chips by the tool name — "which
-  // bot ran that migration" is a tool-name question. The chip's name lives
-  // in the row's json; a JSON1 extract keeps this one query.
   const scope = threadId ? "thread_id = ? AND " : "";
   const statement = db().prepare(
-    "SELECT thread_id, id, at, role, kind, text, json_extract(json, '$.content') AS content, json_extract(json, '$.tool.name') AS tool_name, json_extract(json, '$.from.name') AS from_name FROM messages " +
-      `WHERE ${scope}json_extract(json, '$.role') IN ('user', 'bot') ` +
-      "  AND ((lower(COALESCE(text, json_extract(json, '$.content'), '')) LIKE ? ESCAPE '\\') " +
+    "SELECT thread_id, id, at, role, kind, text, content, tool_name, json_extract(json, '$.from.name') AS from_name FROM messages " +
+      `WHERE ${scope}role IN ('user', 'bot') ` +
+      "  AND ((lower(COALESCE(text, content, '')) LIKE ? ESCAPE '\\') " +
       "   OR (kind = 'activity' AND tool_name IS NOT NULL AND lower(tool_name) LIKE ? ESCAPE '\\')) " +
       "ORDER BY at DESC LIMIT ?",
   );
@@ -680,8 +881,64 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
   });
 }
 
+/** Message IDs on a thread's active branch (root → active_leaf_id), read via
+ * recursive CTE over the `(thread_id, id)` primary key without loading or
+ * parsing the full thread. */
+export function activePathIds(threadId: string): Set<string> {
+  const database = db();
+  // SAFETY: `active_leaf_id` is a nullable TEXT column on `thread_state`.
+  const state = database
+    .prepare("SELECT active_leaf_id FROM thread_state WHERE thread_id = ?")
+    .get(threadId) as { active_leaf_id: string | null } | undefined;
+  let leafId = state?.active_leaf_id ?? null;
+  if (!leafId) {
+    // Match Store.cacheThread(): a legacy thread with no active_leaf_id uses
+    // its newest row as the active leaf.
+    // SAFETY: `id` is a TEXT NOT NULL column on `messages`.
+    const tail = database
+      .prepare("SELECT id FROM messages WHERE thread_id = ? ORDER BY rowid DESC LIMIT 1")
+      .get(threadId) as { id: string } | undefined;
+    leafId = tail?.id ?? null;
+  }
+  if (!leafId) return new Set();
+  const cached = activePathCache.get(threadId);
+  if (cached && cached.leafId === leafId) {
+    activePathCache.delete(threadId);
+    activePathCache.set(threadId, cached);
+    return cached.ids;
+  }
+  // SAFETY: recursive CTE projects only `id` (TEXT NOT NULL) using `UNION` to
+  // guard against any parentId cycle. When `$.parentId` is absent (legacy rows
+  // where `parentId === undefined`), fall back to the preceding `rowid`,
+  // matching `Store.cacheThread`; an explicit `parentId: null` stops at root.
+  const rows = database
+    .prepare(
+      "WITH RECURSIVE branch(id, parent_id) AS (" +
+        "  SELECT m.id, CASE WHEN json_type(m.json, '$.parentId') IS NULL " +
+        "    THEN (SELECT p.id FROM messages p WHERE p.thread_id = m.thread_id AND p.rowid < m.rowid ORDER BY p.rowid DESC LIMIT 1) " +
+        "    ELSE json_extract(m.json, '$.parentId') END " +
+        "  FROM messages m WHERE m.thread_id = ? AND m.id = ? " +
+        "  UNION " +
+        "  SELECT m.id, CASE WHEN json_type(m.json, '$.parentId') IS NULL " +
+        "    THEN (SELECT p.id FROM messages p WHERE p.thread_id = m.thread_id AND p.rowid < m.rowid ORDER BY p.rowid DESC LIMIT 1) " +
+        "    ELSE json_extract(m.json, '$.parentId') END " +
+        "  FROM messages m JOIN branch b ON m.id = b.parent_id WHERE m.thread_id = ?" +
+        ") SELECT id FROM branch",
+    )
+    .all(threadId, leafId, threadId) as Array<{ id: string }>;
+  const ids = new Set(rows.map((row) => row.id));
+  if (activePathCache.size >= ACTIVE_PATH_CACHE_LIMIT) {
+    const oldest = activePathCache.keys().next().value;
+    if (oldest !== undefined) activePathCache.delete(oldest);
+  }
+  activePathCache.set(threadId, { leafId, ids });
+  return ids;
+}
+
 /** Test/shutdown hook — closes the handle so a wiped DATA_DIR starts clean. */
 export function closeMessageDb(): void {
+  activePathCache.clear();
+  threadSummaryCache.clear();
   try {
     handle?.close();
   } catch {
