@@ -551,6 +551,40 @@ final class MacResourcesSettingsTests: XCTestCase {
             XCTAssertEqual(errors.first?.message, message, "\(values)")
         }
 
+        // Prefilled server-configured sub-2048 MB disk floor stays accepted when unchanged,
+        // so unrelated CPU/RAM/inodes edits can save; changing or lowering still refuses.
+        let subFloorReport = makeReport(
+            admission: HostAdmissionThresholds(maxSwapPercent: 98, minFreeDiskBytes: 512 * 1024 * 1024)
+        )
+        let subFloorCurrent = HostResourcesPresentation.headroomCurrentKnobs(subFloorReport)
+        var subFloorValues = HostResourcesPresentation.headroomEditInitial(subFloorReport)
+        XCTAssertEqual(subFloorValues.minFreeDiskMb, "512")
+        subFloorValues.reservedCpuCores = "2"
+        subFloorValues.minFreeInodes = "5000"
+        let preserved = HostResourcesPresentation.parseHeadroomEdit(subFloorValues, current: subFloorCurrent)
+        XCTAssertEqual(
+            preserved,
+            .valid(HeadroomParsedEdit(reservedCpuCores: 2, minFreeDiskMb: 512, minFreeInodes: 5000))
+        )
+        if case .valid(let parsedSubFloor) = preserved {
+            let patch = HostResourcesPresentation.headroomConfigPatch(for: subFloorReport, parsed: parsedSubFloor)
+            XCTAssertEqual(patch["minFreeDiskMb"] as? Double, 512)
+            XCTAssertEqual(patch["reservedCpuCores"] as? Double, 2)
+        }
+        var lowered = HostResourcesPresentation.headroomEditInitial(subFloorReport)
+        lowered.minFreeDiskMb = "256"
+        XCTAssertEqual(
+            HostResourcesPresentation.parseHeadroomEdit(lowered, current: subFloorCurrent),
+            .invalid([HeadroomFieldError(field: .minFreeDiskMb, message: "Below the built-in safety gate (2 GB).")])
+        )
+        var clearedSubFloor = HostResourcesPresentation.headroomEditInitial(subFloorReport)
+        clearedSubFloor.minFreeDiskMb = ""
+        let clearedSubFloorParsed = HostResourcesPresentation.parseHeadroomEdit(clearedSubFloor, current: subFloorCurrent)
+        XCTAssertEqual(clearedSubFloorParsed, .valid(HeadroomParsedEdit()))
+        XCTAssertTrue(
+            HostResourcesPresentation.headroomConfigPatch(for: subFloorReport, parsed: HeadroomParsedEdit())["minFreeDiskMb"] is NSNull
+        )
+
         // An all-empty save over unset knobs is a no-op and is refused.
         XCTAssertEqual(
             HostResourcesPresentation.parseHeadroomEdit(HeadroomEditValues()),

@@ -875,6 +875,12 @@ public enum HostResourcesPresentation {
                 return
             }
             if field == .minFreeDiskMb, num >= 0, num < bounds.min {
+                if let existingDiskMb = current?.minFreeDiskMb,
+                   existingDiskMb < builtinMinFreeDiskMb,
+                   num == existingDiskMb {
+                    parsed.minFreeDiskMb = num
+                    return
+                }
                 errors.append(HeadroomFieldError(field: field, message: "Below the built-in safety gate (2 GB)."))
                 return
             }
@@ -942,12 +948,16 @@ public enum HostResourcesPresentation {
     /// shallow jobs merge never erases an unrelated admission gate.
     public static func headroomConfigPatch(for report: HostResourcesReport, parsed: HeadroomParsedEdit) -> [String: Any] {
         let currentDiskMb = (report.admission.minFreeDiskBytes / 1024.0 / 1024.0).rounded()
-        let resolvedDiskMb: Any = parsed.minFreeDiskMb
-            ?? (currentDiskMb != builtinMinFreeDiskMb ? NSNull() : currentDiskMb)
         var admission: [String: Any] = [
             "maxSwapPercent": report.admission.maxSwapPercent,
-            "minFreeDiskMb": resolvedDiskMb,
         ]
+        if let disk = parsed.minFreeDiskMb {
+            admission["minFreeDiskMb"] = disk
+        } else if currentDiskMb != builtinMinFreeDiskMb {
+            admission["minFreeDiskMb"] = NSNull()
+        } else {
+            admission["minFreeDiskMb"] = currentDiskMb
+        }
         if let inodes = parsed.minFreeInodes {
             admission["minFreeInodes"] = inodes
         } else if report.admission.minFreeInodes != nil {

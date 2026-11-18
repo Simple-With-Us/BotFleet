@@ -468,6 +468,45 @@ describe("parseHeadroomEdit", () => {
     expect(parseHeadroomEdit({ reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "", minFreeInodes: "-1" }).ok).toBe(false);
   });
 
+  it("carries an unchanged pre-configured sub-2048 MB disk floor so saving unrelated knobs still works", () => {
+    const existingSubFloor = report({
+      admission: {
+        maxSwapPercent: 98,
+        minFreeDiskBytes: 512 * 1024 * 1024,
+        unknownReading: "admit",
+      },
+    });
+    const current = currentHeadroomKnobs(existingSubFloor.admission);
+    const initial = headroomEditInitial(existingSubFloor);
+    expect(initial.minFreeDiskMb).toBe("512");
+
+    // Unchanged prefilled "512" passes when saving CPU or inodes.
+    const unchangedSave = parseHeadroomEdit(
+      { ...initial, reservedCpuCores: "2", minFreeInodes: "5000" },
+      current,
+    );
+    expect(unchangedSave).toEqual({
+      ok: true,
+      parsed: { reservedCpuCores: 2, minFreeDiskMb: 512, minFreeInodes: 5000 },
+    });
+    if (!unchangedSave.ok) throw new Error("unreachable");
+    const carriedPatch = buildHeadroomPatch(existingSubFloor, unchangedSave.parsed);
+    expect(carriedPatch.jobs.admission.minFreeDiskMb).toBe(512);
+    expect(carriedPatch.jobs.admission.reservedCpuCores).toBe(2);
+
+    // Changing to a different sub-floor value still refuses.
+    expect(parseHeadroomEdit({ ...initial, minFreeDiskMb: "256" }, current)).toEqual({
+      ok: false,
+      errors: [{ field: "minFreeDiskMb", message: "Below the built-in safety gate (2 GB)." }],
+    });
+
+    // Clearing the prefilled sub-floor box restores the 2 GB gate via null.
+    const clearedSave = parseHeadroomEdit({ ...initial, reservedCpuCores: "2", minFreeDiskMb: "" }, current);
+    expect(clearedSave).toEqual({ ok: true, parsed: { reservedCpuCores: 2 } });
+    if (!clearedSave.ok) throw new Error("unreachable");
+    expect(buildHeadroomPatch(existingSubFloor, clearedSave.parsed).jobs.admission.minFreeDiskMb).toBeNull();
+  });
+
   it("refuses an all-empty save as a no-op", () => {
     const parsed = parseHeadroomEdit({ reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "" });
     expect(parsed.ok).toBe(false);

@@ -585,7 +585,11 @@ export interface HeadroomNumberResult {
   error?: string;
 }
 
-function parseHeadroomNumber(field: keyof HeadroomEditValues, raw: string): HeadroomNumberResult {
+function parseHeadroomNumber(
+  field: keyof HeadroomEditValues,
+  raw: string,
+  current?: HeadroomCurrentKnobs,
+): HeadroomNumberResult {
   const text = raw.trim();
   if (text === "") return {};
   if (!/^-?\d+(\.\d+)?$/.test(text)) return { error: "Enter a number." };
@@ -594,6 +598,13 @@ function parseHeadroomNumber(field: keyof HeadroomEditValues, raw: string): Head
   const bounds = HEADROOM_BOUNDS[field];
   if (bounds.int && !Number.isInteger(num)) return { error: "Enter a whole number." };
   if (field === "minFreeDiskMb" && num >= 0 && num < bounds.min) {
+    if (
+      current?.minFreeDiskMb !== undefined &&
+      current.minFreeDiskMb < BUILTIN_MIN_FREE_DISK_MB &&
+      num === current.minFreeDiskMb
+    ) {
+      return { value: num };
+    }
     return { error: "Below the built-in safety gate (2 GB)." };
   }
   if (num < bounds.min || num > bounds.max) {
@@ -620,7 +631,7 @@ export function parseHeadroomEdit(values: HeadroomEditValues, current?: Headroom
   const mem = parseHeadroomNumber("minMemoryAvailablePercent", values.minMemoryAvailablePercent);
   if (mem.error) errors.push({ field: "minMemoryAvailablePercent", message: mem.error });
   else if (mem.value !== undefined) parsed.minMemoryAvailablePercent = mem.value;
-  const disk = parseHeadroomNumber("minFreeDiskMb", values.minFreeDiskMb ?? "");
+  const disk = parseHeadroomNumber("minFreeDiskMb", values.minFreeDiskMb ?? "", current);
   if (disk.error) errors.push({ field: "minFreeDiskMb", message: disk.error });
   else if (disk.value !== undefined) parsed.minFreeDiskMb = disk.value;
   const inodes = parseHeadroomNumber("minFreeInodes", values.minFreeInodes ?? "");
