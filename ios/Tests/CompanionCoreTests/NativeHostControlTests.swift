@@ -230,6 +230,23 @@ struct NativeHostControlTests {
         #expect(reason == "startNotVerified:stopped")
     }
 
+    @Test("The checked start does not widen the peer fence")
+    func checkedStartKeepsThePeerFence() async throws {
+        let fixture = try HostFixture(shortPath: true)
+        defer { fixture.remove() }
+        let host = try await fixture.start()
+        // Every peer is unprivileged here, so the channel refuses them all.
+        let server = try NativeHostControlServer(host: host, peerUID: { _ in 501 })
+        defer { server.close() }
+        // The checked start never borrows a peer's privilege: it reads the host's own
+        // state and proves the listener answers, and nothing more.
+        #expect(try await server.verifyStart() == .running)
+        #expect(try await controlRequest(fixture, "status\n").contains("denied"))
+        #expect(try await controlRequest(fixture, "stop\n").contains("denied"))
+        #expect(await host.state == .running)
+        try await host.shutdown()
+    }
+
     @Test("A failed start reports the reason and is never reported as successful")
     func failedStartReportsTheReason() async throws {
         let fixture = try HostFixture(shortPath: true)
