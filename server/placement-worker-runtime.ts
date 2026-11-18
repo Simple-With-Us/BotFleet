@@ -68,7 +68,10 @@ const leaseRecordSchema = z.object({
   pid: z.number().int().nullable().optional(),
 }).strict();
 
-const leaseStoreSchema = z.record(z.string(), leaseRecordSchema);
+/** The worker's lease store as the runtime writes and reads it: one strict
+ *  record per job id.  Exported so a test reads the file through the same
+ *  schema the runtime does. */
+export const leaseStoreSchema = z.record(z.string(), leaseRecordSchema);
 
 /** How a leased job's process ended, as whoever watched it saw it. */
 export interface WorkerJobExit {
@@ -100,8 +103,9 @@ export interface PlacementWorkerRuntimeDeps {
    *  check can tell the job's own process from a stranger that was handed
    *  the same pid since. */
   isProcessAlive?: (pid: number, record?: WorkerLocalLeaseRecord) => boolean;
-  /** Exit of a child that outlived the previous process. Without it, a later death is reported lost.
-   *  A rejection means the exit could not be observed. */
+  /** Exit of a child that outlived the previous process.  Without it, a later
+   *  death is reported lost unless `readExit` finds a status the job left on
+   *  disk.  A rejection means the exit could not be observed. */
   watchProcess?: (pid: number, record?: WorkerLocalLeaseRecord) => Promise<WorkerJobExit>;
   /** The exit status a leased job left on disk, or null when it left none.
    *  With it, a job that ended while nothing watched it (the worker was
@@ -453,7 +457,9 @@ export class PlacementWorkerRuntime {
     if (this.activeJobs.has(lease.jobId)) {
       return { polled: true, jobId: lease.jobId, keepPulling: false };
     }
-    if (this.deps.spool.pending().some((row) => row.message.jobId === lease.jobId && row.message.leaseId === lease.leaseId)) {
+    // One row read by job id, never the whole spool: a pull happens on every
+    // poll, and the spool may hold thousands of undelivered reports.
+    if (this.deps.spool.get(lease.jobId)?.message.leaseId === lease.leaseId) {
       await settlePendingReports(this.deps.spool, this.deps.client);
       return { polled: true, jobId: lease.jobId, keepPulling: false };
     }

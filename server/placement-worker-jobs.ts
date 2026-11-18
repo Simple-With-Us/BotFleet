@@ -32,7 +32,9 @@
  *     counts against the job.
  *   - A lease runs at most once.  A log or an exit file for the lease means
  *     it was started here before, and a second spawn is refused, whatever a
- *     restart did to the worker's memory or its lease records.
+ *     restart did to the worker's memory or its lease records.  A start that
+ *     failed ran nothing, so it takes back the empty log it made and the
+ *     lease may be tried again.
  *   - A group is signalled only when it is proved the lease's own.  For a
  *     job adopted after a restart the proof is the leader's start time, read
  *     with `ps`.  A start time that was read and does not match is a
@@ -91,6 +93,13 @@ const MAX_TIMEOUT_MS = JOB_OWNER_MAX_MINUTES * 60_000;
  *  be that spawn's process: `LEADER_START_SLACK_MS` of
  *  server/tools/process-group.ts, which keeps it private. */
 const LEADER_START_SLACK_MS = 10_000;
+
+/** How long one synchronous `ps` may hold the worker's event loop.  The call
+ *  sits on the restart reconciliation, the adopted poll and every kill check,
+ *  and a worker that is blocked cannot answer a heartbeat.  `ps` answers in
+ *  milliseconds; one that has not in this long reads as "could not be read",
+ *  which keeps the job adopted and tries again, and never signals anyone. */
+const PS_TIMEOUT_MS = 500;
 
 /** The longest wait between two tries of a kill that could not go out. */
 const OWED_RETRY_MAX_MS = 30_000;
@@ -205,7 +214,7 @@ function leaderStartedNearNow(pid: number, at: number): boolean | null {
       env: { ...modelShellEnv(), LC_ALL: "C", TZ: "UTC0" },
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
-      timeout: 5_000,
+      timeout: PS_TIMEOUT_MS,
     });
     const startedAt = Date.parse(`${stdout.trim()} UTC`);
     if (!Number.isFinite(startedAt)) return null;
@@ -223,7 +232,17 @@ export function createPlacementWorkerJobs(deps: PlacementWorkerJobsDeps): Placem
   const fileMaxAgeMs = deps.fileMaxAgeMs ?? PLACEMENT_JOB_FILE_MAX_AGE_MS;
   const now = deps.now ?? (() => Date.now());
   const spawn = deps.spawn ?? spawnJobProcess;
-  const startedNear = deps.leaderStartedNear ?? leaderStartedNearNow;
+  const readStart = deps.leaderStartedNear ?? leaderStartedNearNow;
+  /** A start time that cannot be read, including by a check that throws, is
+   *  `null`: no answer, never proof of a stranger.  It runs inside timers and
+   *  the runtime's own callbacks, where a throw would be uncaught. */
+  const startedNear = (pid: number, at: number): boolean | null => {
+    try {
+      return readStart(pid, at);
+    } catch {
+      return null;
+    }
+  };
   const jobs = new Map<string, LeasedJob>();
 
   const stemFor = (lease: { jobId: string; leaseId: string }): string =>
@@ -299,7 +318,8 @@ export function createPlacementWorkerJobs(deps: PlacementWorkerJobsDeps): Placem
 
   const expire = (job: LeasedJob): void => {
     if (passive || job.leaderExited || job.kill) return;
-    void killJob(job, graceMs, true);
+    // Nobody awaits the run limit's kill, so a failure of it is caught here.
+    killJob(job, graceMs, true).catch(() => undefined);
   };
 
   const armRunLimit = (job: LeasedJob, ms: number): void => {
@@ -319,11 +339,13 @@ export function createPlacementWorkerJobs(deps: PlacementWorkerJobsDeps): Placem
       settle(leftRunning);
     };
     if (job.kill) {
-      void job.kill.then(() => finish(false));
+      // The leader is gone either way: a kill that failed does not keep the
+      // job from settling.
+      void job.kill.then(() => finish(false), () => finish(false));
       return;
     }
     const leftRunning = !passive && stillOurs(job);
-    if (leftRunning) void killJob(job, graceMs);
+    if (leftRunning) killJob(job, graceMs).catch(() => undefined);
     finish(leftRunning);
   };
 
@@ -393,7 +415,18 @@ export function createPlacementWorkerJobs(deps: PlacementWorkerJobsDeps): Placem
       exitPath,
       cpuSeconds: (timeoutMs / 1000) * cpuCores,
     });
-    if (!spawned.ok) throw new Error(spawned.error);
+    if (!spawned.ok) {
+      // The runner opens the log before it starts the shell, so a start that
+      // failed leaves an empty log behind.  Nothing ran, and that file must
+      // not make the once-only guard above refuse the lease's next attempt.
+      // This call made it: the guard just found no log.
+      try {
+        unlinkSync(logPath);
+      } catch {
+        /* never created, or already gone: the spawn error is what matters */
+      }
+      throw new Error(spawned.error);
+    }
 
     const entry: LeasedJob = { jobId: job.jobId, pid: spawned.pid, stem, exitPath, leaderExited: false, timedOut: false };
     jobs.set(job.jobId, entry);
@@ -439,7 +472,7 @@ export function createPlacementWorkerJobs(deps: PlacementWorkerJobsDeps): Placem
         if (written === null && !job.leaderExited && pidAlive(pid)) {
           // Still running.  A stop or a run limit that could not go out is
           // tried again here, so neither is lost to one failed `ps`.
-          if (job.owed && !job.kill && now() >= job.owed.nextAt) void killJob(job, job.owed.grace, job.owed.limit);
+          if (job.owed && !job.kill && now() >= job.owed.nextAt) killJob(job, job.owed.grace, job.owed.limit).catch(() => undefined);
           return;
         }
         clearInterval(poll);

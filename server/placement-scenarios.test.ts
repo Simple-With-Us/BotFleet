@@ -36,7 +36,7 @@ import { createWorkerRequestBoundary, type WorkerAuthorization } from "./placeme
 import { nodeHttpWorkerLink, PlacementWorkerClient } from "./placement-worker-client.ts";
 import { createPlacementWorkerJobs, type PlacementWorkerJobs } from "./placement-worker-jobs.ts";
 import { createWorkerTransport } from "./placement-worker-routes.ts";
-import { PlacementWorkerRuntime } from "./placement-worker-runtime.ts";
+import { leaseStoreSchema, PlacementWorkerRuntime } from "./placement-worker-runtime.ts";
 import { startFaultProxy, type FaultProxy } from "./testing/fault-proxy.ts";
 import { nonceRuns } from "./testing/two-process.ts";
 
@@ -401,7 +401,7 @@ describe("Placement Transport T6b: Two-Process Fault Scenarios", () => {
     expect(leases.job("job-offered-after")?.status).toBe("completed");
     expect(spool.pending().length).toBe(0);
     expect(runtime.getActiveJobs().size).toBe(0);
-    expect(JSON.parse(readFileSync(join(workerDir, "placement", "worker-leases.json"), "utf8"))).toEqual({});
+    expect(leaseStoreSchema.parse(JSON.parse(readFileSync(join(workerDir, "placement", "worker-leases.json"), "utf8")))).toEqual({});
     expect(nonceRuns(nonceDir, nonce).length).toBe(1);
     expect(spawns()).toBe(1);
   });

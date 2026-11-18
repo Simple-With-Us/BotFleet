@@ -1,11 +1,14 @@
 /** The runner-backed spawn, stop and adopt adapter of the placement worker
  *  runtime (the remainder of transport slice T5, BF-2559).  Every process
  *  here is real and every file lives in a temporary folder. */
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import type { CapacitySample, ClaimReply, HeartbeatReply, HostId, RegisterReply, ReportMessage, ReportReply } from "../shared/placement.ts";
 import { PlacementReportSpool } from "./placement-report-spool.ts";
 import type { PayloadReply, StopReceiptReply, WorkerCallOutcome } from "./placement-worker-client.ts";
@@ -16,6 +19,7 @@ import {
   type PlacementWorkerJobsDeps,
 } from "./placement-worker-jobs.ts";
 import {
+  leaseStoreSchema,
   PlacementWorkerRuntime,
   type PlacementWorkerClientLike,
   type WorkerLocalLeaseRecord,
@@ -23,6 +27,7 @@ import {
 import { nonceRuns } from "./testing/two-process.ts";
 
 const posix = describe.skipIf(process.platform === "win32");
+const execFileAsync = promisify(execFile);
 
 const controllerId: HostId = "server:11111111-1111-4111-8111-111111111111";
 const workerId: HostId = "mac:22222222-2222-4222-8222-222222222222";
@@ -75,14 +80,14 @@ function adapter(dataDir: string, extra: Partial<PlacementWorkerJobsDeps> = {}):
   };
 }
 
+/** Waits for a real process or file to reach a state: the framework retries
+ *  the read, bounded by `ms`, and fails the test when it never holds. */
 async function until<T>(read: () => T | undefined | null | false, ms = 15_000): Promise<T> {
-  const deadline = Date.now() + ms;
-  for (;;) {
+  return vi.waitFor(() => {
     const value = read();
-    if (value) return value;
-    if (Date.now() > deadline) throw new Error("condition never held");
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
+    if (!value) throw new Error("condition never held");
+    return value;
+  }, { timeout: ms, interval: 25 });
 }
 
 function alive(pid: number): boolean {
@@ -150,7 +155,8 @@ function leasedRuntime(
     passiveReason: composed.undeclared ? undefined : jobs.passiveReason,
   });
   /** The job ids the runtime still holds a lease record for. */
-  const storedLeases = (): string[] => Object.keys(JSON.parse(readFileSync(join(dataDir, "placement", "worker-leases.json"), "utf8")));
+  const storedLeases = (): string[] =>
+    Object.keys(leaseStoreSchema.parse(JSON.parse(readFileSync(join(dataDir, "placement", "worker-leases.json"), "utf8"))));
   return { runtime, client, reports, lease, storedLeases };
 }
 
@@ -249,6 +255,24 @@ posix("placement worker jobs: one leased job through the real runner", () => {
     await expect(jobs.spawnJob({ ...job, leaseId: "lease-other" })).rejects.toThrow("already running");
     await jobs.stopJob(job.jobId);
     expect(await first.done).toEqual({ exitCode: null, signal: "SIGTERM" });
+  });
+
+  it("takes back the log of a start that failed, so the lease is not spent by a run that never was", async () => {
+    const { dataDir, workDir } = folder();
+    const jobs = adapter(dataDir);
+    const lease = { jobId: "job-failed-start", leaseId: "lease-failed-start" };
+    const command = `"${process.execPath}" "${nonceScript}" "${workDir}" after-failed-start`;
+    // the shell cannot start in a folder that is not there
+    await expect(jobs.spawnJob({ ...lease, cwd: join(workDir, "missing"), timeoutMs: 10_000, command }))
+      .rejects.toThrow(/did not start|Could not start/);
+    expect(existsSync(jobs.files(lease).logPath)).toBe(false);
+    expect(jobs.running()).toBe(0);
+
+    // nothing ran, so the lease may still be started, and it runs once
+    const second = await jobs.spawnJob({ ...lease, cwd: workDir, timeoutMs: 10_000, command });
+    expect(await second.done).toEqual({ exitCode: 0, signal: null });
+    expect(nonceRuns(workDir, "after-failed-start").length).toBe(1);
+    await expect(jobs.spawnJob({ ...lease, cwd: workDir, timeoutMs: 10_000, command })).rejects.toThrow("already started");
   });
 
   it("refuses a payload with no working folder, no run limit, a limit past the ceiling, or an unreadable CPU setting", async () => {
@@ -555,37 +579,126 @@ posix("placement worker jobs: a restarted worker", () => {
   });
 
   it("reads the start time the same in whatever zone the harness runs", async () => {
+    // The restarted worker is a process of its own, run here with its zone
+    // set in its environment (never by changing this one's).  The zones are
+    // many hours apart, so at least one is not this machine's: `ps` printing
+    // in one zone and the worker reading in another would put the start time
+    // hours from the spawn.
+    const adapterModule = new URL("./placement-worker-jobs.ts", import.meta.url).href;
+    const restarted = `
+      import { createPlacementWorkerJobs } from ${JSON.stringify(adapterModule)};
+      const { dataDir, pid, record } = JSON.parse(process.env.BF_ZONE_CASE);
+      const jobs = createPlacementWorkerJobs({ dataDir, cpuCores: () => 2, graceMs: 200, adoptedPollMs: 20 });
+      const hour = 60 * 60_000;
+      const answer = {
+        sameStart: jobs.isProcessAlive(pid, record),
+        startedAnHourEarlier: jobs.isProcessAlive(pid, { ...record, spawnedAt: record.spawnedAt - hour }),
+        startedAnHourLater: jobs.isProcessAlive(pid, { ...record, spawnedAt: record.spawnedAt + hour }),
+      };
+      // and the adopted job can still be stopped there
+      const ended = jobs.watchProcess(pid, record).then(() => "settled", (error) => error.message);
+      await jobs.stopJob(record.jobId);
+      answer.ended = await ended;
+      console.log(JSON.stringify(answer));
+    `;
+    const answerSchema = z.object({
+      sameStart: z.boolean(),
+      startedAnHourEarlier: z.boolean(),
+      startedAnHourLater: z.boolean(),
+      ended: z.string(),
+    }).strict();
+
+    for (const [index, harnessZone] of ["Asia/Tokyo", "America/Los_Angeles"].entries()) {
+      const { dataDir, workDir } = folder();
+      const before = adapter(dataDir);
+      const lease = { jobId: `job-zone-${index}`, leaseId: `lease-zone-${index}` };
+      const spawnedAt = Date.now();
+      const spawned = await before.spawnJob({ ...lease, cwd: workDir, timeoutMs: 30_000, command: "sleep 30" });
+      const pid = spawned.pid!;
+      const record = leaseRecord(lease, { spawnedAt, timeoutMs: 30_000, pid });
+
+      const { stdout } = await execFileAsync(process.execPath, ["--input-type=module", "-e", restarted], {
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
+        env: {
+          PATH: process.env.PATH,
+          HOME: dataDir,
+          USERPROFILE: dataDir,
+          TZ: harnessZone,
+          BF_ZONE_CASE: JSON.stringify({ dataDir, pid, record }),
+        },
+        encoding: "utf8",
+        timeout: 60_000,
+      });
+      expect(answerSchema.parse(JSON.parse(stdout))).toEqual({
+        sameStart: true,
+        startedAnHourEarlier: false,
+        startedAnHourLater: false,
+        ended: "The adopted job ended without leaving an exit status.",
+      });
+      await until(() => !alive(pid));
+    }
+  });
+
+  it("holds a slow ps to half a second of the worker's time, and reads that as no answer", async () => {
     const { dataDir, workDir } = folder();
     const before = adapter(dataDir);
-    const lease = { jobId: "job-zone", leaseId: "lease-zone" };
+    const lease = { jobId: "job-slow-ps", leaseId: "lease-slow-ps" };
     const spawnedAt = Date.now();
     const spawned = await before.spawnJob({ ...lease, cwd: workDir, timeoutMs: 30_000, command: "sleep 30" });
     const pid = spawned.pid!;
     const record = leaseRecord(lease, { spawnedAt, timeoutMs: 30_000, pid });
 
-    const zone = process.env.TZ;
+    // a `ps` that hangs, found first on the PATH the adapter hands it
+    const bin = join(dataDir, "slow-bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "ps"), "#!/bin/sh\nexec sleep 5\n");
+    chmodSync(join(bin, "ps"), 0o755);
+    const path = process.env.PATH;
+    let verdict: boolean;
+    let blockedMs: number;
     try {
-      // Many hours apart, so at least one is not this machine's zone:
-      // `ps` printing in one zone and the harness reading in another would
-      // put the start time hours from the spawn.
-      for (const harnessZone of ["Asia/Tokyo", "America/Los_Angeles"]) {
-        process.env.TZ = harnessZone;
-        const after = adapter(dataDir);
-        expect(after.isProcessAlive(pid, record)).toBe(true);
-        expect(after.isProcessAlive(pid, { ...record, spawnedAt: spawnedAt - 60 * 60_000 })).toBe(false);
-        expect(after.isProcessAlive(pid, { ...record, spawnedAt: spawnedAt + 60 * 60_000 })).toBe(false);
-      }
-      // and the adopted job can still be stopped there
+      process.env.PATH = `${bin}:${path ?? ""}`;
       const after = adapter(dataDir);
-      const watched = after.watchProcess(pid, record);
-      watched.catch(() => undefined);
-      await after.stopJob(lease.jobId);
-      await expect(watched).rejects.toThrow("without leaving an exit status");
-      expect(alive(pid)).toBe(false);
+      const began = performance.now();
+      verdict = after.isProcessAlive(pid, record);
+      blockedMs = performance.now() - began;
     } finally {
-      if (zone === undefined) delete process.env.TZ;
-      else process.env.TZ = zone;
+      if (path === undefined) delete process.env.PATH;
+      else process.env.PATH = path;
     }
+    // the worker was held for well under the old five seconds, and a start
+    // time that was not read leaves the job adopted rather than lost
+    expect(blockedMs).toBeLessThan(2_500);
+    expect(verdict).toBe(true);
+  });
+
+  it("treats a start-time check that throws as no answer, never as a stranger", async () => {
+    const { dataDir, workDir } = folder();
+    const before = adapter(dataDir);
+    const lease = { jobId: "job-throws", leaseId: "lease-throws" };
+    const spawnedAt = Date.now();
+    const spawned = await before.spawnJob({ ...lease, cwd: workDir, timeoutMs: 30_000, command: "sleep 30" });
+    const pid = spawned.pid!;
+    const record = leaseRecord(lease, { spawnedAt, timeoutMs: 30_000, pid });
+
+    let broken = true;
+    const after = adapter(dataDir, {
+      leaderStartedNear: () => {
+        if (broken) throw new Error("ps could not be run");
+        return true;
+      },
+    });
+    expect(after.isProcessAlive(pid, record)).toBe(true);
+    const watched = after.watchProcess(pid, record);
+    watched.catch(() => undefined);
+    // the stop is owed, not lost to a throw out of a timer
+    await after.stopJob(lease.jobId);
+    expect(alive(pid)).toBe(true);
+    expect(after.running()).toBe(1);
+
+    broken = false;
+    await expect(watched).rejects.toThrow("without leaving an exit status");
+    await until(() => !alive(pid));
   });
 
   it("keeps an adopted job, and the stop it is owed, while its start time cannot be read", async () => {

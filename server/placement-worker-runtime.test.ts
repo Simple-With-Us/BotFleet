@@ -12,6 +12,7 @@ import {
 } from "../shared/placement.ts";
 import { PlacementReportSpool } from "./placement-report-spool.ts";
 import {
+  leaseStoreSchema,
   PlacementWorkerRuntime,
   type PlacementWorkerClientLike,
   type PlacementWorkerRuntimeDeps,
@@ -28,6 +29,11 @@ const sample: CapacitySample = {
   diskTotalBytes: 100000, diskFreeBytes: 50000, inodesTotal: 10000, inodesFree: 5000,
   dataVolume: null, rootDiskFreeBytes: 50000,
 };
+
+/** The lease file as the runtime itself reads it: through its strict schema. */
+function readLeases(leaseFile: string) {
+  return leaseStoreSchema.parse(JSON.parse(readFileSync(leaseFile, "utf8")));
+}
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -481,7 +487,7 @@ describe("PlacementWorkerRuntime", () => {
     expect(await runtime.pullAssignment()).toEqual({ polled: true, jobId: "job-again" });
     expect(spawnJob).toHaveBeenCalledTimes(1);
     expect(mockClient.payload).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(readFileSync(leaseFile, "utf8"))["job-again"].pid).toBe(4321);
+    expect(readLeases(leaseFile)["job-again"]?.pid).toBe(4321);
 
     // it ends, and its report does not reach the controller
     mockClient.report.mockResolvedValueOnce({ outcome: "link-failed", reason: "link down" });
@@ -495,7 +501,39 @@ describe("PlacementWorkerRuntime", () => {
     expect(mockClient.payload).toHaveBeenCalledTimes(1);
     expect(spool.pending().length).toBe(0);
     expect(mockClient.report).toHaveBeenLastCalledWith(expect.objectContaining({ jobId: "job-again", leaseId: "lease-again", status: "completed" }));
-    expect(JSON.parse(readFileSync(leaseFile, "utf8"))["job-again"]).toBeUndefined();
+    expect(readLeases(leaseFile)["job-again"]).toBeUndefined();
+  });
+
+  it("finds a job's spooled report by name when a lease is offered, never scanning the spool", async () => {
+    const { dir, spool, mockClient, now } = fixtureEnv();
+    const spawnJob = vi.fn(async () => ({ pid: 4322, done: new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>(() => undefined) }));
+    const runtime = new PlacementWorkerRuntime({
+      client: mockClient,
+      spool,
+      hostId: workerId,
+      capabilities: ["shell"],
+      dataDir: dir,
+      sampleProvider: () => sample,
+      admissionProvider: () => ({ admit: true }),
+      spawnJob,
+      stopJob: vi.fn(),
+      now,
+    });
+    mockClient.assignment.mockResolvedValue({
+      outcome: "accepted",
+      reply: {
+        controllerId, epoch: 1, accepted: true,
+        lease: { controllerId, epoch: 1, leaseId: "lease-lookup", jobId: "job-lookup", host: workerId },
+      },
+    });
+    const scan = vi.spyOn(spool, "pending");
+    const lookup = vi.spyOn(spool, "get");
+
+    expect(await runtime.pullAssignment()).toEqual({ polled: true, jobId: "job-lookup" });
+    expect(spawnJob).toHaveBeenCalledTimes(1);
+    // one row read by job id, however many reports are waiting
+    expect(lookup).toHaveBeenCalledWith("job-lookup");
+    expect(scan).not.toHaveBeenCalled();
   });
 
   // A worker-leases.json exactly as the runtime wrote it before exit-file
@@ -541,7 +579,7 @@ describe("PlacementWorkerRuntime", () => {
       ...processes,
     });
     /** The job ids the runtime still holds a lease record for. */
-    const remaining = (): string[] => Object.keys(JSON.parse(readFileSync(leaseFile, "utf8")));
+    const remaining = (): string[] => Object.keys(readLeases(leaseFile));
     return { ...env, runtime, remaining, spawnJob, stopJob };
   }
 
