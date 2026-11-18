@@ -14,7 +14,12 @@ import { build, identity, source, thin, universal } from "./native-host-macho.fi
 // described, and the rest of the file passes through untouched.
 const PackageSchema = z
   .object({
-    scripts: z.record(z.string(), z.string()),
+    scripts: z
+      .object({
+        "test:native-release": z.string(),
+        test: z.string(),
+      })
+      .passthrough(),
   })
   .passthrough();
 
@@ -199,9 +204,10 @@ test("the native-release chain runs this proof, and hosted CI runs the chain", (
   // vitest does not collect *.node-test.mjs.  Hosted CI runs `pnpm test`,
   // which only reaches a node:test file that package.json names, so the
   // identity proof is only proved when both name it.
-  const pkg = PackageSchema.parse(JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")));
+  const parsed = PackageSchema.safeParse(JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")));
+  assert.ok(parsed.success, "package.json names no native-release test chain");
+  const pkg = parsed.data;
   const nativeRelease = pkg.scripts["test:native-release"];
-  assert.equal(typeof nativeRelease, "string", "package.json names no native-release test chain");
   assert.match(nativeRelease, /scripts\/native-host-artifact\.node-test\.mjs/);
   assert.match(pkg.scripts.test, /pnpm test:native-release/);
   const ci = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
