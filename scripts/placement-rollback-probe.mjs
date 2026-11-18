@@ -281,6 +281,68 @@ function fingerprintRuntime(named) {
 }
 
 /**
+ * The text of one regular, singly linked file, read through a handle that was
+ * opened without following a link and that is the very inode `listed` (an
+ * lstat of the same path) describes.  A file swapped for a link or another
+ * file between the listing and the open, or one with another hard link, is a
+ * `problem` and never a read.
+ */
+function readListedRegularFile(path, listed) {
+  let fd;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== listed.dev || opened.ino !== listed.ino) {
+      return { problem: `${path} changed while it was being opened, or has another hard link` };
+    }
+    return { text: readFileSync(fd, "utf8") };
+  } catch (error) {
+    return { problem: `${path}: ${describe(error)}` };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/**
+ * Credential and login directories a candidate path may never name or lead
+ * into.  This restates PROTECTED_WRITE_PARTS in server/tool-policy.ts (that
+ * file is TypeScript and imports zod, so this module cannot); the probe's own
+ * test pins the two lists together.  It deliberately does NOT refuse every dot
+ * directory the way that file's isProtectedPath does: the release store's own
+ * default home is ~/.botfleet, so a release root there is the normal case.
+ */
+export const PROTECTED_PATH_PARTS = Object.freeze([
+  "/.ssh/", "/.secrets/", "/.gnupg/", "/.aws/", "/.config/gh/", "/Library/LaunchAgents/", "/Library/LaunchDaemons/",
+]);
+
+function namesProtectedPlace(path) {
+  // macOS volumes are case-insensitive by default, so compare folded.
+  const folded = `${path}/`.toLowerCase();
+  return PROTECTED_PATH_PARTS.some((part) => folded.includes(part.toLowerCase()));
+}
+
+/**
+ * A blocker when `path` names a protected place, leads into one through any
+ * link, or is a link that leads nowhere (where it was meant to land is then
+ * unknown); null otherwise.  A path that does not exist at all is left to the
+ * later steps, which report it as missing.
+ */
+function protectedPathBlocker(label, path) {
+  const named = resolve(path);
+  if (namesProtectedPlace(named)) return blocker("candidate-path-protected", `${label} ${named} names a credential or login directory`);
+  let real;
+  try {
+    real = realpathSync(named);
+  } catch {
+    return lstatOrNull(named).stat?.isSymbolicLink()
+      ? blocker("candidate-path-dangling-link", `${label} ${named} is a link that does not resolve, so where it leads is unknown`)
+      : null;
+  }
+  if (namesProtectedPlace(real)) return blocker("candidate-path-protected", `${label} ${named} leads into a credential or login directory (${real})`);
+  return null;
+}
+
+/**
  * Run one SYNCHRONOUS action with some environment variables set (a string)
  * or removed (null), and put the previous values back afterwards.  The
  * provenance and identity modules start git with this process's environment,
@@ -383,6 +445,14 @@ async function bindCandidate(candidate, { platform = process.platform } = {}) {
     return refused(kind, blocker("reference-deps-invalid", "referenceDeps, when given, must be an absolute path to a trusted dependency reference tree"));
   }
 
+  // Before anything is read, hashed, handed to git or started: none of the
+  // four named paths may name or lead into a credential or login directory.
+  for (const [label, named] of [["releaseRoot", releaseRoot], ["sourceRepo", sourceRepo], ["runtimePath", runtimePath], ["referenceDeps", referenceDeps]]) {
+    if (!isText(named)) continue;
+    const protectedPath = protectedPathBlocker(label, named);
+    if (protectedPath) return refused(kind, protectedPath);
+  }
+
   const selected = resolve(releaseRoot);
   const seen = lstatOrNull(selected);
   if (seen.error) {
@@ -412,14 +482,20 @@ async function bindCandidate(candidate, { platform = process.platform } = {}) {
   if (!await isReleaseDirectory(physicalRoot)) {
     return refused(kind, blocker("release-manifest-invalid", `${physicalRoot} does not carry a manifest the release store accepts`));
   }
-  let manifest;
-  try {
-    manifest = validateReleaseManifest(JSON.parse(readFileSync(join(physicalRoot, MANIFEST), "utf8")));
-  } catch {
-    manifest = null;
+  // The manifest is read through a handle opened without following a link and
+  // checked to be the very file that was just listed, so bytes other than the
+  // regular release file cannot be validated in its place.
+  const manifestText = readListedRegularFile(join(physicalRoot, MANIFEST), manifestSeen.stat);
+  let manifest = null;
+  if (manifestText.text !== undefined) {
+    try {
+      manifest = validateReleaseManifest(JSON.parse(manifestText.text));
+    } catch {
+      manifest = null;
+    }
   }
   if (manifest === null) {
-    return refused(kind, blocker("release-manifest-invalid", `${physicalRoot} does not carry a manifest the release store accepts`));
+    return refused(kind, blocker("release-manifest-invalid", manifestText.problem ?? `${physicalRoot} does not carry a manifest the release store accepts`));
   }
   if (manifest.commit !== sourceCommit) {
     return refused(kind, blocker("commit-mismatch", `the release manifest names ${manifest.commit}, not the expected commit ${sourceCommit}`));
@@ -1001,6 +1077,19 @@ async function requirePlacementRefusals(base, fence, dataDir, timeouts, label) {
   return cases.length;
 }
 
+/**
+ * A value the candidate answered with, shown in a blocker.  The candidate is
+ * the party under judgement, so neither the size nor the shape of what it
+ * sends is trusted: a scalar is shown, a long string is cut, and anything
+ * structured is named rather than copied into the receipt.
+ */
+function echoed(value) {
+  if (value === null || value === undefined) return "null";
+  if (value === String(value)) return JSON.stringify(value.length > 80 ? `${value.slice(0, 80)}...` : value);
+  if (Number.isFinite(value) || value === true || value === false) return String(value);
+  return "[non-scalar]";
+}
+
 async function requireIdentity(base, expected, timeouts, code) {
   let answer;
   try {
@@ -1009,7 +1098,7 @@ async function requireIdentity(base, expected, timeouts, code) {
     throw new ProbeBlocked(code, `placement identity did not answer: ${describe(error)}`);
   }
   if (answer.status !== 200 || !sameController(answer.json, expected)) {
-    throw new ProbeBlocked(code, `placement identity answered ${answer.status} with ${JSON.stringify({ controllerId: answer.json?.controllerId ?? null, epoch: answer.json?.epoch ?? null })}; the stored fence is ${JSON.stringify(expected)}`);
+    throw new ProbeBlocked(code, `placement identity answered ${answer.status} with controllerId ${echoed(answer.json?.controllerId)} at epoch ${echoed(answer.json?.epoch)}; the stored fence is ${JSON.stringify(expected)}`);
   }
 }
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import {
-  appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync,
+  appendFileSync, chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync,
   renameSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { connect } from "node:net";
@@ -15,6 +15,7 @@ import {
   CONTAINER_LOCKDOWN_ENV,
   PLACEMENT_ROLLBACK_RECIPE_VERSION,
   PLACEMENT_ROLLBACK_SCHEMA,
+  PROTECTED_PATH_PARTS,
   RELEASE_STORE_LAUNCH_ARGUMENTS,
   inspectPlacementRollbackCandidate,
   runPlacementRollbackFixtureProbe,
@@ -126,7 +127,13 @@ function readBody(req) {
   return new Promise((resolve) => {
     let text = "";
     req.on("data", (chunk) => { text += chunk; });
-    req.on("end", () => { try { resolve(JSON.parse(text || "{}")); } catch { resolve({}); } });
+    // Only a plain object is a body; anything else reads as an empty one.
+    req.on("end", () => {
+      try {
+        const parsed = JSON.parse(text || "{}");
+        resolve(Object(parsed) === parsed && !Array.isArray(parsed) ? parsed : {});
+      } catch { resolve({}); }
+    });
   });
 }
 createServer(async (req, res) => {
@@ -135,6 +142,8 @@ createServer(async (req, res) => {
   if (req.method === "GET" && path === "/api/health") return send(res, 200, { app: "botfleet", pid: process.pid, ready: true });
   if (req.method === "GET" && path === "/api/placement/identity") {
     if (companion) return send(res, 403, { error: "forbidden" });
+    // An answer whose size and shape the probe must not copy into its receipt.
+    if (VARIANT === "identity-flood") return send(res, 200, { hostId: HOST, version: "1", controllerId: "x".repeat(100000), epoch: { nested: true } });
     try { return send(res, 200, { hostId: HOST, version: "1", ...controller() }); }
     catch { return send(res, 503, { error: "unavailable" }); }
   }
@@ -142,7 +151,7 @@ createServer(async (req, res) => {
     if (companion) return send(res, 403, { error: "forbidden" });
     const action = path.slice("/api/placement/".length);
     const body = await readBody(req);
-    if (VARIANT === "accepts-stale" && action === "claim" && body.epoch < controller().epoch) return send(res, 200, { accepted: true });
+    if (VARIANT === "accepts-stale" && action === "claim" && Number.isSafeInteger(body.epoch) && body.epoch < controller().epoch) return send(res, 200, { accepted: true });
     if (VARIANT === "accepts-released-dispatch" && action === "dispatch" && body.lease?.leaseId === "released-lease") {
       return send(res, 200, { accepted: true, leaseId: "released-lease" });
     }
@@ -423,6 +432,60 @@ test("the runtime is bound by its bytes, and a missing, linked, scripted or non-
   }
 });
 
+test("a candidate path that names or leads into a credential or login directory is blocked before it is read", { skip: POSIX_ONLY }, async (t) => {
+  const fixture = await makeCandidate(t);
+  const root = realpathSync(fixture.root);
+  const blockedFor = async (overrides, code, detail) => {
+    const result = await inspectPlacementRollbackCandidate({ ...fixture.candidate, ...overrides });
+    assertNeverActivates(result);
+    assert.deepEqual(codes(result), [code], JSON.stringify(overrides));
+    assert.match(result.blockers[0].detail, detail);
+  };
+
+  // A release root that sits under a credential directory, even a valid one.
+  const credentials = join(root, ".ssh");
+  mkdirSync(credentials);
+  const inside = join(credentials, fixture.commit);
+  execFileSync("cp", ["-Rp", fixture.releaseRoot, inside]);
+  await blockedFor({ releaseRoot: inside }, "candidate-path-protected", /^releaseRoot .* names a credential or login directory$/);
+  await blockedFor({ referenceDeps: credentials }, "candidate-path-protected", /^referenceDeps /);
+
+  // An innocent name that is a link into one: the repository and the runtime.
+  const aws = join(root, ".aws");
+  mkdirSync(aws);
+  copyFileSync(NODE, join(aws, "node"));
+  chmodSync(join(aws, "node"), 0o755);
+  const innocent = join(root, "innocent");
+  symlinkSync(aws, innocent);
+  await blockedFor({ runtimePath: join(innocent, "node") }, "candidate-path-protected", /^runtimePath .* leads into a credential or login directory/);
+  await blockedFor({ sourceRepo: innocent }, "candidate-path-protected", /^sourceRepo .* leads into a credential or login directory/);
+
+  // A link that leads nowhere says nothing about where it was meant to land.
+  const dangling = join(root, "dangling");
+  symlinkSync(join(root, "no-such-target"), dangling);
+  await blockedFor({ sourceRepo: dangling }, "candidate-path-dangling-link", /^sourceRepo .* does not resolve/);
+
+  // Only credential and login places are refused: the release store's own
+  // default home is a dot directory, and a release root there is ordinary.
+  const store = join(root, ".botfleet", "releases", fixture.commit);
+  mkdirSync(dirname(store), { recursive: true });
+  execFileSync("cp", ["-Rp", fixture.releaseRoot, store]);
+  const ordinary = await inspectPlacementRollbackCandidate({ ...fixture.candidate, releaseRoot: store });
+  assertNeverActivates(ordinary);
+  assert.deepEqual(ordinary.blockers, []);
+  assert.equal(ordinary.status, "probe-required");
+});
+
+test("a release manifest with another hard link is not read", { skip: POSIX_ONLY }, async (t) => {
+  const fixture = await makeCandidate(t);
+  linkSync(join(fixture.releaseRoot, ".botfleet-release.json"), join(fixture.root, "second-name.json"));
+  const result = await inspectPlacementRollbackCandidate(fixture.candidate);
+  assertNeverActivates(result);
+  assert.deepEqual(codes(result), ["release-manifest-invalid"]);
+  assert.match(result.blockers[0].detail, /another hard link/);
+  assert.equal(result.binding, null);
+});
+
 test("a signed-bundle candidate off darwin is blocked with a named missing proof, and no other kind is bound", async () => {
   const bundle = { kind: "signed-bundle", releaseRoot: "/Applications/BotFleet.app", sourceCommit: "a".repeat(40), runtimePath: "/Applications/BotFleet.app/Contents/MacOS/BotFleet" };
   const offDarwin = await inspectPlacementRollbackCandidate(bundle, { platform: "linux" });
@@ -587,6 +650,17 @@ test("a candidate that acknowledges a stale request or a released-lease dispatch
     assert.deepEqual(codes(result), ["placement-post-not-refused"], variant);
     assert.match(result.blockers[0].detail, named);
   }
+});
+
+test("an identity answer of any size or shape is blocked without being copied into the receipt", { skip: POSIX_ONLY }, async (t) => {
+  const fixture = await makeCandidate(t, { variant: "identity-flood" });
+  const result = await probe(fixture);
+  assertNeverActivates(result);
+  assert.deepEqual(codes(result), ["legacy-identity-mismatch"]);
+  assert.ok(result.blockers[0].detail.length < 400, String(result.blockers[0].detail.length));
+  assert.match(result.blockers[0].detail, /\[non-scalar\]/);
+  assert.match(result.blockers[0].detail, /controllerId "x{80}\.\.\."/);
+  assert.ok(readFileSync(onlyReceipt(fixture), "utf8").length < 100_000);
 });
 
 test("a candidate that releases the hold on DELETE is blocked", { skip: POSIX_ONLY }, async (t) => {
@@ -845,6 +919,14 @@ test("the restated launch shape, lockdown environment and action list match thei
   for (const line of ['[CONTAINER_RUNTIME_DISABLED_ENV]: "1"', "DOCKER_HOST: UNREACHABLE_RUNTIME_SOCKET", "CONTAINER_HOST: UNREACHABLE_RUNTIME_SOCKET"]) {
     assert.ok(lockdown.includes(line), line);
   }
+
+  // The credential and login directories are the ones the routine policy
+  // refuses to write, restated because that file is TypeScript.
+  const policy = readFileSync(join(REPO_ROOT, "server", "tool-policy.ts"), "utf8");
+  const declaredParts = policy.slice(policy.indexOf("const PROTECTED_WRITE_PARTS = ["));
+  const policyParts = [...declaredParts.slice(0, declaredParts.indexOf("];")).matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+  assert.ok(policyParts.length > 0);
+  assert.deepEqual([...PROTECTED_PATH_PARTS], policyParts);
 
   const probeSource = readFileSync(join(REPO_ROOT, "scripts", "placement-rollback-probe.mjs"), "utf8");
   const leases = readFileSync(join(REPO_ROOT, "server", "placement-leases.ts"), "utf8");
