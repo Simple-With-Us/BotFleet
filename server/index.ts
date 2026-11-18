@@ -14508,7 +14508,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const client: SseClient = {
         res,
         screens: url.searchParams.get("screens") === "on",
-        screenBotIds: parsedFilters.screenBotIds,
+        screenBotIds: url.searchParams.has("botId") ? new Set(url.searchParams.getAll("botId")) : null,
         onlyKinds: parsedFilters.onlyKinds,
         threadIds: parsedFilters.threadIds,
         slow: false,

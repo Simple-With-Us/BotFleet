@@ -16,6 +16,7 @@ import {
   wantsReplayEntry,
   writeToClient,
   type SseClient,
+  type SseFilterList,
   type SseWritable,
 } from "./sse-broadcast.ts";
 
@@ -166,7 +167,8 @@ describe("SSE filter validation, target extraction, and replay filtering", () =>
   });
 
   it("validates and bounds SSE query filter allowlists", () => {
-    expect(SseFilterListSchema.safeParse(["runtime", "bot"]).success).toBe(true);
+    const validKinds: SseFilterList = ["runtime", "bot"];
+    expect(SseFilterListSchema.safeParse(validKinds).success).toBe(true);
     expect(SseFilterListSchema.safeParse([""]).success).toBe(false);
     expect(SseFilterListSchema.safeParse(["bad space"]).success).toBe(false);
     expect(SseFilterListSchema.safeParse(["a".repeat(SSE_FILTER_VALUE_MAX_LENGTH + 1)]).success).toBe(false);
@@ -179,7 +181,6 @@ describe("SSE filter validation, target extraction, and replay filtering", () =>
     if (parsed.ok) {
       expect(parsed.onlyKinds).toEqual(new Set(["runtime"]));
       expect(parsed.threadIds).toEqual(new Set(["t-1"]));
-      expect(parsed.screenBotIds).toEqual(new Set(["b-1"]));
     }
 
     expect(parseSseFilters(new URLSearchParams("threadId=")).ok).toBe(false);

@@ -6624,11 +6624,20 @@ describe("resumable event stream", () => {
     expect(await res.json()).toMatchObject({ ok: false, error: "invalid_cursor" });
   });
 
-  it("rejects empty or invalid kind/threadId/botId SSE filters with HTTP 400", async () => {
-    for (const query of ["kind=", "threadId=", "botId=", `threadId=${"x".repeat(129)}`, "threadId=bad%20value"]) {
+  it("rejects empty or invalid kind/threadId SSE filters with HTTP 400 and preserves unconstrained botId subscriptions", async () => {
+    for (const query of ["kind=", "threadId=", `threadId=${"x".repeat(129)}`, "threadId=bad%20value"]) {
       const res = await fetch(`${BASE}/api/events?${query}`);
       expect(res.status).toBe(400);
       expect(await res.json()).toMatchObject({ ok: false, error: "invalid_filter" });
+    }
+
+    const manyBots = Array.from({ length: 35 }, (_, i) => `botId=${encodeURIComponent(`bot/custom ${i}`)}`).join("&");
+    const stream = await openSse(`${BASE}/api/events?screens=on&${manyBots}`);
+    try {
+      const hello = await stream.until((f) => f.kind === "hello");
+      expect(hello.resumed).toBe(false);
+    } finally {
+      stream.close();
     }
   });
 

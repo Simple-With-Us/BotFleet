@@ -21,11 +21,13 @@ export const SseFilterListSchema = z
   )
   .max(SSE_FILTER_MAX_VALUES, `At most ${SSE_FILTER_MAX_VALUES} SSE filter values are allowed`);
 
+export type SseFilterList = z.infer<typeof SseFilterListSchema>;
+
 export type SseFilterParseResult =
   | { ok: true; values: Set<string> | null }
   | { ok: false; message: string };
 
-/** Validate repeated SSE filter query parameters (`?kind=`, `?threadId=`, `?botId=`). */
+/** Validate repeated SSE filter query parameters (`?kind=`, `?threadId=`). */
 export function parseSseFilterParam(searchParams: URLSearchParams, name: string): SseFilterParseResult {
   if (!searchParams.has(name)) return { ok: true, values: null };
   const parsed = SseFilterListSchema.safeParse(searchParams.getAll(name));
@@ -65,30 +67,27 @@ export function extractSseFrameTarget(payload: SseFrameEnvelope): SseFrameTarget
 }
 
 export type SseFiltersParseResult =
-  | { ok: true; screenBotIds: Set<string> | null; onlyKinds: Set<string> | null; threadIds: Set<string> | null }
+  | { ok: true; onlyKinds: Set<string> | null; threadIds: Set<string> | null }
   | { ok: false; message: string };
 
 interface SseFilterBuckets {
-  botId: Set<string> | null;
   kind: Set<string> | null;
   threadId: Set<string> | null;
 }
 
-/** Parse and validate all supported SSE subscription filters in one uniform pass. */
+/** Parse and validate new SSE subscription allowlists (`?kind=`, `?threadId=`). */
 export function parseSseFilters(searchParams: URLSearchParams): SseFiltersParseResult {
   const parsed: SseFilterBuckets = {
-    botId: null,
     kind: null,
     threadId: null,
   };
-  for (const name of ["botId", "kind", "threadId"] as const) {
+  for (const name of ["kind", "threadId"] as const) {
     const result = parseSseFilterParam(searchParams, name);
     if (!result.ok) return result;
     parsed[name] = result.values;
   }
   return {
     ok: true,
-    screenBotIds: parsed.botId,
     onlyKinds: parsed.kind,
     threadIds: parsed.threadId,
   };
