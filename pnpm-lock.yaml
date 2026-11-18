@@ -220,7 +220,7 @@ importers:
         version: 12.3.0
       posthog-js:
         specifier: ^1.415.6
-        version: 1.447.15(@types/react@19.3.0)(react@19.3.1)
+        version: 1.448.0(@types/react@19.3.0)(react@19.3.1)
       qrcode.react:
         specifier: ^4.2.0
         version: 4.2.0(react@19.3.1)
@@ -7883,8 +7883,8 @@ packages:
     resolution: {integrity: sha512-LJlKCCAUFKOuZxipUdYw1NzIITEsPcgyOG9LkvRJvuKj/bRzbuRY0ARXvL0pWGpsZvn8jku+LMep2eU0seHp8g==}
     engines: {node: ^10 || ^12 || >=14}
 
-  posthog-js@1.447.15:
-    resolution: {integrity: sha512-pgSLqlDqklvHrr0qVfvn+7LuRznLJ3pzv1ZIL0UmAUKYw3d/KMrG7PFgPO31U2QxxeT0HEIMAejRzKi5TSzkrA==}
+  posthog-js@1.448.0:
+    resolution: {integrity: sha512-MX5/l3J5a/NPGCHcPDGh+UnbarZeoSed7ukfx9FKPmNXL4CAwtgsjnJFqlx+f6FpzO6Hfo7WWfUY+9WIavSwjA==}
     peerDependencies:
       '@types/react': '>=16.8.0'
       react: '>=16.8.0'
@@ -17761,7 +17761,7 @@ snapshots:
       picocolors: 1.1.1
       source-map-js: 1.2.2
 
-  posthog-js@1.447.15(@types/react@19.3.0)(react@19.3.1):
+  posthog-js@1.448.0(@types/react@19.3.0)(react@19.3.1):
     dependencies:
       '@posthog/browser-common': 0.10.8
       '@posthog/core': 1.67.3
