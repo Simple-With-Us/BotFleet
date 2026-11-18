@@ -1943,7 +1943,7 @@ export class Store {
     const warm = this.threads.peek(threadId);
     if (warm) {
       return {
-        lastMessage: warm.messages.at(-1),
+        lastMessage: mdb.clipTaskLastMessage(warm.messages.at(-1)),
         messageCount: warm.messages.length,
         startedAt: warm.messages[0]?.at,
       };

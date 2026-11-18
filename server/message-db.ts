@@ -121,18 +121,44 @@ export interface ThreadSummary {
   startedAt: number | undefined;
 }
 
+export const TASK_PREVIEW_TEXT_LIMIT = 500;
+
+/** Clip a message for lightweight summary storage and wire previews so neither
+ * `threadSummaryCache` nor `wireTask` retains base64 screen captures, audio
+ * recordings, or multi-kilobyte text blobs. */
+export function clipTaskLastMessage(message: Message | undefined): Message | undefined {
+  if (!message) return undefined;
+  const clipped: Message = { ...message };
+  delete clipped.png;
+  delete clipped.recording;
+  if (clipped.text && clipped.text.length > TASK_PREVIEW_TEXT_LIMIT) {
+    clipped.text = clipped.text.slice(0, TASK_PREVIEW_TEXT_LIMIT);
+  }
+  if (clipped.tool?.detail && clipped.tool.detail.length > TASK_PREVIEW_TEXT_LIMIT) {
+    clipped.tool = {
+      ...clipped.tool,
+      detail: clipped.tool.detail.slice(0, TASK_PREVIEW_TEXT_LIMIT),
+    };
+  }
+  return clipped;
+}
+
 const THREAD_SUMMARY_CACHE_LIMIT = 512;
 const threadSummaryCache = new Map<string, ThreadSummary>();
 
 function cacheThreadSummary(threadId: string, summary: ThreadSummary): ThreadSummary {
+  const clipped: ThreadSummary = {
+    ...summary,
+    lastMessage: clipTaskLastMessage(summary.lastMessage),
+  };
   if (threadSummaryCache.has(threadId)) {
     threadSummaryCache.delete(threadId);
   } else if (threadSummaryCache.size >= THREAD_SUMMARY_CACHE_LIMIT) {
     const oldest = threadSummaryCache.keys().next().value;
     if (oldest !== undefined) threadSummaryCache.delete(oldest);
   }
-  threadSummaryCache.set(threadId, summary);
-  return { ...summary };
+  threadSummaryCache.set(threadId, clipped);
+  return { ...clipped };
 }
 
 /** One-time import for databases that predated the side table. */
@@ -246,11 +272,11 @@ export function readThreadSummary(threadId: string, legacyFile?: string): Thread
   if (countRow.n === 0) {
     if (legacyFile && existsSync(legacyFile)) {
       const imported = importLegacy(threadId, legacyFile);
-      return {
+      return cacheThreadSummary(threadId, {
         lastMessage: imported.messages.at(-1),
         messageCount: imported.messages.length,
         startedAt: imported.messages[0]?.at,
-      };
+      });
     }
     return cacheThreadSummary(threadId, {
       lastMessage: undefined,

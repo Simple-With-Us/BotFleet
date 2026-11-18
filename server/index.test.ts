@@ -6623,6 +6623,53 @@ describe("resumable event stream", () => {
     expect(res.status).toBe(400);
     expect(await res.json()).toMatchObject({ ok: false, error: "invalid_cursor" });
   });
+
+  it("rejects empty or invalid kind/threadId/botId SSE filters with HTTP 400", async () => {
+    for (const query of ["kind=", "threadId=", "botId=", `threadId=${"x".repeat(129)}`, "threadId=bad%20value"]) {
+      const res = await fetch(`${BASE}/api/events?${query}`);
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ ok: false, error: "invalid_filter" });
+    }
+  });
+
+  it("filters live and replayed SSE frames by kind and nested bot threadId", async () => {
+    const firstBot = (await api("POST", "/api/bots")).body.bot;
+    const secondBot = (await api("POST", "/api/bots")).body.bot;
+
+    const stream = await openSse(
+      `${BASE}/api/events?screens=off&kind=bot&threadId=${encodeURIComponent(firstBot.threadId)}`,
+    );
+    let resumeCursor: string;
+    let firstSeenSeq = 0;
+    try {
+      const hello = await stream.until((f) => f.kind === "hello");
+      resumeCursor = String(hello.cursor);
+      await nudge(secondBot.id);
+      await nudge(firstBot.id);
+      const matched = await stream.until((f) => f.kind === "bot" && f.bot?.id === firstBot.id);
+      firstSeenSeq = Number(matched.seq);
+      expect(stream.frames.some((f) => f.kind === "bot" && f.bot?.id === secondBot.id)).toBe(false);
+    } finally {
+      stream.close();
+    }
+
+    await nudge(secondBot.id);
+    await nudge(firstBot.id);
+
+    const resumed = await openSse(
+      `${BASE}/api/events?screens=off&kind=bot&threadId=${encodeURIComponent(firstBot.threadId)}&since=${encodeURIComponent(resumeCursor)}`,
+    );
+    try {
+      const back = await resumed.until((f) => f.kind === "hello");
+      expect(back.resumed).toBe(true);
+      await resumed.until(
+        (f) => f.kind === "bot" && f.bot?.id === firstBot.id && Number(f.seq) > firstSeenSeq,
+      );
+      expect(resumed.frames.some((f) => f.kind === "bot" && f.bot?.id === secondBot.id)).toBe(false);
+    } finally {
+      resumed.close();
+    }
+  });
 });
 
 describe("instance CLI override API", () => {

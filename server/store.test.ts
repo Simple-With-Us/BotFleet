@@ -1580,6 +1580,37 @@ describe("Store thread cache", () => {
     expect(reloadedSummary.startedAt).toBe(1_000);
     expect(reloadedSummary.lastMessage?.text).toBe("fourth");
     expect(reloaded.threadIsCachedForTests(cold.threadId)).toBe(false);
+
+    // Oversized text/tool detail and base64 screen pixels/recordings are clipped/stripped
+    // inside both cacheThreadSummary (cold path) and Store.threadSummary (warm path).
+    const heavy = setup.createBot({ name: "Heavy" }, { seedMessages: false });
+    setup.appendMessage(heavy.threadId, {
+      role: "bot",
+      kind: "screen",
+      text: "x".repeat(800),
+      png: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk",
+      mime: "image/png",
+      recording: { path: "/tmp/rec.wav", mime: "audio/wav", transcript: "rec", engine: "apple-on-device" },
+      tool: { name: "capture", kind: "other", detail: "d".repeat(800) },
+      at: 5_000,
+    });
+    const coldHeavy = reloaded.threadSummary(heavy.threadId);
+    expect(coldHeavy.lastMessage?.png).toBeUndefined();
+    expect(coldHeavy.lastMessage?.recording).toBeUndefined();
+    expect(coldHeavy.lastMessage?.text).toHaveLength(500);
+    expect(coldHeavy.lastMessage?.tool?.detail).toHaveLength(500);
+    // Warm cache path produces the exact same clipped shape and reads cached entry on repeat.
+    const cachedHeavy = reloaded.threadSummary(heavy.threadId);
+    expect(cachedHeavy.lastMessage?.png).toBeUndefined();
+    expect(cachedHeavy.lastMessage?.recording).toBeUndefined();
+    expect(cachedHeavy.lastMessage?.text).toHaveLength(500);
+    expect(cachedHeavy.lastMessage?.tool?.detail).toHaveLength(500);
+    reloaded.messagesFor(heavy.threadId);
+    const warmHeavy = reloaded.threadSummary(heavy.threadId);
+    expect(warmHeavy.lastMessage?.png).toBeUndefined();
+    expect(warmHeavy.lastMessage?.recording).toBeUndefined();
+    expect(warmHeavy.lastMessage?.text).toHaveLength(500);
+    expect(warmHeavy.lastMessage?.tool?.detail).toHaveLength(500);
   });
 });
 

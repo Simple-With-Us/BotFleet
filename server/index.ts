@@ -20,7 +20,16 @@ import { extname, join } from "node:path";
 import { z } from "zod";
 import { InstancePatchBodySchema, InstancePatchRestoreBodySchema, instancePatchInputError } from "./instance-patch.ts";
 import { ScreenPollers } from "./screen-poller.ts";
-import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseClient } from "./sse-broadcast.ts";
+import {
+  extractSseFrameTarget,
+  parseSseFilters,
+  ReplayBuffer,
+  SLOW_CLIENT_BYTE_LIMIT,
+  wantsReplayEntry,
+  writeToClient,
+  type SseClient,
+  type SseFrameEnvelope,
+} from "./sse-broadcast.ts";
 import { BOT_AVATAR_CROPS, botAvatarRecolorableSchema, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
 import { DEFAULT_ROOM_TERMINOLOGY, lowerRoomLabels, resolveRoomLabels } from "../shared/terminology.ts";
 import { isThreadSnoozed, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
@@ -427,7 +436,7 @@ import { loadLocalMiniMaxConfig } from "./drivers/minimax.ts";
 import { fetchProviderModels, providerModelIds } from "./drivers/model-discovery.ts";
 import { flushNativeTee } from "./drivers/native.ts";
 import { mirrorActivity, mirrorReply, type CommsBus } from "./comms-visibility.ts";
-import { DEFAULT_MAX_DEAD_SHARE, pruneDeadThreads, searchMessages } from "./message-db.ts";
+import { clipTaskLastMessage, DEFAULT_MAX_DEAD_SHARE, pruneDeadThreads, searchMessages } from "./message-db.ts";
 import { exportMessageSpeaker, promptWithReply, transcriptText } from "./replies.ts";
 import { lastInterruptedChatStarter, resumedDelegationChannel } from "./update-turn-starter.ts";
 import { createJobHost, type JobHost, type JobHostBody } from "./job-host.ts";
@@ -1104,14 +1113,12 @@ function broadcast(payload: Record<string, unknown>) {
   const seq = ++lastSeq;
   const kind = String(payload.kind ?? "");
   const frame = `id: ${STREAM_ID}:${seq}\ndata: ${JSON.stringify({ ...payload, seq })}\n\n`;
+  // SAFETY: broadcast payloads follow `SseFrameEnvelope` when carrying top-level or nested bot/group/event ids.
+  const { botId, threadId } = extractSseFrameTarget(payload as SseFrameEnvelope);
   // Live desktop captures can each be hundreds of kilobytes and become stale
   // as soon as the next one arrives. Keep their sequence slots so resume-gap
   // detection stays honest, but never retain their base64 payloads.
-  replayBuffer.push(seq, kind, frame);
-  // SAFETY: when callers omit top-level `botId`/`threadId`, `bot`/`event` payloads carry `.id` / `.threadId`.
-  const botId = String(payload.botId ?? (payload.bot as { id?: string } | undefined)?.id ?? "");
-  // SAFETY: runtime frames nest `threadId` inside `event` rather than repeating it at top level.
-  const threadId = String(payload.threadId ?? (payload.event as { threadId?: string } | undefined)?.threadId ?? "");
+  replayBuffer.push(seq, kind, frame, threadId);
   for (const client of [...sseClients]) {
     const result = writeToClient(client, frame, kind, botId, threadId);
     if (result === "slow-end") {
@@ -3363,25 +3370,6 @@ setInterval(() => {
  * paired phone has even less business holding provider session identifiers
  * than the desktop window did. Stripped here rather than at each call site
  * so a new broadcast cannot forget. */
-const TASK_PREVIEW_TEXT_LIMIT = 500;
-
-function clipTaskLastMessage(message: Message | undefined): Message | undefined {
-  if (!message) return undefined;
-  const clipped: Message = { ...message };
-  delete clipped.png;
-  delete clipped.recording;
-  if (clipped.text && clipped.text.length > TASK_PREVIEW_TEXT_LIMIT) {
-    clipped.text = clipped.text.slice(0, TASK_PREVIEW_TEXT_LIMIT);
-  }
-  if (clipped.tool?.detail && clipped.tool.detail.length > TASK_PREVIEW_TEXT_LIMIT) {
-    clipped.tool = {
-      ...clipped.tool,
-      detail: clipped.tool.detail.slice(0, TASK_PREVIEW_TEXT_LIMIT),
-    };
-  }
-  return clipped;
-}
-
 const wireTask = ({ resumeCursors, lastInstanceId, snoozedUntil, ...task }: TaskRecord) => {
   const summary = store.threadSummary(task.threadId);
   const last = clipTaskLastMessage(summary.lastMessage);
@@ -14512,12 +14500,17 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         validatedCursor = parsed.data;
       }
 
+      const parsedFilters = parseSseFilters(url.searchParams);
+      if (!parsedFilters.ok) {
+        return json(res, 400, { ok: false, error: "invalid_filter", message: parsedFilters.message });
+      }
+
       const client: SseClient = {
         res,
         screens: url.searchParams.get("screens") === "on",
-        screenBotIds: url.searchParams.has("botId") ? new Set(url.searchParams.getAll("botId")) : null,
-        onlyKinds: url.searchParams.has("kind") ? new Set(url.searchParams.getAll("kind").filter(Boolean)) : null,
-        threadIds: url.searchParams.has("threadId") ? new Set(url.searchParams.getAll("threadId").filter(Boolean)) : null,
+        screenBotIds: parsedFilters.screenBotIds,
+        onlyKinds: parsedFilters.onlyKinds,
+        threadIds: parsedFilters.threadIds,
         slow: false,
       };
       res.writeHead(200, {
@@ -14555,7 +14548,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       );
       if (resumed) {
         for (const buffered of replayBuffer.entries) {
-          if (buffered.seq > since && buffered.frame && wants(client, buffered.kind)) res.write(buffered.frame);
+          if (buffered.seq > since && buffered.frame && wantsReplayEntry(client, buffered)) res.write(buffered.frame);
         }
       }
 

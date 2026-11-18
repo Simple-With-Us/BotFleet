@@ -4,7 +4,20 @@
 // through a real socket without genuinely stalling a client.
 import { describe, expect, it } from "vitest";
 
-import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseClient, type SseWritable } from "./sse-broadcast.ts";
+import {
+  extractSseFrameTarget,
+  parseSseFilters,
+  ReplayBuffer,
+  SLOW_CLIENT_BYTE_LIMIT,
+  SSE_FILTER_MAX_VALUES,
+  SSE_FILTER_VALUE_MAX_LENGTH,
+  SseFilterListSchema,
+  wants,
+  wantsReplayEntry,
+  writeToClient,
+  type SseClient,
+  type SseWritable,
+} from "./sse-broadcast.ts";
 
 /** A fake response whose write() outcome and writableLength are scripted
  * by the test, and which records every chunk actually written. */
@@ -114,6 +127,13 @@ describe("writeToClient", () => {
     expect(writeToClient(c, "frame-2", "runtime", "bot-1", "")).toBe("dropped");
     expect(writeToClient(c, "frame-3", "runtime", "bot-1", "t-1")).toBe("wrote");
   });
+
+  it("drops all frames when onlyKinds or threadIds is a non-null empty allowlist", () => {
+    const emptyKinds = client({ screens: true, onlyKinds: new Set() });
+    expect(writeToClient(emptyKinds, "frame-1", "message", "bot-1", "t-1")).toBe("dropped");
+    const emptyThreads = client({ screens: true, threadIds: new Set() });
+    expect(writeToClient(emptyThreads, "frame-1", "message", "bot-1", "t-1")).toBe("dropped");
+  });
 });
 
 describe("wants", () => {
@@ -133,6 +153,50 @@ describe("wants", () => {
     expect(wants({ screens: true, onlyKinds: new Set(["screen"]) }, "screen")).toBe(true);
     expect(wants({ screens: true, onlyKinds: new Set(["screen"]) }, "bot")).toBe(false);
     expect(wants({ screens: false, onlyKinds: new Set(["screen"]) }, "screen")).toBe(false);
+    expect(wants({ screens: true, onlyKinds: new Set() }, "runtime")).toBe(false);
+  });
+});
+
+describe("SSE filter validation, target extraction, and replay filtering", () => {
+  it("extracts botId and threadId across direct and nested frame envelopes", () => {
+    expect(extractSseFrameTarget({ threadId: "t-msg", botId: "b-1" })).toEqual({ botId: "b-1", threadId: "t-msg" });
+    expect(extractSseFrameTarget({ event: { threadId: "t-rt" } })).toEqual({ botId: "", threadId: "t-rt" });
+    expect(extractSseFrameTarget({ bot: { id: "b-2", threadId: "t-bot" } })).toEqual({ botId: "b-2", threadId: "t-bot" });
+    expect(extractSseFrameTarget({ group: { threadId: "t-grp" } })).toEqual({ botId: "", threadId: "t-grp" });
+  });
+
+  it("validates and bounds SSE query filter allowlists", () => {
+    expect(SseFilterListSchema.safeParse(["runtime", "bot"]).success).toBe(true);
+    expect(SseFilterListSchema.safeParse([""]).success).toBe(false);
+    expect(SseFilterListSchema.safeParse(["bad space"]).success).toBe(false);
+    expect(SseFilterListSchema.safeParse(["a".repeat(SSE_FILTER_VALUE_MAX_LENGTH + 1)]).success).toBe(false);
+    expect(
+      SseFilterListSchema.safeParse(Array.from({ length: SSE_FILTER_MAX_VALUES + 1 }, (_, i) => `t-${i}`)).success,
+    ).toBe(false);
+
+    const parsed = parseSseFilters(new URLSearchParams("kind=runtime&threadId=t-1&botId=b-1"));
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.onlyKinds).toEqual(new Set(["runtime"]));
+      expect(parsed.threadIds).toEqual(new Set(["t-1"]));
+      expect(parsed.screenBotIds).toEqual(new Set(["b-1"]));
+    }
+
+    expect(parseSseFilters(new URLSearchParams("threadId=")).ok).toBe(false);
+    expect(parseSseFilters(new URLSearchParams("kind=bad%20kind")).ok).toBe(false);
+  });
+
+  it("enforces threadIds and onlyKinds on buffered replay entries", () => {
+    const buffer = new ReplayBuffer(10, 1_000_000);
+    buffer.push(1, "runtime", "rt-1", "t-1");
+    buffer.push(2, "runtime", "rt-2", "t-2");
+    buffer.push(3, "bot", "bot-1", "t-1");
+
+    const sub = client({ screens: false, onlyKinds: new Set(["runtime"]), threadIds: new Set(["t-1"]) });
+    expect(buffer.entries.filter((entry) => wantsReplayEntry(sub, entry)).map((e) => e.seq)).toEqual([1]);
+
+    const threadOnly = client({ screens: false, threadIds: new Set(["t-1"]) });
+    expect(buffer.entries.filter((entry) => wantsReplayEntry(threadOnly, entry)).map((e) => e.seq)).toEqual([1, 3]);
   });
 });
 
