@@ -220,8 +220,9 @@ function nativeExecutableFormat(head) {
  * Open one file read-only without following a link in its last component.
  * Where the platform has no O_NOFOLLOW this refuses instead of opening, so a
  * file is never read through a link that was swapped in after it was listed.
+ * Exported so a test can show the refusal on a real link.
  */
-function openWithoutFollowing(path) {
+export function openWithoutFollowing(path) {
   const noFollow = constants.O_NOFOLLOW;
   if (!Number.isInteger(noFollow)) {
     throw new Error("this platform has no O_NOFOLLOW, so a file cannot be opened without following a link");
@@ -264,8 +265,13 @@ function fingerprintRuntime(named) {
   try {
     fd = openWithoutFollowing(path);
     const opened = fstatSync(fd);
-    if (opened.dev !== seen.stat.dev || opened.ino !== seen.stat.ino) {
+    if (!opened.isFile() || opened.dev !== seen.stat.dev || opened.ino !== seen.stat.ino) {
       return { blocker: blocker("runtime-unreadable", `${path} changed while it was being opened`) };
+    }
+    // Another name for these bytes is another way to change them.  A runtime
+    // with one name is the only one whose hash is the hash of what will run.
+    if (opened.nlink !== 1) {
+      return { blocker: blocker("runtime-hard-linked", `${path} has another hard link; name a runtime file that has one name`) };
     }
     const hash = createHash("sha256");
     const chunk = Buffer.allocUnsafe(1024 * 1024);

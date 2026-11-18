@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import {
-  appendFileSync, chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync,
+  appendFileSync, chmodSync, closeSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync,
   renameSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { connect } from "node:net";
@@ -18,6 +18,7 @@ import {
   PROTECTED_PATH_PARTS,
   RELEASE_STORE_LAUNCH_ARGUMENTS,
   inspectPlacementRollbackCandidate,
+  openWithoutFollowing,
   runPlacementRollbackFixtureProbe,
 } from "./placement-rollback-probe.mjs";
 
@@ -230,8 +231,8 @@ async function makeCandidate(t, { variant = "bridge", files = {} } = {}) {
  * A runtime whose bytes a test can change: a private copy of this Node.  It
  * has to be a real binary, because the binding refuses an interpreter script.
  */
-function copiedRuntime(root) {
-  const path = join(root, "fixture-runtime");
+function copiedRuntime(root, name = "fixture-runtime") {
+  const path = join(root, name);
   copyFileSync(NODE, path);
   chmodSync(path, 0o755);
   return path;
@@ -414,6 +415,9 @@ test("the runtime is bound by its bytes, and a missing, linked, scripted or non-
   writeFileSync(empty, "", { mode: 0o755 });
   chmodSync(empty, 0o755);
   chmodSync(physical, 0o644);
+  // Another name for the same bytes: the hash would not be the hash of what runs.
+  const hardLinked = copiedRuntime(fixture.root, "hard-linked-runtime");
+  linkSync(hardLinked, join(fixture.root, "second-name-for-runtime"));
   const cases = [
     [join(fixture.root, "no-such-runtime"), "runtime-missing"],
     [join(fixture.root, "no-such-directory", "node"), "runtime-missing"],
@@ -423,6 +427,7 @@ test("the runtime is bound by its bytes, and a missing, linked, scripted or non-
     // The script's own bytes would be bound while a different program ran.
     [scriptRuntime(fixture.root), "runtime-not-binary"],
     [empty, "runtime-not-binary"],
+    [hardLinked, "runtime-hard-linked"],
     ["node", "runtime-path-invalid"],
   ];
   for (const [path, code] of cases) {
@@ -430,6 +435,20 @@ test("the runtime is bound by its bytes, and a missing, linked, scripted or non-
     assertNeverActivates(result);
     assert.deepEqual(codes(result), [code]);
   }
+});
+
+test("a file is opened without following a link in its last component, or not at all", { skip: POSIX_ONLY }, (t) => {
+  const root = mkdtempSync(join(tmpdir(), "bf-rollback-probe-nofollow-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const real = join(root, "real");
+  const link = join(root, "link");
+  writeFileSync(real, "bytes");
+  symlinkSync(real, link);
+  const fd = openWithoutFollowing(real);
+  closeSync(fd);
+  // The link is refused by the open itself, which is what a swap between the
+  // listing and the open meets; the inspector's earlier lstat cannot be raced.
+  assert.throws(() => openWithoutFollowing(link), { code: "ELOOP" });
 });
 
 test("a candidate path that names or leads into a credential or login directory is blocked before it is read", { skip: POSIX_ONLY }, async (t) => {
@@ -929,12 +948,15 @@ test("the restated launch shape, lockdown environment and action list match thei
   assert.deepEqual([...PROTECTED_PATH_PARTS], policyParts);
 
   const probeSource = readFileSync(join(REPO_ROOT, "scripts", "placement-rollback-probe.mjs"), "utf8");
-  // A file is opened without following a link or not at all: no `?? 0`
-  // fallback for a platform that lacks O_NOFOLLOW, and no open that bypasses
-  // the one helper that refuses there.
+  // The behavior is shown by the open test above.  These pin its wiring: no
+  // `?? 0` fallback for a platform that lacks O_NOFOLLOW, the helper's one
+  // direct open carries the flag, and every handle on a listed path comes
+  // from the helper, whatever the variable is called.
   assert.ok(!probeSource.includes("O_NOFOLLOW ?? 0"));
-  assert.equal(probeSource.match(/openSync\(path, /g).length, 1);
-  assert.equal(probeSource.match(/fd = openWithoutFollowing\(path\)/g).length, 2);
+  const directOpens = [...probeSource.matchAll(/\bopenSync\s*\(([^)]*)\)/g)].map((match) => match[1]);
+  assert.equal(directOpens.filter((args) => !/^\w+Path, "w", /.test(args)).length, 1);
+  assert.ok(directOpens.some((args) => /constants\.O_RDONLY \| noFollow\b/.test(args)));
+  assert.equal(probeSource.match(/=\s*openWithoutFollowing\(/g).length, 2);
   const leases = readFileSync(join(REPO_ROOT, "server", "placement-leases.ts"), "utf8");
   const declared = leases.slice(leases.indexOf("export const PLACEMENT_LEASE_ACTIONS"));
   const actions = [...declared.slice(0, declared.indexOf("];")).matchAll(/"([a-z-]+)"/g)].map((match) => match[1]);
