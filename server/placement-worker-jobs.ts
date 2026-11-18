@@ -361,7 +361,8 @@ export function createPlacementWorkerJobs(deps: PlacementWorkerJobsDeps): Placem
 
   /** The leader is gone.  A kill in flight is waited out, so a stopped job
    *  settles once its whole group is gone.  Otherwise whatever the command
-   *  left running (`cmd &`) is stopped too: nothing would ever report on it.
+   *  left running (`cmd &`) is stopped too, and that stop is waited out the
+   *  same way: nothing would ever report on it.
    *  `leaderLive` is the adopted poll giving up its wait on a leader that
    *  still holds its pid: that pid is not written off as ended, so the group
    *  is judged by the leader's start time and not taken for a stranger's. */
@@ -379,8 +380,17 @@ export function createPlacementWorkerJobs(deps: PlacementWorkerJobsDeps): Placem
       return;
     }
     const leftRunning = !passive && stillOurs(job);
-    if (leftRunning) killJob(job, graceMs).catch(() => undefined);
-    finish(leftRunning);
+    if (!leftRunning) {
+      finish(false);
+      return;
+    }
+    // The stop is waited out, as a kill in flight is above: the job is not
+    // settled, its lease not given back and its slot not freed while the
+    // group may still stand.  A worker that goes down meanwhile leaves the
+    // lease on record, so the next start adopts the job and stops it, and a
+    // controller stop in the meantime finds the job and joins this kill.  A
+    // kill that failed does not keep the job from settling.
+    killJob(job, graceMs).then(() => finish(true), () => finish(true));
   };
 
   /** What the runtime is told.  The exit file is the job's own word and wins

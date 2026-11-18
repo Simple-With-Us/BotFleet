@@ -434,6 +434,32 @@ posix("placement worker jobs: reports through the worker runtime", () => {
     await until(() => !alive(leftover));
   });
 
+  it("settles a job that left a stubborn process running only once the group is gone", async () => {
+    const { dataDir, workDir } = folder();
+    const graceMs = 600;
+    const jobs = adapter(dataDir, { graceMs });
+    const { runtime, reports, lease, storedLeases } = leasedRuntime(jobs, dataDir, {
+      // the leftover ignores SIGTERM, so only the SIGKILL after the grace ends it
+      command: "(trap '' TERM; exec sleep 30) & echo $!",
+      cwd: workDir,
+      timeoutMs: 60_000,
+    });
+    await runtime.pullAssignment();
+    const leftover = await until(() => printedPid(jobs.files(lease).logPath));
+    const printedAt = Date.now();
+    // A stop that is settled before it has gone out reports in a few
+    // milliseconds, with the lease given back and the process still standing.
+    // A stop that is waited out cannot report before its SIGKILL.
+    await runtime.waitForJob("job-1");
+    expect(Date.now() - printedAt).toBeGreaterThanOrEqual(graceMs / 2);
+    expect(reports).toEqual([
+      expect.objectContaining({ jobId: "job-1", status: "completed", exitCode: 0, reason: "processes it left running were stopped" }),
+    ]);
+    await until(() => !alive(leftover));
+    expect(jobs.running()).toBe(0);
+    expect(storedLeases()).toEqual([]);
+  });
+
   it("pulls no lease when passive: the worker admits no work, and no queued job is failed", async () => {
     const { dataDir, workDir } = folder();
     const jobs = adapter(dataDir, { passive: true });
@@ -872,6 +898,39 @@ posix("placement worker jobs: a restarted worker", () => {
       expect(await watched).toEqual({ exitCode: 0, signal: null, reason: "processes it left running were stopped" });
       await until(() => !alive(grandchild));
       await until(() => !alive(pid));
+    } finally {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        /* the group is already gone */
+      }
+    }
+  });
+
+  it("does not settle an adopted job whose leader outlasts the wait until its group is gone", async () => {
+    const { dataDir, workDir } = folder();
+    const lease = { jobId: "job-lingering-stubborn", leaseId: "lease-lingering-stubborn" };
+    const graceMs = 600;
+    const after = adapter(dataDir, { adoptedPollMs: 20, graceMs, leaderStartedNear: () => true });
+    // the leftover ignores SIGTERM, so only the SIGKILL after the grace ends it
+    const leader = spawn("/bin/sh", ["-c", `(trap '' TERM; exec sleep 30) & echo $! > "${join(workDir, "left")}"; wait`], { detached: true, stdio: "ignore", cwd: workDir });
+    const pid = leader.pid!;
+    try {
+      const grandchild = await until(() => {
+        const printed = existsSync(join(workDir, "left")) ? Number(readFileSync(join(workDir, "left"), "utf8").trim()) : 0;
+        return printed > 0 ? printed : null;
+      });
+      mkdirSync(join(dataDir, "placement", "jobs"), { recursive: true });
+      writeFileSync(after.files(lease).exitPath, "0\n");
+      const watchedAt = Date.now();
+      const watched = after.watchProcess(pid, leaseRecord(lease, { timeoutMs: 30_000, pid }));
+      expect(await watched).toEqual({ exitCode: 0, signal: null, reason: "processes it left running were stopped" });
+      // The wait for the leader is three polls of 20 ms, so a job that reports
+      // before the grace is over reported before its SIGKILL went out, with
+      // the slot given back and the group still standing.
+      expect(Date.now() - watchedAt).toBeGreaterThanOrEqual(graceMs / 2);
+      expect(after.running()).toBe(0);
+      await until(() => !alive(grandchild));
     } finally {
       try {
         process.kill(-pid, "SIGKILL");
