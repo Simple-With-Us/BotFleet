@@ -10,18 +10,19 @@ import { build, identity, source, thin, universal } from "./native-host-macho.fi
 
 // The wiring claim is about package.json, so the file is parsed through a
 // schema instead of a bare JSON.parse: a shape that does not match is
-// refused rather than read by accident.  Only the fields this test reads are
-// described, and the rest of the file passes through untouched.
-const PackageSchema = z
-  .object({
-    scripts: z
-      .object({
-        "test:native-release": z.string(),
-        test: z.string(),
-      })
-      .passthrough(),
-  })
-  .passthrough();
+// refused rather than read by accident.
+//
+// Only the entries this test reads are declared, and the schema strips
+// everything it does not declare, at both levels: the parsed value holds the
+// two named scripts and nothing else, never a key this test has not checked.
+// The repository's other scripts and the file's other top-level keys are
+// none of this gate's business, and nothing here is written back.
+const PackageSchema = z.object({
+  scripts: z.object({
+    "test:native-release": z.string(),
+    test: z.string(),
+  }),
+});
 
 const signature = () => ({ codeIdentifier: "BotFleetNativeHost", teamIdentifier: "CC8UTF7ATG", adHoc: false, hardenedRuntime: true });
 function fixture(bytes = universal()) {

@@ -21,6 +21,7 @@ function makeFixture({ withDependencies = false } = {}) {
   const dataDir = join(dir, "data");
   mkdirSync(dataDir);
   writeFileSync(join(dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
+  mkdirSync(join(dir, "home"));
   const serverRoot = join(dir, "root");
   mkdirSync(join(serverRoot, "server"), { recursive: true });
   writeFileSync(join(serverRoot, "server", "index.ts"), "// fake entry\n");
@@ -38,24 +39,16 @@ function makeFixture({ withDependencies = false } = {}) {
   return { dir, dataDir, node, serverRoot, ledger: join(dir, "ledger"), marker: join(dir, "stopped.marker"), disabled: join(dir, "startup-disabled.marker"), enabled: join(dir, "startup-enabled.marker"), session: join(dir, "startup-session"), port };
 }
 
-// The environment the launcher runs with, built from the host environment
-// and then made explicit.
+// The environment the launcher runs with.
 //
-// The startup answer and the Keychain reader belong to the fixture, never to
-// the machine that runs the suite: an inherited answer would change which
-// branch the launcher takes, and an inherited reader would probe the
-// developer's real login Keychain, where the desktop's enrollment item would
-// answer remote and break every "reads nothing" assertion.  The default
-// reader points at a path that does not exist, so the probe fails closed to
-// "no enrollment" until a fixture names a stub of its own.
-function launcherEnv(fixture, { processEnv = process.env, dropIdentity = false } = {}) {
-  const env = { ...processEnv };
-  for (const key of Object.keys(env)) {
-    if (dropIdentity && key.startsWith("INFISICAL_")) delete env[key];
-    if (key === "BOTFLEET_STARTUP_ENROLLMENT" || key === "BOTFLEET_SECURITY_BIN" ||
-        key === "BOTFLEET_KEYCHAIN_SERVICE" || key === "BOTFLEET_KEYCHAIN_ACCOUNT") delete env[key];
-  }
-  return { ...env, BOTFLEET_SECURITY_BIN: join(fixture.dir, "no-such-security-binary") };
+// Nothing is inherited from the machine that runs the suite.  The launcher
+// finds its tools with PATH and keeps its own fixture home; every other
+// value it reads is named by the caller.  A host credential must never reach
+// the launcher through the environment, the startup answer and the Keychain
+// reader belong to the fixture, and an inherited XPC_SERVICE_NAME would even
+// change whether the run looks like launchd.
+function launcherEnv(fixture, { home = join(fixture.dir, "home") } = {}) {
+  return { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home };
 }
 
 function run(fixture, { threshold = 20, windowSeconds = 3600, args = [], node = fixture.node, xpcServiceName = "" } = {}) {
@@ -415,7 +408,7 @@ function runIdentity(fixture, extraEnv = {}, { dataDir = fixture.dataDir } = {})
   return spawnSync("bash", [SCRIPT], {
     encoding: "utf8",
     env: {
-      ...launcherEnv(fixture, { dropIdentity: true }),
+      ...launcherEnv(fixture, { home: fixture.home }),
       ...extraEnv,
       HOME: fixture.home,
       OMB_DATA_DIR: dataDir,
@@ -668,26 +661,22 @@ test("the operator opt-in marker file overrides a saved local choice", () => {
   }
 });
 
-test("the fixture environment never inherits the startup answer or the Keychain reader", () => {
-  // A machine that holds the desktop's enrollment item, or an operator
-  // answer in the shell, must not be able to change what this suite
-  // measures: the launcher runs with fixture-local values only.
+test("the fixture environment inherits nothing from the machine that runs the suite", () => {
+  // A machine that holds the desktop's enrollment item, an operator answer
+  // in the shell, or a credential in the environment must not be able to
+  // change what this suite measures: the launcher runs with PATH, its own
+  // fixture home, and nothing else.
   const fixture = identityFixture();
   try {
-    const env = launcherEnv(fixture, { processEnv: {
-      PATH: "/bin",
-      INFISICAL_TOKEN: "st.inherited",
-      BOTFLEET_STARTUP_ENROLLMENT: "remote",
-      BOTFLEET_SECURITY_BIN: "/usr/bin/security",
-      BOTFLEET_KEYCHAIN_SERVICE: "inherited",
-      BOTFLEET_KEYCHAIN_ACCOUNT: "inherited",
-    }, dropIdentity: true });
+    const env = launcherEnv(fixture);
+    assert.deepEqual(Object.keys(env).sort(), ["HOME", "PATH"]);
+    assert.equal(env.HOME, join(fixture.dir, "home"));
+    assert.equal(env.INFISICAL_TOKEN, undefined);
     assert.equal(env.BOTFLEET_STARTUP_ENROLLMENT, undefined);
-    assert.equal(env.BOTFLEET_SECURITY_BIN, join(fixture.dir, "no-such-security-binary"));
+    assert.equal(env.BOTFLEET_SECURITY_BIN, undefined);
     assert.equal(env.BOTFLEET_KEYCHAIN_SERVICE, undefined);
     assert.equal(env.BOTFLEET_KEYCHAIN_ACCOUNT, undefined);
-    assert.equal(env.INFISICAL_TOKEN, undefined);
-    assert.equal(env.PATH, "/bin");
+    assert.equal(env.XPC_SERVICE_NAME, undefined);
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
