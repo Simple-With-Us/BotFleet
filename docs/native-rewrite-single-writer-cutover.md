@@ -482,6 +482,7 @@ When the cutover runs, the following belong in the BF-2514 issue, and BF-2515's 
 -  The Step 0 baseline output from both hosts.
 -  The Step 2 `comm` output showing no id enabled on both hosts.
 -  The Step 4 `soak-24h-server-writer`: the dates, the inbound-message count, and the single daily run of the shared routine.
+-  The decommission evidence bundle does not take that soak from an issue comment.  Its `server-writer-soak` receipt is made of logged coverage segments, and each segment's required fields (the interval, a hashed log, the selected writer host, the controller id and epoch, the Mac harness recorded as loaded but unused, the six surface outcomes, a nonzero inbound-message count and the shared routine run counts) are the `serverWriterSegment` schema in `scripts/decommission-evidence-bundle.mjs`.  [The final evidence bundle](verification/native-final-evidence.md#observation-intervals) says how they are checked.  This runbook does not define how those logs are captured, and no script on main produces them.
 -  The Step 3 output showing the Mac app reaching the server's pid.
 -  The Step 5 output showing `Could not find service "app.botfleet.server"` and an empty listener list.
 -  The path of the backup directory Step 5 wrote, and the two files inside it.
