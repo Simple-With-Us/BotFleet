@@ -120,3 +120,49 @@ The read-only `--estimate <exact-source-sha>` command reports unique one-commit 
 No actual fleet sparse fixture was created by the toy test, and the default executor still creates exports rather than claiming those exports have Git provenance.
 
 All fixture results remain source-test evidence, and the final Linux-preservation assertion stays false until actual candidate/prior build/start/update/rollback acceptance is recorded.
+
+## Linux Retention Receipt
+
+The decommission evidence bundle's `linux-retention` receipt has a producer: `scripts/emit-linux-retention-receipt.mjs` reads an executed fixture result and the two closure receipts that run was made from, and writes `linux-retention.receipt.json` in the shape `scripts/decommission-evidence-bundle.mjs` validates.
+
+The producer runs no fixture, starts no process, contacts no host and neither reads nor edits the gate state; it only converts files that were already captured.
+
+Do not use the fixture's output root as the capture directory: it also holds the `prior/` and `candidate/` checkouts, and the capture directory travels as the evidence packet.  Copy `actual-source-runtime-result.json`, both closure receipts and the provenance record into a separate capture directory owned by the executing account, mode `0700` with `0600` files, then run:
+
+```sh
+node scripts/emit-linux-retention-receipt.mjs \
+  --capture /private/captures/capture \
+  --request /private/captures/request.json \
+  --result /private/captures/capture/actual-source-runtime-result.json \
+  --candidate-closure /private/captures/capture/current.json \
+  --prior-closure /private/captures/capture/prior.json \
+  --provenance-record /private/captures/capture/linux-retention-provenance.txt \
+  --provenance-source "$PROVENANCE_URL" --provenance-by "$WHO"
+```
+
+Every argument is one of those flags, given once and followed by its value; `--provenance-at <iso-8601-instant>` may be added, and without it the receipt is stamped with the time it was emitted.  A flag that has lost its value, a flag given twice and an argument the command does not read are refused, so a mistyped `--provenance-at` is never ignored and never replaced by the current time.
+
+Every cited file is read through the bundle's own reader, so a file the bundle would refuse is refused here first: a symlink, a hard link, a file with group or other access, a path outside the capture directory, a path the bundle's reference format cannot name and a file over the bundle's 1 MiB per-file limit.
+
+A closure receipt may be up to 4 MiB while the bundle reads at most 1 MiB of one file, so an oversized closure receipt is refused with its size instead of producing a receipt the bundle rejects later.
+
+The receipt pins `maintainedSourceSha` to the source the candidate closure receipt names and `rollbackSourceSha` to the source the prior closure receipt names, and its `closureManifest` is the candidate closure receipt bound by hash.
+
+The four exit codes are read out of the result's trace and are never asserted.  The fixture records a step only when its adapter reported success and writes its steps in one fixed order, so each check is read from the position the fixture writes it at:
+
+| Check | Fixture Phases | What The Trace Must Show |
+| --- | --- | --- |
+| `clean-export-build` | `export-both`, `install-and-build-prior`, `install-and-build-candidate` | `installDependencies` and `buildUi` for the prior and for the candidate. |
+| `install-start` | `prior-start-health` | The prior's install and build, then its `start` and `health`, before any candidate step. |
+| `update` | `candidate-update-health` | The prior's `stop`, then the candidate's install, build, `start`, `health` and `stop`, one directly after the other, with no `candidate-refused` marker. |
+| `rollback` | `prior-rollback-health` | Directly after the candidate's run ended with the candidate stopped, a second prior `start`, `health` and `stop` as the last steps of the run, with no `rollback-refused` marker and an empty `cleanupFailures` list. |
+
+A missing or misplaced step, a refusal marker and a fixture process left behind are honest failures: the check earns exit code 1, the receipt is still written, the command exits 1 and the bundle refuses the failing code.
+
+The command exits 2 and writes nothing when its inputs cannot be read, do not match their contracts or contradict each other, including a plan instead of an executed result, a `candidateHealthy` or `rollbackHealthy` summary that disagrees with the health steps in the trace, a step that ran a source other than the one its slot's closure receipt names, candidate and prior receipts for the same source, a cited file that is the `linux-retention.receipt.json` the command is about to replace, a bundle request that is not a regular file of at most 1 MiB, or a result that claims any preservation status other than the fixture's own `external-runtime-acceptance-still-required`.
+
+The result does not record how the two sources were materialized.  The fixture materializes both before its first step, so a trace that reaches the prior's install had both materialized, but `retained-actual-run.mjs` uses the filtered Git checkout rather than the plain export, and the `clean-export-build` name does not tell the two apart.  Record the materialization in the provenance record.
+
+The producer cannot authenticate the run.  A result written by the toy adapters in the source tests has the same shape as one written by the actual adapters, so the receipt establishes only that the named result is internally consistent, agrees with the named closure receipts and shows what the table above requires.
+
+The receipt never asserts `linux-server-preservation`.  That remains a separate human assertion in the gate state, and it stays false until actual candidate/prior build/start/update/rollback acceptance is recorded.
