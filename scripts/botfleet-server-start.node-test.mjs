@@ -370,6 +370,18 @@ function writeKeys(fixture, body) {
   ].join("\n"));
 }
 
+// A stand-in for /usr/bin/security.  It answers the presence question the
+// launcher asks, records the arguments it was given, and prints nothing at
+// all: the real tool's output is discarded, and no value ever reaches a
+// fixture.
+function fakeSecurity(fixture, status) {
+  const binary = join(fixture.dir, "fake-security");
+  const args = join(fixture.dir, "fake-security-args");
+  writeFileSync(binary, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(args)}\nexit ${status}\n`);
+  chmodSync(binary, 0o755);
+  return binary;
+}
+
 function installFakeFleetSecrets(fixture, script) {
   writeFileSync(fixture.bin, `${script}\n`);
   chmodSync(fixture.bin, 0o755);
@@ -452,7 +464,9 @@ test("a host with no identity source and no choice file starts this Mac and read
   }
 });
 
-test("a host that already had the fleet-secrets helper keeps remote startup without a choice file", () => {
+test("a helper binary with no enrollment and no choice starts this Mac and reads nothing", () => {
+  // The helper's PRESENCE was read as consent, so every fleet Mac -- the
+  // helper is mandated there -- bootstrapped Infisical by default (BF-2636).
   const fixture = identityFixture();
   const called = join(fixture.dir, "helper-called");
   try {
@@ -460,7 +474,93 @@ test("a host that already had the fleet-secrets helper keeps remote startup with
     installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
     const result = runIdentity(fixture);
     assert.equal(result.status, 0);
+    assert.match(result.stdout, /without Infisical bootstrap/);
+    assert.equal(existsSync(called), false, "the helper's presence must not be read as consent");
+    const got = identityReport(fixture, result);
+    assert.equal(got.INFISICAL_TOKEN, "unset");
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a saved remote enrollment answers remote and reads the helper", () => {
+  const fixture = identityFixture();
+  const called = join(fixture.dir, "helper-called");
+  try {
+    writeFileSync(join(fixture.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "remote" }));
+    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    const result = runIdentity(fixture);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /with the Infisical bootstrap/);
     assert.equal(existsSync(called), true);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("an explicit operator opt-in answers remote and reads the helper", () => {
+  const fixture = identityFixture();
+  const called = join(fixture.dir, "helper-called");
+  try {
+    rmSync(join(fixture.dataDir, "startup-enrollment.json"));
+    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    const result = runIdentity(fixture, { BOTFLEET_STARTUP_ENROLLMENT: "remote" });
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /with the Infisical bootstrap/);
+    assert.equal(existsSync(called), true);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("the operator opt-in marker file answers remote and reads the helper", () => {
+  const fixture = identityFixture();
+  const called = join(fixture.dir, "helper-called");
+  try {
+    rmSync(join(fixture.dataDir, "startup-enrollment.json"));
+    writeFileSync(join(fixture.dataDir, "startup-infisical.opt-in"), "");
+    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    const result = runIdentity(fixture);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /with the Infisical bootstrap/);
+    assert.equal(existsSync(called), true);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a Mac holding the Keychain enrollment keeps remote startup", () => {
+  // The same enrollment the Electron path accepts as a legacy enrollment
+  // (electron/main.mjs asks hasLegacyEnrollment for that Keychain item).
+  const fixture = identityFixture();
+  const called = join(fixture.dir, "helper-called");
+  try {
+    rmSync(join(fixture.dataDir, "startup-enrollment.json"));
+    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    const result = runIdentity(fixture, { BOTFLEET_SECURITY_BIN: fakeSecurity(fixture, 0) });
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /with the Infisical bootstrap/);
+    assert.equal(existsSync(called), true);
+    // The same Keychain item the Electron path reads (electron/server-target.mjs
+    // names that service and account), asked for without ever printing a value.
+    assert.deepEqual(readFileSync(join(fixture.dir, "fake-security-args"), "utf8").trim().split("\n"),
+      ["find-generic-password", "-s", "BotFleet Infisical read token", "-a", "botfleet"]);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a Keychain that cannot be read fails closed to local", () => {
+  const fixture = identityFixture();
+  const called = join(fixture.dir, "helper-called");
+  try {
+    rmSync(join(fixture.dataDir, "startup-enrollment.json"));
+    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    const result = runIdentity(fixture, { BOTFLEET_SECURITY_BIN: fakeSecurity(fixture, 1) });
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /without Infisical bootstrap/);
+    assert.equal(existsSync(called), false);
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
@@ -469,11 +569,15 @@ test("a host that already had the fleet-secrets helper keeps remote startup with
 test("a host already holding an Infisical identity keeps remote startup without a choice file", () => {
   for (const env of [{ INFISICAL_TOKEN: "st.legacy" }, { INFISICAL_CLIENT_ID: "id", INFISICAL_CLIENT_SECRET: "secret" }]) {
     const fixture = identityFixture();
+    const called = join(fixture.dir, "helper-called");
     try {
       rmSync(join(fixture.dataDir, "startup-enrollment.json"));
+      installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
       const result = runIdentity(fixture, env);
       assert.equal(result.status, 0);
       assert.doesNotMatch(result.stdout, /startup setup is required/);
+      assert.match(result.stdout, /with the Infisical bootstrap/);
+      assert.equal(existsSync(called), true, "an environment identity still selects remote");
       assert.equal(existsSync(fixture.report), true);
     } finally {
       rmSync(fixture.dir, { recursive: true, force: true });
@@ -487,7 +591,21 @@ test("an explicit local choice wins over every legacy identity source", () => {
   try {
     writeFileSync(join(local.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
     installFakeFleetSecrets(local, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
-    const result = runIdentity(local, { INFISICAL_TOKEN: "st.legacy" });
+    const result = runIdentity(local, { INFISICAL_TOKEN: "st.legacy", BOTFLEET_SECURITY_BIN: fakeSecurity(local, 0) });
+    assert.match(result.stdout, /without Infisical bootstrap/);
+    assert.equal(existsSync(called), false);
+  } finally {
+    rmSync(local.dir, { recursive: true, force: true });
+  }
+});
+
+test("an explicit local operator choice wins over the Keychain enrollment", () => {
+  const local = identityFixture();
+  const called = join(local.dir, "helper-called");
+  try {
+    rmSync(join(local.dataDir, "startup-enrollment.json"));
+    installFakeFleetSecrets(local, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    const result = runIdentity(local, { BOTFLEET_STARTUP_ENROLLMENT: "local", BOTFLEET_SECURITY_BIN: fakeSecurity(local, 0) });
     assert.match(result.stdout, /without Infisical bootstrap/);
     assert.equal(existsSync(called), false);
   } finally {
@@ -541,8 +659,8 @@ test("generic machine identity names are never fetched or exported", () => {
       fixture,
       [
         "INFISICAL_CLIENT_ID=fixture-canonical-id",
-        "INFISICAL_CLIENT_SECRET=fixture-canonical-secret",
-        "UNRELATED_TOKEN=fixture-should-not-leak",
+        "INFISICAL_CLIENT_SECRET=fixture-secret",
+        "UNRELATED_TOKEN=fixture-no-leak",
       ].join("\n"),
     );
     const got = identityReport(fixture, runIdentity(fixture));
@@ -560,15 +678,15 @@ test("only dedicated service tokens are fetched, without a machine identity fall
     writeKeys(
       fixture,
       [
-        "BOTFLEET_HARNESS_INFISICAL_READ_TOKEN=fixture-read-token",
-        "BOTFLEET_HARNESS_INFISICAL_WRITE_TOKEN=fixture-write-token",
+        "BOTFLEET_HARNESS_INFISICAL_READ_TOKEN=fixture-read",
+        "BOTFLEET_HARNESS_INFISICAL_WRITE_TOKEN=fixture-write",
         "INFISICAL_CLIENT_ID=fixture-canonical-id",
-        "INFISICAL_CLIENT_SECRET=fixture-canonical-secret",
+        "INFISICAL_CLIENT_SECRET=fixture-secret",
       ].join("\n"),
     );
     const got = identityReport(fixture, runIdentity(fixture));
-    assert.equal(got.INFISICAL_TOKEN, "fixture-read-token");
-    assert.equal(got.INFISICAL_WRITE_TOKEN, "fixture-write-token");
+    assert.equal(got.INFISICAL_TOKEN, "fixture-read");
+    assert.equal(got.INFISICAL_WRITE_TOKEN, "fixture-write");
     // Dedicated token bootstrap never requests or exports a machine identity.
     assert.equal(got.INFISICAL_CLIENT_ID, "unset");
     assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");
@@ -583,13 +701,13 @@ test("a token-only host still starts, with no machine identity to fall back to",
     writeKeys(
       fixture,
       [
-        "BOTFLEET_HARNESS_INFISICAL_READ_TOKEN=fixture-read-token",
-        "BOTFLEET_HARNESS_INFISICAL_WRITE_TOKEN=fixture-write-token",
+        "BOTFLEET_HARNESS_INFISICAL_READ_TOKEN=fixture-read",
+        "BOTFLEET_HARNESS_INFISICAL_WRITE_TOKEN=fixture-write",
       ].join("\n"),
     );
     const got = identityReport(fixture, runIdentity(fixture));
-    assert.equal(got.INFISICAL_TOKEN, "fixture-read-token");
-    assert.equal(got.INFISICAL_WRITE_TOKEN, "fixture-write-token");
+    assert.equal(got.INFISICAL_TOKEN, "fixture-read");
+    assert.equal(got.INFISICAL_WRITE_TOKEN, "fixture-write");
     // Nothing to fetch means nothing is exported, and the missing
     // fallback is not a startup failure.
     assert.equal(got.INFISICAL_CLIENT_ID, "unset");
@@ -603,7 +721,7 @@ test("automation names cannot provision the managed launcher", () => {
   try {
     writeKeys(
       fixture,
-      ["INFISICAL_AUTOMATION_CLIENT_ID=fixture-auto-id", "INFISICAL_AUTOMATION_CLIENT_SECRET=fixture-auto-secret"].join("\n"),
+      ["INFISICAL_AUTOMATION_CLIENT_ID=fixture-auto-id", "INFISICAL_AUTOMATION_CLIENT_SECRET=fixture-auto"].join("\n"),
     );
     const got = identityReport(fixture, runIdentity(fixture));
     assert.equal(got.INFISICAL_CLIENT_ID, "unset");
@@ -621,8 +739,8 @@ test("neither generic nor automation names are consulted", () => {
       [
         "INFISICAL_AUTOMATION_CLIENT_ID=fixture-auto-id",
         "INFISICAL_CLIENT_ID=fixture-canonical-id",
-        "INFISICAL_AUTOMATION_CLIENT_SECRET=fixture-auto-secret",
-        "INFISICAL_CLIENT_SECRET=fixture-canonical-secret",
+        "INFISICAL_AUTOMATION_CLIENT_SECRET=fixture-auto",
+        "INFISICAL_CLIENT_SECRET=fixture-secret",
       ].join("\n"),
     );
     const got = identityReport(fixture, runIdentity(fixture));
@@ -642,7 +760,7 @@ test("blank generic names never activate automation fallback", () => {
         "INFISICAL_CLIENT_ID=",
         "INFISICAL_AUTOMATION_CLIENT_ID=fixture-auto-id",
         "INFISICAL_CLIENT_SECRET=",
-        "INFISICAL_AUTOMATION_CLIENT_SECRET=fixture-auto-secret",
+        "INFISICAL_AUTOMATION_CLIENT_SECRET=fixture-auto",
       ].join("\n"),
     );
     const got = identityReport(fixture, runIdentity(fixture));
@@ -656,7 +774,7 @@ test("blank generic names never activate automation fallback", () => {
 test("a store with no identity does not export empty strings", () => {
   const fixture = identityFixture();
   try {
-    writeKeys(fixture, "OTHER_TOKEN=fixture-unrelated\n");
+    writeKeys(fixture, "OTHER_TOKEN=fixture-none\n");
     const got = identityReport(fixture, runIdentity(fixture, {
       INFISICAL_UNIVERSAL_AUTH_CLIENT_ID: "fixture-alias-id",
       INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET: "fixture-alias-secret",
@@ -687,7 +805,7 @@ test("an identity already in the environment is not replaced by fleet-secrets", 
   try {
     writeKeys(
       fixture,
-      ["INFISICAL_CLIENT_ID=fixture-file-id", "INFISICAL_CLIENT_SECRET=fixture-file-secret"].join("\n"),
+      ["INFISICAL_CLIENT_ID=fixture-file-id", "INFISICAL_CLIENT_SECRET=fixture-file"].join("\n"),
     );
     const got = identityReport(fixture, runIdentity(fixture, {
       INFISICAL_CLIENT_ID: "fixture-env-id",

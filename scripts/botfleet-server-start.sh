@@ -75,6 +75,8 @@ fi
 PORT="${BOTFLEET_PORT:-8799}"
 NODE="${BOTFLEET_NODE:-/opt/homebrew/bin/node}"
 PNPM="${BOTFLEET_PNPM:-pnpm}"
+# The Keychain reader, overridable for fixtures the way NODE and PNPM are.
+SECURITY_BIN="${BOTFLEET_SECURITY_BIN:-/usr/bin/security}"
 HEAL_MINUTES="${BOTFLEET_HEAL_MINUTES:-15}"
 # The heal stamp records "a self-heal was tried recently", so it is MUTABLE state
 # and cannot live inside a release directory: a release is read-only by
@@ -526,18 +528,78 @@ load_infisical_identity() {
   if [ -n "${INFISICAL_WRITE_TOKEN:-}" ]; then export INFISICAL_WRITE_TOKEN; fi
 }
 
-read_startup_enrollment() {
-  # Match botfleetDataDir(): trim the override and ignore a blank value.
+# The data directory the desktop resolver uses, trimmed the same way.
+startup_data_dir() {
   local data_dir="${OMB_DATA_DIR:-}"
   data_dir="${data_dir#"${data_dir%%[![:space:]]*}"}"
   data_dir="${data_dir%"${data_dir##*[![:space:]]}"}"
-  local preference="${data_dir:-$HOME/.botfleet}/startup-enrollment.json"
+  printf '%s' "${data_dir:-$HOME/.botfleet}"
+}
+
+# The operator's explicit answer for this Mac, when there is one.
+#
+# Two documented ways to answer:
+#
+#   * BOTFLEET_STARTUP_ENROLLMENT=remote (or local) in the launchd agent's
+#     EnvironmentVariables, or in the shell that starts the harness.
+#   * The marker file <data dir>/startup-infisical.opt-in, which opts this
+#     Mac in to the Infisical bootstrap.
+#
+# A helper binary's presence is NOT an answer: fleet-secrets is installed on
+# every fleet Mac, so inferring the choice from it answered remote for every
+# Mac, which is the opposite of what the startup choice is for (BF-2636).
+#
+# Prints "remote", "local", or nothing when the operator has not answered.
+operator_startup_choice() {
+  case "${BOTFLEET_STARTUP_ENROLLMENT:-}" in
+    remote|infisical|1|true|yes) printf '%s' remote; return 0 ;;
+    local|none|off|0|no) printf '%s' local; return 0 ;;
+    "") ;;
+    *) log_err "BOTFLEET_STARTUP_ENROLLMENT is not a recognised startup choice; this Mac starts locally"; printf '%s' local; return 0 ;;
+  esac
+  if [ -f "$(startup_data_dir)/startup-infisical.opt-in" ]; then printf '%s' remote; return 0; fi
+  return 0
+}
+
+# Whether this Mac holds the Keychain enrollment the desktop reads.
+#
+# A Mac enrolled before the explicit startup choice existed keeps its remote
+# startup, exactly like the Electron path does: electron/startup-enrollment.mjs
+# asks hasLegacyEnrollment, which is this very Keychain item.
+#
+# Only the item's PRESENCE matters.  The value is never read, never printed
+# and never put on a command line: `security` is asked for the item and its
+# output is discarded.  Exit 0 means the item exists, 44 means it does not,
+# and anything else (no `security` at all, a locked Keychain) counts as "no
+# enrollment", so the harness still starts.
+keychain_enrollment_present() {
+  local service="${BOTFLEET_KEYCHAIN_SERVICE:-BotFleet Infisical read token}"
+  local account="${BOTFLEET_KEYCHAIN_ACCOUNT:-botfleet}"
+  [ -x "$SECURITY_BIN" ] || return 1
+  "$SECURITY_BIN" find-generic-password -s "$service" -a "$account" >/dev/null 2>&1
+}
+
+read_startup_enrollment() {
+  local preference="$(startup_data_dir)/startup-enrollment.json"
   if [ ! -e "$preference" ] && [ ! -L "$preference" ]; then
-    # A host that already had an Infisical identity source (environment or the
-    # fleet-secrets helper the old script read) was enrolled before this
-    # choice existed, so it keeps its remote startup.  Nothing is read here.
-    if [ -n "${INFISICAL_TOKEN:-}" ] || { [ -n "${INFISICAL_CLIENT_ID:-}" ] && [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; } ||
-       { [ -f "$HOME/.local/bin/fleet-secrets" ] && [ -x "$HOME/.local/bin/fleet-secrets" ]; }; then
+    # No saved choice on this Mac.  An explicit operator answer comes first:
+    # it is the only thing that can turn the Infisical bootstrap on here.
+    local choice
+    choice="$(operator_startup_choice)"
+    if [ -n "$choice" ]; then
+      printf '%s' "$choice"
+      return 0
+    fi
+    # An identity override in the environment is an answer the operator has
+    # already given, so it keeps selecting remote exactly as it did before.
+    # Nothing is read here.
+    if [ -n "${INFISICAL_TOKEN:-}" ] || { [ -n "${INFISICAL_CLIENT_ID:-}" ] && [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; }; then
+      printf '%s' remote
+      return 0
+    fi
+    # A Mac that enrolled before this choice existed keeps its remote
+    # startup, exactly like the Electron path.
+    if keychain_enrollment_present; then
       printf '%s' remote
       return 0
     fi
@@ -545,7 +607,6 @@ read_startup_enrollment() {
     # started this Mac without Infisical here too.  Remote needs an explicit
     # choice in BotFleet Server Setup.
     printf '%s' local
-    return 0
     return 0
   fi
   "$NODE" --input-type=module -e '
@@ -572,7 +633,7 @@ if ! startup_mode="$(read_startup_enrollment)"; then
   exit 1
 fi
 case "$startup_mode" in
-  remote) load_infisical_identity ;;
+  remote) log "starting with the Infisical bootstrap"; load_infisical_identity ;;
   local) log "starting this Mac without Infisical bootstrap" ;;
   missing)
     log "startup setup is required; open BotFleet to choose this Mac or Infisical server settings"

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -184,6 +184,16 @@ for (const product of ["Host_Core.bundle", "Core.framework", "libCore.dylib"]) {
     await assert.rejects(packageWithBinPathEntries([...swiftIntermediates, product]), /packaging refused/);
   });
 }
+test("the native-release chain runs this proof, and hosted CI runs the chain", () => {
+  // vitest does not collect *.node-test.mjs.  Hosted CI runs `pnpm test`,
+  // which only reaches a node:test file that package.json names, so the
+  // identity proof is only proved when both name it.
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.match(pkg.scripts["test:native-release"], /scripts\/native-host-artifact\.node-test\.mjs/);
+  assert.match(pkg.scripts.test, /pnpm test:native-release/);
+  const ci = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+  assert.match(ci, /run: pnpm test$/m);
+});
 test("packaging refuses a symlinked output parent or dangling output before invoking a build", async () => {
   const root = mkdtempSync(join(tmpdir(), "bf-host-output-"));
   try {
