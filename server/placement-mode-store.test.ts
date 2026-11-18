@@ -251,7 +251,10 @@ describe("the placement mode route", () => {
   });
 
   it("matches the shared T7 Swift/TypeScript placement-mode contract fixture", () => {
-    const fixtureHostId = z.string().regex(HOST_ID_PATTERN).transform((value) => value as HostId);
+    const fixtureHostId = z.string().regex(HOST_ID_PATTERN).transform((value): HostId => {
+      if (value.startsWith("mac:")) return `mac:${value.slice(4)}`;
+      return `server:${value.slice(7)}`;
+    });
     const ackFrameSchema = z.object({
       controllerId: fixtureHostId,
       epoch: z.number().int().nonnegative(),
