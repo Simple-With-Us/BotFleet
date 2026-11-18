@@ -1377,7 +1377,7 @@ public actor NativeCompanionServer {
     /// 1. Loopback address guard (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`).
     /// 2. Explicit `allowRemoteDesktopLaunch == true` setting gate so a request replayed over
     ///    `127.0.0.1` by the companion proxy is still refused when disabled.
-    /// 3. Installed `onDesktopOpen` callback guard so builds without launch wiring return 503
+    /// 3. Installed `onDesktopOpen` callback guard so builds without launch wiring return 501
     ///    instead of reporting `launched: true`.
     private func handleDesktopOpen(_ request: CompanionHTTPRequest) async -> CompanionHTTPResponse {
         guard Self.isLoopbackAddress(request.remoteAddress) else {
@@ -1387,7 +1387,9 @@ public actor NativeCompanionServer {
             return .error(403, "Opening the desktop app from iOS is disabled in Mac settings")
         }
         guard let onDesktopOpen else {
-            return .error(503, "Opening the desktop app is not available on this Mac")
+            // This Mac answered. An unavailable feature is not a dead gateway;
+            // 502...504 would trigger route failover and macOffline advice.
+            return .error(501, "Opening the desktop app is not available on this Mac")
         }
         do {
             try await onDesktopOpen()
