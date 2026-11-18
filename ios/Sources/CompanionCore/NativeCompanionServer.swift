@@ -1387,8 +1387,8 @@ public actor NativeCompanionServer {
             return .error(403, "Opening the desktop app from iOS is disabled in Mac settings")
         }
         guard let onDesktopOpen else {
-            // This Mac answered. An unavailable feature is not a dead gateway;
-            // 502...504 would trigger route failover and macOffline advice.
+            // This Mac answered, but desktop launch is not implemented here.
+            // Report the unavailable feature without claiming a transport outage.
             return .error(501, "Opening the desktop app is not available on this Mac")
         }
         do {
