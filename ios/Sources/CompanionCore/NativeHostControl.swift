@@ -117,10 +117,20 @@ public final class NativeHostControlServer: @unchecked Sendable {
               payload.contains("\"state\":\"\(NativeHeadlessHostState.running.rawValue)\"") else {
             throw NativeHostControlError.startNotVerified(state: state.rawValue)
         }
-        guard Self.channelAnswers(path: path) else {
+        guard await channelAnswersOffExecutor(path: path) else {
             throw NativeHostControlError.controlChannelUnreachable
         }
         return state
+    }
+
+    /// The probe blocks on a poll while a pending connection completes, so it
+    /// runs on a dispatch queue and never holds a cooperative executor thread.
+    private func channelAnswersOffExecutor(path: String) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            DispatchQueue.global(qos: .utility).async {
+                continuation.resume(returning: Self.channelAnswers(path: path))
+            }
+        }
     }
 
     /// A bare connection proves the listener is live.  No request is sent, so the
@@ -129,20 +139,30 @@ public final class NativeHostControlServer: @unchecked Sendable {
     /// A non-blocking connect can be pending or refused by a full backlog, and
     /// neither state means the listener is gone, so the result is read by errno
     /// and a pending connection is completed before it is believed.
-    static func channelAnswers(path: String) -> Bool {
+    ///
+    /// The connect outcome can be injected, so a fixture can reach the pending
+    /// branch without depending on a kernel's backlog timing.
+    static func channelAnswers(path: String, connect: ((Int32) -> (result: Int32, connectError: Int32))? = nil) -> Bool {
         var address: sockaddr_un
         do { address = try Self.address(path) } catch { return false }
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
         defer { Darwin.close(fd) }
-        // A non-blocking connect can never wait on a full backlog.
-        _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+        var result: Int32 = 0
         var connectError: Int32 = 0
-        let result = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                let status = Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-                if status != 0 { connectError = errno }
-                return status
+        if let connect = connect {
+            let outcome = connect(fd)
+            result = outcome.result
+            connectError = outcome.connectError
+        } else {
+            // A non-blocking connect can never wait on a full backlog.
+            _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+            result = withUnsafePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    let status = Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                    if status != 0 { connectError = errno }
+                    return status
+                }
             }
         }
         guard NativeHostChannelProbe.isReachable(connectResult: result, connectError: connectError) else { return false }

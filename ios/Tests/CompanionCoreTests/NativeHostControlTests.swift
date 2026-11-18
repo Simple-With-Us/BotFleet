@@ -318,11 +318,9 @@ struct NativeHostControlTests {
         process.standardError = Pipe()
         try process.run()
         defer { if process.isRunning { kill(process.processIdentifier, SIGKILL); process.waitUntilExit() } }
-        // The channel that backs the announcement is live and answers for the host.
-        try await controlEventually {
-            FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent(NativeHostControlServer.socketName).path)
-        }
-        let status = try await controlRequest(fixture, "status\n")
+        // The channel that backs the announcement is live and answers for the
+        // host, so the wait is for the answer and not for the socket file.
+        let status = try await controlEventuallyAnswering(fixture)
         #expect(status.contains(geteuid() == 0 ? "\"state\":\"running\"" : "denied"))
         process.terminate()
         try await controlEventually { !process.isRunning }
@@ -377,6 +375,42 @@ struct NativeHostControlTests {
         try await host.shutdown()
     }
 
+    @Test("A pending connect is believed only after it completed without a socket error")
+    func pendingConnectIsBelievedOnlyAfterCompletion() async throws {
+        // The pending branch of the probe, reached without kernel backlog timing.
+        let fixture = try HostFixture(shortPath: true)
+        defer { fixture.remove() }
+        let host = try await fixture.start()
+        let server = try NativeHostControlServer(host: host, peerUID: { _ in 0 })
+        defer { server.close() }
+        let live = fixture.root.appendingPathComponent(NativeHostControlServer.socketName)
+        let socket = live.path
+        // A pending connect that completed cleanly is a live channel.
+        let completed = NativeHostControlServer.channelAnswers(path: socket, connect: { fd in
+            var address = controlAddress(live)
+            _ = withUnsafePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                }
+            }
+            return (-1, EINPROGRESS)
+        })
+        #expect(completed)
+        // A pending connect that carries a socket error is not a live channel.
+        let missing = controlAddress(fixture.root.appendingPathComponent("absent.sock"))
+        let failed = NativeHostControlServer.channelAnswers(path: socket, connect: { fd in
+            var address = missing
+            _ = withUnsafePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                }
+            }
+            return (-1, EINPROGRESS)
+        })
+        #expect(!failed)
+        try await host.shutdown()
+    }
+
     @Test("Every error type keeps its reason code on every platform")
     func crossPlatformReasonCodes() throws {
         // The classification is direct, not through a macOS-only path.
@@ -419,16 +453,45 @@ private func nativeHostMainScript() -> URL {
     iosRoot().appendingPathComponent("Scripts/BotFleetNativeHost/main.swift")
 }
 
-/// Writes a fixture payload through a verified handle: the path is opened with
-/// O_NOFOLLOW, the handle is checked to be a regular single-link file, and its
-/// device and inode must still match the listed path before anything is written.
+/// Writes a fixture payload through a verified handle.
+///
+/// The file is opened relative to its trusted directory: every ancestor is
+/// traversed with `openat` and `O_NOFOLLOW`, so no symlinked directory can
+/// redirect the write, and each traversed directory must be a real directory
+/// owned by root or by the effective user.  The opened handle is checked with
+/// `fstat` (a regular, single-link file) and compared with the listed path
+/// before anything is written.
 private func writeFixtureFile(_ payload: String, to url: URL) throws {
     let path = url.path
-    let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
+    let components = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+    guard components.count >= 2 else { throw NativeHostControlError.unsafeSocket }
+    let name = components.removeLast()
+    var directories: [Int32] = []
+    defer { for descriptor in directories { Darwin.close(descriptor) } }
+    var directory = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0)
+    guard directory >= 0 else { throw NativeHostControlError.unsafeSocket }
+    directories.append(directory)
+    for component in components {
+        let next = component.withCString {
+            openat(directory, $0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW, 0)
+        }
+        guard next >= 0 else { throw NativeHostControlError.unsafeSocket }
+        directories.append(next)
+        directory = next
+        var info = stat()
+        guard fstat(next, &info) == 0, info.st_mode & S_IFMT == S_IFDIR,
+              info.st_uid == 0 || info.st_uid == geteuid() else {
+            throw NativeHostControlError.unsafeSocket
+        }
+    }
+    let fd = name.withCString {
+        openat(directory, $0, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
+    }
     guard fd >= 0 else { throw NativeHostControlError.unsafeSocket }
     defer { Darwin.close(fd) }
     var handle = stat()
-    guard fstat(fd, &handle) == 0, handle.st_mode & S_IFMT == S_IFREG, handle.st_nlink == 1 else {
+    guard fstat(fd, &handle) == 0, handle.st_mode & S_IFMT == S_IFREG, handle.st_nlink == 1,
+          handle.st_uid == geteuid() else {
         throw NativeHostControlError.unsafeSocket
     }
     var listed = stat()
@@ -489,6 +552,17 @@ private func controlEventually(_ predicate: () -> Bool) async throws {
         try await Task.sleep(nanoseconds: 20_000_000)
     }
     throw NativeHeadlessHostError.stopped
+}
+
+/// Waits until the control channel answers a request.  The server binds the
+/// socket before it listens, so the socket file can exist while the listener is
+/// not ready yet, and only an answer proves the channel is live.
+private func controlEventuallyAnswering(_ fixture: HostFixture) async throws -> String {
+    for _ in 0..<250 {
+        if let answer = try? await controlRequest(fixture, "status\n"), !answer.isEmpty { return answer }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    throw NativeHostControlError.socketUnavailable
 }
 
 private func controlStatusEventually(_ fixture: HostFixture) async throws {
