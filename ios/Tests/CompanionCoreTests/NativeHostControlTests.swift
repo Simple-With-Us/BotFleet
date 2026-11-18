@@ -385,28 +385,16 @@ struct NativeHostControlTests {
         defer { server.close() }
         let live = fixture.root.appendingPathComponent(NativeHostControlServer.socketName)
         let socket = live.path
-        // A pending connect that completed cleanly is a live channel.
-        let completed = NativeHostControlServer.channelAnswers(path: socket, connect: { fd in
-            var address = controlAddress(live)
-            _ = withUnsafePointer(to: &address) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-                }
-            }
-            return (-1, EINPROGRESS)
-        })
+        // A pending connect that completed cleanly is a live channel: the
+        // injected outcome selects the pending branch, and the descriptor's own
+        // completion decides the answer.
+        let completed = NativeHostControlServer.channelAnswers(path: socket, connect: { _ in (-1, EINPROGRESS) })
         #expect(completed)
-        // A pending connect that carries a socket error is not a live channel.
-        let missing = controlAddress(fixture.root.appendingPathComponent("absent.sock"))
-        let failed = NativeHostControlServer.channelAnswers(path: socket, connect: { fd in
-            var address = missing
-            _ = withUnsafePointer(to: &address) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-                }
-            }
-            return (-1, EINPROGRESS)
-        })
+        // A pending connect that carries a socket error is not a live channel:
+        // the descriptor kept the kernel's own failure, so the injected errno
+        // cannot report a connection the socket did not make.
+        let absent = fixture.root.appendingPathComponent("absent.sock").path
+        let failed = NativeHostControlServer.channelAnswers(path: absent, connect: { _ in (-1, EINPROGRESS) })
         #expect(!failed)
         try await host.shutdown()
     }
@@ -456,7 +444,10 @@ private func nativeHostMainScript() -> URL {
 /// Why a fixture write was refused, so a failure names the step that failed.
 private enum FixtureWriteRefusal: Error, CustomStringConvertible {
     case ancestor(String, Int32)
+    case protectedPlace
     case trustedDirectory(Int32)
+    case trustedDirectoryOwnership
+    case trustedDirectoryWritable
     case entry(Int32)
     case handle(Int32)
     case listed(Int32)
@@ -464,12 +455,25 @@ private enum FixtureWriteRefusal: Error, CustomStringConvertible {
     var description: String {
         switch self {
         case .ancestor(let component, let code): return "ancestor \(component) errno=\(code)"
+        case .protectedPlace: return "protected place"
         case .trustedDirectory(let code): return "trusted directory errno=\(code)"
+        case .trustedDirectoryOwnership: return "trusted directory is not owned by this user"
+        case .trustedDirectoryWritable: return "trusted directory is group or world writable"
         case .entry(let code): return "entry errno=\(code)"
         case .handle(let code): return "handle errno=\(code)"
         case .listed(let code): return "listed errno=\(code)"
         }
     }
+}
+
+/// The repository's protected-place policy, mirrored for the fixture writer: a
+/// dotfile or dot directory, or anything under a credential or login
+/// directory, is never written to, whether the path names it or resolves to it.
+private func isProtectedFixturePath(_ path: String) -> Bool {
+    if path.split(separator: "/").contains(where: { $0.hasPrefix(".") }) { return true }
+    let folded = (path + "/").lowercased()
+    return ["/.ssh/", "/.secrets/", "/.gnupg/", "/.aws/", "/.config/gh/",
+            "/library/launchagents/", "/library/launchdaemons/"].contains { folded.contains($0) }
 }
 
 /// Writes a fixture payload through a verified handle.
@@ -494,14 +498,20 @@ private func writeFixtureFile(_ payload: String, to url: URL) throws {
         return String(cString: resolvedPath)
     }
     guard !resolved.isEmpty else { throw FixtureWriteRefusal.trustedDirectory(errno) }
+    // The named path and the path it resolves to are both refused when either
+    // names a protected place.
+    guard !isProtectedFixturePath(path), !isProtectedFixturePath(resolved) else {
+        throw FixtureWriteRefusal.protectedPlace
+    }
     let directory = open(resolved, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW, 0)
     guard directory >= 0 else { throw FixtureWriteRefusal.trustedDirectory(errno) }
     defer { Darwin.close(directory) }
     var directoryInfo = stat()
-    guard fstat(directory, &directoryInfo) == 0, directoryInfo.st_mode & S_IFMT == S_IFDIR,
-          directoryInfo.st_uid == geteuid(), directoryInfo.st_mode & 0o022 == 0 else {
+    guard fstat(directory, &directoryInfo) == 0, directoryInfo.st_mode & S_IFMT == S_IFDIR else {
         throw FixtureWriteRefusal.trustedDirectory(0)
     }
+    guard directoryInfo.st_uid == geteuid() else { throw FixtureWriteRefusal.trustedDirectoryOwnership }
+    guard directoryInfo.st_mode & 0o022 == 0 else { throw FixtureWriteRefusal.trustedDirectoryWritable }
     let fd = name.withCString {
         openat(directory, $0, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
     }

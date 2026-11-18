@@ -142,27 +142,34 @@ public final class NativeHostControlServer: @unchecked Sendable {
     ///
     /// The connect outcome can be injected, so a fixture can reach the pending
     /// branch without depending on a kernel's backlog timing.
+    ///
+    /// The real connect always runs first, so the descriptor holds the kernel's
+    /// own answer, and an injected outcome only selects which branch is taken.
+    /// The completion is still read from the descriptor, so an injected errno
+    /// can never report a connection the socket did not make.
     static func channelAnswers(path: String, connect: ((Int32) -> (result: Int32, connectError: Int32))? = nil) -> Bool {
         var address: sockaddr_un
         do { address = try Self.address(path) } catch { return false }
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
         defer { Darwin.close(fd) }
+        // A non-blocking connect can never wait on a full backlog.
+        _ = fcntl(fd, F_SETFL, O_NONBLOCK)
         var result: Int32 = 0
         var connectError: Int32 = 0
+        result = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                let status = Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                if status != 0 { connectError = errno }
+                return status
+            }
+        }
         if let connect = connect {
             let outcome = connect(fd)
-            result = outcome.result
-            connectError = outcome.connectError
-        } else {
-            // A non-blocking connect can never wait on a full backlog.
-            _ = fcntl(fd, F_SETFL, O_NONBLOCK)
-            result = withUnsafePointer(to: &address) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    let status = Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-                    if status != 0 { connectError = errno }
-                    return status
-                }
+            if outcome.result == -1,
+               NativeHostChannelProbe.isReachable(connectResult: outcome.result, connectError: outcome.connectError) {
+                result = outcome.result
+                connectError = outcome.connectError
             }
         }
         guard NativeHostChannelProbe.isReachable(connectResult: result, connectError: connectError) else { return false }
