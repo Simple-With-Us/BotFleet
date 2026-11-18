@@ -323,21 +323,25 @@ function readListedRegularFile(path, listed) {
 }
 
 /**
- * Credential and login directories a candidate path may never name or lead
- * into.  This restates PROTECTED_WRITE_PARTS in server/tool-policy.ts (that
- * file is TypeScript and imports zod, so this module cannot); the probe's own
- * test pins the two lists together.  It deliberately does NOT refuse every dot
- * directory the way that file's isProtectedPath does: the release store's own
- * default home is ~/.botfleet, so a release root there is the normal case.
+ * Credential, login and dot directories a candidate path may never name or
+ * lead into.  This restates PROTECTED_WRITE_PARTS in server/tool-policy.ts
+ * (that file is TypeScript and imports zod, so this module cannot); the
+ * probe's own test pins the two lists together.  Like that file's
+ * isProtectedPath, any other path component that starts with a dot is refused
+ * too, with one deliberate exception: APPLICATION_HOMES, BotFleet's own
+ * non-secret home.  The release store's default root is ~/.botfleet, so a
+ * release root there is the normal case and has to inspect.
  */
 export const PROTECTED_PATH_PARTS = Object.freeze([
   "/.ssh/", "/.secrets/", "/.gnupg/", "/.aws/", "/.config/gh/", "/Library/LaunchAgents/", "/Library/LaunchDaemons/",
 ]);
+export const APPLICATION_HOMES = Object.freeze([".botfleet"]);
 
 function namesProtectedPlace(path) {
   // macOS volumes are case-insensitive by default, so compare folded.
   const folded = `${path}/`.toLowerCase();
-  return PROTECTED_PATH_PARTS.some((part) => folded.includes(part.toLowerCase()));
+  if (PROTECTED_PATH_PARTS.some((part) => folded.includes(part.toLowerCase()))) return true;
+  return path.split("/").some((part) => part.startsWith(".") && !APPLICATION_HOMES.includes(part.toLowerCase()));
 }
 
 /**
@@ -348,7 +352,7 @@ function namesProtectedPlace(path) {
  */
 function protectedPathBlocker(label, path) {
   const named = resolve(path);
-  if (namesProtectedPlace(named)) return blocker("candidate-path-protected", `${label} ${named} names a credential or login directory`);
+  if (namesProtectedPlace(named)) return blocker("candidate-path-protected", `${label} ${named} names a credential, login or dot directory`);
   let real;
   try {
     real = realpathSync(named);
@@ -357,7 +361,7 @@ function protectedPathBlocker(label, path) {
       ? blocker("candidate-path-dangling-link", `${label} ${named} is a link that does not resolve, so where it leads is unknown`)
       : null;
   }
-  if (namesProtectedPlace(real)) return blocker("candidate-path-protected", `${label} ${named} leads into a credential or login directory (${real})`);
+  if (namesProtectedPlace(real)) return blocker("candidate-path-protected", `${label} ${named} leads into a credential, login or dot directory (${real})`);
   return null;
 }
 
@@ -465,7 +469,7 @@ async function bindCandidate(candidate, { platform = process.platform } = {}) {
   }
 
   // Before anything is read, hashed, handed to git or started: none of the
-  // four named paths may name or lead into a credential or login directory.
+  // four named paths may name or lead into a credential, login or dot directory.
   for (const [label, named] of [["releaseRoot", releaseRoot], ["sourceRepo", sourceRepo], ["runtimePath", runtimePath], ["referenceDeps", referenceDeps]]) {
     if (!isText(named)) continue;
     const protectedPath = protectedPathBlocker(label, named);

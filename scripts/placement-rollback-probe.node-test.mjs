@@ -12,6 +12,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { promoteStaging, stagingPath, validateReleaseManifest } from "./harness-release-store.mjs";
 import {
+  APPLICATION_HOMES,
   CONTAINER_LOCKDOWN_ENV,
   PLACEMENT_ROLLBACK_RECIPE_VERSION,
   PLACEMENT_ROLLBACK_SCHEMA,
@@ -32,7 +33,19 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const POSIX_ONLY = process.platform === "win32"
   ? "process groups, release-store fixtures and normalized placement storage are POSIX-only"
   : false;
-const NODE = realpathSync(process.execPath);
+// The inspector refuses a runtime under a dot directory other than the
+// application's own (a Node under ~/.nvm, ~/.volta or ~/.asdf), so a host that
+// keeps its Node there runs these cases with a private copy of the same binary.
+function privateNodeCopy(path) {
+  const dir = mkdtempSync(join(tmpdir(), "bf-rollback-probe-node-"));
+  const copy = join(dir, "node");
+  copyFileSync(path, copy);
+  chmodSync(copy, 0o755);
+  process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
+  return copy;
+}
+const HOST_NODE = realpathSync(process.execPath);
+const NODE = HOST_NODE.split("/").some((part) => part.startsWith(".") && part.toLowerCase() !== ".botfleet") ? privateNodeCopy(HOST_NODE) : HOST_NODE;
 // Only a deadline is shortened here.  The recovery wait and the stop grace are
 // recipe steps a caller cannot shorten, so every case that reaches the passive
 // comparison pays the full recovery wait, exactly as a real run does.
@@ -451,7 +464,7 @@ test("a file is opened without following a link in its last component, or not at
   assert.throws(() => openWithoutFollowing(link), { code: "ELOOP" });
 });
 
-test("a candidate path that names or leads into a credential or login directory is blocked before it is read", { skip: POSIX_ONLY }, async (t) => {
+test("a candidate path that names or leads into a credential, login or dot directory is blocked before it is read", { skip: POSIX_ONLY }, async (t) => {
   const fixture = await makeCandidate(t);
   const root = realpathSync(fixture.root);
   const blockedFor = async (overrides, code, detail) => {
@@ -466,7 +479,7 @@ test("a candidate path that names or leads into a credential or login directory 
   mkdirSync(credentials);
   const inside = join(credentials, fixture.commit);
   execFileSync("cp", ["-Rp", fixture.releaseRoot, inside]);
-  await blockedFor({ releaseRoot: inside }, "candidate-path-protected", /^releaseRoot .* names a credential or login directory$/);
+  await blockedFor({ releaseRoot: inside }, "candidate-path-protected", /^releaseRoot .* names a credential, login or dot directory$/);
   await blockedFor({ referenceDeps: credentials }, "candidate-path-protected", /^referenceDeps /);
 
   // An innocent name that is a link into one: the repository and the runtime.
@@ -476,16 +489,25 @@ test("a candidate path that names or leads into a credential or login directory 
   chmodSync(join(aws, "node"), 0o755);
   const innocent = join(root, "innocent");
   symlinkSync(aws, innocent);
-  await blockedFor({ runtimePath: join(innocent, "node") }, "candidate-path-protected", /^runtimePath .* leads into a credential or login directory/);
-  await blockedFor({ sourceRepo: innocent }, "candidate-path-protected", /^sourceRepo .* leads into a credential or login directory/);
+  await blockedFor({ runtimePath: join(innocent, "node") }, "candidate-path-protected", /^runtimePath .* leads into a credential, login or dot directory/);
+  await blockedFor({ sourceRepo: innocent }, "candidate-path-protected", /^sourceRepo .* leads into a credential, login or dot directory/);
+
+  // Any other dot directory is refused the same way, named or reached by a link.
+  await blockedFor({ sourceRepo: join(root, ".git", "repo") }, "candidate-path-protected", /^sourceRepo .* names a credential, login or dot directory$/);
+  await blockedFor({ referenceDeps: join(root, ".cache") }, "candidate-path-protected", /^referenceDeps .* names a credential, login or dot directory$/);
+  const hidden = join(root, ".hidden-tools");
+  mkdirSync(hidden);
+  const toHidden = join(root, "plain-name");
+  symlinkSync(hidden, toHidden);
+  await blockedFor({ referenceDeps: toHidden }, "candidate-path-protected", /^referenceDeps .* leads into a credential, login or dot directory/);
 
   // A link that leads nowhere says nothing about where it was meant to land.
   const dangling = join(root, "dangling");
   symlinkSync(join(root, "no-such-target"), dangling);
   await blockedFor({ sourceRepo: dangling }, "candidate-path-dangling-link", /^sourceRepo .* does not resolve/);
 
-  // Only credential and login places are refused: the release store's own
-  // default home is a dot directory, and a release root there is ordinary.
+  // The one exception is BotFleet's own application home:  the release store's
+  // default root is ~/.botfleet, so a release root there is the ordinary case.
   const store = join(root, ".botfleet", "releases", fixture.commit);
   mkdirSync(dirname(store), { recursive: true });
   execFileSync("cp", ["-Rp", fixture.releaseRoot, store]);
@@ -946,6 +968,10 @@ test("the restated launch shape, lockdown environment and action list match thei
   const policyParts = [...declaredParts.slice(0, declaredParts.indexOf("];")).matchAll(/"([^"]+)"/g)].map((match) => match[1]);
   assert.ok(policyParts.length > 0);
   assert.deepEqual([...PROTECTED_PATH_PARTS], policyParts);
+  // The one dot directory allowed is where the release store itself lives.
+  const store = readFileSync(join(REPO_ROOT, "scripts", "harness-release-store.mjs"), "utf8");
+  assert.deepEqual([...APPLICATION_HOMES], [".botfleet"]);
+  assert.ok(store.includes(`return join(home, "${APPLICATION_HOMES[0]}");`));
 
   const probeSource = readFileSync(join(REPO_ROOT, "scripts", "placement-rollback-probe.mjs"), "utf8");
   // The behavior is shown by the open test above.  These pin its wiring: no
