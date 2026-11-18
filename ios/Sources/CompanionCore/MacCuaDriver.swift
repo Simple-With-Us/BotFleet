@@ -914,10 +914,15 @@ public final class MacCuaDriver: @unchecked Sendable {
         // Iterate Characters, not UTF-16 code units: a non-BMP scalar (emoji,
         // extended scripts) is a surrogate pair and both halves must ride in a
         // single CGEvent or the character is corrupted.
+        var charactersSinceTrustCheck = 0
         for character in text {
-            // The grant can be revoked mid-typing, so re-check it per character
-            // the way drag re-checks per step instead of relying on the opening check.
-            guard desktopControlIsAuthorized() else { return false }
+            // The grant can be revoked mid-typing, so re-check it at a bounded
+            // interval - every 32 characters - instead of paying a synchronous
+            // AXIsProcessTrusted() lookup per character with the default provider.
+            if charactersSinceTrustCheck % 32 == 0 {
+                guard desktopControlIsAuthorized() else { return false }
+            }
+            charactersSinceTrustCheck += 1
             guard isGenerationActive(startGeneration) else {
                 return false
             }
@@ -959,6 +964,13 @@ public final class MacCuaDriver: @unchecked Sendable {
     ///
     /// A mouse release is never gated: a button that was pressed has to be
     /// releasable even when the grant was taken away in the meantime.
+    /// The authorization source the action layer enforces, exposed so
+    /// permission gates (e.g. requireAccessibility) check the same grant,
+    /// including providers injected for tests and VMs.
+    public func isDesktopControlAuthorized() -> Bool {
+        desktopControlIsAuthorized()
+    }
+
     private func desktopControlIsAuthorized() -> Bool {
         accessibilityProvider()
     }
