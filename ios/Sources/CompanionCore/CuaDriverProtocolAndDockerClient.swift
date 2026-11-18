@@ -335,7 +335,7 @@ public final class HostMacCuaDriver: CuaDriverProtocol {
         guard macDriver.typeText(text) else {
             throw ContainerSocketError.httpStatus(
                 code: 409,
-                body: "Typing was interrupted before it completed, so the text was not typed."
+                body: "Typing was interrupted before it completed, so only part of the text may have been typed."
             )
         }
     }
@@ -343,7 +343,7 @@ public final class HostMacCuaDriver: CuaDriverProtocol {
     /// Mirrors `captureFrame`: no Accessibility grant means the action cannot
     /// happen, so the client gets a 403 instead of a silent success.
     private func requireAccessibility() throws {
-        guard macDriver.checkPermissions().hasAccessibility else {
+        guard macDriver.isDesktopControlAuthorized() else {
             throw ContainerSocketError.httpStatus(
                 code: 403,
                 body: "Accessibility permission is not granted, so BotFleet cannot control this Mac.\u{00A0} Turn it on in System Settings › Privacy & Security › Accessibility."
