@@ -9,14 +9,19 @@ import {
   parseSseFilters,
   ReplayBuffer,
   SLOW_CLIENT_BYTE_LIMIT,
+  SSE_BOT_ID_MAX_VALUES,
   SSE_FILTER_MAX_VALUES,
   SSE_FILTER_VALUE_MAX_LENGTH,
+  SseBotIdListSchema,
   SseFilterListSchema,
+  SseFiltersQuerySchema,
   wants,
   wantsReplayEntry,
   writeToClient,
+  type SseBotIdList,
   type SseClient,
   type SseFilterList,
+  type SseFiltersQuery,
   type SseWritable,
 } from "./sse-broadcast.ts";
 
@@ -168,12 +173,21 @@ describe("SSE filter validation, target extraction, and replay filtering", () =>
 
   it("validates and bounds SSE query filter allowlists", () => {
     const validKinds: SseFilterList = ["runtime", "bot"];
+    const validBots: SseBotIdList = Array.from({ length: 40 }, (_, i) => `bot/custom ${i}`);
+    const validQuery: SseFiltersQuery = { botId: validBots, kind: validKinds, threadId: ["t-1"] };
     expect(SseFilterListSchema.safeParse(validKinds).success).toBe(true);
+    expect(SseBotIdListSchema.safeParse(validBots).success).toBe(true);
+    expect(SseFiltersQuerySchema.safeParse(validQuery).success).toBe(true);
     expect(SseFilterListSchema.safeParse([""]).success).toBe(false);
     expect(SseFilterListSchema.safeParse(["bad space"]).success).toBe(false);
     expect(SseFilterListSchema.safeParse(["a".repeat(SSE_FILTER_VALUE_MAX_LENGTH + 1)]).success).toBe(false);
     expect(
       SseFilterListSchema.safeParse(Array.from({ length: SSE_FILTER_MAX_VALUES + 1 }, (_, i) => `t-${i}`)).success,
+    ).toBe(false);
+    expect(SseBotIdListSchema.safeParse([""]).success).toBe(false);
+    expect(SseBotIdListSchema.safeParse(["b".repeat(SSE_FILTER_VALUE_MAX_LENGTH + 1)]).success).toBe(false);
+    expect(
+      SseBotIdListSchema.safeParse(Array.from({ length: SSE_BOT_ID_MAX_VALUES + 1 }, (_, i) => `bot-${i}`)).success,
     ).toBe(false);
 
     const parsed = parseSseFilters(new URLSearchParams("kind=runtime&threadId=t-1&botId=b-1"));
@@ -181,8 +195,17 @@ describe("SSE filter validation, target extraction, and replay filtering", () =>
     if (parsed.ok) {
       expect(parsed.onlyKinds).toEqual(new Set(["runtime"]));
       expect(parsed.threadIds).toEqual(new Set(["t-1"]));
+      expect(parsed.screenBotIds).toEqual(new Set(["b-1"]));
     }
 
+    const manyBotsParams = new URLSearchParams(validBots.map((id) => ["botId", id]));
+    const parsedMany = parseSseFilters(manyBotsParams);
+    expect(parsedMany.ok).toBe(true);
+    if (parsedMany.ok) {
+      expect(parsedMany.screenBotIds?.size).toBe(40);
+    }
+
+    expect(parseSseFilters(new URLSearchParams("botId=")).ok).toBe(false);
     expect(parseSseFilters(new URLSearchParams("threadId=")).ok).toBe(false);
     expect(parseSseFilters(new URLSearchParams("kind=bad%20kind")).ok).toBe(false);
   });

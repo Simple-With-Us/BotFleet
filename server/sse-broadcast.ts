@@ -7,6 +7,7 @@
 import { z } from "zod";
 
 export const SSE_FILTER_MAX_VALUES = 32;
+export const SSE_BOT_ID_MAX_VALUES = 1024;
 export const SSE_FILTER_VALUE_MAX_LENGTH = 128;
 
 /** Bounded validation schema for repeated SSE query allowlists (`?kind=`, `?threadId=`). */
@@ -23,11 +24,35 @@ export const SseFilterListSchema = z
 
 export type SseFilterList = z.infer<typeof SseFilterListSchema>;
 
+/** Bounded validation schema for repeated SSE screen-watcher `?botId=` allowlists. */
+export const SseBotIdListSchema = z
+  .array(
+    z
+      .string()
+      .trim()
+      .min(1, "SSE botId filter value must not be empty")
+      .max(SSE_FILTER_VALUE_MAX_LENGTH, `SSE botId filter value must be at most ${SSE_FILTER_VALUE_MAX_LENGTH} characters`),
+  )
+  .max(SSE_BOT_ID_MAX_VALUES, `At most ${SSE_BOT_ID_MAX_VALUES} SSE botId filter values are allowed`);
+
+export type SseBotIdList = z.infer<typeof SseBotIdListSchema>;
+
+/** Strict boundary schema for `/api/events` subscription filter query parameters. */
+export const SseFiltersQuerySchema = z
+  .object({
+    botId: SseBotIdListSchema.optional(),
+    kind: SseFilterListSchema.optional(),
+    threadId: SseFilterListSchema.optional(),
+  })
+  .strict();
+
+export type SseFiltersQuery = z.infer<typeof SseFiltersQuerySchema>;
+
 export type SseFilterParseResult =
   | { ok: true; values: Set<string> | null }
   | { ok: false; message: string };
 
-/** Validate repeated SSE filter query parameters (`?kind=`, `?threadId=`). */
+/** Validate one repeated SSE filter query parameter (`?kind=`, `?threadId=`). */
 export function parseSseFilterParam(searchParams: URLSearchParams, name: string): SseFilterParseResult {
   if (!searchParams.has(name)) return { ok: true, values: null };
   const parsed = SseFilterListSchema.safeParse(searchParams.getAll(name));
@@ -67,29 +92,33 @@ export function extractSseFrameTarget(payload: SseFrameEnvelope): SseFrameTarget
 }
 
 export type SseFiltersParseResult =
-  | { ok: true; onlyKinds: Set<string> | null; threadIds: Set<string> | null }
+  | { ok: true; screenBotIds: Set<string> | null; onlyKinds: Set<string> | null; threadIds: Set<string> | null }
   | { ok: false; message: string };
 
-interface SseFilterBuckets {
-  kind: Set<string> | null;
-  threadId: Set<string> | null;
+interface SseFiltersQueryInput {
+  botId?: string[];
+  kind?: string[];
+  threadId?: string[];
 }
 
-/** Parse and validate new SSE subscription allowlists (`?kind=`, `?threadId=`). */
+/** Parse and validate `/api/events` SSE subscription allowlists (`?botId=`, `?kind=`, `?threadId=`). */
 export function parseSseFilters(searchParams: URLSearchParams): SseFiltersParseResult {
-  const parsed: SseFilterBuckets = {
-    kind: null,
-    threadId: null,
-  };
-  for (const name of ["kind", "threadId"] as const) {
-    const result = parseSseFilterParam(searchParams, name);
-    if (!result.ok) return result;
-    parsed[name] = result.values;
+  const raw: SseFiltersQueryInput = {};
+  if (searchParams.has("botId")) raw.botId = searchParams.getAll("botId");
+  if (searchParams.has("kind")) raw.kind = searchParams.getAll("kind");
+  if (searchParams.has("threadId")) raw.threadId = searchParams.getAll("threadId");
+  const parsed = SseFiltersQuerySchema.safeParse(raw);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      message: parsed.error.issues[0]?.message ?? "Invalid SSE filter",
+    };
   }
   return {
     ok: true,
-    onlyKinds: parsed.kind,
-    threadIds: parsed.threadId,
+    screenBotIds: parsed.data.botId ? new Set(parsed.data.botId) : null,
+    onlyKinds: parsed.data.kind ? new Set(parsed.data.kind) : null,
+    threadIds: parsed.data.threadId ? new Set(parsed.data.threadId) : null,
   };
 }
 

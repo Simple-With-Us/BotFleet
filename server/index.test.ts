@@ -6624,8 +6624,8 @@ describe("resumable event stream", () => {
     expect(await res.json()).toMatchObject({ ok: false, error: "invalid_cursor" });
   });
 
-  it("rejects empty or invalid kind/threadId SSE filters with HTTP 400 and preserves unconstrained botId subscriptions", async () => {
-    for (const query of ["kind=", "threadId=", `threadId=${"x".repeat(129)}`, "threadId=bad%20value"]) {
+  it("rejects empty or invalid kind/threadId/botId SSE filters with HTTP 400 while allowing >32 arbitrary botIds", async () => {
+    for (const query of ["kind=", "threadId=", "botId=", `threadId=${"x".repeat(129)}`, "threadId=bad%20value"]) {
       const res = await fetch(`${BASE}/api/events?${query}`);
       expect(res.status).toBe(400);
       expect(await res.json()).toMatchObject({ ok: false, error: "invalid_filter" });
