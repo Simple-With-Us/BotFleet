@@ -151,6 +151,34 @@ public struct ManagedServices: Equatable {
         statusAvailable || serverOutdated
     }
 
+    /// Whether the menu offers to start the local server.
+    ///
+    /// Only a refused connection proves the server is stopped, so the offer
+    /// needs the status route to be unreachable and the LaunchAgent to be
+    /// installed but not running.  A loaded job that does not answer is
+    /// unresponsive, not stopped, and a server older than Control answered
+    /// its health check, so neither is offered a start (BF-2527).  A wrapper
+    /// that predates the startup policy cannot be started through Control
+    /// either.
+    public static func canStartServer(startupPolicySupported: Bool,
+                                      apiUnavailable: Bool,
+                                      installedServerState: InstalledServerState) -> Bool {
+        startupPolicySupported && apiUnavailable && installedServerState == .stopped
+    }
+
+    /// Whether the menu offers to create the local shared VM while the
+    /// server is down.
+    ///
+    /// The server has to be proven stopped, the offline VM helper has to be
+    /// present, and the helper has to report the shared VM as missing.  Any
+    /// other shared VM state, or none at all, is not offered a create.
+    public static func canCreateOfflineVM(apiUnavailable: Bool,
+                                          installedServerState: InstalledServerState,
+                                          helperAvailable: Bool,
+                                          sharedVMState: String?) -> Bool {
+        apiUnavailable && installedServerState == .stopped && helperAvailable && sharedVMState == "missing"
+    }
+
     /// What a forced stop of a too-old server has to say afterwards, or nil
     /// when the port closed and there is nothing to say.
     ///
