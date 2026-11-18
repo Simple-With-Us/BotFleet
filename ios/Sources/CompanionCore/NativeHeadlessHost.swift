@@ -157,8 +157,6 @@ public enum NativeHeadlessHostState: String, Sendable {
 
 public enum NativeHostStartIntent: Equatable, Sendable { case automatic, explicit }
 
-public enum NativeHostLaunchArgumentsError: Error { case invalidArguments }
-
 /// Shared by the executable and installer fixtures so automatic startup has one argument contract.
 public struct NativeHostLaunchArguments: Sendable {
     public let serviceData: URL

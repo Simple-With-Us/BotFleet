@@ -318,6 +318,48 @@ struct NativeHostControlTests {
         try await host.shutdown()
     }
 
+    @Test("A pending non-blocking connect is treated as reachable and then verified")
+    func pendingConnectIsVerified() async throws {
+        // The decision a connect result makes: a connected socket, a pending
+        // connection and a full backlog all still mean the listener is live.
+        #expect(NativeHostChannelProbe.isReachable(connectResult: 0, connectError: 0))
+        #expect(NativeHostChannelProbe.isReachable(connectResult: -1, connectError: EINPROGRESS))
+        #expect(NativeHostChannelProbe.isReachable(connectResult: -1, connectError: EAGAIN))
+        // A refused or missing listener is not a live channel.
+        #expect(!NativeHostChannelProbe.isReachable(connectResult: -1, connectError: ENOENT))
+        #expect(!NativeHostChannelProbe.isReachable(connectResult: -1, connectError: ECONNREFUSED))
+        // A completed connection carries no socket error.
+        let pair = try fixtureSocketPair()
+        defer { Darwin.close(pair.0); Darwin.close(pair.1) }
+        #expect(NativeHostControlServer.connectionCompleted(pair.0))
+        // The live channel answers the probe and a missing one does not.
+        let fixture = try HostFixture(shortPath: true)
+        defer { fixture.remove() }
+        let host = try await fixture.start()
+        let server = try NativeHostControlServer(host: host, peerUID: { _ in 0 })
+        defer { server.close() }
+        let socket = fixture.root.appendingPathComponent(NativeHostControlServer.socketName).path
+        #expect(NativeHostControlServer.channelAnswers(path: socket))
+        #expect(!NativeHostControlServer.channelAnswers(path: fixture.root.appendingPathComponent("absent.sock").path))
+        try await host.shutdown()
+    }
+
+    @Test("Every error type keeps its reason code on every platform")
+    func crossPlatformReasonCodes() throws {
+        // The classification is direct, not through a macOS-only path.
+        #expect(NativeHostFailureReason.code(for: NativeHostControlError.unsafeSocket) == "unsafeSocket")
+        #expect(NativeHostFailureReason.code(for: NativeHostControlError.socketUnavailable) == "socketUnavailable")
+        #expect(NativeHostFailureReason.code(for: NativeHostControlError.startNotVerified(state: "stopped")) == "startNotVerified:stopped")
+        #expect(NativeHostFailureReason.code(for: NativeHostControlError.controlChannelUnreachable) == "controlChannelUnreachable")
+        #expect(NativeHostFailureReason.code(for: NativeHostLaunchArgumentsError.invalidArguments) == "invalidArguments")
+        // Neither the error types nor the map hide a case behind a platform guard,
+        // so a build that does not run the host classifies them the same way.
+        let errors = try String(contentsOf: companionCoreSource("NativeHostErrors.swift"), encoding: .utf8)
+        let reasons = try String(contentsOf: companionCoreSource("NativeHostFailureReason.swift"), encoding: .utf8)
+        #expect(!errors.contains("#if os(macOS)"))
+        #expect(!reasons.contains("#if os(macOS)"))
+    }
+
     @Test("Failure reasons are stable codes that never carry a message, a path or a token")
     func stableFailureReasons() {
         #expect(NativeHostFailureReason.code(for: NativeHeadlessHostError.ownerAlreadyRunning) == "ownerAlreadyRunning")
@@ -332,9 +374,29 @@ struct NativeHostControlTests {
     }
 }
 
+private func iosRoot() -> URL {
+    URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+}
+
+private func companionCoreSource(_ name: String) -> URL {
+    iosRoot().appendingPathComponent("Sources/CompanionCore").appendingPathComponent(name)
+}
+
 private func nativeHostMainScript() -> URL {
-    let ios = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-    return ios.appendingPathComponent("Scripts/BotFleetNativeHost/main.swift")
+    iosRoot().appendingPathComponent("Scripts/BotFleetNativeHost/main.swift")
+}
+
+/// A connected pair of sockets, used to read a completed connection's error.
+private func fixtureSocketPair() throws -> (Int32, Int32) {
+    var first: Int32 = 0
+    var second: Int32 = 0
+    let result = withUnsafeMutablePointer(to: &first) { firstPointer in
+        withUnsafeMutablePointer(to: &second) { secondPointer in
+            Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, firstPointer, secondPointer)
+        }
+    }
+    guard result == 0 else { throw NativeHostControlError.socketUnavailable }
+    return (first, second)
 }
 
 private func nativeHostExecutable() -> URL {

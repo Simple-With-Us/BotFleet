@@ -7,7 +7,9 @@ import Foundation
 /// could turn into a disclosure, so it is safe to write to a launchd stream, a
 /// log or a control reply.  An error the host does not recognise is reported as
 /// `unclassified` instead of by its description, because a description may
-/// quote a path or a credential.
+/// quote a path or a credential.  Every error type it classifies is declared
+/// outside the macOS-only runtime, so the mapping is never platform-conditional
+/// and no error type loses its code on a build that does not run the host.
 public enum NativeHostFailureReason {
     public static func code(for error: any Error) -> String {
         switch error {
@@ -15,12 +17,10 @@ public enum NativeHostFailureReason {
             return error.reasonCode
         case let error as DatabaseError:
             return error.reasonCode
-        #if os(macOS)
         case let error as NativeHostControlError:
             return error.reasonCode
         case let error as NativeHostLaunchArgumentsError:
             return error.reasonCode
-        #endif
         default:
             return "unclassified"
         }
@@ -57,10 +57,3 @@ extension DatabaseError {
         }
     }
 }
-
-#if os(macOS)
-extension NativeHostLaunchArgumentsError {
-    /// A stable reason code for a rejected launch request.
-    public var reasonCode: String { "invalidArguments" }
-}
-#endif

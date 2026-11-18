@@ -2,24 +2,14 @@
 import Foundation
 import Darwin
 
-public enum NativeHostControlError: Error, Equatable {
-    case unsafeSocket
-    case socketUnavailable
-    /// The host did not report a validated running state when the start was checked.
-    case startNotVerified(state: String)
-    /// The control channel did not answer, so the start could not be confirmed.
-    case controlChannelUnreachable
-}
-
-extension NativeHostControlError {
-    /// A stable, secret-free reason code for a failed control operation.
-    public var reasonCode: String {
-        switch self {
-        case .unsafeSocket: return "unsafeSocket"
-        case .socketUnavailable: return "socketUnavailable"
-        case .startNotVerified(let state): return "startNotVerified:\(state)"
-        case .controlChannelUnreachable: return "controlChannelUnreachable"
-        }
+/// How a non-blocking connect result is read.  A pending connection and a full
+/// backlog both mean the listener is still live, so they are completed and
+/// verified before the channel is ever called unreachable.
+public enum NativeHostChannelProbe {
+    /// True when the connect result still allows a live listener.
+    public static func isReachable(connectResult: Int32, connectError: Int32) -> Bool {
+        if connectResult == 0 { return true }
+        return connectError == EINPROGRESS || connectError == EAGAIN
     }
 }
 
@@ -135,7 +125,11 @@ public final class NativeHostControlServer: @unchecked Sendable {
 
     /// A bare connection proves the listener is live.  No request is sent, so the
     /// root-only peer check stays exactly as strict as it is in production.
-    private static func channelAnswers(path: String) -> Bool {
+    ///
+    /// A non-blocking connect can be pending or refused by a full backlog, and
+    /// neither state means the listener is gone, so the result is read by errno
+    /// and a pending connection is completed before it is believed.
+    static func channelAnswers(path: String) -> Bool {
         var address: sockaddr_un
         do { address = try Self.address(path) } catch { return false }
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
@@ -143,12 +137,29 @@ public final class NativeHostControlServer: @unchecked Sendable {
         defer { Darwin.close(fd) }
         // A non-blocking connect can never wait on a full backlog.
         _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+        var connectError: Int32 = 0
         let result = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                let status = Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                if status != 0 { connectError = errno }
+                return status
             }
         }
-        return result == 0
+        guard NativeHostChannelProbe.isReachable(connectResult: result, connectError: connectError) else { return false }
+        if result == 0 { return true }
+        // A pending connection is only a live channel once it completed cleanly.
+        return Self.connectionCompleted(fd)
+    }
+
+    /// Waits for a pending connection and reads the socket error the kernel kept
+    /// for it, so a pending connect is trusted only when it really connected.
+    static func connectionCompleted(_ fd: Int32) -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + 1
+        guard Self.wait(fd, events: Int16(POLLOUT), deadline: deadline) else { return false }
+        var socketError: Int32 = 0
+        var length = socklen_t(MemoryLayout<Int32>.size)
+        guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError, &length) == 0 else { return false }
+        return socketError == 0
     }
 
     private func acceptConnections(_ listener: Int32) {
