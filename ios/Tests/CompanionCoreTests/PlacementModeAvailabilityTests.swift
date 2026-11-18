@@ -130,6 +130,50 @@ final class PlacementModeAvailabilityTests: XCTestCase {
         )
         XCTAssertFalse(unreachableMacFirstBlocksServerFirst.options[1].isSelectable)
         XCTAssertFalse(unreachableMacFirstBlocksServerFirst.canTakeOverOnThisMac)
+
+        // Switching off reachable serverFirst with a server-owned overflow job running only on the Mac worker
+        // (runningLocalJobsCount = 1, runningServerJobsCount = 0) must still fence both localOnly and macFirst.
+        let serverOverflowOnMacOnly = PlacementModeAvailability.evaluate(
+            hosts: [.thisMac, verified],
+            selectedServerID: verified.id,
+            placement: serverApplied,
+            runningLocalJobsCount: 1,
+            runningServerJobsCount: 0,
+            serverReachable: true
+        )
+        XCTAssertFalse(serverOverflowOnMacOnly.options[0].isSelectable)
+        XCTAssertEqual(serverOverflowOnMacOnly.options[0].disabledReason, "Finish or stop 1 job running on this Mac first")
+        XCTAssertTrue(serverOverflowOnMacOnly.options[1].isSelectable)
+        XCTAssertFalse(serverOverflowOnMacOnly.options[2].isSelectable)
+        XCTAssertEqual(serverOverflowOnMacOnly.options[2].disabledReason, "Finish or stop 1 job running on this Mac first")
+    }
+
+    func testAppliedModeRemainsSelectableEvenIfServerRemovedOrUnmatched() throws {
+        let verified = try verifiedRemoteHost()
+        var serverApplied = PlacementSettings()
+        serverApplied.saved = PlacementSelection(mode: .serverFirst, serverID: verified.id)
+        serverApplied.applied = serverApplied.saved
+
+        let removedServer = PlacementModeAvailability.evaluate(
+            hosts: [.thisMac],
+            selectedServerID: verified.id,
+            placement: serverApplied
+        )
+        XCTAssertTrue(removedServer.options[0].isSelectable)
+        XCTAssertTrue(removedServer.options[1].isSelectable)
+        XCTAssertNil(removedServer.options[1].disabledReason)
+        XCTAssertFalse(removedServer.options[2].isSelectable)
+
+        let unmatchedSelection = PlacementModeAvailability.evaluate(
+            hosts: [.thisMac, verified],
+            selectedServerID: "missing-server-id",
+            placement: PlacementSettings()
+        )
+        XCTAssertTrue(unmatchedSelection.options[0].isSelectable)
+        XCTAssertFalse(unmatchedSelection.options[1].isSelectable)
+        XCTAssertEqual(unmatchedSelection.options[1].disabledReason, PlacementModeAvailability.selectServerReason)
+        XCTAssertFalse(unmatchedSelection.options[2].isSelectable)
+        XCTAssertEqual(unmatchedSelection.options[2].disabledReason, PlacementModeAvailability.selectServerReason)
     }
 
     func testSavedVsAppliedAndUnreachableBannerCopy() throws {

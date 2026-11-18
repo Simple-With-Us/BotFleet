@@ -19,6 +19,7 @@ public struct PlacementModeAvailability: Equatable, Sendable {
     public static let sectionTitle = "Where Bots Run"
     public static let emptyServerBanner = "No server added.\u{00A0} BotFleet runs on this Mac.\u{00A0} Add a server if you have one."
     public static let addServerReason = "Add a server to use this mode."
+    public static let selectServerReason = "Select a saved server to use this mode."
     public static let testServerReason = "Test this server before using this mode."
     public static let overflowToggleTitle = "Allow Overflow To This Mac"
     public static let takeOverActionTitle = "Take Over On This Mac…"
@@ -47,9 +48,16 @@ public struct PlacementModeAvailability: Equatable, Sendable {
         }
         let hasRemote = !remoteHosts.isEmpty
         let hasVerified = !verifiedHosts.isEmpty
-        let targetServer = selectedServerID.flatMap { id in remoteHosts.first(where: { $0.id == id }) }
-            ?? verifiedHosts.first
-            ?? remoteHosts.first
+        let targetServer: HostRecord?
+        let hasUnmatchedSelection: Bool
+        if let selectedServerID {
+            let matched = remoteHosts.first(where: { $0.id == selectedServerID })
+            targetServer = matched
+            hasUnmatchedSelection = hasRemote && matched == nil
+        } else {
+            targetServer = verifiedHosts.first ?? remoteHosts.first
+            hasUnmatchedSelection = false
+        }
         let targetVerified = targetServer.flatMap { host -> Bool in
             guard let hostId = host.hostId else { return false }
             return HostRecord.validHostId(hostId)
@@ -63,6 +71,7 @@ public struct PlacementModeAvailability: Equatable, Sendable {
                 for: mode,
                 appliedMode: appliedMode,
                 hasRemote: hasRemote,
+                hasUnmatchedSelection: hasUnmatchedSelection,
                 targetVerified: targetVerified,
                 runningLocalJobsCount: runningLocalJobsCount,
                 runningServerJobsCount: runningServerJobsCount,
@@ -121,21 +130,25 @@ public struct PlacementModeAvailability: Equatable, Sendable {
         for targetMode: NativePlacementMode,
         appliedMode: NativePlacementMode,
         hasRemote: Bool,
+        hasUnmatchedSelection: Bool,
         targetVerified: Bool,
         runningLocalJobsCount: Int,
         runningServerJobsCount: Int,
         serverReachable: Bool
     ) -> String? {
+        if targetMode == appliedMode {
+            return nil
+        }
         if targetMode != .localOnly {
             if !hasRemote {
                 return addServerReason
             }
+            if hasUnmatchedSelection {
+                return selectServerReason
+            }
             if !targetVerified {
                 return testServerReason
             }
-        }
-        if targetMode == appliedMode {
-            return nil
         }
         if !serverReachable {
             if appliedMode == .serverFirst {
@@ -145,6 +158,20 @@ public struct PlacementModeAvailability: Equatable, Sendable {
             }
             if targetMode == .serverFirst {
                 return "Server is unreachable.\u{00A0} Wait for the server to return before switching to Server First."
+            }
+        }
+        if appliedMode == .serverFirst {
+            let activeTotal = runningServerJobsCount + runningLocalJobsCount
+            if activeTotal > 0 {
+                if runningServerJobsCount > 0 && runningLocalJobsCount > 0 {
+                    return "Finish or stop \(activeTotal) jobs running across the server and this Mac first"
+                }
+                if runningServerJobsCount > 0 {
+                    let noun = runningServerJobsCount == 1 ? "job" : "jobs"
+                    return "Finish or stop \(runningServerJobsCount) \(noun) running on the server first"
+                }
+                let noun = runningLocalJobsCount == 1 ? "job" : "jobs"
+                return "Finish or stop \(runningLocalJobsCount) \(noun) running on this Mac first"
             }
         }
         if runningLocalJobsCount > 0 && targetMode == .serverFirst {

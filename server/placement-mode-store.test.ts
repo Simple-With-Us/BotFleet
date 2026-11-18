@@ -3,10 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { PLACEMENT_WIRE_VERSION, type HostId } from "../shared/placement.ts";
+import { HOST_ID_PATTERN, PLACEMENT_WIRE_VERSION, type HostId } from "../shared/placement.ts";
 import { openControllerEpochStore } from "./placement-identity.ts";
 import { PlacementLeaseService } from "./placement-leases.ts";
-import { PlacementModeStore, placementModeRead, placementModeWrite } from "./placement-mode-store.ts";
+import { PlacementModeStore, placementModeInputSchema, placementModeRead, placementModeWrite } from "./placement-mode-store.ts";
 
 /** The stored record, read back the way the store writes it. */
 const storedRecord = z.object({
@@ -251,8 +251,41 @@ describe("the placement mode route", () => {
   });
 
   it("matches the shared T7 Swift/TypeScript placement-mode contract fixture", () => {
-    const shared = JSON.parse(
-      readFileSync(new URL("../ios/Tests/CompanionCoreTests/Fixtures/placement-mode-frames.json", import.meta.url), "utf8"),
+    const fixtureHostId = z.string().regex(HOST_ID_PATTERN).transform((value) => value as HostId);
+    const ackFrameSchema = z.object({
+      controllerId: fixtureHostId,
+      epoch: z.number().int().nonnegative(),
+      mode: z.enum(["localOnly", "serverFirst", "macFirst"]),
+      serverId: fixtureHostId.nullable(),
+      allowOverflowToThisMac: z.boolean(),
+      acknowledged: z.boolean(),
+      appliedAt: z.number().int().nonnegative().nullable(),
+      reason: z.string().nullable(),
+    }).strict();
+    const sharedFixtureSchema = z.object({
+      macHostId: fixtureHostId,
+      serverHostId: fixtureHostId,
+      takeoverServerHostId: fixtureHostId,
+      appliedAt: z.number().int().nonnegative(),
+      unwrittenDefault: ackFrameSchema,
+      localOnlyWrite: placementModeInputSchema,
+      localOnlyAck: ackFrameSchema,
+      macFirstWrite: placementModeInputSchema,
+      macFirstAck: ackFrameSchema,
+      serverFirstWrite: placementModeInputSchema,
+      serverFirstAck: ackFrameSchema,
+      staleFence409: z.object({
+        error: z.string(),
+        controllerId: fixtureHostId,
+        epoch: z.number().int().nonnegative(),
+      }).strict(),
+      staleAckUnacknowledged: ackFrameSchema,
+    }).strict();
+
+    const shared = sharedFixtureSchema.parse(
+      JSON.parse(
+        readFileSync(new URL("../ios/Tests/CompanionCoreTests/Fixtures/placement-mode-frames.json", import.meta.url), "utf8"),
+      ),
     );
 
     // 1. Mac controller: unwritten default & localOnly write.
