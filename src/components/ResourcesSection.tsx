@@ -235,7 +235,14 @@ function HeadroomCard({
     setTouched(false);
     setSubmitAttempted(false);
     setError(null);
-  }, [report.hostId, report.admission.reservedCpuCores, report.admission.reservedRamBytes, report.admission.minMemoryAvailablePercent]);
+  }, [
+    report.hostId,
+    report.admission.reservedCpuCores,
+    report.admission.reservedRamBytes,
+    report.admission.minMemoryAvailablePercent,
+    report.admission.minFreeDiskBytes,
+    report.admission.minFreeInodes,
+  ]);
 
   const parsed = parseHeadroomEdit(values, currentHeadroomKnobs(report.admission));
   const showValidation = !parsed.ok && (touched || submitAttempted);
@@ -324,6 +331,38 @@ function HeadroomCard({
             className={inputClass}
           />
         </div>
+        <div className="flex flex-col gap-1">
+          <label className="text-[12px] font-medium text-ink-secondary" htmlFor="resources-min-free-disk">
+            Minimum free disk (MB)
+          </label>
+          <input
+            id="resources-min-free-disk"
+            type="number"
+            value={values.minFreeDiskMb ?? ""}
+            min={2048}
+            step={1}
+            placeholder="2048 (2 GB built-in)"
+            onChange={(e) => markTouched({ ...values, minFreeDiskMb: e.target.value })}
+            aria-label="Minimum free disk in MB"
+            className={inputClass}
+          />
+        </div>
+        <div className="flex flex-col gap-1">
+          <label className="text-[12px] font-medium text-ink-secondary" htmlFor="resources-min-free-inodes">
+            Minimum free inodes
+          </label>
+          <input
+            id="resources-min-free-inodes"
+            type="number"
+            value={values.minFreeInodes ?? ""}
+            min={0}
+            step={1}
+            placeholder="Not set"
+            onChange={(e) => markTouched({ ...values, minFreeInodes: e.target.value })}
+            aria-label="Minimum free inodes"
+            className={inputClass}
+          />
+        </div>
       </div>
       {showValidation && (
         <div role="alert" className="mt-2 text-[12px] leading-relaxed text-danger">
@@ -363,6 +402,8 @@ function HeadroomCard({
           <li>BOTFLEET_JOBS_RESERVED_CPU_CORES</li>
           <li>BOTFLEET_JOBS_RESERVED_RAM_MB</li>
           <li>BOTFLEET_JOBS_MIN_MEMORY_AVAILABLE_PERCENT</li>
+          <li>BOTFLEET_JOBS_MIN_FREE_DISK_MB</li>
+          <li>BOTFLEET_JOBS_MIN_FREE_INODES</li>
         </ul>
       </details>
     </Card>
