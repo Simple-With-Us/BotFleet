@@ -45,6 +45,13 @@ test("pnpm test must chain the script as its own unmasked step", () => {
   assert.match(wired(plain, "node scripts/test-floor.mjs && pnpm test:ci-scope").join("\n"), /does not chain `pnpm test:mac-updater`/);
   assert.match(wired(plain, "pnpm test:mac-updater || true && pnpm test:ci-scope").join("\n"), /does not chain `pnpm test:mac-updater`/);
   assert.match(wired(plain, "pnpm test:mac-updater-old && pnpm test:ci-scope").join("\n"), /does not chain `pnpm test:mac-updater`/);
+  // A clean step is not enough when something masks the whole chain.
+  const masked = (chain) => wired(plain, chain).join("\n");
+  assert.match(masked("pnpm test:mac-updater && pnpm test:ci-scope || true"), /carries `\|\|`/);
+  assert.match(masked("pnpm test:mac-updater && pnpm test:ci-scope ; true"), /carries `;`/);
+  assert.match(masked("pnpm test:mac-updater && pnpm test:ci-scope | tee gate.log"), /carries `\|`/);
+  assert.match(masked("pnpm test:mac-updater && pnpm test:ci-scope &"), /carries `&`/);
+  assert.deepEqual(wired(plain, "pnpm test:mac-updater && pnpm test:ci-scope"), [], "`&&` alone joins steps");
   assert.deepEqual(gateWiringProblems({ "test:mac-updater": plain }, "test:mac-updater", [PROVENANCE]), [
     "`pnpm test` does not chain `pnpm test:mac-updater` as its own step, so hosted CI never runs it",
   ]);
@@ -65,7 +72,13 @@ test("an opt-in file is refused in any step that reaches it without the switch",
   // The switch belongs to the step that runs the file, not to a neighbour.
   assert.deepEqual(reaches(`${OPT_IN} node --version && node --test ${INSTALL}`), refusal);
   assert.deepEqual(reaches(`${OPT_IN}0 node --test ${INSTALL}`), refusal, "the switch is a whole token");
+  // After the runner it is an argument to node, and the variable stays unset.
+  assert.deepEqual(reaches(`node --test ${INSTALL} ${OPT_IN}`), refusal, "a trailing assignment sets nothing");
+  assert.deepEqual(reaches(`node --test ${OPT_IN} ${INSTALL}`), refusal, "an assignment after the flag sets nothing");
   assert.deepEqual(reaches(`${OPT_IN} node --test ${INSTALL}`), []);
+  assert.deepEqual(reaches(`OTHER=1 ${OPT_IN} node --test ${INSTALL}`), [], "several leading assignments");
+  assert.deepEqual(reaches(`env ${OPT_IN} node --test ${INSTALL}`), [], "env sets it for its command");
+  assert.deepEqual(reaches(`cross-env ${OPT_IN} node --test ${INSTALL}`), [], "cross-env sets it for its command");
   assert.deepEqual(reaches(`node --test ${PROVENANCE} ${RELEASE}`), []);
   assert.deepEqual(reaches("node --test scripts/update-*.node-test.mjs"), [], "a glob that cannot cover it");
   assert.deepEqual(reaches("node --test electron/*.node-test.mjs"), []);

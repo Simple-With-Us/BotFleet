@@ -29,9 +29,17 @@ export function gateWiringProblems(scripts, script, suites) {
   for (const suite of suites) {
     if (!files.includes(suite)) problems.push(`${script} does not name ${suite}, so hosted CI never runs it`);
   }
-  const chain = String(scripts.test ?? "").split("&&").map((step) => step.trim());
+  const testCommand = String(scripts.test ?? "");
+  const chain = testCommand.split("&&").map((step) => step.trim());
   if (!chain.includes(`pnpm ${script}`)) {
     problems.push(`\`pnpm test\` does not chain \`pnpm ${script}\` as its own step, so hosted CI never runs it`);
+  }
+  // A clean step inside a chain that something else masks still cannot fail
+  // CI: `a && b || true` exits 0 whatever b does, and `a && b | tee log` or
+  // `a && b ; c` report only the last command.  Only `&&` may join steps.
+  const masking = testCommand.replaceAll("&&", " ").match(/\|\||[|;&]/);
+  if (masking) {
+    problems.push(`\`pnpm test\` carries \`${masking[0]}\`, so a failing step in its chain would not fail hosted CI`);
   }
   return problems;
 }
@@ -49,11 +57,22 @@ function globCovers(token, file) {
   return file.startsWith(pattern.slice(0, first)) && file.endsWith(pattern.slice(last + 1));
 }
 
+// The environment assignments a step sets for its command: the leading
+// `NAME=value` tokens, after an optional `env` or `cross-env`.  A `NAME=value`
+// after the runner is an argument to node and leaves the variable unset.
+function leadingAssignments(tokens) {
+  let index = tokens[0] === "env" || tokens[0] === "cross-env" ? 1 : 0;
+  const assigned = [];
+  while (index < tokens.length && /^[A-Za-z_]\w*=/.test(tokens[index])) assigned.push(tokens[index++]);
+  return assigned;
+}
+
 /**
  * Scripts that would run the opt-in test `file` without its switch.  Such a
  * run reports one skip, which reads as coverage that never ran.  A step
  * reaches the file by naming it anywhere (any prefix, or run directly), or by
- * a `--test` glob that covers it; the switch must be a token of that step.
+ * a `--test` glob that covers it; the switch must be set in that step's own
+ * environment, as a leading `NAME=value` assignment before the runner.
  */
 export function optInProblems(scripts, file, optIn) {
   const base = file.slice(file.lastIndexOf("/") + 1);
@@ -63,7 +82,7 @@ export function optInProblems(scripts, file, optIn) {
       const tokens = step.trim().split(/\s+/);
       const named = tokens.some((token) => token.includes(base));
       const globbed = tokens.includes("--test") && tokens.some((token) => globCovers(token, file));
-      if ((named || globbed) && !tokens.includes(optIn)) {
+      if ((named || globbed) && !leadingAssignments(tokens).includes(optIn)) {
         problems.push(`${name} reaches ${file} without ${optIn}, so it would only report a skip`);
       }
     }
