@@ -115,6 +115,52 @@ function searchColumns(message: Message & { content?: string }): [string | null,
 const ACTIVE_PATH_CACHE_LIMIT = 256;
 const activePathCache = new Map<string, { leafId: string; ids: Set<string> }>();
 
+export interface ThreadSummary {
+  lastMessage: Message | undefined;
+  messageCount: number;
+  startedAt: number | undefined;
+}
+
+export const TASK_PREVIEW_TEXT_LIMIT = 500;
+
+/** Clip a message for lightweight summary storage and wire previews so neither
+ * `threadSummaryCache` nor `wireTask` retains base64 screen captures, audio
+ * recordings, or multi-kilobyte text blobs. */
+export function clipTaskLastMessage(message: Message | undefined): Message | undefined {
+  if (!message) return undefined;
+  const clipped: Message = { ...message };
+  delete clipped.png;
+  delete clipped.recording;
+  if (clipped.text && clipped.text.length > TASK_PREVIEW_TEXT_LIMIT) {
+    clipped.text = clipped.text.slice(0, TASK_PREVIEW_TEXT_LIMIT);
+  }
+  if (clipped.tool?.detail && clipped.tool.detail.length > TASK_PREVIEW_TEXT_LIMIT) {
+    clipped.tool = {
+      ...clipped.tool,
+      detail: clipped.tool.detail.slice(0, TASK_PREVIEW_TEXT_LIMIT),
+    };
+  }
+  return clipped;
+}
+
+const THREAD_SUMMARY_CACHE_LIMIT = 512;
+const threadSummaryCache = new Map<string, ThreadSummary>();
+
+function cacheThreadSummary(threadId: string, summary: ThreadSummary): ThreadSummary {
+  const clipped: ThreadSummary = {
+    ...summary,
+    lastMessage: clipTaskLastMessage(summary.lastMessage),
+  };
+  if (threadSummaryCache.has(threadId)) {
+    threadSummaryCache.delete(threadId);
+  } else if (threadSummaryCache.size >= THREAD_SUMMARY_CACHE_LIMIT) {
+    const oldest = threadSummaryCache.keys().next().value;
+    if (oldest !== undefined) threadSummaryCache.delete(oldest);
+  }
+  threadSummaryCache.set(threadId, clipped);
+  return { ...clipped };
+}
+
 /** One-time import for databases that predated the side table. */
 function backfillRunningHelpers(database: DatabaseSync): void {
   // SAFETY: `COUNT(*)` on `running_helpers` always returns one numeric row.
@@ -169,6 +215,8 @@ function db(): DatabaseSync {
   } catch (error) {
     console.error("[message-db] closing the previous database handle before reopen failed", error);
   }
+  activePathCache.clear();
+  threadSummaryCache.clear();
   handle = open();
   handlePath = DB_FILE();
   return handle;
@@ -196,9 +244,60 @@ export function readThread(threadId: string, legacyFile: string): ThreadRows {
     const state = db()
       .prepare("SELECT active_leaf_id FROM thread_state WHERE thread_id = ?")
       .get(threadId) as { active_leaf_id: string | null } | undefined;
+    cacheThreadSummary(threadId, {
+      lastMessage: messages.at(-1),
+      messageCount: messages.length,
+      startedAt: messages[0]?.at,
+    });
     return { messages, activeLeafId: state?.active_leaf_id ?? null };
   }
   return importLegacy(threadId, legacyFile);
+}
+
+/** Read a thread's count, start timestamp, and last message without hydrating
+ * the full transcript. Uses an indexed bounded LRU summary cache so repeated
+ * `wireTask` / `wireBot` serializations do not re-query SQLite. */
+export function readThreadSummary(threadId: string, legacyFile?: string): ThreadSummary {
+  const database = db();
+  const cached = threadSummaryCache.get(threadId);
+  if (cached) {
+    threadSummaryCache.delete(threadId);
+    threadSummaryCache.set(threadId, cached);
+    return { ...cached };
+  }
+  // SAFETY: `COUNT(*)` always returns one `{ n: number }` row.
+  const countRow = database
+    .prepare("SELECT COUNT(*) AS n FROM messages WHERE thread_id = ?")
+    .get(threadId) as { n: number };
+  if (countRow.n === 0) {
+    if (legacyFile && existsSync(legacyFile)) {
+      const imported = importLegacy(threadId, legacyFile);
+      return cacheThreadSummary(threadId, {
+        lastMessage: imported.messages.at(-1),
+        messageCount: imported.messages.length,
+        startedAt: imported.messages[0]?.at,
+      });
+    }
+    return cacheThreadSummary(threadId, {
+      lastMessage: undefined,
+      messageCount: 0,
+      startedAt: undefined,
+    });
+  }
+  // SAFETY: `ORDER BY rowid ASC LIMIT 1` returns at most one `{ at: number }` row for the earliest message.
+  const firstRow = database
+    .prepare("SELECT at FROM messages WHERE thread_id = ? ORDER BY rowid ASC LIMIT 1")
+    .get(threadId) as { at: number } | undefined;
+  // SAFETY: `ORDER BY rowid DESC LIMIT 1` returns at most one `{ json: string }` row for the latest message.
+  const lastRow = database
+    .prepare("SELECT json FROM messages WHERE thread_id = ? ORDER BY rowid DESC LIMIT 1")
+    .get(threadId) as { json: string } | undefined;
+  const lastMessage = lastRow ? rowToMessage(lastRow) : undefined;
+  return cacheThreadSummary(threadId, {
+    lastMessage,
+    messageCount: countRow.n,
+    startedAt: firstRow?.at,
+  });
 }
 
 /** One message by id, without hydrating its thread — the boot helper sweep
@@ -320,7 +419,13 @@ function importLegacy(threadId: string, legacyFile: string): ThreadRows {
     // ENOENT is a fresh thread with no legacy file yet; anything else means a
     // real transcript failed to read and is about to masquerade as empty.
     // SAFETY: a failed `readFileSync` throws an errno exception carrying `code`.
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      cacheThreadSummary(threadId, {
+        lastMessage: undefined,
+        messageCount: 0,
+        startedAt: undefined,
+      });
+    } else {
       console.error(`[message-db] could not read legacy thread file ${legacyFile}; treating the thread as empty`, error);
     }
     return { messages, activeLeafId }; // fresh thread
@@ -351,6 +456,11 @@ function importLegacy(threadId: string, legacyFile: string): ThreadRows {
     }
     setActiveLeaf(threadId, activeLeafId);
     db().exec("COMMIT");
+    cacheThreadSummary(threadId, {
+      lastMessage: messages.at(-1),
+      messageCount: messages.length,
+      startedAt: messages[0]?.at,
+    });
   } catch (error) {
     db().exec("ROLLBACK");
     throw error;
@@ -401,17 +511,26 @@ export function insertMessage(threadId: string, message: Message): void {
       JSON.stringify(message),
     );
   activePathCache.delete(threadId);
+  threadSummaryCache.delete(threadId);
   syncRunningHelper(threadId, message);
 }
 
 /** Persist a new message and the branch head as one crash-safe mutation. */
 export function appendMessage(threadId: string, message: Message): void {
   const database = db();
+  const previousSummary = threadSummaryCache.get(threadId);
   database.exec("BEGIN IMMEDIATE");
   try {
     insertMessage(threadId, message);
     setActiveLeaf(threadId, message.id);
     database.exec("COMMIT");
+    if (previousSummary) {
+      cacheThreadSummary(threadId, {
+        lastMessage: message,
+        messageCount: previousSummary.messageCount + 1,
+        startedAt: previousSummary.startedAt ?? message.at,
+      });
+    }
   } catch (error) {
     database.exec("ROLLBACK");
     throw error;
@@ -523,6 +642,7 @@ export function updateMessage(threadId: string, message: Message): void {
       message.id,
     );
   activePathCache.delete(threadId);
+  threadSummaryCache.delete(threadId);
   syncRunningHelper(threadId, message);
 }
 
@@ -541,6 +661,7 @@ export function deleteThread(threadId: string): void {
   db().prepare("DELETE FROM thread_state WHERE thread_id = ?").run(threadId);
   db().prepare("DELETE FROM running_helpers WHERE thread_id = ?").run(threadId);
   activePathCache.delete(threadId);
+  threadSummaryCache.delete(threadId);
 }
 
 /** Freelist bytes above which `pruneDeadThreads` runs a full `VACUUM`
@@ -666,7 +787,10 @@ export function pruneDeadThreads(
       threadStateDeleted += Number(deleteState.run(threadId).changes ?? 0);
     }
     database.exec("COMMIT");
-    for (const threadId of dead) activePathCache.delete(threadId);
+    for (const threadId of dead) {
+      activePathCache.delete(threadId);
+      threadSummaryCache.delete(threadId);
+    }
   } catch (error) {
     database.exec("ROLLBACK");
     throw error;
@@ -814,6 +938,7 @@ export function activePathIds(threadId: string): Set<string> {
 /** Test/shutdown hook — closes the handle so a wiped DATA_DIR starts clean. */
 export function closeMessageDb(): void {
   activePathCache.clear();
+  threadSummaryCache.clear();
   try {
     handle?.close();
   } catch {

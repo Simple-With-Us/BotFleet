@@ -4,7 +4,7 @@ Refs BF-2559 and BF-2601.  This collector records current host capacity and the
 
 ## Authorization And Invocation
 
-The implementation is fixture-tested only; no live host inventory is included with this change.  The owner has not authorized the live Mac or server collection yet.  After that authorization, choose the host, selected units or PIDs, observation window, sample interval and a dedicated output directory, then run from this checkout:
+The implementation is fixture-tested only; no live host inventory is included with this change.  The owner authorized the live collection on November 18, 2026, for the server host and the Mac host, and the scope is the one below:  the chosen host, the selected units or PIDs, the observation window, the sample interval and a dedicated output directory.  The server collection ran on the server host on November 17 and 18, 2026, over a thirty-minute window with a ten-second interval, with `/` as the root path and `/mnt/fleet-extra` as the data path, against `botfleet-server.service` and `botfleet-owner-gate.service`;  its two artifacts are on that host in a private report directory.  The Mac collection has not run, and it is assigned to a Mac seat.  Choose the host, selected units or PIDs, observation window, sample interval and a dedicated output directory, then run from this checkout:
 
 ```sh
 node scripts/host-inventory.mjs \

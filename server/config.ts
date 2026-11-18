@@ -625,8 +625,8 @@ const appConfigSchema = z.object({
     cpuCores: z.number().min(1).max(64).optional(),
     admission: z.object({
       maxSwapPercent: z.number().min(1).max(100).optional(),
-      minFreeDiskMb: z.number().min(0).optional(),
-      minFreeInodes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+      minFreeDiskMb: z.number().min(0).nullable().optional(),
+      minFreeInodes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable().optional(),
       // Headroom (P-BF-6 B7): absent means unset — no gate and no default.
       // `null` is the wire spelling of "clear this knob back to unset" and is
       // what a client sends when the owner empties a previously-set box.
@@ -897,7 +897,7 @@ export interface AppConfig {
     maxMinutes?: number;
     queueWaitMinutes?: number;
     cpuCores?: number;
-    admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number; reservedCpuCores?: number | null; reservedRamMb?: number | null; minMemoryAvailablePercent?: number | null };
+    admission?: { maxSwapPercent?: number; minFreeDiskMb?: number | null; minFreeInodes?: number | null; reservedCpuCores?: number | null; reservedRamMb?: number | null; minMemoryAvailablePercent?: number | null };
     /** Minutes a hot host may park a webhook before the wake dispatches
      *  anyway.  Absent means 20. */
     webhookHotDeferMinutes?: number;
@@ -2575,12 +2575,21 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // null deletes; an absent key still leaves the stored value alone.
   {
     const admission = checkedPatch.jobs?.admission;
-    if (admission && (admission.reservedCpuCores === null || admission.reservedRamMb === null || admission.minMemoryAvailablePercent === null)) {
+    if (
+      admission &&
+      (admission.minFreeDiskMb === null ||
+        admission.minFreeInodes === null ||
+        admission.reservedCpuCores === null ||
+        admission.reservedRamMb === null ||
+        admission.minMemoryAvailablePercent === null)
+    ) {
       const stored = jsonObjectSchema.safeParse(disk.jobs);
       if (stored.success) {
         const storedAdmission = jsonObjectSchema.safeParse(stored.data.admission);
         if (storedAdmission.success) {
           const next = { ...storedAdmission.data };
+          if (admission.minFreeDiskMb === null) delete next.minFreeDiskMb;
+          if (admission.minFreeInodes === null) delete next.minFreeInodes;
           if (admission.reservedCpuCores === null) delete next.reservedCpuCores;
           if (admission.reservedRamMb === null) delete next.reservedRamMb;
           if (admission.minMemoryAvailablePercent === null) delete next.minMemoryAvailablePercent;
