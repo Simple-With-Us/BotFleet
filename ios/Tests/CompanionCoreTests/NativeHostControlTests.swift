@@ -453,56 +453,73 @@ private func nativeHostMainScript() -> URL {
     iosRoot().appendingPathComponent("Scripts/BotFleetNativeHost/main.swift")
 }
 
+/// Why a fixture write was refused, so a failure names the step that failed.
+private enum FixtureWriteRefusal: Error, CustomStringConvertible {
+    case ancestor(String, Int32)
+    case trustedDirectory(Int32)
+    case entry(Int32)
+    case handle(Int32)
+    case listed(Int32)
+
+    var description: String {
+        switch self {
+        case .ancestor(let component, let code): return "ancestor \(component) errno=\(code)"
+        case .trustedDirectory(let code): return "trusted directory errno=\(code)"
+        case .entry(let code): return "entry errno=\(code)"
+        case .handle(let code): return "handle errno=\(code)"
+        case .listed(let code): return "listed errno=\(code)"
+        }
+    }
+}
+
 /// Writes a fixture payload through a verified handle.
 ///
-/// The file is opened relative to its trusted directory: every ancestor is
-/// traversed with `openat` and `O_NOFOLLOW`, so no symlinked directory can
-/// redirect the write, and each traversed directory must be a real directory
-/// owned by root or by the effective user.  The opened handle is checked with
-/// `fstat` (a regular, single-link file) and compared with the listed path
-/// before anything is written.
+/// The payload never goes through a resolved path.  Every ancestor of the
+/// trusted directory must be a real directory, so a symlinked directory cannot
+/// redirect the write, and the trusted directory itself is opened with
+/// `O_NOFOLLOW`, so a symlinked service root is refused.  The entry is then
+/// opened relative to that directory descriptor with `O_NOFOLLOW`, the opened
+/// handle is checked with `fstat` (a regular, single-link file owned by this
+/// user), and its device and inode are compared with the listed path before
+/// anything is written.
 private func writeFixtureFile(_ payload: String, to url: URL) throws {
     let path = url.path
-    var components = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
-    guard components.count >= 2 else { throw NativeHostControlError.unsafeSocket }
-    let name = components.removeLast()
-    var directories: [Int32] = []
-    defer { for descriptor in directories { Darwin.close(descriptor) } }
-    var directory = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0)
-    guard directory >= 0 else { throw NativeHostControlError.unsafeSocket }
-    directories.append(directory)
-    for component in components {
-        let next = component.withCString {
-            openat(directory, $0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW, 0)
-        }
-        guard next >= 0 else { throw NativeHostControlError.unsafeSocket }
-        directories.append(next)
-        directory = next
+    let directoryPath = url.deletingLastPathComponent().path
+    let name = url.lastPathComponent
+    var ancestor = URL(fileURLWithPath: "/")
+    for component in directoryPath.split(separator: "/", omittingEmptySubsequences: true).map(String.init) {
+        ancestor = ancestor.appendingPathComponent(component)
         var info = stat()
-        guard fstat(next, &info) == 0, info.st_mode & S_IFMT == S_IFDIR,
-              info.st_uid == 0 || info.st_uid == geteuid() else {
-            throw NativeHostControlError.unsafeSocket
+        guard lstat(ancestor.path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else {
+            throw FixtureWriteRefusal.ancestor(ancestor.path, errno)
         }
+    }
+    let directory = open(directoryPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW, 0)
+    guard directory >= 0 else { throw FixtureWriteRefusal.trustedDirectory(errno) }
+    defer { Darwin.close(directory) }
+    var directoryInfo = stat()
+    guard fstat(directory, &directoryInfo) == 0, directoryInfo.st_mode & S_IFMT == S_IFDIR,
+          directoryInfo.st_uid == 0 || directoryInfo.st_uid == geteuid(),
+          directoryInfo.st_mode & 0o022 == 0 else {
+        throw FixtureWriteRefusal.trustedDirectory(0)
     }
     let fd = name.withCString {
         openat(directory, $0, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
     }
-    guard fd >= 0 else { throw NativeHostControlError.unsafeSocket }
+    guard fd >= 0 else { throw FixtureWriteRefusal.entry(errno) }
     defer { Darwin.close(fd) }
     var handle = stat()
     guard fstat(fd, &handle) == 0, handle.st_mode & S_IFMT == S_IFREG, handle.st_nlink == 1,
           handle.st_uid == geteuid() else {
-        throw NativeHostControlError.unsafeSocket
+        throw FixtureWriteRefusal.handle(0)
     }
     var listed = stat()
     guard lstat(path, &listed) == 0, listed.st_mode & S_IFMT == S_IFREG,
           listed.st_dev == handle.st_dev, listed.st_ino == handle.st_ino else {
-        throw NativeHostControlError.unsafeSocket
+        throw FixtureWriteRefusal.listed(errno)
     }
     let bytes = Array(payload.utf8)
     guard !bytes.isEmpty else { return }
-    // The payload goes out through the verified handle, with the plain buffer
-    // API, so the fixture never hand-rolls a pointer write.
     var written = 0
     while written < bytes.count {
         let offset = written
@@ -512,7 +529,7 @@ private func writeFixtureFile(_ payload: String, to url: URL) throws {
         }
         if count > 0 { written = offset + count }
         else if count < 0, errno == EINTR { continue }
-        else { throw NativeHostControlError.unsafeSocket }
+        else { throw FixtureWriteRefusal.handle(errno) }
     }
 }
 
