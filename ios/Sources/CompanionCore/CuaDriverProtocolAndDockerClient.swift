@@ -311,15 +311,44 @@ public final class HostMacCuaDriver: CuaDriverProtocol {
     }
 
     public func click(point: CGPoint, button: MouseButton = .left, count: Int = 1) async throws {
-        _ = macDriver.click(at: point, button: button, clickCount: count)
+        try requireAccessibility()
+        guard macDriver.click(at: point, button: button, clickCount: count) else {
+            throw ContainerSocketError.httpStatus(
+                code: 409,
+                body: "The click was interrupted before it completed, so it did not happen."
+            )
+        }
     }
 
     public func move(to point: CGPoint) async throws {
-        _ = macDriver.moveMouse(to: point)
+        try requireAccessibility()
+        guard macDriver.moveMouse(to: point) else {
+            throw ContainerSocketError.httpStatus(
+                code: 409,
+                body: "The pointer move was interrupted before it completed, so it did not happen."
+            )
+        }
     }
 
     public func type(text: String) async throws {
-        _ = macDriver.typeText(text)
+        try requireAccessibility()
+        guard macDriver.typeText(text) else {
+            throw ContainerSocketError.httpStatus(
+                code: 409,
+                body: "Typing was interrupted before it completed, so only part of the text may have been typed."
+            )
+        }
+    }
+
+    /// Mirrors `captureFrame`: no Accessibility grant means the action cannot
+    /// happen, so the client gets a 403 instead of a silent success.
+    private func requireAccessibility() throws {
+        guard macDriver.isDesktopControlAuthorized() else {
+            throw ContainerSocketError.httpStatus(
+                code: 403,
+                body: "Accessibility permission is not granted, so BotFleet cannot control this Mac.\u{00A0} Turn it on in System Settings › Privacy & Security › Accessibility."
+            )
+        }
     }
 
     public func inspectAccessibilityTree(pid: pid_t? = nil) async throws -> [AXElementNode] {
