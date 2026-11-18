@@ -15,6 +15,9 @@ import {
   inspectProcesses,
   inspectRunningExecutable,
   isBotFleetNodeProcess,
+  isNodeListenerCommand,
+  probeLaunchDomain,
+  recordLaunchProbes,
 } from "./check-post-reboot-node.mjs";
 import { resolveBoardCli } from "./decommission-gate-state.mjs";
 
@@ -250,6 +253,87 @@ test("inspectLaunchAgents records probe error into probeErrors", () => {
   assert.ok(verdict.failures.some((f) => f.includes("timed out querying launchd")));
 });
 
+test("recordLaunchProbes keeps every launchd answer, including a skipped one", () => {
+  // A probe that was skipped and a probe that found nothing both leave
+  // `inspectLaunchAgents` with an empty list, so the answers are kept beside it.
+  const answers = {
+    "app.botfleet.server": { loaded: true, running: true, rawOutput: "state = running" },
+    "app.botfleet.companion": { loaded: false, running: false },
+    "com.jay.botfleet-server": { loaded: false, running: false, skipped: true },
+    "com.jay.botfleet-companion": { loaded: false, running: false, error: "launchctl timed out" },
+  };
+  const launchProbes = [];
+  const probeErrors = [];
+  const lingering = inspectLaunchAgents(BOTFLEET_AGENTS, recordLaunchProbes((label) => answers[label], launchProbes), probeErrors);
+
+  assert.deepEqual(lingering.map((agent) => agent.label), ["app.botfleet.server"]);
+  assert.equal(probeErrors.length, 1);
+  assert.deepEqual(launchProbes, [
+    { label: "app.botfleet.server", loaded: true, running: true, skipped: false },
+    { label: "app.botfleet.companion", loaded: false, running: false, skipped: false },
+    { label: "com.jay.botfleet-server", loaded: false, running: false, skipped: true },
+    { label: "com.jay.botfleet-companion", loaded: false, running: false, skipped: false },
+  ]);
+});
+
+test("probeLaunchDomain says whether launchd holds the GUI domain the agent probes ask", () => {
+  // A label probe reads "not found" as "not loaded", and launchd answers the
+  // same way when the domain itself is missing.  The domain is asked alone.
+  const calls = [];
+  const found = probeLaunchDomain({
+    platform: "darwin",
+    uid: 501,
+    run: (command, args, options) => {
+      calls.push({ command, args, options });
+      return "";
+    },
+  });
+  assert.deepEqual(found, { uid: 501, target: "gui/501", observed: true, skipped: false });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, "launchctl");
+  assert.deepEqual(calls[0].args, ["print", "gui/501"]);
+  // Only the exit status is read, so the long domain listing is never buffered.
+  assert.equal(calls[0].options.stdio, "ignore");
+
+  // Run as root, or over SSH with nobody logged in at the console:  launchd
+  // has no such domain, and the probe says so instead of reading as clean.
+  const missing = probeLaunchDomain({
+    platform: "darwin",
+    uid: 0,
+    run: () => {
+      throw Object.assign(new Error("Could not find domain for user gui: 0"), { status: 112 });
+    },
+  });
+  assert.deepEqual(missing, { uid: 0, target: "gui/0", observed: false, skipped: false });
+
+  // Off macOS there is no launchd to ask, and nothing is run.
+  const offMac = probeLaunchDomain({
+    platform: "linux",
+    uid: 1001,
+    run: () => {
+      throw new Error("launchctl must not be run off macOS");
+    },
+  });
+  assert.deepEqual(offMac, { uid: 1001, target: null, observed: false, skipped: true });
+});
+
+test("isNodeListenerCommand is the predicate inspectPortListeners flags a listener with", () => {
+  assert.equal(isNodeListenerCommand("node"), true);
+  assert.equal(isNodeListenerCommand("Electron"), true);
+  assert.equal(isNodeListenerCommand("BotFleet"), true);
+  assert.equal(isNodeListenerCommand("python3"), false);
+  assert.equal(isNodeListenerCommand(undefined), false);
+
+  const lsof = `
+COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+node     1234  jay   22u  IPv4 0x1234567890abcdef      0t0  TCP 127.0.0.1:8799 (LISTEN)
+python3  9000  jay    4u  IPv4 0x1234567890abcdff      0t0  TCP 127.0.0.1:8800 (LISTEN)
+`;
+  for (const listener of inspectPortListeners(lsof, BOTFLEET_PORTS)) {
+    assert.equal(listener.isNode, isNodeListenerCommand(listener.command));
+  }
+});
+
 test("inspectPortListeners parses lsof output for BotFleet ports", () => {
   const sampleLsof = `
 COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
@@ -329,6 +413,24 @@ test("check-post-reboot-node.mjs CLI responds with JSON on --json", () => {
   assert.ok(parsed.ok === true || parsed.ok === false);
   assert.ok(Array.isArray(parsed.failures));
   assert.ok(parsed.details);
+  // The verdict says where it was taken and what launchd answered for each
+  // label, so a verdict from a host without launchd cannot read as a clean Mac.
+  assert.equal(parsed.platform, process.platform);
+  assert.deepEqual(parsed.launchProbes.map((probe) => probe.label), BOTFLEET_AGENTS);
+  for (const probe of parsed.launchProbes) {
+    assert.ok(probe.loaded === true || probe.loaded === false);
+    assert.ok(probe.running === true || probe.running === false);
+    assert.equal(probe.skipped, process.platform !== "darwin");
+  }
+  // And which launchd domain it asked, and whether that domain answered.
+  assert.equal(parsed.launchDomain.skipped, process.platform !== "darwin");
+  assert.ok(parsed.launchDomain.observed === true || parsed.launchDomain.observed === false);
+  if (process.platform !== "darwin") {
+    assert.equal(parsed.launchDomain.observed, false);
+    assert.equal(parsed.launchDomain.target, null);
+  } else {
+    assert.equal(parsed.launchDomain.target, `gui/${parsed.launchDomain.uid}`);
+  }
 });
 
 test("resolveBoardCli resolves BOARD_CLI or board", () => {
