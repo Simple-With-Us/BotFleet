@@ -360,6 +360,10 @@ function identityFixture() {
 // Installs a fake `fleet-secrets` whose `get NAME` prints the value of the first
 // NAME=value line in the fixture store (no quote stripping, like the real one)
 // and exits 3 when the name is absent.
+//
+// The placeholder values in that store stay short on purpose: the relay's
+// secret scan refuses a file whose fixture values are credential-shaped, and
+// these strings are placeholders that never stand for a real credential.
 function writeKeys(fixture, body) {
   writeFileSync(fixture.keys, body.endsWith("\n") ? body : `${body}\n`, { mode: 0o600 });
   installFakeFleetSecrets(fixture, [
