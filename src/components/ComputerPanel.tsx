@@ -539,7 +539,7 @@ export function ComputerPanel({
     setScreenStreamState("connecting");
     // A brand new stream has not demonstrated anything yet.
     setLastFrameAt(0);
-    const stream = new EventSource(`/api/events?screens=on&botId=${encodeURIComponent(bot.id)}`);
+    const stream = new EventSource(`/api/events?screens=on&kind=screen&botId=${encodeURIComponent(bot.id)}`);
     let active = true;
     let failed = false;
     stream.onopen = () => {
