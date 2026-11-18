@@ -1372,10 +1372,13 @@ public actor NativeCompanionServer {
         return .json(200, unconfigured)
     }
 
-    /// Enforces both BF-2489 security gates on `POST /api/desktop/open`:
+    /// Enforces both BF-2489 security gates on `POST /api/desktop/open` and
+    /// fails honestly when no desktop launch action is installed:
     /// 1. Loopback address guard (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`).
     /// 2. Explicit `allowRemoteDesktopLaunch == true` setting gate so a request replayed over
     ///    `127.0.0.1` by the companion proxy is still refused when disabled.
+    /// 3. Installed `onDesktopOpen` callback guard so builds without launch wiring return 503
+    ///    instead of reporting `launched: true`.
     private func handleDesktopOpen(_ request: CompanionHTTPRequest) async -> CompanionHTTPResponse {
         guard Self.isLoopbackAddress(request.remoteAddress) else {
             return .error(403, "Desktop launch requires a loopback connection")
@@ -1383,8 +1386,11 @@ public actor NativeCompanionServer {
         guard config.allowRemoteDesktopLaunch else {
             return .error(403, "Opening the desktop app from iOS is disabled in Mac settings")
         }
+        guard let onDesktopOpen else {
+            return .error(503, "Opening the desktop app is not available on this Mac")
+        }
         do {
-            try await onDesktopOpen?()
+            try await onDesktopOpen()
             desktopOpenCount += 1
             return .json(200, ["ok": true, "launched": true])
         } catch {

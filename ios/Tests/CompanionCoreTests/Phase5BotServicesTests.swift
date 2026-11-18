@@ -169,11 +169,13 @@ struct Phase5BotServicesTests {
         let db = try DatabaseService(path: ":memory:")
         let token = "bf_tok_desktop_test"
         let authHeaders = ["Authorization": "Bearer \(token)"]
+        let launches = TestCounter()
 
         let server = NativeCompanionServer(
             database: db,
             pairedTokens: [token],
-            config: CompanionServerConfig(allowRemoteDesktopLaunch: false)
+            config: CompanionServerConfig(allowRemoteDesktopLaunch: false),
+            onDesktopOpen: { _ = await launches.increment() }
         )
 
         // Case 1: Replayed over 127.0.0.1 while allowRemoteDesktopLaunch == false -> MUST return 403
@@ -188,6 +190,7 @@ struct Phase5BotServicesTests {
         #expect(loopbackDisabled.statusCode == 403)
         #expect(loopbackDisabled.bodyString.contains("Opening the desktop app from iOS is disabled in Mac settings"))
         #expect(await server.desktopOpenCount == 0)
+        #expect(await launches.current() == 0)
 
         // Case 2: A paired phone may not flip the BF-2489 desktop-launch gate.
         // The knob is owner-side Mac configuration, and the companion proxy
@@ -217,6 +220,7 @@ struct Phase5BotServicesTests {
         )
         #expect(remoteDenied.statusCode == 403)
         #expect(await server.desktopOpenCount == 0)
+        #expect(await launches.current() == 0)
 
         // Case 3: Loopback address (127.0.0.1 and ::ffff:127.0.0.1) + allowRemoteDesktopLaunch == true -> 200
         let loopbackAllowed = await server.handleRequest(
@@ -229,6 +233,7 @@ struct Phase5BotServicesTests {
         )
         #expect(loopbackAllowed.statusCode == 200)
         #expect(await server.desktopOpenCount == 1)
+        #expect(await launches.current() == 1)
 
         let ipv6MappedAllowed = await server.handleRequest(
             CompanionHTTPRequest(
@@ -240,6 +245,75 @@ struct Phase5BotServicesTests {
         )
         #expect(ipv6MappedAllowed.statusCode == 200)
         #expect(await server.desktopOpenCount == 2)
+        #expect(await launches.current() == 2)
+    }
+
+    @Test("BF-2498: POST /api/desktop/open returns 503 after gates when no launch action is installed")
+    func desktopOpenReturns503WhenLaunchActionUnset() async throws {
+        let db = try DatabaseService(path: ":memory:")
+        let token = "bf_tok_desktop_unset"
+        let authHeaders = ["Authorization": "Bearer \(token)"]
+
+        // Disabled knob must still fail 403 before disclosing launch-action availability.
+        let disabledServer = NativeCompanionServer(
+            database: db,
+            pairedTokens: [token],
+            config: CompanionServerConfig(allowRemoteDesktopLaunch: false)
+        )
+        let disabledResponse = await disabledServer.handleRequest(
+            CompanionHTTPRequest(
+                method: "POST",
+                path: "/api/desktop/open",
+                headers: authHeaders,
+                remoteAddress: "127.0.0.1"
+            )
+        )
+        #expect(disabledResponse.statusCode == 403)
+        #expect(await disabledServer.desktopOpenCount == 0)
+
+        let enabledServer = NativeCompanionServer(
+            database: db,
+            pairedTokens: [token],
+            config: CompanionServerConfig(allowRemoteDesktopLaunch: true)
+        )
+        let unavailableResponse = await enabledServer.handleRequest(
+            CompanionHTTPRequest(
+                method: "POST",
+                path: "/api/desktop/open",
+                headers: authHeaders,
+                remoteAddress: "127.0.0.1"
+            )
+        )
+        #expect(unavailableResponse.statusCode == 503)
+        #expect(unavailableResponse.bodyString.contains("Opening the desktop app is not available on this Mac"))
+        #expect(await enabledServer.desktopOpenCount == 0)
+    }
+
+    private struct StubDesktopOpenError: Error {}
+
+    @Test("BF-2498: POST /api/desktop/open returns 500 when the launch action throws")
+    func desktopOpenReturns500WhenLaunchActionThrows() async throws {
+        let db = try DatabaseService(path: ":memory:")
+        let token = "bf_tok_desktop_throw"
+        let authHeaders = ["Authorization": "Bearer \(token)"]
+        let server = NativeCompanionServer(
+            database: db,
+            pairedTokens: [token],
+            config: CompanionServerConfig(allowRemoteDesktopLaunch: true),
+            onDesktopOpen: { throw StubDesktopOpenError() }
+        )
+
+        let response = await server.handleRequest(
+            CompanionHTTPRequest(
+                method: "POST",
+                path: "/api/desktop/open",
+                headers: authHeaders,
+                remoteAddress: "127.0.0.1"
+            )
+        )
+        #expect(response.statusCode == 500)
+        #expect(response.bodyString.contains("Failed to launch desktop application"))
+        #expect(await server.desktopOpenCount == 0)
     }
 
     @Test("NativeCompanionServer serves FTS5 search, thread messages, and loopback shutdown marker")
