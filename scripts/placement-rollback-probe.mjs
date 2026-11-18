@@ -217,6 +217,19 @@ function nativeExecutableFormat(head) {
 }
 
 /**
+ * Open one file read-only without following a link in its last component.
+ * Where the platform has no O_NOFOLLOW this refuses instead of opening, so a
+ * file is never read through a link that was swapped in after it was listed.
+ */
+function openWithoutFollowing(path) {
+  const noFollow = constants.O_NOFOLLOW;
+  if (!Number.isInteger(noFollow)) {
+    throw new Error("this platform has no O_NOFOLLOW, so a file cannot be opened without following a link");
+  }
+  return openSync(path, constants.O_RDONLY | noFollow);
+}
+
+/**
  * sha256 of one native executable, opened without following a link and
  * checked to be the same inode that was inspected.
  *
@@ -249,7 +262,7 @@ function fingerprintRuntime(named) {
   if ((seen.stat.mode & 0o111) === 0) return { blocker: blocker("runtime-not-executable", `${path} has no executable bit`) };
   let fd;
   try {
-    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    fd = openWithoutFollowing(path);
     const opened = fstatSync(fd);
     if (opened.dev !== seen.stat.dev || opened.ino !== seen.stat.ino) {
       return { blocker: blocker("runtime-unreadable", `${path} changed while it was being opened`) };
@@ -290,7 +303,7 @@ function fingerprintRuntime(named) {
 function readListedRegularFile(path, listed) {
   let fd;
   try {
-    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    fd = openWithoutFollowing(path);
     const opened = fstatSync(fd);
     if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== listed.dev || opened.ino !== listed.ino) {
       return { problem: `${path} changed while it was being opened, or has another hard link` };
@@ -1085,8 +1098,13 @@ async function requirePlacementRefusals(base, fence, dataDir, timeouts, label) {
  */
 function echoed(value) {
   if (value === null || value === undefined) return "null";
-  if (value === String(value)) return JSON.stringify(value.length > 80 ? `${value.slice(0, 80)}...` : value);
-  if (Number.isFinite(value) || value === true || value === false) return String(value);
+  // An object, array or function is named and never coerced: its own
+  // `toString` or `valueOf` can be anything a JSON answer chose, and a throw
+  // here would replace the specific blocker with a generic one.
+  if (Object(value) === value) return "[non-scalar]";
+  const kind = Object.prototype.toString.call(value);
+  if (kind === "[object String]") return JSON.stringify(value.length > 80 ? `${value.slice(0, 80)}...` : value);
+  if (kind === "[object Number]" || kind === "[object Boolean]") return String(value);
   return "[non-scalar]";
 }
 

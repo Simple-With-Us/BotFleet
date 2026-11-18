@@ -143,7 +143,7 @@ createServer(async (req, res) => {
   if (req.method === "GET" && path === "/api/placement/identity") {
     if (companion) return send(res, 403, { error: "forbidden" });
     // An answer whose size and shape the probe must not copy into its receipt.
-    if (VARIANT === "identity-flood") return send(res, 200, { hostId: HOST, version: "1", controllerId: "x".repeat(100000), epoch: { nested: true } });
+    if (VARIANT === "identity-flood") return send(res, 200, { hostId: HOST, version: "1", controllerId: "x".repeat(100000), epoch: { toString: null, valueOf: null } });
     try { return send(res, 200, { hostId: HOST, version: "1", ...controller() }); }
     catch { return send(res, 503, { error: "unavailable" }); }
   }
@@ -929,6 +929,12 @@ test("the restated launch shape, lockdown environment and action list match thei
   assert.deepEqual([...PROTECTED_PATH_PARTS], policyParts);
 
   const probeSource = readFileSync(join(REPO_ROOT, "scripts", "placement-rollback-probe.mjs"), "utf8");
+  // A file is opened without following a link or not at all: no `?? 0`
+  // fallback for a platform that lacks O_NOFOLLOW, and no open that bypasses
+  // the one helper that refuses there.
+  assert.ok(!probeSource.includes("O_NOFOLLOW ?? 0"));
+  assert.equal(probeSource.match(/openSync\(path, /g).length, 1);
+  assert.equal(probeSource.match(/fd = openWithoutFollowing\(path\)/g).length, 2);
   const leases = readFileSync(join(REPO_ROOT, "server", "placement-leases.ts"), "utf8");
   const declared = leases.slice(leases.indexOf("export const PLACEMENT_LEASE_ACTIONS"));
   const actions = [...declared.slice(0, declared.indexOf("];")).matchAll(/"([a-z-]+)"/g)].map((match) => match[1]);
