@@ -10,18 +10,24 @@
 // red test rather than a receipt that certifies a run nobody made.
 //
 // Every result and closure receipt here is synthetic and lives in a temporary
-// private directory.  No fixture is executed, no service is started and no
-// gate state is read or written.
+// private directory.  One test runs the retained fixture itself, over a
+// throwaway repository and with stub adapters that start nothing, so that the
+// traces the producer reads are ones the fixture wrote.  No service is
+// started and no gate state is read or written.
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
-  chmodSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync,
+  chmodSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync,
+  symlinkSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { FIXTURE_ACTIONS, linuxFixturePlan } from "../deploy/linux-server/retained-fixture.mjs";
+import { FIXTURE_ACTIONS, linuxFixturePlan, runLinuxClosureFixture } from "../deploy/linux-server/retained-fixture.mjs";
+import {
+  collectLinuxClosure, discoverLinuxRetention, immutableGitSource, LINUX_ENTRY_POINTS, LINUX_REQUIRED_INPUTS, RETENTION_POLICY_PATH,
+} from "./linux-retained-source.mjs";
 import {
   assertReceiptBinding, createEvidenceReader, evidenceHash, MAX_EVIDENCE_FILE_BYTES, parseEvidenceReceipt, readEvidenceRef,
   receiptReferences, REQUIRED_CHECKS,
@@ -35,11 +41,11 @@ const PRIOR_SHA = "d".repeat(40);
 const SOURCES = { candidate: CANDIDATE_SHA, prior: PRIOR_SHA };
 const SCRIPT = fileURLToPath(new URL("./emit-linux-retention-receipt.mjs", import.meta.url));
 
-/** A request the receipt is bound to. */
-function makeRequest() {
+/** A request the receipt is bound to, for a packet whose candidate is the given source. */
+function makeRequest(sourceSha = CANDIDATE_SHA) {
   return {
     version: 1,
-    candidate: { sourceSha: "a".repeat(40), build: "202611170715", artifactSha256: "b".repeat(64) },
+    candidate: { sourceSha, build: "202611170715", artifactSha256: "b".repeat(64) },
     mode: "serverFirst",
     hosts: [
       { id: `mac:${"1".repeat(8)}-${"2".repeat(4)}-${"3".repeat(4)}-${"4".repeat(4)}-${"5".repeat(12)}`, role: "mac" },
@@ -465,6 +471,22 @@ test("a candidate and a prior that are the same source are refused", () => {
   assertRefused(captureDir, /name the same source, and a rollback needs a distinct prior/);
 });
 
+test("a candidate closure receipt for a source other than the packet's candidate is refused", () => {
+  // The bundle's identity check compares the receipt's candidate to the
+  // request's and never looks at the source the receipt pins, so a complete,
+  // consistent run of some other source would otherwise certify this packet.
+  const captureDir = makeCapture();
+  const otherCandidate = "a".repeat(40);
+  assertRefused(
+    captureDir,
+    new RegExp(`the candidate closure receipt names source ${CANDIDATE_SHA} and the bundle request's candidate is source ${otherCandidate}`),
+    { request: makeRequest(otherCandidate) },
+  );
+
+  // The same capture, bound to its own candidate, is emitted.
+  assert.equal(emit(captureDir).data.maintainedSourceSha, CANDIDATE_SHA);
+});
+
 test("a result reporting a proof the fixture does not report is refused", () => {
   const captureDir = makeCapture({ result: makeResult(undefined, { proof: "production-acceptance" }) });
   assertRefused(captureDir, /reports the proof "production-acceptance" and the fixture reports "isolated-source-fixture-only"/);
@@ -490,6 +512,52 @@ test("an artifact outside the capture directory is refused", () => {
   assertRefused(captureDir, /not inside the capture directory/, { candidateClosurePath: join(outside, "candidate-closure.json") });
   assertRefused(captureDir, /not inside the capture directory/, { priorClosurePath: join(outside, "prior-closure.json") });
   assertRefused(captureDir, /not inside the capture directory/, { provenance: { ...PROVENANCE, record: join(outside, "provenance.txt") } });
+});
+
+test("a capture directory and its files spelled through different symlinked aliases are the same directory", () => {
+  // macOS reaches its temp folder as both `/var/...` and `/private/var/...`.
+  // The bundle's reader roots at the real path, so the references have to be
+  // measured from it too, or a legitimate capture is refused as "not inside
+  // the capture directory" for the way an operator spelled it.
+  const real = makeCapture();
+  const aliasParent = mkdtempSync(join(tmpdir(), "linux-retention-alias-"));
+  const alias = join(aliasParent, "capture-alias");
+  symlinkSync(real, alias);
+  const inReal = (name) => join(real, name);
+  const inAlias = (name) => join(alias, name);
+
+  // The directory through the alias, every file through the real path.
+  const throughAlias = emit(alias, {
+    resultPath: inReal("actual-source-runtime-result.json"),
+    candidateClosurePath: inReal("candidate-closure.json"),
+    priorClosurePath: inReal("prior-closure.json"),
+    provenance: { ...PROVENANCE, record: inReal("provenance.txt") },
+  });
+  assert.deepEqual(throughAlias.data.closureManifest.path, "candidate-closure.json");
+  assert.equal(throughAlias.provenance.record.path, "provenance.txt");
+  assert.deepEqual(exitCodes(throughAlias), { "clean-export-build": 0, "install-start": 0, update: 0, rollback: 0 });
+
+  // The directory by its real path, every file through the alias.
+  const throughReal = emit(real, {
+    resultPath: inAlias("actual-source-runtime-result.json"),
+    candidateClosurePath: inAlias("candidate-closure.json"),
+    priorClosurePath: inAlias("prior-closure.json"),
+    provenance: { ...PROVENANCE, record: inAlias("provenance.txt") },
+  });
+  assert.deepEqual(throughReal, throughAlias);
+
+  // The receipt is the same one however the directory was spelled, and the
+  // bundle's reader accepts it and every file it cites.
+  const reader = createEvidenceReader(real);
+  const parsed = parseEvidenceReceipt("linux-retention", reader.read(LINUX_RETENTION_RECEIPT_FILE));
+  for (const reference of receiptReferences(parsed)) assert.doesNotThrow(() => readEvidenceRef(reader, reference));
+
+  // A symlink as a file's own name is still not that file, aliased directory or not.
+  symlinkSync(inReal("prior-closure.json"), inReal("prior-link.json"));
+  assert.throws(
+    () => emit(alias, { priorClosurePath: inAlias("prior-link.json") }),
+    /the prior closure receipt is not a file the evidence bundle will read/,
+  );
 });
 
 test("a closure manifest larger than the bundle reads is refused with its size", () => {
@@ -635,6 +703,170 @@ test("the vocabulary the producer reads is the fixture's and the bundle's own", 
     "export-both", "install-and-build-prior", "prior-start-health",
     "install-and-build-candidate", "candidate-update-health", "prior-rollback-health",
   ]);
+});
+
+const server = `import { createServer } from "node:http";
+import { value } from "../shared/value.ts";
+import "./proxy-paths.ts";
+const server = createServer((request, response) => response.end(JSON.stringify({ value })));
+server.listen(0, "127.0.0.1", () => process.send?.({ port: server.address().port }));
+setTimeout(() => process.exit(0), 15000).unref();
+`;
+
+/**
+ * A throwaway Git repository holding two commits of a synthetic source, and
+ * the closure receipts the collector writes for them.  It is built the way
+ * `deploy/linux-server/retained-source.node-test.mjs` builds its own, and
+ * has no remote, credential, account or service configuration.
+ */
+async function sourceFixture() {
+  // The fixture refuses a linked root, and macOS links its temp folder through /private.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "linux-retention-fixture-")));
+  const source = join(root, "source");
+  mkdirSync(source, { mode: 0o700 });
+  const put = (path, content) => {
+    mkdirSync(dirname(join(source, path)), { recursive: true, mode: 0o700 });
+    writeFileSync(join(source, path), content, { mode: 0o644 });
+  };
+  const git = (...args) => execFileSync("git", ["-C", source, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  const commit = () => {
+    git("add", ".");
+    git("-c", "user.name=Synthetic Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Synthetic source fixture");
+    return git("rev-parse", "HEAD");
+  };
+  for (const path of [...LINUX_ENTRY_POINTS.map(([entry]) => entry), ...LINUX_REQUIRED_INPUTS]) put(path, path.endsWith(".json") ? "{}" : "");
+  put("server/index.ts", server);
+  put("server/proxy-paths.ts", 'function resolveProxy(name) { return name; } export const SPAWNED_PROXIES = { fixture: resolveProxy("fixture-proxy") };');
+  put("server/fixture-proxy.ts", "export const fixture = true;");
+  put("shared/value.ts", 'export const value = "prior";');
+  put("deploy/linux-server/owner-gate.mjs", 'export { allowed } from "../../electron/infisical-read.mjs";');
+  put("electron/infisical-read.mjs", "export const allowed = true;");
+  put("electron/main.mjs", 'throw new Error("unretained Mac application must never load");');
+  put("src/main.tsx", 'export { ui } from "./ui.js";');
+  put("src/ui.ts", "export const ui = true;");
+  put("public/retained.txt", "synthetic UI asset");
+  put("package.json", JSON.stringify({ name: "synthetic-linux-fixture", version: "0.1.0", type: "module", packageManager: "pnpm@12.16.1" }));
+  put("deploy/linux-server/common.sh", 'NODE_VERSION="${NODE_VERSION:-24.18.0}"\n');
+  put("pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+  put("pnpm-workspace.yaml", "packages: ['.']\n");
+  git("init", "-q");
+  const basis = commit();
+  put(RETENTION_POLICY_PATH, JSON.stringify(await discoverLinuxRetention(immutableGitSource(source, basis))));
+  const prior = commit();
+  put("shared/value.ts", 'export const value = "candidate";');
+  const candidate = commit();
+  return {
+    root,
+    source,
+    prior,
+    candidate,
+    previous: await collectLinuxClosure(immutableGitSource(source, prior)),
+    current: await collectLinuxClosure(immutableGitSource(source, candidate)),
+    close: () => rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+/**
+ * Stub adapters for the fixture that start nothing.  A call fails when its
+ * `action:slot:n` is listed, `n` counting that action's calls for that slot
+ * from one, and the evidence a call returns is the shape the fixture bounds.
+ */
+function stubAdapters({ failures = [], cleanupOk = true } = {}) {
+  const calls = new Map();
+  const failing = new Set(failures);
+  const adapter = (action, evidence) => async ({ slot, sourceSha }) => {
+    const key = `${action}:${slot}`;
+    const count = (calls.get(key) ?? 0) + 1;
+    calls.set(key, count);
+    if (failing.has(`${key}:${count}`)) return { ok: false };
+    return { ok: true, ...evidence(sourceSha, 4000 + count) };
+  };
+  return {
+    installDependencies: adapter("installDependencies", () => ({ executable: "/usr/bin/pnpm", joined: true })),
+    buildUi: adapter("buildUi", () => ({ uiHash: "5".repeat(64) })),
+    start: adapter("start", (sourceSha, pid) => ({ sourceSha, pid, httpPort: 41001, webhookPort: 41002, uiPort: 41003 })),
+    health: adapter("health", (sourceSha, pid) => ({ sourceSha, pid, version: "0.1.0" })),
+    stop: adapter("stop", (_sourceSha, pid) => ({ pid, joined: true })),
+    cleanup: async () => ({ ok: cleanupOk }),
+  };
+}
+
+/** A trace as the order of its steps, so a test names the order the fixture writes. */
+const stepOrder = (trace) => trace.map((item) => (item.slot === undefined ? item.action : `${item.action}:${item.slot}`));
+
+test("the traces the fixture itself writes are read as the runs they record", { skip: process.platform === "win32" ? "private capture modes need POSIX" : false }, async () => {
+  // Every other trace here is written by hand in the order this producer
+  // assumes the fixture writes it.  These are written by the fixture, over a
+  // real two-commit source, so a change to the fixture's step order makes
+  // this test red instead of making the producer misread every real run.
+  const f = await sourceFixture();
+  try {
+    const priorSteps = ["installDependencies:prior", "buildUi:prior", "start:prior", "health:prior", "stop:prior"];
+    const candidateBuilt = ["installDependencies:candidate", "buildUi:candidate"];
+    const rollback = ["start:prior", "health:prior", "stop:prior"];
+    const main = [...priorSteps, ...candidateBuilt, "start:candidate", "health:candidate", "stop:candidate"];
+    const pass = { "clean-export-build": 0, "install-start": 0, update: 0, rollback: 0 };
+    const scenarios = [
+      { name: "every step succeeds", order: [...main, ...rollback], codes: pass },
+      {
+        name: "the candidate's health step fails",
+        failures: ["health:candidate:1"],
+        order: [...priorSteps, ...candidateBuilt, "start:candidate", "stop:candidate", "candidate-refused", ...rollback],
+        codes: { ...pass, update: 1 },
+      },
+      {
+        name: "the candidate's first stop fails",
+        failures: ["stop:candidate:1"],
+        order: [...priorSteps, ...candidateBuilt, "start:candidate", "health:candidate", "candidate-refused", "stop:candidate", ...rollback],
+        codes: { ...pass, update: 1 },
+      },
+      {
+        name: "the candidate's start fails",
+        failures: ["start:candidate:1"],
+        order: [...priorSteps, ...candidateBuilt, "candidate-refused", "stop:candidate", ...rollback],
+        codes: { ...pass, update: 1 },
+      },
+      {
+        name: "the rollback's health step fails",
+        failures: ["health:prior:2"],
+        order: [...main, "start:prior", "rollback-refused", "stop:prior"],
+        codes: { ...pass, rollback: 1 },
+      },
+      {
+        name: "a fixture process is left behind",
+        cleanupOk: false,
+        order: main,
+        codes: { ...pass, rollback: 1 },
+      },
+      {
+        name: "the prior's start fails",
+        failures: ["start:prior:1"],
+        order: ["installDependencies:prior", "buildUi:prior", "candidate-refused", "stop:prior"],
+        codes: { "clean-export-build": 1, "install-start": 1, update: 1, rollback: 1 },
+      },
+    ];
+
+    let run = 0;
+    for (const { name, failures, cleanupOk, order, codes } of scenarios) {
+      const result = await runLinuxClosureFixture({
+        repo: f.source,
+        candidate: f.current,
+        prior: f.previous,
+        output: join(f.root, `run-${run += 1}`),
+        execute: true,
+        adapters: stubAdapters({ failures, cleanupOk }),
+      });
+      assert.deepEqual(stepOrder(result.trace), order, `${name}: the order the fixture writes`);
+
+      const captureDir = makeCapture({ result, candidate: f.current, prior: f.previous });
+      const receipt = emit(captureDir, { request: makeRequest(f.candidate) });
+      assert.deepEqual(exitCodes(receipt), codes, name);
+      assert.equal(receipt.data.maintainedSourceSha, f.candidate);
+      assert.equal(receipt.data.rollbackSourceSha, f.prior);
+    }
+  } finally {
+    f.close();
+  }
 });
 
 /** The complete command line for a capture directory, as flag-and-value pairs. */
@@ -784,12 +1016,16 @@ test("the CLI refuses a flag given twice", () => {
 test("a refusal prints text from the result as one bounded line of printable characters", () => {
   // The proof label is the result's own text.  An escape sequence in it must
   // not reach the terminal and a line break must not forge a second line.
-  const unprintable = ["\n", "\u001b", "\u009b", "\u202e"];
+  // Beside the escape, the line break and the bidirectional override, the
+  // three Unicode line terminators:  NEL, LINE SEPARATOR and PARAGRAPH SEPARATOR.
+  const unprintable = ["\n", "\u001b", "\u009b", "\u202e", "\u0085", "\u2028", "\u2029"];
   const clean = (text) => unprintable.every((character) => !text.includes(character));
 
-  const hostile = makeCapture({ result: makeResult(undefined, { proof: "\u001b[2J\u001b[31mALL CHECKS PASSED\nok\u009b0m\u202e" }) });
+  const hostile = makeCapture({
+    result: makeResult(undefined, { proof: "\u001b[2JPASSED\nok\u009b0m\u202e\u0085\u2028\u2029" }),
+  });
   const proof = runCli(hostile);
-  assertCliRefused(proof, hostile, /reports the proof "\\u\{1b\}\[2J\\u\{1b\}\[31mALL CHECKS PASSED\\u\{a\}ok\\u\{9b\}0m\\u\{202e\}"/);
+  assertCliRefused(proof, hostile, /reports the proof "\\u\{1b\}\[2JPASSED\\u\{a\}ok\\u\{9b\}0m\\u\{202e\}\\u\{85\}\\u\{2028\}\\u\{2029\}"/);
   assert.equal(clean(proof.stderr.trimEnd()), true);
 
   // The name of a field the fixture does not write is the result's text too,
@@ -810,6 +1046,88 @@ test("a refusal prints text from the result as one bounded line of printable cha
   const named = makeCapture();
   const path = runCli(named, (pairs) => pairs.map(([flag, value]) => (flag === "--result" ? [flag, join(named, "absent\nforged: ok.json")] : [flag, value])));
   assertCliRefused(path, named, /the retained-run result could not be read: .*absent\\u\{a\}forged: ok\.json$/m);
+});
+
+test("a refusal tells text that spells an escape apart from a character that was escaped", () => {
+  // A label that literally reads `\u{1b}` is not an ESC.  Printed alike, the
+  // two would be indistinguishable in a captured refusal log.
+  const spelled = makeCapture({ result: makeResult(undefined, { proof: "\\u{1b}[2J" }) });
+  const literal = runCli(spelled);
+  assertCliRefused(literal, spelled, /reports the proof "\\\\u\{1b\}\[2J" and the fixture reports/);
+
+  const real = makeCapture({ result: makeResult(undefined, { proof: "\u001b[2J" }) });
+  const escaped = runCli(real);
+  assertCliRefused(escaped, real, /reports the proof "\\u\{1b\}\[2J" and the fixture reports/);
+  assert.notEqual(literal.stderr.split("the proof")[1], escaped.stderr.split("the proof")[1]);
+
+  // A backslash in a path is doubled once, and the refusal line does not
+  // double it again on its way to the terminal.
+  const named = makeCapture();
+  const path = runCli(named, (pairs) => pairs.map(([flag, value]) => (flag === "--result" ? [flag, join(named, "back\\slash\nabsent.json")] : [flag, value])));
+  assertCliRefused(path, named, /the retained-run result could not be read: .*back\\\\slash\\u\{a\}absent\.json$/m);
+});
+
+test("a caller of the module gets paths that are as printable as the CLI prints them", () => {
+  // The CLI's last step cleans up a refusal line, but a caller of the module
+  // prints the message itself, so the text is made printable where it is quoted.
+  const clean = (text) => !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(text);
+  const captureDir = makeCapture();
+  const hostile = (name) => join(captureDir, `${name}\n\u001b[2J\u2028forged.json`);
+
+  assert.throws(() => emit(captureDir, { resultPath: hostile("absent") }), (error) => {
+    assert.match(error.message, /the retained-run result could not be read: .*absent\\u\{a\}\\u\{1b\}\[2J\\u\{2028\}forged\.json$/);
+    return clean(error.message);
+  });
+
+  // A file that is there but is not inside the capture directory, and one the
+  // bundle's reader refuses, both quote the path the same way.
+  const outside = makeCapture();
+  const stray = join(outside, "stray\u001b[2J.json");
+  writeFileSync(stray, "{}\n", { mode: 0o600 });
+  assert.throws(() => emit(captureDir, { priorClosurePath: stray }), (error) => {
+    assert.match(error.message, /not inside the capture directory: .*stray\\u\{1b\}\[2J\.json$/);
+    return clean(error.message);
+  });
+
+  const unreadable = join(captureDir, "open\u001b[2J.json");
+  copyFileSync(join(captureDir, "prior-closure.json"), unreadable);
+  chmodSync(unreadable, 0o644);
+  assert.throws(() => emit(captureDir, { priorClosurePath: unreadable }), (error) => {
+    assert.match(error.message, /the prior closure receipt is not a file the evidence bundle will read \(.*\): .*open\\u\{1b\}\[2J\.json$/);
+    return clean(error.message);
+  });
+
+  // The capture directory's own path is quoted the same way.
+  assert.throws(() => emit(join(captureDir, "absent\u001b[2J")), (error) => clean(error.message));
+});
+
+test("the CLI refuses a bundle request that is a symlink or has other links", (t) => {
+  // The request is read from an open handle that is checked, so it is the
+  // file the path names and not one a link has put in its place.
+  const linked = makeCapture();
+  const target = join(linked, "request-target.json");
+  writeFileSync(target, JSON.stringify(makeRequest()), { mode: 0o600 });
+  const link = join(linked, "request-link.json");
+  symlinkSync(target, link);
+  const asSymlink = runCli(linked, (pairs) => pairs.map(([flag, value]) => (flag === "--request" ? [flag, link] : [flag, value])));
+  assertCliRefused(asSymlink, linked, /refused: the bundle request is a symbolic link, and a request is read only as the file it is: /);
+
+  const hard = makeCapture();
+  const request = join(hard, "request-hard.json");
+  writeFileSync(request, JSON.stringify(makeRequest()), { mode: 0o600 });
+  linkSync(request, join(hard, "request-hard-copy.json"));
+  const asHardLink = runCli(hard, (pairs) => pairs.map(([flag, value]) => (flag === "--request" ? [flag, request] : [flag, value])));
+  assertCliRefused(asHardLink, hard, /refused: the bundle request has 2 links, and a request is read only as a single-link file: /);
+
+  // A directory reached through a symlink is not the file's own name, so a
+  // request in it is still read.
+  const through = makeCapture();
+  const outer = mkdtempSync(join(tmpdir(), "linux-retention-request-"));
+  const alias = join(outer, "alias");
+  symlinkSync(through, alias);
+  const aliased = runCli(through, (pairs) => pairs.map(([flag, value]) => (flag === "--request" ? [flag, join(alias, "request.json")] : [flag, value])));
+  assert.equal(aliased.status, 0, aliased.stderr);
+  t.diagnostic("a request in a symlinked directory is read");
 });
 
 test("the CLI refuses a bundle request that is not a bounded regular file", (t) => {

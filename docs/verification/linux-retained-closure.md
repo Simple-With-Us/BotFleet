@@ -146,7 +146,11 @@ Every cited file is read through the bundle's own reader, so a file the bundle w
 
 A closure receipt may be up to 4 MiB while the bundle reads at most 1 MiB of one file, so an oversized closure receipt is refused with its size instead of producing a receipt the bundle rejects later.
 
-The receipt pins `maintainedSourceSha` to the source the candidate closure receipt names and `rollbackSourceSha` to the source the prior closure receipt names, and its `closureManifest` is the candidate closure receipt bound by hash.
+The capture directory and the files in it may be spelled through symlinked directories, because references are measured from the capture directory's real path, the root the bundle's reader holds.  A symlink as a file's own name is still refused.
+
+The bundle request is not cited, so it may live outside the capture directory, but it is opened without following a symlink as its own name and is read only when the open handle is a regular single-link file that is still the file its path names.
+
+The receipt pins `maintainedSourceSha` to the source the candidate closure receipt names and `rollbackSourceSha` to the source the prior closure receipt names, and its `closureManifest` is the candidate closure receipt bound by hash.  The bundle's identity check does not compare the pinned source to anything, so the command does: the candidate closure receipt has to name the bundle request's `candidate.sourceSha`, or the command refuses, because a run of some other source would otherwise certify the packet's candidate.
 
 The four exit codes are read out of the result's trace and are never asserted.  The fixture records a step only when its adapter reported success and writes its steps in one fixed order, so each check is read from the position the fixture writes it at:
 
@@ -159,7 +163,7 @@ The four exit codes are read out of the result's trace and are never asserted. 
 
 A missing or misplaced step, a refusal marker and a fixture process left behind are honest failures: the check earns exit code 1, the receipt is still written, the command exits 1 and the bundle refuses the failing code.
 
-The command exits 2 and writes nothing when its inputs cannot be read, do not match their contracts or contradict each other, including a plan instead of an executed result, a `candidateHealthy` or `rollbackHealthy` summary that disagrees with the health steps in the trace, a step that ran a source other than the one its slot's closure receipt names, candidate and prior receipts for the same source, a cited file that is the `linux-retention.receipt.json` the command is about to replace, a bundle request that is not a regular file of at most 1 MiB, or a result that claims any preservation status other than the fixture's own `external-runtime-acceptance-still-required`.
+The command exits 2 and writes nothing when its inputs cannot be read, do not match their contracts or contradict each other, including a plan instead of an executed result, a `candidateHealthy` or `rollbackHealthy` summary that disagrees with the health steps in the trace, a step that ran a source other than the one its slot's closure receipt names, candidate and prior receipts for the same source, a candidate closure receipt for a source other than the bundle request's candidate, a cited file that is the `linux-retention.receipt.json` the command is about to replace, a bundle request that is a symlink, has other hard links or is not a regular file of at most 1 MiB, or a result that claims any preservation status other than the fixture's own `external-runtime-acceptance-still-required`.
 
 The result does not record how the two sources were materialized.  The fixture materializes both before its first step, so a trace that reaches the prior's install had both materialized, but `retained-actual-run.mjs` uses the filtered Git checkout rather than the plain export, and the `clean-export-build` name does not tell the two apart.  Record the materialization in the provenance record.
 

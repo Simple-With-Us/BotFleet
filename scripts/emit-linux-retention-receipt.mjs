@@ -58,7 +58,7 @@
 import {
   chmodSync, closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { evidenceSchema, FIXTURE_ACTIONS, linuxFixturePlan } from "../deploy/linux-server/retained-fixture.mjs";
@@ -208,11 +208,30 @@ const MAX_REFUSAL_TEXT = 4000;
  * file it came from.
  */
 function printable(text, limit) {
-  const escaped = text.replace(
+  // A backslash is written as two first, so the escape form of a control
+  // character can only have come from this function:  file text that spells
+  // out `\u{1b}` is printed as `\\u{1b}`, and a real ESC as `\u{1b}`.
+  return bounded(escapeControls(text.replace(/\\/gu, "\\\\")), limit);
+}
+
+/** Every control, format and line-separator character written as its code point. */
+function escapeControls(text) {
+  return text.replace(
     /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu,
     (character) => `\\u{${character.codePointAt(0).toString(16)}}`,
   );
-  return escaped.length > limit ? `${escaped.slice(0, limit)}...` : escaped;
+}
+
+function bounded(text, limit) {
+  return text.length > limit ? `${text.slice(0, limit)}...` : text;
+}
+
+/** The most of a path, or of an error that quotes one, that a refusal repeats. */
+const MAX_PATH_TEXT = 1024;
+
+/** A path, or an error's text, as it is quoted in a refusal. */
+function shown(text) {
+  return printable(String(text), MAX_PATH_TEXT);
 }
 
 /** The issues of a failed parse, as one bounded line. */
@@ -367,7 +386,7 @@ function openCapture(capture) {
   try {
     return createEvidenceReader(capture);
   } catch (error) {
-    throw new Error(`the capture directory is not one the evidence bundle will read (${error.message}): ${capture}`);
+    throw new Error(`the capture directory is not one the evidence bundle will read (${shown(error.message)}): ${shown(capture)}`);
   }
 }
 
@@ -385,37 +404,54 @@ function openCapture(capture) {
  * then replace that file, and the bundle would find a hash that matches
  * nothing.  The file is compared by identity, not by name, so another
  * spelling of the same name is refused as well.
+ *
+ * `capture` is the capture directory's real path, the root the bundle's
+ * reader holds, and the reference is computed against the file's directory
+ * resolved the same way.  A directory reached through a symlinked alias, on
+ * either side, is then the same directory to both.  Only the directory is
+ * resolved:  a symlink as the file's own name stays one and the reader
+ * refuses it.
  */
 function citeEvidence(reader, capture, filePath, what) {
+  const named = shown(filePath);
   let stat;
+  let located;
   try {
-    stat = statSync(filePath);
+    const absolute = resolve(filePath);
+    stat = statSync(absolute);
+    located = join(realpathSync(dirname(absolute)), basename(absolute));
   } catch {
-    throw new Error(`${what} could not be read: ${filePath}`);
+    throw new Error(`${what} could not be read: ${named}`);
   }
   // Only a regular file is hashed:  reading a pipe or a device to hash it
   // could wait forever or never end.
   if (!stat.isFile()) {
-    throw new Error(`${what} is not a regular file: ${filePath}`);
+    throw new Error(`${what} is not a regular file: ${named}`);
   }
   const written = lstatSync(join(capture, LINUX_RETENTION_RECEIPT_FILE), { throwIfNoEntry: false });
   if (written !== undefined && written.dev === stat.dev && written.ino === stat.ino) {
-    throw new Error(`${what} is the receipt this command writes, and a receipt cannot cite the file it replaces: ${filePath}`);
+    throw new Error(`${what} is the receipt this command writes, and a receipt cannot cite the file it replaces: ${named}`);
   }
   if (stat.size > MAX_EVIDENCE_FILE_BYTES) {
     throw new Error(
-      `${what} is ${stat.size} bytes and the evidence bundle reads at most ${MAX_EVIDENCE_FILE_BYTES} bytes of one file, so a receipt citing it would be refused: ${filePath}`,
+      `${what} is ${stat.size} bytes and the evidence bundle reads at most ${MAX_EVIDENCE_FILE_BYTES} bytes of one file, so a receipt citing it would be refused: ${named}`,
     );
   }
-  const reference = evidenceRef(capture, filePath);
+  let reference;
+  try {
+    reference = evidenceRef(capture, located);
+  } catch (error) {
+    // The reference names the path it refused, so its text is quoted the same way.
+    throw new Error(shown(error.message));
+  }
   let bytes;
   try {
     bytes = reader.read(reference.path);
   } catch (error) {
-    throw new Error(`${what} is not a file the evidence bundle will read (${error.message}): ${filePath}`);
+    throw new Error(`${what} is not a file the evidence bundle will read (${shown(error.message)}): ${named}`);
   }
   if (evidenceHash(bytes) !== reference.sha256) {
-    throw new Error(`${what} changed while it was being read: ${filePath}`);
+    throw new Error(`${what} changed while it was being read: ${named}`);
   }
   return { reference, bytes };
 }
@@ -441,15 +477,25 @@ function parseClosureReceipt(bytes, slot) {
  * The candidate, mode and hosts come from the bundle request the operator
  * prepared, so the receipt is bound to the same candidate as the rest of the
  * packet.  The maintained source is the one the candidate closure receipt
- * names and the rollback source is the one the prior closure receipt names;
- * neither is taken from the command line.
+ * names, and it has to be the request's candidate source;  the rollback
+ * source is the one the prior closure receipt names.  Neither is taken from
+ * the command line.
  *
  * Nothing is written unless every input was read, agreed with the others and
  * produced a receipt the bundle's own schema accepts.
  */
 export function emitLinuxRetentionReceipt({ captureDir, request, provenance, resultPath, candidateClosurePath, priorClosurePath }) {
-  const capture = resolve(captureDir);
-  assertPrivateCaptureDir(capture);
+  const requested = resolve(captureDir);
+  let capture;
+  try {
+    assertPrivateCaptureDir(requested);
+    // The capture directory's real path is the root everything below is
+    // measured from, as it is for the bundle's reader.
+    capture = realpathSync(requested);
+  } catch (error) {
+    // The message names the directory, which is the operator's own text.
+    throw new Error(shown(error.message));
+  }
   const bundle = validateBundleRequest(request);
   const source = ProvenanceSourceSchema.safeParse(provenance?.source);
   if (!source.success) {
@@ -469,6 +515,15 @@ export function emitLinuxRetentionReceipt({ captureDir, request, provenance, res
   };
   if (closures.candidate.sourceSha === closures.prior.sourceSha) {
     throw new Error("the candidate and the prior closure receipts name the same source, and a rollback needs a distinct prior");
+  }
+  // The receipt is bound to the packet's candidate by the bundle's identity
+  // check, and that check does not look at the source the receipt pins.  So
+  // the candidate closure receipt has to be for the packet's own source:
+  // otherwise a run of some other source would certify this candidate.
+  if (closures.candidate.sourceSha !== bundle.candidate.sourceSha) {
+    throw new Error(
+      `the candidate closure receipt names source ${closures.candidate.sourceSha} and the bundle request's candidate is source ${bundle.candidate.sourceSha}, so the run is not of the candidate this packet deploys`,
+    );
   }
 
   // The plan the fixture makes for these two receipts carries the proof
@@ -524,7 +579,7 @@ export function emitLinuxRetentionReceipt({ captureDir, request, provenance, res
   try {
     assertReceiptBinding(parseEvidenceReceipt("linux-retention", Buffer.from(body)), bundle);
   } catch (error) {
-    throw new Error(`the receipt is not one the evidence bundle accepts (${error.message}); check who the provenance is by and its timestamp`);
+    throw new Error(`the receipt is not one the evidence bundle accepts (${shown(error.message)}); check who the provenance is by and its timestamp`);
   }
 
   // The receipt is written beside its final name and renamed into place, so
@@ -569,7 +624,7 @@ function parseFlags(args) {
     const flag = args[index];
     const value = args[index + 1];
     if (!known.includes(flag)) {
-      throw new Error(`"${flag}" is not an argument this command reads; it reads ${known.join(", ")}, each followed by its value`);
+      throw new Error(`"${shown(flag)}" is not an argument this command reads; it reads ${known.join(", ")}, each followed by its value`);
     }
     if (flags.has(flag)) {
       throw new Error(`${flag} is given more than once`);
@@ -590,26 +645,40 @@ function parseFlags(args) {
  *
  * The request is the one input the receipt does not cite, so it is not read
  * through the bundle's reader and it may live outside the capture directory.
- * It is held to the rule the cited files get all the same:  it is opened
- * without waiting and read only when it is a regular file no larger than the
- * bundle reads of one file, so a pipe or a device named by mistake is refused
- * instead of being waited on or read without end.
+ * It is held to the rule the cited files get all the same, and the bundle
+ * reader's handle checks:  it is opened without waiting and without following
+ * a symlink as its own name, and the open handle is read only when it is a
+ * regular single-link file, still the file the path names, no larger than the
+ * bundle reads of one file.  A pipe or a device named by mistake is refused
+ * instead of being waited on or read without end, and a link swapped in under
+ * the name is never the file that is read.
  */
 function readBundleRequest(requestPath) {
+  const named = shown(requestPath);
   let descriptor;
   try {
-    descriptor = openSync(requestPath, constants.O_RDONLY | constants.O_NONBLOCK);
-  } catch {
-    throw new Error(`the bundle request could not be read: ${requestPath}`);
+    descriptor = openSync(requestPath, constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0));
+  } catch (error) {
+    if (error.code === "ELOOP") {
+      throw new Error(`the bundle request is a symbolic link, and a request is read only as the file it is: ${named}`);
+    }
+    throw new Error(`the bundle request could not be read: ${named}`);
   }
   let bytes;
   try {
     const stat = fstatSync(descriptor);
     if (!stat.isFile()) {
-      throw new Error(`the bundle request is not a regular file: ${requestPath}`);
+      throw new Error(`the bundle request is not a regular file: ${named}`);
+    }
+    if (stat.nlink !== 1) {
+      throw new Error(`the bundle request has ${stat.nlink} links, and a request is read only as a single-link file: ${named}`);
+    }
+    const listed = lstatSync(requestPath, { throwIfNoEntry: false });
+    if (listed === undefined || listed.isSymbolicLink() || listed.dev !== stat.dev || listed.ino !== stat.ino) {
+      throw new Error(`the bundle request is no longer the file its path names: ${named}`);
     }
     if (stat.size > MAX_EVIDENCE_FILE_BYTES) {
-      throw new Error(`the bundle request is ${stat.size} bytes and at most ${MAX_EVIDENCE_FILE_BYTES} bytes of one are read: ${requestPath}`);
+      throw new Error(`the bundle request is ${stat.size} bytes and at most ${MAX_EVIDENCE_FILE_BYTES} bytes of one are read: ${named}`);
     }
     const buffer = Buffer.alloc(stat.size);
     let length = 0;
@@ -625,7 +694,7 @@ function readBundleRequest(requestPath) {
   try {
     return JSON.parse(bytes.toString("utf8"));
   } catch {
-    throw new Error(`the bundle request could not be read as JSON: ${requestPath}`);
+    throw new Error(`the bundle request could not be read as JSON: ${named}`);
   }
 }
 
@@ -645,7 +714,10 @@ if (isEntry) {
   // A refusal repeats text from the files and the arguments it refused, so
   // it reaches the terminal as one bounded line of printable characters.
   const fail = (message) => {
-    console.error(`emit-linux-retention-receipt refused: ${printable(message, MAX_REFUSAL_TEXT)}`);
+    // Text from the files and the arguments was already written as printable
+    // where it was quoted;  anything still carrying a control character is
+    // written as its code point here, without doubling a backslash again.
+    console.error(`emit-linux-retention-receipt refused: ${bounded(escapeControls(message), MAX_REFUSAL_TEXT)}`);
     process.exitCode = 2;
   };
   try {
