@@ -115,10 +115,14 @@ describe("ResourcesSectionView", () => {
     expect(html).toContain("BOTFLEET_JOBS_RESERVED_CPU_CORES");
     expect(html).toContain("BOTFLEET_JOBS_RESERVED_RAM_MB");
     expect(html).toContain("BOTFLEET_JOBS_MIN_MEMORY_AVAILABLE_PERCENT");
-    // All three headroom inputs render enabled: numeric editing is allowed.
+    expect(html).toContain("BOTFLEET_JOBS_MIN_FREE_DISK_MB");
+    expect(html).toContain("BOTFLEET_JOBS_MIN_FREE_INODES");
+    // All five headroom inputs render enabled: numeric editing is allowed.
     expect(html).toContain('id="resources-reserved-cpu"');
     expect(html).toContain('id="resources-reserved-ram"');
     expect(html).toContain('id="resources-min-memory-percent"');
+    expect(html).toContain('id="resources-min-free-disk"');
+    expect(html).toContain('id="resources-min-free-inodes"');
     const disabledInputs = html.match(/<input[^>]*\sdisabled(?:\s|=|>)/g) ?? [];
     expect(disabledInputs.length).toBe(0);
   });
