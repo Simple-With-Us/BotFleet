@@ -398,6 +398,11 @@ node scripts/check-post-reboot-node.mjs --json > "$CAPTURE/post-reboot-verdict.j
 # the others as notices.
 grep -E '^\|.*(app\.botfleet\.server|botfleet-server-start\.sh)' \
   /Users/jay/apps/MAC-LOCAL-PROCESSES.md > "$CAPTURE/inventory-rows.md"
+# The instant of this capture, in UTC.  The producer judges the rows' retirement
+# dates against it and records it as the receipt's instant, so take it here,
+# right after the two files above, and pass it on.  The producer has no default
+# for it:  the moment the producer runs is not the moment of the capture.
+CAPTURED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ```
 
 Expected: a verdict whose `platform` is `darwin`, whose `launchDomain` is the owner's own (`gui/501` or the like, never `gui/0`) with `observed` set to `true`, whose `launchProbes` list carries no skipped probe, and whose `ok` is `true`; and one captured row for each table that names the job or its wrapper, plus any other row that mentions them.
@@ -410,8 +415,11 @@ node scripts/emit-process-inventory-receipt.mjs --capture "$CAPTURE" \
   --verdict "$CAPTURE/post-reboot-verdict.json" \
   --inventory-rows "$CAPTURE/inventory-rows.md" \
   --provenance-record "$CAPTURE/provenance.txt" \
-  --provenance-source "$PROVENANCE_HTTPS_URL" --provenance-by "$RUNNER"
+  --provenance-source "$PROVENANCE_HTTPS_URL" --provenance-by "$RUNNER" \
+  --provenance-at "$CAPTURED_AT"
 ```
+
+The output carries a `receipts` object with the receipt's `path` and `sha256`.  Merge it into the `receipts` object of the same `request.json`:  the evidence collector reads only a receipt the request names by path and hash, and a packet whose request does not name it is blocked with `process-inventory: missing-receipt`.  When no receipt was written, the object is empty and there is nothing to merge.
 
 Expected: exit 0, four checks with exit code 0 (`processes`, `launchd`, `listeners`, `inventory-updated`), and `process-inventory.receipt.json` in the capture directory.  Exit 1 means a check failed and the output names it: when the harness is still present no receipt is written, and when only the inventory rows fail the receipt is written with a failing code that the bundle refuses.  Exit 2 means nothing could be judged at all: the verdict was taken off the Mac, as root, or where the owner's launchd domain did not exist, or one of the cited files is a link or is readable by anyone but the owner.  The output's `notices` fail nothing: they name, by line number, the captured rows that mention the harness outside their first cell, and those rows are read and brought up to date by hand.  `docs/verification/native-final-evidence.md` says what the producer reads and what it cannot establish.
 

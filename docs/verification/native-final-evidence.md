@@ -94,8 +94,13 @@ node scripts/emit-process-inventory-receipt.mjs --capture /private/captures/capt
   --verdict /private/captures/capture/post-reboot-verdict.json \
   --inventory-rows /private/captures/capture/inventory-rows.md \
   --provenance-record /private/captures/capture/provenance.txt \
-  --provenance-source "$PROVENANCE_HTTPS_URL" --provenance-by "$RUNNER"
+  --provenance-source "$PROVENANCE_HTTPS_URL" --provenance-by "$RUNNER" \
+  --provenance-at "$CAPTURED_AT"
 ```
+
+`--provenance-at` is the instant the verdict and the rows were captured, as an ISO 8601 instant with an offset, and it has no default.  The producer judges the rows' retirement dates against it and records it as the receipt's instant, so it is the capture's and not the moment the producer happens to run.  Taking it right after the capture, `CAPTURED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"`, is how the runbook does it.
+
+The producer's output carries a `receipts` object, `{"process-inventory": {"path": ..., "sha256": ...}}`, which is empty when no receipt was written.  Merge it into the `receipts` object of the bundle request.  The collector reads only a receipt the request names by path and hash, so a packet whose request does not name this one is blocked with `process-inventory: missing-receipt`.
 
 Each exit code is read out of the file its check cites, and each check cites that file by hash.
 

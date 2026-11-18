@@ -55,8 +55,12 @@
 //     --request <bundle-request.json> --verdict <post-reboot-verdict.json> \
 //     --inventory-rows <inventory-rows.md> \
 //     --provenance-record <file-in-capture-dir> \
-//     --provenance-source <https-url> --provenance-by <who>
-import { chmodSync, lstatSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+//     --provenance-source <https-url> --provenance-by <who> \
+//     --provenance-at <capture-instant>
+//
+// The output's `receipts` object is the entry to merge into the bundle
+// request's own `receipts`, so the collector finds the receipt this wrote.
+import { closeSync, constants, fchmodSync, fstatSync, ftruncateSync, lstatSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -567,6 +571,47 @@ function assertWritableReceiptPath(receiptPath) {
 }
 
 /**
+ * Write the receipt through a handle that has been looked at.
+ *
+ * `assertWritableReceiptPath` inspects the path, and a path can change between
+ * that look and the write.  So the file is opened without following a link and
+ * without truncating it, the handle is checked to be a plain single-link file
+ * this user owns and to be the very file the path lists now, and only then is
+ * it emptied, written and set owner-only, all through the handle.  A link or a
+ * second name swapped in after the inspection is refused, and the file it
+ * points at is left as it was.
+ */
+export function writeReceiptFile(receiptPath, bytes) {
+  const refused = () => new Error(`the receipt path is not a plain single-link file: ${receiptPath}`);
+  let fd;
+  try {
+    fd = openSync(receiptPath, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+  } catch (error) {
+    if (error.code === "ELOOP") throw refused();
+    throw new Error(`the receipt path could not be opened: ${receiptPath}`);
+  }
+  try {
+    const opened = fstatSync(fd);
+    let listed;
+    try {
+      listed = lstatSync(receiptPath);
+    } catch {
+      throw refused();
+    }
+    const sameFile = listed.dev === opened.dev && listed.ino === opened.ino;
+    const ownedHere = !process.getuid || opened.uid === process.getuid();
+    if (!opened.isFile() || opened.nlink !== 1 || !sameFile || !ownedHere) throw refused();
+    ftruncateSync(fd, 0);
+    writeFileSync(fd, bytes);
+    // The mode is only applied when the open created the file, so it is set
+    // again for the case where a receipt was already there.
+    fchmodSync(fd, 0o600);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
  * Emit the `process-inventory` receipt.
  *
  * The candidate, mode and hosts come from the bundle request the operator
@@ -575,10 +620,13 @@ function assertWritableReceiptPath(receiptPath) {
  * check the bundle starts to require and this script cannot derive is a
  * refusal rather than a receipt with a hole in it.
  *
- * Returns `{ receipt, macHarness, checks, reasons, notices }`.  `receipt` is
- * null when nothing was written, which is the case whenever the harness is
- * not absent.  `notices` fail nothing:  they name the captured rows that
- * mention the harness and were not judged.
+ * Returns `{ receipt, reference, macHarness, checks, reasons, notices }`.
+ * `receipt` is null when nothing was written, which is the case whenever the
+ * harness is not absent.  `reference` is the receipt's `{ path, sha256 }`, the
+ * entry the bundle request's `receipts["process-inventory"]` has to carry for
+ * the collector to read the receipt, and is null when `receipt` is.  `notices`
+ * fail nothing:  they name the captured rows that mention the harness and were
+ * not judged.
  */
 export function emitProcessInventoryReceipt({ captureDir, request, provenance, verdictPath, inventoryRowsPath }) {
   const capture = resolve(captureDir);
@@ -632,7 +680,7 @@ export function emitProcessInventoryReceipt({ captureDir, request, provenance, v
     // behind is removed so the capture directory does not keep a statement
     // the newest verdict contradicts.
     rmSync(receiptPath, { force: true });
-    return { receipt: null, macHarness: "present", checks: summary, reasons, notices: inventory.notices };
+    return { receipt: null, reference: null, macHarness: "present", checks: summary, reasons, notices: inventory.notices };
   }
 
   const receipt = {
@@ -656,11 +704,11 @@ export function emitProcessInventoryReceipt({ captureDir, request, provenance, v
     throw new Error("the receipt would not match the bundle's schema, so nothing was written:  check the provenance fields");
   }
 
-  writeFileSync(receiptPath, receiptBytes, { mode: 0o600 });
-  // `writeFileSync` only applies the mode when it creates the file, so the
-  // mode is set again for the case where a receipt was already there.
-  chmodSync(receiptPath, 0o600);
-  return { receipt, macHarness: "absent", checks: summary, reasons, notices: inventory.notices };
+  writeReceiptFile(receiptPath, receiptBytes);
+  // The entry the bundle request's `receipts` object needs for this kind.  The
+  // collector only reads a receipt the request names, by path and hash.
+  const reference = { path: PROCESS_INVENTORY_RECEIPT_FILE, sha256: evidenceHash(receiptBytes) };
+  return { receipt, reference, macHarness: "absent", checks: summary, reasons, notices: inventory.notices };
 }
 
 /** A flag's value, or undefined when the flag is absent or has no value. */
@@ -696,8 +744,22 @@ if (isEntry) {
     const provenanceRecord = flagValue(args, "--provenance-record");
     const provenanceSource = flagValue(args, "--provenance-source");
     const provenanceBy = flagValue(args, "--provenance-by");
-    if (!captureDir || !requestPath || !verdictPath || !inventoryRowsPath || !provenanceRecord || !provenanceSource || !provenanceBy) {
-      throw new Error("--capture, --request, --verdict, --inventory-rows, --provenance-record, --provenance-source and --provenance-by are required");
+    // The instant is the capture's, not the run's:  the captured rows are
+    // judged against it, so it is stated by the operator who took the capture
+    // and never defaulted to the moment this script happens to run.
+    const provenanceAt = flagValue(args, "--provenance-at");
+    const missing = Object.entries({
+      "--capture": captureDir,
+      "--request": requestPath,
+      "--verdict": verdictPath,
+      "--inventory-rows": inventoryRowsPath,
+      "--provenance-record": provenanceRecord,
+      "--provenance-source": provenanceSource,
+      "--provenance-by": provenanceBy,
+      "--provenance-at": provenanceAt,
+    }).filter(([, value]) => !value).map(([flag]) => flag);
+    if (missing.length > 0) {
+      throw new Error(`${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} required, each with a value`);
     }
     let requestJson;
     try {
@@ -712,7 +774,7 @@ if (isEntry) {
       inventoryRowsPath: resolve(inventoryRowsPath),
       provenance: {
         by: provenanceBy,
-        at: flagValue(args, "--provenance-at") ?? new Date().toISOString(),
+        at: provenanceAt,
         source: provenanceSource,
         record: resolve(provenanceRecord),
       },
@@ -720,6 +782,9 @@ if (isEntry) {
     console.log(JSON.stringify({
       emitted: result.receipt ? [PROCESS_INVENTORY_RECEIPT_FILE] : [],
       macHarness: result.macHarness,
+      // Merge this object into the bundle request's `receipts`:  the collector
+      // reads only a receipt the request names by path and hash.
+      receipts: result.reference ? { "process-inventory": result.reference } : {},
       checks: result.checks,
       reasons: result.reasons,
       notices: result.notices,

@@ -41,6 +41,7 @@ import {
   PROCESS_INVENTORY_RECEIPT_FILE,
   readPostRebootVerdict,
   retiredMarker,
+  writeReceiptFile,
 } from "./emit-process-inventory-receipt.mjs";
 
 const script = fileURLToPath(new URL("./emit-process-inventory-receipt.mjs", import.meta.url));
@@ -155,8 +156,12 @@ function receiptExists(captureDir) {
  * final check over it.  Every other receipt is a synthetic stand-in, the way
  * `decommission-evidence.node-test.mjs` builds them;  the `process-inventory`
  * receipt is the file the producer wrote, byte for byte.
+ *
+ * `reference` is the entry the request's `receipts` object carries for it:
+ * the producer's own `reference`, or `null` for a request that does not name
+ * the receipt at all.
  */
-function finalBundleVerdict(captureDir, request) {
+function finalBundleVerdict(captureDir, request, reference) {
   const put = (path, value) => {
     const bytes = Buffer.isBuffer(value) ? value : Buffer.from(JSON.stringify(value));
     mkdirSync(dirname(join(captureDir, path)), { recursive: true, mode: 0o700 });
@@ -168,10 +173,12 @@ function finalBundleVerdict(captureDir, request) {
   const bundle = { ...request, state: put("state.json", { synthetic: true }), receipts: {} };
   for (const kind of REQUIRED_RECEIPTS) {
     if (kind === "process-inventory") {
-      bundle.receipts[kind] = {
-        path: PROCESS_INVENTORY_RECEIPT_FILE,
-        sha256: evidenceHash(readFileSync(join(captureDir, PROCESS_INVENTORY_RECEIPT_FILE))),
-      };
+      if (reference !== null) {
+        bundle.receipts[kind] = reference ?? {
+          path: PROCESS_INVENTORY_RECEIPT_FILE,
+          sha256: evidenceHash(readFileSync(join(captureDir, PROCESS_INVENTORY_RECEIPT_FILE))),
+        };
+      }
       continue;
     }
     let data;
@@ -245,10 +252,30 @@ test("a clean Mac verdict and retired rows earn four passing checks the bundle a
   assert.equal(parsed.data.macHarness, "absent");
   assert.equal(parsed.provenance.record.path, "provenance.txt");
 
-  // And a complete packet carrying it passes the bundle's own final check.
-  const verdict = finalBundleVerdict(captureDir, request);
+  // The producer hands back the entry the request has to carry for it.
+  assert.deepEqual(result.reference, {
+    path: PROCESS_INVENTORY_RECEIPT_FILE,
+    sha256: evidenceHash(readFileSync(join(captureDir, PROCESS_INVENTORY_RECEIPT_FILE))),
+  });
+
+  // And a complete packet whose request carries that entry passes the
+  // bundle's own final check.
+  const verdict = finalBundleVerdict(captureDir, request, result.reference);
   assert.deepEqual(verdict.blockers, []);
   assert.equal(verdict.ok, true);
+});
+
+test("a request that does not name the emitted receipt is blocked, so the producer's reference is the registration", onPosix, () => {
+  // The collector reads only a receipt the request names by path and hash.
+  // Without the entry the packet is refused whatever the receipt says, which
+  // is why the producer prints it and the runbook says to merge it.
+  const request = makeRequest();
+  const captureDir = makeCapture();
+  emit(captureDir);
+
+  const unregistered = finalBundleVerdict(captureDir, request, null);
+  assert.equal(unregistered.ok, false);
+  assert.ok(unregistered.blockers.includes("process-inventory: missing-receipt"), unregistered.blockers.join("\n"));
 });
 
 test("the receipt is written owner-only", () => {
@@ -267,6 +294,7 @@ test("a lingering process fails `processes` and no receipt is written", () => {
   assert.deepEqual(exitCodes(result), { processes: 1, launchd: 0, listeners: 0, "inventory-updated": 0 });
   assert.equal(result.macHarness, "present");
   assert.equal(result.receipt, null);
+  assert.equal(result.reference, null);
   assert.equal(receiptExists(captureDir), false);
   assert.match(result.reasons.join("\n"), /processes: 1 BotFleet process/);
 });
@@ -812,22 +840,63 @@ test("a receipt path that is a link is refused rather than written through", () 
   assert.equal(readFileSync(join(elsewhere, "target.json"), "utf8"), "{}\n");
 });
 
-/** Run the producer's CLI over a capture directory. */
-function runCli(captureDir, extra = []) {
+// `emit` inspects the receipt path before it writes, and a path can change
+// between that look and the write.  `writeReceiptFile` is the write itself, so
+// these call it directly, with the path already holding what the inspection
+// would have had to catch:  a link, a second name, a longer earlier receipt.
+test("the receipt write refuses a link at the path and leaves its target alone", onPosix, () => {
+  const captureDir = temporaryDirectory("process-inventory-write-");
+  const elsewhere = temporaryDirectory("process-inventory-elsewhere-");
+  writeFileSync(join(elsewhere, "target.json"), "untouched\n", { mode: 0o600 });
+  const receiptPath = join(captureDir, PROCESS_INVENTORY_RECEIPT_FILE);
+  symlinkSync(join(elsewhere, "target.json"), receiptPath);
+
+  assert.throws(() => writeReceiptFile(receiptPath, Buffer.from("{}\n")), /not a plain single-link file/);
+  assert.equal(readFileSync(join(elsewhere, "target.json"), "utf8"), "untouched\n");
+});
+
+test("the receipt write refuses a file with a second name before it empties it", onPosix, () => {
+  const captureDir = temporaryDirectory("process-inventory-write-");
+  const elsewhere = temporaryDirectory("process-inventory-elsewhere-");
+  writeFileSync(join(elsewhere, "target.json"), "untouched\n", { mode: 0o600 });
+  const receiptPath = join(captureDir, PROCESS_INVENTORY_RECEIPT_FILE);
+  linkSync(join(elsewhere, "target.json"), receiptPath);
+
+  assert.throws(() => writeReceiptFile(receiptPath, Buffer.from("{}\n")), /not a plain single-link file/);
+  assert.equal(readFileSync(join(elsewhere, "target.json"), "utf8"), "untouched\n");
+});
+
+test("the receipt write replaces an earlier receipt whole and leaves it owner-only", onPosix, () => {
+  const captureDir = temporaryDirectory("process-inventory-write-");
+  const receiptPath = join(captureDir, PROCESS_INVENTORY_RECEIPT_FILE);
+  writeFileSync(receiptPath, `${"an earlier, longer receipt\n".repeat(20)}`, { mode: 0o644 });
+  chmodSync(receiptPath, 0o644);
+
+  writeReceiptFile(receiptPath, Buffer.from("{}\n"));
+
+  assert.equal(readFileSync(receiptPath, "utf8"), "{}\n");
+  assert.equal(statSync(receiptPath).mode & 0o777, 0o600);
+});
+
+/** The producer's flags with their values, for a capture directory. */
+function cliFlags(captureDir) {
   const requestPath = join(captureDir, "request.json");
   writeFileSync(requestPath, JSON.stringify(makeRequest()), { mode: 0o600 });
-  return spawnSync(process.execPath, [
-    script,
-    "--capture", captureDir,
-    "--request", requestPath,
-    "--verdict", join(captureDir, "post-reboot-verdict.json"),
-    "--inventory-rows", join(captureDir, "inventory-rows.md"),
-    "--provenance-record", join(captureDir, "provenance.txt"),
-    "--provenance-source", PROVENANCE.source,
-    "--provenance-by", PROVENANCE.by,
-    "--provenance-at", PROVENANCE.at,
-    ...extra,
-  ], { encoding: "utf8", timeout: 30_000 });
+  return [
+    ["--capture", captureDir],
+    ["--request", requestPath],
+    ["--verdict", join(captureDir, "post-reboot-verdict.json")],
+    ["--inventory-rows", join(captureDir, "inventory-rows.md")],
+    ["--provenance-record", join(captureDir, "provenance.txt")],
+    ["--provenance-source", PROVENANCE.source],
+    ["--provenance-by", PROVENANCE.by],
+    ["--provenance-at", PROVENANCE.at],
+  ];
+}
+
+/** Run the producer's CLI over a capture directory. */
+function runCli(captureDir, extra = []) {
+  return spawnSync(process.execPath, [script, ...cliFlags(captureDir).flat(), ...extra], { encoding: "utf8", timeout: 30_000 });
 }
 
 test("the CLI exits 0 with a receipt, 1 without one on a dirty verdict, and 2 on a refusal", () => {
@@ -883,11 +952,64 @@ test("the CLI exits 0 with a receipt, 1 without one on a dirty verdict, and 2 on
   assert.equal(receiptExists(noDomain), false);
 });
 
-test("the CLI refuses a flag with no value", () => {
+/** Run the CLI with every flag but one, and that one given without a value. */
+function runCliWithoutValue(captureDir, flag) {
+  const args = cliFlags(captureDir).flatMap(([name, value]) => (name === flag ? [name] : [name, value]));
+  return spawnSync(process.execPath, [script, ...args], { encoding: "utf8", timeout: 30_000 });
+}
+
+test("the CLI refuses a flag with no value, and does not read the next flag as its value", () => {
+  // Every other flag is supplied, so the only thing wrong is the missing
+  // value.  `--request` is followed by `--verdict`:  a guard that took the
+  // next argument as the value would read the request from a file named
+  // `--verdict` and fail with a different message, so the refusal has to name
+  // `--request` as the missing flag and say nothing about reading a file.
+  const followed = makeCapture();
+  const request = runCliWithoutValue(followed, "--request");
+  assert.equal(request.status, 2);
+  assert.match(request.stderr, /emit-process-inventory-receipt refused: --request is required, each with a value/);
+  assert.doesNotMatch(request.stderr, /could not be read/);
+  assert.equal(request.stdout, "");
+  assert.equal(receiptExists(followed), false);
+
+  // The last flag on the line has nothing after it at all.
+  const last = makeCapture();
+  const trailing = runCliWithoutValue(last, "--provenance-at");
+  assert.equal(trailing.status, 2);
+  assert.match(trailing.stderr, /emit-process-inventory-receipt refused: --provenance-at is required, each with a value/);
+  assert.equal(receiptExists(last), false);
+});
+
+test("the CLI has no default for the capture instant", () => {
+  // The rows are judged against the capture's instant, so a run that was not
+  // told it must not fall back to the moment the producer happens to run.
   const captureDir = makeCapture();
-  const proc = spawnSync(process.execPath, [script, "--capture", captureDir, "--request", "--verdict"], { encoding: "utf8", timeout: 30_000 });
+  const flags = cliFlags(captureDir).filter(([name]) => name !== "--provenance-at").flat();
+  const proc = spawnSync(process.execPath, [script, ...flags], { encoding: "utf8", timeout: 30_000 });
   assert.equal(proc.status, 2);
-  assert.match(proc.stderr, /--inventory-rows, --provenance-record, --provenance-source and --provenance-by are required/);
+  assert.match(proc.stderr, /emit-process-inventory-receipt refused: --provenance-at is required, each with a value/);
+  assert.equal(proc.stdout, "");
+  assert.equal(receiptExists(captureDir), false);
+});
+
+test("the CLI prints the entry the bundle request has to carry for the receipt", () => {
+  const captureDir = makeCapture();
+  const passed = runCli(captureDir);
+  assert.equal(passed.status, 0, passed.stderr);
+  assert.deepEqual(JSON.parse(passed.stdout).receipts, {
+    "process-inventory": {
+      path: PROCESS_INVENTORY_RECEIPT_FILE,
+      sha256: evidenceHash(readFileSync(join(captureDir, PROCESS_INVENTORY_RECEIPT_FILE))),
+    },
+  });
+
+  // With no receipt written there is nothing to register.
+  const dirty = makeCapture({
+    verdict: makeVerdict({ launchAgents: [{ label: "app.botfleet.server", running: true, details: "state = running" }] }),
+  });
+  const failed = runCli(dirty);
+  assert.equal(failed.status, 1, failed.stderr);
+  assert.deepEqual(JSON.parse(failed.stdout).receipts, {});
 });
 
 test("`pnpm test` reaches this file, so CI runs these fixtures", () => {
