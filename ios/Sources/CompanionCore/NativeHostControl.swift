@@ -140,14 +140,11 @@ public final class NativeHostControlServer: @unchecked Sendable {
     /// neither state means the listener is gone, so the result is read by errno
     /// and a pending connection is completed before it is believed.
     ///
-    /// The connect outcome can be injected, so a fixture can reach the pending
-    /// branch without depending on a kernel's backlog timing.
-    ///
-    /// The real connect always runs first, so the descriptor holds the kernel's
-    /// own answer, and an injected outcome only selects which branch is taken.
-    /// The completion is still read from the descriptor, so an injected errno
-    /// can never report a connection the socket did not make.
-    static func channelAnswers(path: String, connect: ((Int32) -> (result: Int32, connectError: Int32))? = nil) -> Bool {
+    /// The kernel's own result and errno are the only answer this path accepts.
+    /// There is no seam for a fabricated one, and the completion of a pending
+    /// connection is read from the descriptor itself, so nothing here can
+    /// report a connection the socket did not make.
+    static func channelAnswers(path: String) -> Bool {
         var address: sockaddr_un
         do { address = try Self.address(path) } catch { return false }
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
@@ -164,22 +161,27 @@ public final class NativeHostControlServer: @unchecked Sendable {
                 return status
             }
         }
-        if let connect = connect {
-            let outcome = connect(fd)
-            if outcome.result == -1,
-               NativeHostChannelProbe.isReachable(connectResult: outcome.result, connectError: outcome.connectError) {
-                result = outcome.result
-                connectError = outcome.connectError
-            }
-        }
+        return Self.channelIsLive(result: result, connectError: connectError, fd: fd)
+    }
+
+    /// Decides liveness from the kernel's own connect answer and the descriptor.
+    ///
+    /// The errno decides whether the listener can be live at all, and a pending
+    /// connect is believed only once the descriptor completed without a socket
+    /// error.  The descriptor is the only source of that completion, so a
+    /// pending answer can never stand in for a connection the socket did not
+    /// make.
+    static func channelIsLive(result: Int32, connectError: Int32, fd: Int32) -> Bool {
         guard NativeHostChannelProbe.isReachable(connectResult: result, connectError: connectError) else { return false }
         if result == 0 { return true }
-        // A pending connection is only a live channel once it completed cleanly.
         return Self.connectionCompleted(fd)
     }
 
     /// Waits for a pending connection and reads the socket error the kernel kept
     /// for it, so a pending connect is trusted only when it really connected.
+    ///
+    /// The socket error is read once, after the wait, because the kernel keeps
+    /// the outcome of a pending connect there and clears it when it is read.
     static func connectionCompleted(_ fd: Int32) -> Bool {
         let deadline = ProcessInfo.processInfo.systemUptime + 1
         guard Self.wait(fd, events: Int16(POLLOUT), deadline: deadline) else { return false }

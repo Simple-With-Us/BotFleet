@@ -375,28 +375,88 @@ struct NativeHostControlTests {
         try await host.shutdown()
     }
 
-    @Test("A pending connect is believed only after it completed without a socket error")
+    @Test("A pending connect is believed only after the descriptor completed without a socket error")
     func pendingConnectIsBelievedOnlyAfterCompletion() async throws {
-        // The pending branch of the probe, reached without kernel backlog timing.
         let fixture = try HostFixture(shortPath: true)
         defer { fixture.remove() }
         let host = try await fixture.start()
         let server = try NativeHostControlServer(host: host, peerUID: { _ in 0 })
         defer { server.close() }
-        let live = fixture.root.appendingPathComponent(NativeHostControlServer.socketName)
-        let socket = live.path
-        // A pending connect that completed cleanly is a live channel: the
-        // injected outcome selects the pending branch, and the descriptor's own
-        // completion decides the answer.
-        let completed = NativeHostControlServer.channelAnswers(path: socket, connect: { _ in (-1, EINPROGRESS) })
-        #expect(completed)
-        // A pending connect that carries a socket error is not a live channel:
-        // the descriptor kept the kernel's own failure, so the injected errno
-        // cannot report a connection the socket did not make.
+        let socket = fixture.root.appendingPathComponent(NativeHostControlServer.socketName).path
+        // A pending connect that completed cleanly is a live channel, and the
+        // answer comes from the descriptor's own completion.  This assertion
+        // fails when the completion check is weakened, because the descriptor
+        // below never completes.
+        let completed = try controlConnect(fixture)
+        defer { Darwin.close(completed) }
+        #expect(NativeHostControlServer.channelIsLive(result: -1, connectError: EINPROGRESS, fd: completed))
+        // A pending connect whose descriptor never became writable is not a
+        // live channel, so the pending branch cannot be believed on the errno
+        // alone.  This assertion fails when the completion check is weakened,
+        // because the descriptor really never completes.
+        let blocked = try fixtureBlockedSocket()
+        defer { Darwin.close(blocked.descriptor) }
+        defer { Darwin.close(blocked.peer) }
+        #expect(!NativeHostControlServer.channelIsLive(result: -1, connectError: EINPROGRESS, fd: blocked.descriptor))
+        // The connected branch answers on the kernel's result alone, so the
+        // difference between the two answers is the pending branch consulting
+        // the descriptor rather than the pending errno.
+        #expect(NativeHostControlServer.channelIsLive(result: 0, connectError: 0, fd: blocked.descriptor))
+        // The production path reads the kernel's own answer and nothing else: a
+        // live listener answers and a missing one does not.
+        #expect(NativeHostControlServer.channelAnswers(path: socket))
         let absent = fixture.root.appendingPathComponent("absent.sock").path
-        let failed = NativeHostControlServer.channelAnswers(path: absent, connect: { _ in (-1, EINPROGRESS) })
-        #expect(!failed)
+        #expect(!NativeHostControlServer.channelAnswers(path: absent))
+        // The refusal is the kernel's own errno for the missing listener, so no
+        // fabricated outcome could have produced it.
+        let refusal = try fixtureConnectError(absent)
+        #expect(refusal == ENOENT)
         try await host.shutdown()
+    }
+
+    @Test("A refused fixture write names the step that failed and never reports a success errno")
+    func refusalNamesTheFailedStep() throws {
+        // Every refusal names its own step, and only the cases that carry an
+        // errno carry one, so no refusal can report "Success" for a failed
+        // directory or ownership check.
+        let refusals: [FixtureWriteRefusal] = [
+            .ancestorOpen("service", ELOOP),
+            .ancestorStat("service", EIO),
+            .ancestorNotDirectory("service"),
+            .ancestorOwnership("service"),
+            .protectedPlace,
+            .trustedDirectory(ENOENT),
+            .trustedDirectoryStat(EIO),
+            .trustedDirectoryNotDirectory,
+            .trustedDirectoryOwnership,
+            .trustedDirectoryWritable,
+            .entry(EEXIST),
+            .handleStat(EIO),
+            .handleShape,
+            .listedStat(ENOENT),
+            .listedMismatch,
+            .writeFailed(ENOSPC),
+        ]
+        for refusal in refusals {
+            #expect(!refusal.description.contains("errno=0"))
+            #expect(!refusal.description.isEmpty)
+        }
+        // The errno cases carry the errno the call reported.
+        #expect(FixtureWriteRefusal.ancestorOpen("service", ELOOP).description.contains("errno=\(ELOOP)"))
+        // The ownership and type cases name the step instead of an errno.
+        #expect(FixtureWriteRefusal.ancestorOwnership("service").description.contains("not owned"))
+        #expect(FixtureWriteRefusal.ancestorNotDirectory("service").description.contains("not a directory"))
+        // A protected place is refused by name, before anything is opened.
+        let fixture = try HostFixture(shortPath: true)
+        defer { fixture.remove() }
+        let hidden = fixture.parent.appendingPathComponent(".hidden", isDirectory: true)
+        try FileManager.default.createDirectory(at: hidden, withIntermediateDirectories: false)
+        do {
+            try writeFixtureFile("payload", to: hidden.appendingPathComponent("control.sock"))
+            Issue.record("A protected place was written")
+        } catch let refusal as FixtureWriteRefusal {
+            #expect(refusal == .protectedPlace)
+        }
     }
 
     @Test("Every error type keeps its reason code on every platform")
@@ -442,26 +502,46 @@ private func nativeHostMainScript() -> URL {
 }
 
 /// Why a fixture write was refused, so a failure names the step that failed.
-private enum FixtureWriteRefusal: Error, CustomStringConvertible {
-    case ancestor(String, Int32)
+///
+/// A case that carries an errno carries the errno the call really reported, and
+/// a case that is not an errno condition carries no number at all, so a refusal
+/// can never name a success it did not have.
+private enum FixtureWriteRefusal: Error, Equatable, CustomStringConvertible {
+    case ancestorOpen(String, Int32)
+    case ancestorStat(String, Int32)
+    case ancestorNotDirectory(String)
+    case ancestorOwnership(String)
     case protectedPlace
     case trustedDirectory(Int32)
+    case trustedDirectoryStat(Int32)
+    case trustedDirectoryNotDirectory
     case trustedDirectoryOwnership
     case trustedDirectoryWritable
     case entry(Int32)
-    case handle(Int32)
-    case listed(Int32)
+    case handleStat(Int32)
+    case handleShape
+    case listedStat(Int32)
+    case listedMismatch
+    case writeFailed(Int32)
 
     var description: String {
         switch self {
-        case .ancestor(let component, let code): return "ancestor \(component) errno=\(code)"
+        case .ancestorOpen(let component, let code): return "ancestor \(component) errno=\(code)"
+        case .ancestorStat(let component, let code): return "ancestor \(component) stat errno=\(code)"
+        case .ancestorNotDirectory(let component): return "ancestor \(component) is not a directory"
+        case .ancestorOwnership(let component): return "ancestor \(component) is not owned by root or this user"
         case .protectedPlace: return "protected place"
         case .trustedDirectory(let code): return "trusted directory errno=\(code)"
+        case .trustedDirectoryStat(let code): return "trusted directory stat errno=\(code)"
+        case .trustedDirectoryNotDirectory: return "trusted directory is not a directory"
         case .trustedDirectoryOwnership: return "trusted directory is not owned by this user"
         case .trustedDirectoryWritable: return "trusted directory is group or world writable"
         case .entry(let code): return "entry errno=\(code)"
-        case .handle(let code): return "handle errno=\(code)"
-        case .listed(let code): return "listed errno=\(code)"
+        case .handleStat(let code): return "handle stat errno=\(code)"
+        case .handleShape: return "handle is not a regular single-link file owned by this user"
+        case .listedStat(let code): return "listed stat errno=\(code)"
+        case .listedMismatch: return "listed path is not the opened file"
+        case .writeFailed(let code): return "write errno=\(code)"
         }
     }
 }
@@ -516,19 +596,17 @@ private func writeFixtureFile(_ payload: String, to url: URL) throws {
         let next = component.withCString {
             openat(directory, $0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW, 0)
         }
-        guard next >= 0 else { throw FixtureWriteRefusal.ancestor(component, errno) }
+        guard next >= 0 else { throw FixtureWriteRefusal.ancestorOpen(component, errno) }
         directories.append(next)
         directory = next
         var info = stat()
-        guard fstat(next, &info) == 0, info.st_mode & S_IFMT == S_IFDIR,
-              info.st_uid == 0 || info.st_uid == geteuid() else {
-            throw FixtureWriteRefusal.ancestor(component, 0)
-        }
+        guard fstat(next, &info) == 0 else { throw FixtureWriteRefusal.ancestorStat(component, errno) }
+        guard info.st_mode & S_IFMT == S_IFDIR else { throw FixtureWriteRefusal.ancestorNotDirectory(component) }
+        guard info.st_uid == 0 || info.st_uid == geteuid() else { throw FixtureWriteRefusal.ancestorOwnership(component) }
     }
     var directoryInfo = stat()
-    guard fstat(directory, &directoryInfo) == 0, directoryInfo.st_mode & S_IFMT == S_IFDIR else {
-        throw FixtureWriteRefusal.trustedDirectory(0)
-    }
+    guard fstat(directory, &directoryInfo) == 0 else { throw FixtureWriteRefusal.trustedDirectoryStat(errno) }
+    guard directoryInfo.st_mode & S_IFMT == S_IFDIR else { throw FixtureWriteRefusal.trustedDirectoryNotDirectory }
     guard directoryInfo.st_uid == geteuid() else { throw FixtureWriteRefusal.trustedDirectoryOwnership }
     guard directoryInfo.st_mode & 0o022 == 0 else { throw FixtureWriteRefusal.trustedDirectoryWritable }
     let fd = name.withCString {
@@ -537,14 +615,15 @@ private func writeFixtureFile(_ payload: String, to url: URL) throws {
     guard fd >= 0 else { throw FixtureWriteRefusal.entry(errno) }
     defer { Darwin.close(fd) }
     var handle = stat()
-    guard fstat(fd, &handle) == 0, handle.st_mode & S_IFMT == S_IFREG, handle.st_nlink == 1,
-          handle.st_uid == geteuid() else {
-        throw FixtureWriteRefusal.handle(0)
+    guard fstat(fd, &handle) == 0 else { throw FixtureWriteRefusal.handleStat(errno) }
+    guard handle.st_mode & S_IFMT == S_IFREG, handle.st_nlink == 1, handle.st_uid == geteuid() else {
+        throw FixtureWriteRefusal.handleShape
     }
     var listed = stat()
-    guard lstat(path, &listed) == 0, listed.st_mode & S_IFMT == S_IFREG,
+    guard lstat(path, &listed) == 0 else { throw FixtureWriteRefusal.listedStat(errno) }
+    guard listed.st_mode & S_IFMT == S_IFREG,
           listed.st_dev == handle.st_dev, listed.st_ino == handle.st_ino else {
-        throw FixtureWriteRefusal.listed(errno)
+        throw FixtureWriteRefusal.listedMismatch
     }
     let bytes = Array(payload.utf8)
     guard !bytes.isEmpty else { return }
@@ -557,7 +636,7 @@ private func writeFixtureFile(_ payload: String, to url: URL) throws {
         }
         if count > 0 { written = offset + count }
         else if count < 0, errno == EINTR { continue }
-        else { throw FixtureWriteRefusal.handle(errno) }
+        else { throw FixtureWriteRefusal.writeFailed(errno) }
     }
 }
 
@@ -656,6 +735,51 @@ private func controlConnect(_ fixture: HostFixture) throws -> Int32 {
     }
     guard result == 0 else { Darwin.close(fd); throw NativeHostControlError.socketUnavailable }
     return fd
+}
+
+/// A connected descriptor that never becomes writable, so it never reaches a
+/// completed connection.
+///
+/// The send buffer is filled and the peer never reads, so the descriptor stays
+/// unwritable, which is exactly the state a pending connect stays in while it
+/// has not completed.
+private func fixtureBlockedSocket() throws -> (descriptor: Int32, peer: Int32) {
+    var pair: [Int32] = [-1, -1]
+    let created = withUnsafeMutableBytes(of: &pair) { raw in
+        Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, raw.baseAddress!.assumingMemoryBound(to: Int32.self))
+    }
+    guard created == 0 else { throw NativeHostControlError.socketUnavailable }
+    let descriptor = pair[0]
+    let peer = pair[1]
+    guard fcntl(descriptor, F_SETFL, O_NONBLOCK) == 0 else {
+        Darwin.close(descriptor); Darwin.close(peer)
+        throw NativeHostControlError.socketUnavailable
+    }
+    var noSignal: Int32 = 1
+    setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
+    // Fill the send buffer, so the descriptor is connected and not writable.
+    var buffer = [UInt8](repeating: 0, count: 65536)
+    while true {
+        let count = buffer.withUnsafeBytes { raw in Darwin.write(descriptor, raw.baseAddress, raw.count) }
+        if count < 0 { break }
+        if count == 0 { break }
+    }
+    return (descriptor, peer)
+}
+
+/// The errno the kernel reports for a real connect to a path with no listener.
+private func fixtureConnectError(_ path: String) throws -> Int32 {
+    let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { throw NativeHostControlError.socketUnavailable }
+    defer { Darwin.close(fd) }
+    var address = controlAddress(URL(fileURLWithPath: path))
+    let result = withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    if result == 0 { return 0 }
+    return errno
 }
 
 private func controlRequest(_ fixture: HostFixture, _ text: String) async throws -> String {
