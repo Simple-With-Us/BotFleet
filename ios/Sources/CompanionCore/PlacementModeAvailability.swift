@@ -26,6 +26,16 @@ public struct PlacementModeAvailability: Equatable, Sendable {
     public static let takeOverAvailableCaption = "Server is unreachable.\u{00A0} Use Take Over On This Mac… to switch to This Mac Only."
     public static let unappliedSelectionCaption = "Saved selection has not been confirmed by the controller yet."
 
+    public static func testServerReason(serverName: String) -> String {
+        let trimmed = serverName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return testServerReason }
+        return "Test \(trimmed) below to use this mode."
+    }
+
+    public static func missingPlacementRoutesReason(serverName: String, version: String) -> String {
+        "\(serverName) is running version \(version), which has no placement routes.\u{00A0} Update the server to use this mode."
+    }
+
     public let hasRemoteServer: Bool
     public let hasVerifiedServer: Bool
     public let options: [PlacementModeOptionPresentation]
@@ -39,7 +49,8 @@ public struct PlacementModeAvailability: Equatable, Sendable {
         placement: PlacementSettings,
         runningLocalJobsCount: Int = 0,
         runningServerJobsCount: Int = 0,
-        serverReachable: Bool = true
+        serverReachable: Bool = true,
+        unverifiedServerReason: String? = nil
     ) -> PlacementModeAvailability {
         let remoteHosts = hosts.filter { !$0.isLocal }
         let verifiedHosts = remoteHosts.filter { host in
@@ -73,6 +84,8 @@ public struct PlacementModeAvailability: Equatable, Sendable {
                 hasRemote: hasRemote,
                 hasUnmatchedSelection: hasUnmatchedSelection,
                 targetVerified: targetVerified,
+                targetServerName: targetServer?.name,
+                unverifiedServerReason: unverifiedServerReason,
                 runningLocalJobsCount: runningLocalJobsCount,
                 runningServerJobsCount: runningServerJobsCount,
                 serverReachable: serverReachable
@@ -132,6 +145,8 @@ public struct PlacementModeAvailability: Equatable, Sendable {
         hasRemote: Bool,
         hasUnmatchedSelection: Bool,
         targetVerified: Bool,
+        targetServerName: String?,
+        unverifiedServerReason: String?,
         runningLocalJobsCount: Int,
         runningServerJobsCount: Int,
         serverReachable: Bool
@@ -147,6 +162,12 @@ public struct PlacementModeAvailability: Equatable, Sendable {
                 return selectServerReason
             }
             if !targetVerified {
+                if let reason = unverifiedServerReason?.trimmingCharacters(in: .whitespacesAndNewlines), !reason.isEmpty {
+                    return reason
+                }
+                if let targetServerName {
+                    return testServerReason(serverName: targetServerName)
+                }
                 return testServerReason
             }
         }

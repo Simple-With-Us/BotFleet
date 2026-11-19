@@ -427,8 +427,13 @@ final class PlacementModeClientTests: XCTestCase {
         for key in ["unwrittenDefault", "localOnlyAck", "macFirstAck", "serverFirstAck", "staleAckUnacknowledged"] {
             let frameObj = try XCTUnwrap(root[key] as? [String: Any])
             let frameData = try JSONSerialization.data(withJSONObject: frameObj)
+            let beforeCount = PlacementModeURLProtocol.captured.count
             PlacementModeURLProtocol.handler = { _ in (200, frameData) }
             let ack = try await client.read(host: host, credential: gate)
+            XCTAssertEqual(PlacementModeURLProtocol.captured.count, beforeCount + 1)
+            let capturedGet = try XCTUnwrap(PlacementModeURLProtocol.captured.last)
+            XCTAssertEqual(capturedGet.method, "GET")
+            XCTAssertEqual(capturedGet.path, "/api/placement/mode")
             XCTAssertEqual(ack.controllerId, frameObj["controllerId"] as? String)
             XCTAssertEqual(ack.epoch, (frameObj["epoch"] as? NSNumber)?.intValue)
             XCTAssertEqual(ack.mode.rawValue, frameObj["mode"] as? String)
@@ -438,8 +443,7 @@ final class PlacementModeClientTests: XCTestCase {
             XCTAssertEqual(ack.reason, frameObj["reason"] as? String)
         }
 
-        // 2. Verify encoded PUT request bodies match the shared fixture inputs byte-for-key.
-        let encoder = JSONEncoder()
+        // 2. Verify the actual outgoing PUT requests sent by PlacementModeClient.write match the shared fixture inputs.
         for (writeKey, ackKey) in [("localOnlyWrite", "localOnlyAck"), ("macFirstWrite", "macFirstAck"), ("serverFirstWrite", "serverFirstAck")] {
             let writeObj = try XCTUnwrap(root[writeKey] as? [String: Any])
             let ackObj = try XCTUnwrap(root[ackKey] as? [String: Any])
@@ -452,16 +456,20 @@ final class PlacementModeClientTests: XCTestCase {
                 serverId: writeObj["serverId"] as? String,
                 allowOverflowToThisMac: try XCTUnwrap(writeObj["allowOverflowToThisMac"] as? Bool)
             )
-            let encoded = try json(try encoder.encode(submission))
-            XCTAssertEqual(Set(encoded.keys), Set(writeObj.keys))
-            XCTAssertEqual(encoded["mode"] as? String, writeObj["mode"] as? String)
-            XCTAssertEqual(encoded["controllerId"] as? String, writeObj["controllerId"] as? String)
-            XCTAssertEqual((encoded["epoch"] as? NSNumber)?.intValue, (writeObj["epoch"] as? NSNumber)?.intValue)
-            XCTAssertEqual(encoded["serverId"] as? String, writeObj["serverId"] as? String)
-            XCTAssertEqual(encoded["allowOverflowToThisMac"] as? Bool, writeObj["allowOverflowToThisMac"] as? Bool)
-
+            let beforeCount = PlacementModeURLProtocol.captured.count
             PlacementModeURLProtocol.handler = { _ in (200, ackData) }
             let ack = try await client.write(submission, host: host, credential: gate)
+            XCTAssertEqual(PlacementModeURLProtocol.captured.count, beforeCount + 1)
+            let capturedPut = try XCTUnwrap(PlacementModeURLProtocol.captured.last)
+            XCTAssertEqual(capturedPut.method, "PUT")
+            XCTAssertEqual(capturedPut.path, "/api/placement/mode")
+            let sentBody = try json(capturedPut.body)
+            XCTAssertEqual(Set(sentBody.keys), Set(writeObj.keys))
+            XCTAssertEqual(sentBody["mode"] as? String, writeObj["mode"] as? String)
+            XCTAssertEqual(sentBody["controllerId"] as? String, writeObj["controllerId"] as? String)
+            XCTAssertEqual((sentBody["epoch"] as? NSNumber)?.intValue, (writeObj["epoch"] as? NSNumber)?.intValue)
+            XCTAssertEqual(sentBody["serverId"] as? String, writeObj["serverId"] as? String)
+            XCTAssertEqual(sentBody["allowOverflowToThisMac"] as? Bool, writeObj["allowOverflowToThisMac"] as? Bool)
             XCTAssertTrue(ack.acknowledged)
             XCTAssertEqual(ack.mode, mode)
         }

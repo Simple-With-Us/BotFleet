@@ -38,16 +38,30 @@ final class PlacementModeAvailabilityTests: XCTestCase {
 
     func testUnverifiedServerRequiresTestBeforeServerModes() throws {
         let unverified = try unverifiedRemoteHost()
-        let model = PlacementModeAvailability.evaluate(
+        let neverReached = PlacementModeAvailability.evaluate(
             hosts: [.thisMac, unverified],
             selectedServerID: unverified.id,
             placement: PlacementSettings()
         )
-        XCTAssertTrue(model.hasRemoteServer)
-        XCTAssertFalse(model.hasVerifiedServer)
-        XCTAssertTrue(model.options[0].isSelectable)
-        XCTAssertEqual(model.options[1].disabledReason, "Test this server before using this mode.")
-        XCTAssertEqual(model.options[2].disabledReason, "Test this server before using this mode.")
+        XCTAssertTrue(neverReached.hasRemoteServer)
+        XCTAssertFalse(neverReached.hasVerifiedServer)
+        XCTAssertTrue(neverReached.options[0].isSelectable)
+        XCTAssertEqual(neverReached.options[1].disabledReason, "Test Hetzner below to use this mode.")
+        XCTAssertEqual(neverReached.options[2].disabledReason, "Test Hetzner below to use this mode.")
+
+        let missingRoutesReason = PlacementModeAvailability.missingPlacementRoutesReason(serverName: unverified.name, version: "1.0.31")
+        let incompatible = PlacementModeAvailability.evaluate(
+            hosts: [.thisMac, unverified],
+            selectedServerID: unverified.id,
+            placement: PlacementSettings(),
+            unverifiedServerReason: missingRoutesReason
+        )
+        XCTAssertTrue(incompatible.options[0].isSelectable)
+        XCTAssertEqual(
+            incompatible.options[1].disabledReason,
+            "Hetzner is running version 1.0.31, which has no placement routes.\u{00A0} Update the server to use this mode."
+        )
+        XCTAssertEqual(incompatible.options[2].disabledReason, missingRoutesReason)
     }
 
     func testVerifiedServerEnablesAllModesAndExposesOverflowOnServerFirst() throws {
