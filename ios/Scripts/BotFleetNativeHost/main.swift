@@ -42,24 +42,43 @@ struct BotFleetNativeHostMain {
             let result = try await NativeHeadlessHost.launch(
                 serviceData: arguments.serviceData, intent: arguments.intent)
             guard case .running(let host) = result else {
-                FileHandle.standardOutput.write(Data("Native host remains deliberately stopped.\n".utf8))
+                // The owner's Stop is honoured: no host runs and nothing claims one did.
+                FileHandle.standardOutput.write(Data("Native host was not started: the owner's stop marker is set.\n".utf8))
                 return
             }
             let control: NativeHostControlServer
             do {
                 control = try NativeHostControlServer(host: host) { continuation.yield(.checkedStop) }
             } catch {
-                try await host.shutdown()
+                try? await host.shutdown()
                 throw error
             }
             defer { control.close() }
-            FileHandle.standardOutput.write(Data("Native host running with service credential access unavailable.\n".utf8))
+            do {
+                // The start path is checked, never assumed: the sequence verifies the
+                // host through the control channel and owns the announcement, so the
+                // host can never be announced before the check that backs it.
+                try await NativeHostStartSequence.run(
+                    verify: { _ = try await control.verifyStart() },
+                    write: { text in FileHandle.standardOutput.write(Data(text.utf8)) })
+            } catch {
+                // A host that did not come up releases its owner and is never reported
+                // as running; the reason travels with the refusal.
+                try? await host.shutdown()
+                control.close()
+                let reason = NativeHostFailureReason.code(for: error)
+                FileHandle.standardError.write(Data("Native host did not come up: reason=\(reason)\n".utf8))
+                exit(1)
+            }
             for await completion in completions {
                 if case .signal = completion { try await host.shutdown() }
                 break
             }
         } catch {
-            FileHandle.standardError.write(Data("Native host could not complete safely: \(type(of: error))\n".utf8))
+            // The refusal names the reason, never a Swift type and never a value
+            // that could carry a path, a token or any other secret.
+            let reason = NativeHostFailureReason.code(for: error)
+            FileHandle.standardError.write(Data("Native host could not complete safely: reason=\(reason)\n".utf8))
             exit(1)
         }
         #else

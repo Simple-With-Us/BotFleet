@@ -409,4 +409,96 @@ final class PlacementModeClientTests: XCTestCase {
         XCTAssertEqual(model.placement.applied.mode, .localOnly)
         assertNoCompanionHeader()
     }
+
+    func testSharedT7PlacementModeFramesFixtureRoundTrip() async throws {
+        guard let url = Bundle.module.url(forResource: "placement-mode-frames", withExtension: "json", subdirectory: "Fixtures")
+            ?? Bundle.module.url(forResource: "placement-mode-frames", withExtension: "json")
+        else {
+            XCTFail("missing fixture placement-mode-frames.json")
+            return
+        }
+        let data = try Data(contentsOf: url)
+        let root = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let (host, gate) = try remoteHost()
+        let session = session()
+        let client = PlacementModeClient(session: session)
+
+        // 1. Decode every GET / PUT 200 frame produced by TypeScript against the exact shared fixture bytes.
+        for key in ["unwrittenDefault", "localOnlyAck", "macFirstAck", "serverFirstAck", "staleAckUnacknowledged"] {
+            let frameObj = try XCTUnwrap(root[key] as? [String: Any])
+            let frameData = try JSONSerialization.data(withJSONObject: frameObj)
+            let beforeCount = PlacementModeURLProtocol.captured.count
+            PlacementModeURLProtocol.handler = { _ in (200, frameData) }
+            let ack = try await client.read(host: host, credential: gate)
+            XCTAssertEqual(PlacementModeURLProtocol.captured.count, beforeCount + 1)
+            let capturedGet = try XCTUnwrap(PlacementModeURLProtocol.captured.last)
+            XCTAssertEqual(capturedGet.method, "GET")
+            XCTAssertEqual(capturedGet.path, "/api/placement/mode")
+            XCTAssertEqual(ack.controllerId, frameObj["controllerId"] as? String)
+            XCTAssertEqual(ack.epoch, (frameObj["epoch"] as? NSNumber)?.intValue)
+            XCTAssertEqual(ack.mode.rawValue, frameObj["mode"] as? String)
+            XCTAssertEqual(ack.serverId, frameObj["serverId"] as? String)
+            XCTAssertEqual(ack.allowOverflowToThisMac, frameObj["allowOverflowToThisMac"] as? Bool)
+            XCTAssertEqual(ack.acknowledged, frameObj["acknowledged"] as? Bool)
+            XCTAssertEqual(ack.appliedAt, (frameObj["appliedAt"] as? NSNumber)?.doubleValue)
+            XCTAssertEqual(ack.reason, frameObj["reason"] as? String)
+        }
+
+        // 2. Verify the actual outgoing PUT requests sent by PlacementModeClient.write match the shared fixture inputs.
+        for (writeKey, ackKey) in [("localOnlyWrite", "localOnlyAck"), ("macFirstWrite", "macFirstAck"), ("serverFirstWrite", "serverFirstAck")] {
+            let writeObj = try XCTUnwrap(root[writeKey] as? [String: Any])
+            let ackObj = try XCTUnwrap(root[ackKey] as? [String: Any])
+            let ackData = try JSONSerialization.data(withJSONObject: ackObj)
+            let mode = try XCTUnwrap(NativePlacementMode(rawValue: try XCTUnwrap(writeObj["mode"] as? String)))
+            let submission = PlacementModeSubmission(
+                mode: mode,
+                controllerId: try XCTUnwrap(writeObj["controllerId"] as? String),
+                epoch: try XCTUnwrap((writeObj["epoch"] as? NSNumber)?.intValue),
+                serverId: writeObj["serverId"] as? String,
+                allowOverflowToThisMac: try XCTUnwrap(writeObj["allowOverflowToThisMac"] as? Bool)
+            )
+            let beforeCount = PlacementModeURLProtocol.captured.count
+            PlacementModeURLProtocol.handler = { _ in (200, ackData) }
+            let ack = try await client.write(submission, host: host, credential: gate)
+            XCTAssertEqual(PlacementModeURLProtocol.captured.count, beforeCount + 1)
+            let capturedPut = try XCTUnwrap(PlacementModeURLProtocol.captured.last)
+            XCTAssertEqual(capturedPut.method, "PUT")
+            XCTAssertEqual(capturedPut.path, "/api/placement/mode")
+            let sentBody = try json(capturedPut.body)
+            XCTAssertEqual(Set(sentBody.keys), Set(writeObj.keys))
+            XCTAssertEqual(sentBody["mode"] as? String, writeObj["mode"] as? String)
+            XCTAssertEqual(sentBody["controllerId"] as? String, writeObj["controllerId"] as? String)
+            XCTAssertEqual((sentBody["epoch"] as? NSNumber)?.intValue, (writeObj["epoch"] as? NSNumber)?.intValue)
+            XCTAssertEqual(sentBody["serverId"] as? String, writeObj["serverId"] as? String)
+            XCTAssertEqual(sentBody["allowOverflowToThisMac"] as? Bool, writeObj["allowOverflowToThisMac"] as? Bool)
+            XCTAssertTrue(ack.acknowledged)
+            XCTAssertEqual(ack.mode, mode)
+            XCTAssertEqual(ack.appliedAt, (ackObj["appliedAt"] as? NSNumber)?.doubleValue)
+        }
+
+        // 3. Verify 409 stale fence frame throws exact controller pair.
+        let staleObj = try XCTUnwrap(root["staleFence409"] as? [String: Any])
+        let staleData = try JSONSerialization.data(withJSONObject: staleObj)
+        PlacementModeURLProtocol.handler = { _ in (409, staleData) }
+        let staleAttempt = PlacementModeSubmission(
+            mode: .serverFirst,
+            controllerId: try XCTUnwrap(root["serverHostId"] as? String),
+            epoch: 0,
+            serverId: try XCTUnwrap(root["serverHostId"] as? String),
+            allowOverflowToThisMac: true
+        )
+        do {
+            _ = try await client.write(staleAttempt, host: host, credential: gate)
+            XCTFail("409 fixture must throw staleFence")
+        } catch let error as PlacementModeTransportError {
+            XCTAssertEqual(
+                error,
+                .staleFence(
+                    controllerId: try XCTUnwrap(staleObj["controllerId"] as? String),
+                    epoch: try XCTUnwrap((staleObj["epoch"] as? NSNumber)?.intValue)
+                )
+            )
+        }
+        assertNoCompanionHeader()
+    }
 }

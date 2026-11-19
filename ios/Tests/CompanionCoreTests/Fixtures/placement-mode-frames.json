@@ -1,0 +1,82 @@
+{
+  "macHostId": "mac:33333333-3333-4333-8333-333333333333",
+  "serverHostId": "server:11111111-1111-4111-8111-111111111111",
+  "takeoverServerHostId": "server:22222222-2222-4222-8222-222222222222",
+  "appliedAt": 1700000000000,
+  "unwrittenDefault": {
+    "controllerId": "mac:33333333-3333-4333-8333-333333333333",
+    "epoch": 0,
+    "mode": "localOnly",
+    "serverId": null,
+    "allowOverflowToThisMac": false,
+    "acknowledged": false,
+    "appliedAt": null,
+    "reason": "No mode record is written; This Mac Only is the default and no mode is acknowledged"
+  },
+  "localOnlyWrite": {
+    "mode": "localOnly",
+    "controllerId": "mac:33333333-3333-4333-8333-333333333333",
+    "epoch": 0,
+    "serverId": null,
+    "allowOverflowToThisMac": false
+  },
+  "localOnlyAck": {
+    "controllerId": "mac:33333333-3333-4333-8333-333333333333",
+    "epoch": 0,
+    "mode": "localOnly",
+    "serverId": null,
+    "allowOverflowToThisMac": false,
+    "acknowledged": true,
+    "appliedAt": 1700000000000,
+    "reason": null
+  },
+  "macFirstWrite": {
+    "mode": "macFirst",
+    "controllerId": "mac:33333333-3333-4333-8333-333333333333",
+    "epoch": 0,
+    "serverId": "server:11111111-1111-4111-8111-111111111111",
+    "allowOverflowToThisMac": false
+  },
+  "macFirstAck": {
+    "controllerId": "mac:33333333-3333-4333-8333-333333333333",
+    "epoch": 0,
+    "mode": "macFirst",
+    "serverId": "server:11111111-1111-4111-8111-111111111111",
+    "allowOverflowToThisMac": false,
+    "acknowledged": true,
+    "appliedAt": 1700000000000,
+    "reason": null
+  },
+  "serverFirstWrite": {
+    "mode": "serverFirst",
+    "controllerId": "server:11111111-1111-4111-8111-111111111111",
+    "epoch": 0,
+    "serverId": "server:11111111-1111-4111-8111-111111111111",
+    "allowOverflowToThisMac": true
+  },
+  "serverFirstAck": {
+    "controllerId": "server:11111111-1111-4111-8111-111111111111",
+    "epoch": 0,
+    "mode": "serverFirst",
+    "serverId": "server:11111111-1111-4111-8111-111111111111",
+    "allowOverflowToThisMac": true,
+    "acknowledged": true,
+    "appliedAt": 1700000000000,
+    "reason": null
+  },
+  "staleFence409": {
+    "error": "stale controller epoch 0; the controller is server:22222222-2222-4222-8222-222222222222 at epoch 1",
+    "controllerId": "server:22222222-2222-4222-8222-222222222222",
+    "epoch": 1
+  },
+  "staleAckUnacknowledged": {
+    "controllerId": "server:22222222-2222-4222-8222-222222222222",
+    "epoch": 1,
+    "mode": "serverFirst",
+    "serverId": "server:11111111-1111-4111-8111-111111111111",
+    "allowOverflowToThisMac": true,
+    "acknowledged": false,
+    "appliedAt": 1700000000000,
+    "reason": "The mode record was written at epoch 0; the controller is server:22222222-2222-4222-8222-222222222222 at epoch 1"
+  }
+}

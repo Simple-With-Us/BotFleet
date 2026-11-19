@@ -14,13 +14,13 @@
 //   - `inventory-clean` comes from running the audit against the committed
 //     tree, so it is a measurement rather than somebody's belief about one.
 //
-// The CLI leaves everything else blocking; the five human-only evidence
-// items (Mac soak, replay parity, final import, Control disposition, and
-// Linux preservation) stay false because no command on this host can establish
-// them; `macLocalHarness.present` likewise stays true because only somebody on
-// the Mac can verify the harness is gone, and the gate treats a missing or true
-// value as unmet; the optional server deployment is pre-filled as retained because
-// it is the one approved exclusion, not a finding.
+// The CLI leaves everything else blocking; the six human-only evidence items
+// (placement, soak, replay, import, Control, Linux) stay false.  Replay,
+// import, linux-retention and process-inventory have receipt producers, but a
+// receipt only feeds the evidence bundle and never sets one of these booleans.
+// `macLocalHarness.present` stays true: only somebody on the Mac can verify the
+// harness is gone, and a missing or true value is unmet.  The optional server
+// deployment is pre-filled as retained: the one approved exclusion, not a finding.
 //
 //   node scripts/decommission-gate-state.mjs --out /tmp/phase6-state.json
 //   node scripts/decommission-gate-state.mjs --board-json <nodes.json> --out out.json

@@ -3,10 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { PLACEMENT_WIRE_VERSION, type HostId } from "../shared/placement.ts";
+import { HOST_ID_PATTERN, PLACEMENT_WIRE_VERSION, type HostId } from "../shared/placement.ts";
 import { openControllerEpochStore } from "./placement-identity.ts";
 import { PlacementLeaseService } from "./placement-leases.ts";
-import { PlacementModeStore, placementModeRead, placementModeWrite } from "./placement-mode-store.ts";
+import { PlacementModeStore, placementModeInputSchema, placementModeRead, placementModeWrite } from "./placement-mode-store.ts";
 
 /** The stored record, read back the way the store writes it. */
 const storedRecord = z.object({
@@ -248,5 +248,114 @@ describe("the placement mode route", () => {
       appliedAt: 1_700_000_000_000,
       reason: null,
     });
+  });
+
+  it("matches the shared T7 Swift/TypeScript placement-mode contract fixture", () => {
+    const fixtureHostId = z.string().regex(HOST_ID_PATTERN).transform((value): HostId => {
+      if (value.startsWith("mac:")) return `mac:${value.slice(4)}`;
+      return `server:${value.slice(7)}`;
+    });
+    const ackFrameSchema = z.object({
+      controllerId: fixtureHostId,
+      epoch: z.number().int().nonnegative(),
+      mode: z.enum(["localOnly", "serverFirst", "macFirst"]),
+      serverId: fixtureHostId.nullable(),
+      allowOverflowToThisMac: z.boolean(),
+      acknowledged: z.boolean(),
+      appliedAt: z.number().int().nonnegative().nullable(),
+      reason: z.string().nullable(),
+    }).strict();
+    const sharedFixtureSchema = z.object({
+      macHostId: fixtureHostId,
+      serverHostId: fixtureHostId,
+      takeoverServerHostId: fixtureHostId,
+      appliedAt: z.number().int().nonnegative(),
+      unwrittenDefault: ackFrameSchema,
+      localOnlyWrite: placementModeInputSchema,
+      localOnlyAck: ackFrameSchema,
+      macFirstWrite: placementModeInputSchema,
+      macFirstAck: ackFrameSchema,
+      serverFirstWrite: placementModeInputSchema,
+      serverFirstAck: ackFrameSchema,
+      staleFence409: z.object({
+        error: z.string(),
+        controllerId: fixtureHostId,
+        epoch: z.number().int().nonnegative(),
+      }).strict(),
+      staleAckUnacknowledged: ackFrameSchema,
+    }).strict();
+
+    const shared = sharedFixtureSchema.parse(
+      JSON.parse(
+        readFileSync(new URL("../ios/Tests/CompanionCoreTests/Fixtures/placement-mode-frames.json", import.meta.url), "utf8"),
+      ),
+    );
+
+    // 1. Mac controller: unwritten default & localOnly write.
+    const macDir = mkdtempSync(join(tmpdir(), "bf-t7-mac-"));
+    try {
+      const macEpochs = openControllerEpochStore(macDir, shared.macHostId);
+      const macLeases = new PlacementLeaseService({
+        hostId: shared.macHostId,
+        controller: macEpochs.read(),
+        controllerStore: macEpochs,
+      });
+      const macStore = new PlacementModeStore(join(macDir, "jobs"), {
+        controller: () => macLeases.controller(),
+        hostId: shared.macHostId,
+        now: () => shared.appliedAt,
+      });
+      expect(placementModeRead(owner, macStore)).toEqual({ status: 200, body: shared.unwrittenDefault });
+      expect(placementModeWrite(owner, shared.localOnlyWrite, macStore)).toEqual({ status: 200, body: shared.localOnlyAck });
+    } finally {
+      rmSync(macDir, { recursive: true, force: true });
+    }
+
+    // 2. macFirst held by server store while Mac holds controller epoch 0.
+    const macFirstDir = mkdtempSync(join(tmpdir(), "bf-t7-macfirst-"));
+    try {
+      const macEpochs = openControllerEpochStore(macFirstDir, shared.macHostId);
+      const macLeases = new PlacementLeaseService({
+        hostId: shared.macHostId,
+        controller: macEpochs.read(),
+        controllerStore: macEpochs,
+      });
+      const macFirstStore = new PlacementModeStore(join(macFirstDir, "jobs"), {
+        controller: () => macLeases.controller(),
+        hostId: shared.serverHostId,
+        now: () => shared.appliedAt,
+      });
+      expect(placementModeWrite(owner, shared.macFirstWrite, macFirstStore)).toEqual({ status: 200, body: shared.macFirstAck });
+    } finally {
+      rmSync(macFirstDir, { recursive: true, force: true });
+    }
+
+    // 3. Server controller: serverFirst write, then epoch takeover yielding 409 and unacknowledged 200.
+    const serverDir = mkdtempSync(join(tmpdir(), "bf-t7-server-"));
+    try {
+      const serverEpochs = openControllerEpochStore(serverDir, shared.serverHostId);
+      const serverLeases = new PlacementLeaseService({
+        hostId: shared.serverHostId,
+        controller: serverEpochs.read(),
+        controllerStore: serverEpochs,
+      });
+      const serverStore = new PlacementModeStore(join(serverDir, "jobs"), {
+        controller: () => serverLeases.controller(),
+        hostId: shared.serverHostId,
+        now: () => shared.appliedAt,
+      });
+      expect(placementModeWrite(owner, shared.serverFirstWrite, serverStore)).toEqual({ status: 200, body: shared.serverFirstAck });
+      const takeover = serverLeases.takeover({
+        version: PLACEMENT_WIRE_VERSION,
+        controllerId: shared.takeoverServerHostId,
+        epoch: 1,
+        reconcile: false,
+      });
+      expect(takeover.ok && takeover.reply.accepted).toBe(true);
+      expect(placementModeWrite(owner, shared.serverFirstWrite, serverStore)).toEqual({ status: 409, body: shared.staleFence409 });
+      expect(placementModeRead(owner, serverStore)).toEqual({ status: 200, body: shared.staleAckUnacknowledged });
+    } finally {
+      rmSync(serverDir, { recursive: true, force: true });
+    }
   });
 });

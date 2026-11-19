@@ -238,6 +238,56 @@ export function inspectLaunchAgents(agentLabels = BOTFLEET_AGENTS, probeFn, prob
 }
 
 /**
+ * Wrap a launchd probe so every answer it gives is kept, one entry per label.
+ *
+ * `inspectLaunchAgents` keeps only the agents it found loaded, so its result
+ * cannot tell "launchd was asked and the job is gone" from "launchd was never
+ * asked".  On a host without launchd the real probe answers `skipped` with
+ * `loaded: false`, which reads exactly like a clean Mac.  The `--json` verdict
+ * carries this list so a reader can tell the two apart.
+ */
+export function recordLaunchProbes(probeFn, launchProbes) {
+  return (label) => {
+    const status = probeFn(label);
+    launchProbes.push({
+      label,
+      loaded: status?.loaded === true,
+      running: status?.running === true,
+      skipped: status?.skipped === true,
+    });
+    return status;
+  };
+}
+
+/**
+ * Ask launchd whether the GUI domain the agent probes address exists.
+ *
+ * `realLaunchctlProbe` asks `gui/<uid>/<label>` and reads "not found" as "not
+ * loaded".  launchd answers the same way when the domain itself is missing --
+ * the check ran as root, or over SSH with nobody logged in at the console --
+ * so four "not loaded" answers can mean that no agent is loaded, or that the
+ * wrong place was asked.  This probe asks for the domain alone, so the `--json`
+ * verdict can say which.  It reports;  it does not change the verdict's `ok`.
+ */
+export function probeLaunchDomain({
+  platform = process.platform,
+  uid = process.getuid ? process.getuid() : null,
+  run = execFileSync,
+} = {}) {
+  if (platform !== "darwin" || uid === null) {
+    return { uid, target: null, observed: false, skipped: true };
+  }
+  const target = `gui/${uid}`;
+  try {
+    // Only the exit status is read.  The domain listing is long and is not kept.
+    run("launchctl", ["print", target], { stdio: "ignore", timeout: 10_000 });
+    return { uid, target, observed: true, skipped: false };
+  } catch {
+    return { uid, target, observed: false, skipped: false };
+  }
+}
+
+/**
  * Real system probe for launchctl on macOS.
  */
 export function realLaunchctlProbe(label) {
@@ -270,6 +320,16 @@ export function realLaunchctlProbe(label) {
 }
 
 /**
+ * Whether a listener's command reads as Node, Electron or BotFleet.
+ *
+ * Exported so a reader of a saved verdict can recompute a listener's `isNode`
+ * flag from its command instead of trusting the stored flag.
+ */
+export function isNodeListenerCommand(command) {
+  return /node|electron|botfleet/i.test(String(command ?? ""));
+}
+
+/**
  * Inspect `lsof -nP -iTCP -sTCP:LISTEN` output for listeners on BotFleet ports.
  * Returns array of offending listeners on loopback: { port, pid, command }.
  */
@@ -291,7 +351,7 @@ export function inspectPortListeners(lsofOutput, watchedPorts = BOTFLEET_PORTS) 
       const portSuffix = `:${port}`;
       if (addressCol.endsWith(portSuffix)) {
         // We care about Node or BotFleet processes listening on loopback or all interfaces
-        const isNode = /node|electron|botfleet/i.test(command);
+        const isNode = isNodeListenerCommand(command);
         listeners.push({ port, pid, command, address: addressCol, isNode });
       }
     }
@@ -437,14 +497,22 @@ if (isEntryModule()) {
   }
 
   const processes = inspectProcesses(psOut);
-  const launchAgents = inspectLaunchAgents(BOTFLEET_AGENTS, realLaunchctlProbe, probeErrors);
+  const launchProbes = [];
+  const launchAgents = inspectLaunchAgents(BOTFLEET_AGENTS, recordLaunchProbes(realLaunchctlProbe, launchProbes), probeErrors);
   const portListeners = inspectPortListeners(lsofOut, BOTFLEET_PORTS);
   const gitFiles = checkGit ? inspectGitFiles(gitTracked, MAC_LOCAL_ROOTS, retainedFiles) : [];
 
   const verdict = evaluatePostReboot({ processes, launchAgents, portListeners, gitFiles, probeErrors });
 
   if (jsonMode) {
-    console.log(JSON.stringify(verdict, null, 2));
+    // The platform, the launchd domain that was asked and the per-label
+    // launchd answers travel with the verdict.  A verdict taken on a host
+    // without launchd skips every launchd probe, and one taken where the GUI
+    // domain does not exist finds no agent in it;  both would otherwise read
+    // as "no launch agent loaded".  The process-inventory receipt producer
+    // refuses a verdict that is not from macOS, that carries a skipped probe,
+    // or whose domain was not observed.
+    console.log(JSON.stringify({ ...verdict, platform: process.platform, launchDomain: probeLaunchDomain(), launchProbes }, null, 2));
     if (!verdict.ok) {
       process.exit(1);
     }

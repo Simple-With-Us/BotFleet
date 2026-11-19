@@ -343,6 +343,19 @@ Expected: both removed, and `$BACKUP` holds the two files that were installed. 
 
 **Then update the Mac's process inventory** at `/Users/jay/apps/MAC-LOCAL-PROCESSES.md`: the `app.botfleet.server` row and the `~/apps/botfleet-server-start.sh` row become retired, with the date and the reason, and the row states that the job is **always-on** while it existed.  Refresh the Apple Note `[BF, MM] Single-Writer Cutover` in the same change with `apple-notes-coding.sh --update`.
 
+**The wording of those rows is checked.**  `scripts/emit-process-inventory-receipt.mjs` reads the rows Step 6 captures and earns the bundle's `inventory-updated` check from them, and it accepts a row only in this form.
+
+-  The row's first cell names `app.botfleet.server` or `botfleet-server-start.sh`.  The inventory names the harness in more than one table, and every such row is rewritten, not only the first.  A row that names either one only in a later cell, filed under a port or under an older label such as `com.jay.botfleet-server`, is not checked: the producer lists each such captured row as a notice, by line number, so it can be read and brought up to date by hand.
+-  A cell after the name opens with `Retired` and the date, bold or plain: `**Retired 2026-11-20**` or `Retired Nov 20, 2026`.  The reason follows in the same cell.  A cell that only mentions a retirement, such as a retirement plan, does not count, and neither does a date later than the UTC date of the capture, which is the date on the owner's clock or the day after it.
+-  The row says what the job was and not what it is.  The words `running`, `loaded` and `always-on` are accepted only directly after `was`, `were`, `had been`, `formerly`, `previously`, `no longer`, `not` or `never`, with an article allowed between, so the always-on statement is written as "was always-on while it existed".  Each of those words needs its own lead: "was loaded and running" fails the check, and "was loaded and was running" passes it.  History that still describes a loaded or running job is removed from the row or rewritten in the past tense.
+
+A pair of rows in the accepted form, with an example date:
+
+```markdown
+| `app.botfleet.server` | **Retired 2026-11-20** (owner, BF-2514: the server is the single writer) | Was always-on while it existed.  Was the BotFleet harness on `127.0.0.1:8799`; the installed plist and wrapper are saved under `~/apps/_retired/`. |
+| `~/apps/botfleet-server-start.sh` | **Retired 2026-11-20** (owner, BF-2514).  Was the wrapper `app.botfleet.server` ran; removed with the job. |
+```
+
 ## Step 6 — Verify The Retirement
 
 ```bash
@@ -353,6 +366,62 @@ ps -eo pid,command | grep -E 'server/index.ts' | grep -v grep
 ```
 
 Expected: the service is not found, nothing is listening, and no harness process is running.
+
+**The reboot check looks at more than those three commands, so its verdict does not pass on Step 5 alone.**  The commands above look at `app.botfleet.server`, ports 8799 and 8800 and the harness process.  `scripts/check-post-reboot-node.mjs` passes only when all of the following hold on the Mac.
+
+-  None of the four launch agents is loaded: `app.botfleet.server`, `app.botfleet.companion`, `com.jay.botfleet-server` and `com.jay.botfleet-companion`.
+-  Nothing whose command reads as Node, Electron or BotFleet listens on port 8799, 8800, 8810 or 8811.  As the check stands, the native app listening on one of those ports fails it.
+-  No harness or companion Node process is running, and no Electron BotFleet app or helper is running.  A running BotFleet app passes only when the check positively identifies it as the native one.
+
+Step 5 retires `app.botfleet.server` and nothing else.  No step of this runbook retires the companion agent: its source goes at the decommission runbook's Step 4, after BF-2510 and BF-2511, and disabling its installed launch agent is the owner's decision under BF-2537.  While `app.botfleet.companion` is still loaded, the verdict's `ok` is `false`, the producer reports `launchd` as failing, writes no receipt and exits 1.  That answer is the true one, and the `process-inventory` receipt cannot be earned until the companion is retired as well.
+
+**Capture the evidence for the bundle.**  The commands above are for the person at the keyboard.  The bundle's `process-inventory` receipt is built from the reboot check's saved verdict and from the inventory rows Step 5 rewrote, so both are saved into the private capture directory the packet is prepared in.
+
+```bash
+# On the Mac, in the BotFleet checkout, after Step 5.  The capture directory is
+# 0700 and its files are 0600, because the bundle's reader refuses anything else.
+#
+# Run this as the owner, logged in at the Mac's console, in a normal shell.
+# Not under sudo:  root's launchd domain is not the one the launch agents live
+# in, and a capture directory root owns is refused.  Not over SSH with nobody
+# logged in:  the owner's launchd domain does not exist then, every agent reads
+# as not loaded, and the producer refuses the verdict.
+umask 077
+CAPTURE="$HOME/private-captures/bf-2514"
+mkdir -p "$CAPTURE"
+# The check prints its verdict and exits 1 when the verdict is failing, so the
+# file is written either way.  No --check-git:  before the Phase 6 deletion that
+# flag always lists files.
+node scripts/check-post-reboot-node.mjs --json > "$CAPTURE/post-reboot-verdict.json"
+# Every inventory table row that mentions the job or its wrapper, in any cell.
+# The producer judges the rows whose first cell names one of them, and lists
+# the others as notices.
+grep -E '^\|.*(app\.botfleet\.server|botfleet-server-start\.sh)' \
+  /Users/jay/apps/MAC-LOCAL-PROCESSES.md > "$CAPTURE/inventory-rows.md"
+# The instant of this capture, in UTC.  The producer judges the rows' retirement
+# dates against it and records it as the receipt's instant, so take it here,
+# right after the two files above, and pass it on.  The producer has no default
+# for it:  the moment the producer runs is not the moment of the capture.
+CAPTURED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+```
+
+Expected: a verdict whose `platform` is `darwin`, whose `launchDomain` is the owner's own (`gui/501` or the like, never `gui/0`) with `observed` set to `true`, whose `launchProbes` list carries no skipped probe, and whose `ok` is `true`; and one captured row for each table that names the job or its wrapper, plus any other row that mentions them.
+
+Then emit the receipt, with the packet's bundle request and a provenance record in the same directory:
+
+```bash
+node scripts/emit-process-inventory-receipt.mjs --capture "$CAPTURE" \
+  --request "$CAPTURE/request.json" \
+  --verdict "$CAPTURE/post-reboot-verdict.json" \
+  --inventory-rows "$CAPTURE/inventory-rows.md" \
+  --provenance-record "$CAPTURE/provenance.txt" \
+  --provenance-source "$PROVENANCE_HTTPS_URL" --provenance-by "$RUNNER" \
+  --provenance-at "$CAPTURED_AT"
+```
+
+The output carries a `receipts` object with the receipt's `path` and `sha256`.  Merge it into the `receipts` object of the same `request.json`:  the evidence collector reads only a receipt the request names by path and hash, and a packet whose request does not name it is blocked with `process-inventory: missing-receipt`.  When no receipt was written, the object is empty and there is nothing to merge.
+
+Expected: exit 0, four checks with exit code 0 (`processes`, `launchd`, `listeners`, `inventory-updated`), and `process-inventory.receipt.json` in the capture directory.  Exit 1 means a check failed and the output names it: when the harness is still present no receipt is written, and when only the inventory rows fail the receipt is written with a failing code that the bundle refuses.  Exit 2 means nothing could be judged at all: the verdict was taken off the Mac, as root, or where the owner's launchd domain did not exist, or one of the cited files is a link or is readable by anyone but the owner.  The output's `notices` fail nothing: they name, by line number, the captured rows that mention the harness outside their first cell, and those rows are read and brought up to date by hand.  `docs/verification/native-final-evidence.md` says what the producer reads and what it cannot establish.
 
 ```bash
 # On the server.
@@ -413,10 +482,12 @@ When the cutover runs, the following belong in the BF-2514 issue, and BF-2515's 
 -  The Step 0 baseline output from both hosts.
 -  The Step 2 `comm` output showing no id enabled on both hosts.
 -  The Step 4 `soak-24h-server-writer`: the dates, the inbound-message count, and the single daily run of the shared routine.
+-  The decommission evidence bundle does not take that soak from an issue comment.  Its `server-writer-soak` receipt is made of logged coverage segments, and each segment's required fields (the interval, a hashed log, the selected writer host, the controller id and epoch, the Mac harness recorded as loaded but unused, the six surface outcomes, a nonzero inbound-message count and the shared routine run counts) are the `serverWriterSegment` schema in `scripts/decommission-evidence-bundle.mjs`.  [The final evidence bundle](verification/native-final-evidence.md#observation-intervals) says how they are checked.  This runbook does not define how those logs are captured, and no script on main produces them.
 -  The Step 3 output showing the Mac app reaching the server's pid.
 -  The Step 5 output showing `Could not find service "app.botfleet.server"` and an empty listener list.
 -  The path of the backup directory Step 5 wrote, and the two files inside it.
 -  The date of the Apple Note refresh and the inventory rows updated.
+-  The Step 6 capture: the saved post-reboot verdict, the captured inventory rows, and the `process-inventory.receipt.json` the producer wrote from them.
 
 ## What This Runbook Does Not Cover
 

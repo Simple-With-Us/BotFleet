@@ -124,8 +124,14 @@ export class PlacementReportSpool {
     return this.damagedRows;
   }
 
+  /** The one pending row for a job, read by its name: no directory scan, so
+   *  asking about one job costs the same however many reports are waiting. */
+  get(jobId: string): PlacementReportRow | undefined {
+    return this.readRow(join(this.directory, rowName(jobId)));
+  }
+
   has(jobId: string): boolean {
-    return this.readRow(join(this.directory, rowName(jobId))) !== undefined;
+    return this.get(jobId) !== undefined;
   }
 
   remove(jobId: string): void {

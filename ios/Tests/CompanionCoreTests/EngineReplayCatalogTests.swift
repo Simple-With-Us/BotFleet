@@ -65,6 +65,60 @@ struct EngineReplayCatalogTests {
         #expect(outcome.failureReason == nil)
     }
 
+    @Test("A fixture whose recorded event order differs from the replay is measured as failed")
+    func eventOrderMismatchFailsTheVerdict() async throws {
+        // The Claude corpus's first turn records sessionStarted, textDelta,
+        // textDelta, completed.  The replay always produces that order, so a
+        // fixture that RECORDS a different order is a recording the replay
+        // does not reproduce, and the catalog must say so instead of
+        // accepting it.
+        let original = try #require(EngineReplayHarness.claudeFixtures().first)
+        #expect(original.id == "claude-turn-01")
+        try #require(original.expectedEvents.count == 4)
+        guard case .sessionStarted = original.expectedEvents[0], case .textDelta = original.expectedEvents[1] else {
+            Issue.record("claude-turn-01 no longer records a session start followed by a text delta")
+            return
+        }
+
+        // The control:  the unmodified fixture holds on all three
+        // comparisons, so a failure below can only come from the event order.
+        let control = await EngineReplayCatalog.measure(original)
+        #expect(control.passed)
+        #expect(control.eventsMatched)
+        #expect(control.spawnSpecMatched)
+        #expect(control.stdinGuardHeld)
+        #expect(control.failureReason == nil)
+
+        // The same fixture, rebuilt through the public initializer with the
+        // first two recorded events swapped.  Nothing else changes, so the
+        // spawn spec and the scripted wire frames still match what the driver
+        // does, and only the ordered event kinds differ from the recording.
+        var swappedEvents = original.expectedEvents
+        swappedEvents.swapAt(0, 1)
+        let mutated = EngineReplayFixture(
+            id: original.id,
+            family: original.family,
+            title: original.title,
+            input: original.input,
+            expectedSpawnSpec: original.expectedSpawnSpec,
+            steps: original.steps,
+            expectedEvents: swappedEvents
+        )
+        #expect(mutated != original)
+        guard case .textDelta = mutated.expectedEvents[0], case .sessionStarted = mutated.expectedEvents[1] else {
+            Issue.record("the mutated fixture does not record a text delta before the session start")
+            return
+        }
+
+        let outcome = await EngineReplayCatalog.measure(mutated)
+        #expect(outcome.fixtureId == original.id)
+        #expect(outcome.passed == false)
+        #expect(outcome.eventsMatched == false)
+        #expect(outcome.spawnSpecMatched == true)
+        #expect(outcome.stdinGuardHeld == true)
+        #expect(outcome.failureReason == "the event sequence did not match the recorded one")
+    }
+
     @Test("Every fixture behind the Grok family holds")
     func grokFamilyHolds() async throws {
         // The Grok family carries the numbered corpus and seven standalone
