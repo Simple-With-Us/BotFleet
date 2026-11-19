@@ -298,6 +298,20 @@ export function runNativeHostPackageSmoke({
   };
 }
 
+/**
+ * The PASS line:  the evidence a run has to carry.
+ *
+ * The source commit is printed in full, because a run that cannot be tied to an exact commit is
+ * not evidence of anything, and a short prefix would be the one thing that made it untieable.
+ */
+export function passLine(receipt) {
+  return (
+    `PASS: ${receipt.artifact}, build ${receipt.identity.build}, ` +
+    `source ${receipt.identity.sourceCommit}, ` +
+    `${receipt.architectures.join("+")}, ${receipt.notice}.`
+  );
+}
+
 function isEntryModule() {
   try {
     // Both sides are resolved through realpath:  a symlinked invocation (the /var -> /private/var
@@ -335,9 +349,5 @@ if (isEntryModule()) {
     if (report.work) console.error(`the artifacts were kept at ${report.work}`);
     process.exit(1);
   }
-  console.log(
-    `PASS: ${report.receipt.artifact}, build ${report.receipt.identity.build}, ` +
-      `source ${report.receipt.identity.sourceCommit.slice(0, 12)}, ` +
-      `${report.receipt.architectures.join("+")}, ${report.receipt.notice}.`,
-  );
+  console.log(passLine(report.receipt));
 }

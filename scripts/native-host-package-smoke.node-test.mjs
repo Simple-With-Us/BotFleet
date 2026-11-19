@@ -18,6 +18,7 @@ import {
   hostArchitecture,
   identityProblems,
   nativeHostSmokeBuildNumber,
+  passLine,
   receiptProblems,
   runNativeHostPackageSmoke,
 } from "./native-host-package-smoke.mjs";
@@ -176,6 +177,19 @@ test("the identity fields are the ones the packager writes", () => {
     "distribution",
     "sourceDirty",
   ]);
+});
+
+test("the PASS line carries the exact source commit, not a prefix", () => {
+  // A run that cannot be tied to an exact commit is not evidence, and the receipt that holds the
+  // full SHA is deleted with the temporary directory unless --keep is passed, so the line itself
+  // has to carry it.
+  const receipt = clone(RECEIPT);
+  const line = passLine(receipt);
+  assert.match(line, /PASS: BotFleetNativeHost-0\.1\.0-202611181230-UNSIGNED\.zip/);
+  assert.match(line, /source [0-9a-f]{40}/);
+  assert.match(line, /build 202611181230/);
+  assert.match(line, /NOT DISTRIBUTABLE/);
+  assert.doesNotMatch(line, /source c{12}[,.]/);
 });
 
 test("Node's architecture name is not the Mach-O slice name", () => {

@@ -54,7 +54,11 @@ reported.
 
 A run on a real Mac is evidence only when it carries the facts that make it
 checkable:  the PASS line, the exact checkout SHA, the macOS version, the
-architecture and the Swift version.
+architecture and the Swift version.  The PASS line carries the source commit
+in full, because the receipt that holds it is deleted with the temporary
+directory unless `--keep` is passed;  with `--keep` the whole receipt stays at
+`<temp>/package/artifact.json`, and `git rev-parse HEAD` gives the checkout
+SHA on its own.
 
 ```sh
 sw_vers
