@@ -219,10 +219,10 @@ export function runNativeHostPackageSmoke({
       if (raw !== null) {
         const parsed = ReceiptSchema.safeParse(raw);
         if (!parsed.success) {
-          const shape = parsed.error.issues
+          const detail = parsed.error.issues
             .map((issue) => `${issue.path.join(".") || "receipt"}: ${issue.message}`)
             .join("; ");
-          problems.push(`the receipt does not match the expected shape: ${shape}`);
+          problems.push(`the receipt does not match the expected shape: ${detail}`);
         } else {
           receipt = parsed.data;
         }
