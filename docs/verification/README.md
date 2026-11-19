@@ -27,6 +27,7 @@ Verification uses these isolated fixtures:
 - [Independent server controls](server-controls.md) — native menu bar controls, startup policy and protected VM shutdown
 - [Placement and ownership](placement.md) — shared job contract, local identity and sixteen required multi-host acceptance recipes
 - [Host headroom](headroom.md) — inventory, honest enforcement, pressure, storage isolation and authorized server fixture evidence
+- [Native host package smoke](native-host-package.md) — the real packager, the real archive and the packaged executable's own identity
 - [Staged candidate smoke test](staged-candidate-smoke.md) — the pre-activation probe that runs a candidate before anything live is touched
 - [Connector grants](connector-grants.md) — per-bot third-party tool authorization
 - [Saved data faults](saved-data.md) — unreadable bots, rooms, routines and settings files are set aside, never deleted
