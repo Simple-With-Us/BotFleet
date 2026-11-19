@@ -144,7 +144,7 @@ func measure(engineId: String) async -> EngineReplayReport {
 
 /// Measure every engine the packet named.
 func measure(engines: [String]) async -> [EngineReplayReport] {
-    var reports: [EngineReport] = []
+    var reports: [EngineReplayReport] = []
     for engineId in engines {
         reports.append(await measure(engineId: engineId))
     }
