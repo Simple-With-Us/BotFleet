@@ -107,39 +107,17 @@ struct ProbeError: Error, LocalizedError, CustomStringConvertible {
 }
 
 /// One engine's result:  the fixtures behind it, and whether they all held.
-struct EngineReport: Codable {
-    let engineId: String
-    /// The replay family the engine id resolved to, or null when it resolved
-    /// to none.
-    let family: String?
-    /// Whether the engine could be measured at all.
-    let measured: Bool
-    /// Why the engine could not be measured, when it could not.
-    let unmeasuredReason: String?
-    let fixtureCount: Int
-    let passedCount: Int
-    let fixtures: [EngineReplayOutcome]
-    /// Whether every fixture behind this engine held.
-    let isFullyVerified: Bool
-}
-
-/// The whole report.
-struct ReplayParityReport: Codable {
-    let version: Int
-    let engines: [EngineReport]
-    /// Whether every engine the packet named was measured and held.
-    let isFullyVerified: Bool
-    /// The engine ids the packet named, in the packet's order.
-    let requestedEngines: [String]
-}
+/// The type itself is `EngineReplayReport` in CompanionCore, next to the
+/// outcome it carries, so the probe, the receipt producer and the tests read
+/// one public shape instead of three private copies.
 
 /// Measure one engine the packet named.
 ///
 /// An engine with no replay family behind it earns a failing check with the
 /// reason named.  It is never certified and never skipped.
-func measure(engineId: String) async -> EngineReport {
+func measure(engineId: String) async -> EngineReplayReport {
     guard let family = EngineReplayCatalog.family(forEngineId: engineId) else {
-        return EngineReport(
+        return EngineReplayReport(
             engineId: engineId,
             family: nil,
             measured: false,
@@ -152,7 +130,7 @@ func measure(engineId: String) async -> EngineReport {
     }
     let outcomes = await EngineReplayCatalog.measureFamily(family)
     let passedCount = outcomes.filter(\.passed).count
-    return EngineReport(
+    return EngineReplayReport(
         engineId: engineId,
         family: family.rawValue,
         measured: true,
@@ -165,7 +143,7 @@ func measure(engineId: String) async -> EngineReport {
 }
 
 /// Measure every engine the packet named.
-func measure(engines: [String]) async -> [EngineReport] {
+func measure(engines: [String]) async -> [EngineReplayReport] {
     var reports: [EngineReport] = []
     for engineId in engines {
         reports.append(await measure(engineId: engineId))
@@ -182,9 +160,9 @@ func run() async throws {
     }
     let engines = try requestedEngines(in: requestPath)
     let reports = await measure(engines: engines)
-    let fullyVerified = reports.allSatisfy(\.isFullyVerified)
+    let fullyVerified = EngineReplayParityReport.aggregateFullyVerified(engines: reports)
 
-    let report = ReplayParityReport(
+    let report = EngineReplayParityReport(
         version: 1,
         engines: reports,
         isFullyVerified: fullyVerified,
