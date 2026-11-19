@@ -138,11 +138,20 @@ test("an identity the packaged executable did not report at all is refused", () 
 
 test("an identity field that is missing on both sides is refused, not accepted", () => {
   // Two sides that both say nothing have not agreed about anything, and the field-for-field claim
-  // would be false if this were accepted.
+  // would be false if this were accepted.  The field is removed from both sides here, because that
+  // is the only input the missing-key rule can tell apart from a plain value difference.
+  const claimed = clone(IDENTITY);
+  const reported = clone(IDENTITY);
+  delete claimed.sourceDirty;
+  delete reported.sourceDirty;
+  const problems = identityProblems(claimed, reported).join("\n");
+  assert.match(problems, /identity sourceDirty differs/);
+});
+
+test("an identity field that is missing on the executable's side is refused", () => {
   const reported = clone(IDENTITY);
   delete reported.sourceDirty;
-  const problems = identityProblems(IDENTITY, reported).join("\n");
-  assert.match(problems, /identity sourceDirty differs/);
+  assert.match(identityProblems(clone(IDENTITY), reported).join("\n"), /identity sourceDirty differs/);
 });
 
 test("an identity field that is missing on the receipt's side is refused", () => {
@@ -281,6 +290,31 @@ test("an archive whose bytes are not the ones the receipt names fails the macOS 
 
   assert.equal(report.status, "failed");
   assert.match(report.problems.join("\n"), /the archive hashes to/);
+});
+
+test("the packaged executable is not run when its bytes are not the bytes the receipt names", () => {
+  // The proof comes before the use:  a substituted binary is never executed, so it can never
+  // report an identity that the smoke would believe.
+  const source = "e".repeat(40);
+  const identity = { ...IDENTITY, sourceCommit: source, build: "202611181230" };
+  const { run, calls } = fakePackager({
+    source,
+    build: "202611181230",
+    identity,
+    archiveBytes: Buffer.from("archive-bytes"),
+    binaryBytes: Buffer.from("executable-bytes"),
+    receiptOverrides: { binarySha256: "f".repeat(64) },
+  });
+
+  const report = runNativeHostPackageSmoke({ platform: "darwin", run, build: "202611181230" });
+
+  assert.equal(report.status, "failed");
+  assert.match(report.problems.join("\n"), /the unpacked executable hashes to/);
+  assert.equal(
+    calls.some((call) => call.args[0] === "--identity"),
+    false,
+    "the executable was run before the receipt was proved against its bytes",
+  );
 });
 
 test("the native-release chain runs this file, and hosted CI runs the chain", () => {

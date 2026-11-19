@@ -234,40 +234,47 @@ export function runNativeHostPackageSmoke({
       if (!existsSync(archive)) {
         problems.push(`the packager named an artifact that is not there: ${receipt.artifact}`);
       } else {
+        // The proof comes before the use.  The archive, and the executable inside it, are compared
+        // with the receipt first, and the executable is run only when both comparisons succeed, so
+        // the bytes that report an identity are already the bytes the receipt names.
+        const archiveDigest = sha256(readFileSync(archive));
+        const archiveMatches = archiveDigest === receipt.artifactSha256;
+        if (!archiveMatches) {
+          problems.push(
+            `the archive hashes to ${archiveDigest}, not the ${receipt.artifactSha256} the receipt names`,
+          );
+        }
         const unpacked = join(work, "unpacked");
         run("/usr/bin/ditto", ["-x", "-k", archive, unpacked], { timeout: PACKAGE_TIMEOUT_MS });
         const executable = join(unpacked, "payload", "bin", HOST_CODE_ID);
         if (!existsSync(executable)) {
           problems.push(`the archive carries no executable at ${executable}`);
         } else {
-          let reported = null;
-          try {
-            reported = JSON.parse(run(executable, ["--identity"], { timeout: 120_000 }));
-          } catch (error) {
+          const binaryDigest = sha256(readFileSync(executable));
+          const binaryMatches = binaryDigest === receipt.binarySha256;
+          if (!binaryMatches) {
             problems.push(
-              `the packaged executable did not report an identity: ${error instanceof Error ? error.message : String(error)}`,
+              `the unpacked executable hashes to ${binaryDigest}, not the ${receipt.binarySha256} the receipt names`,
             );
           }
-          if (reported !== null) {
-            const parsed = IdentitySchema.safeParse(reported);
-            if (!parsed.success) {
-              problems.push("the packaged executable reported an identity that does not match the expected shape");
-            } else {
-              problems.push(...identityProblems(receipt.identity, parsed.data));
+          if (archiveMatches && binaryMatches) {
+            let reported = null;
+            try {
+              reported = JSON.parse(run(executable, ["--identity"], { timeout: 120_000 }));
+            } catch (error) {
+              problems.push(
+                `the packaged executable did not report an identity: ${error instanceof Error ? error.message : String(error)}`,
+              );
+            }
+            if (reported !== null) {
+              const parsed = IdentitySchema.safeParse(reported);
+              if (!parsed.success) {
+                problems.push("the packaged executable reported an identity that does not match the expected shape");
+              } else {
+                problems.push(...identityProblems(receipt.identity, parsed.data));
+              }
             }
           }
-          const digest = sha256(readFileSync(executable));
-          if (digest !== receipt.binarySha256) {
-            problems.push(
-              `the unpacked executable hashes to ${digest}, not the ${receipt.binarySha256} the receipt names`,
-            );
-          }
-        }
-        const archiveDigest = sha256(readFileSync(archive));
-        if (archiveDigest !== receipt.artifactSha256) {
-          problems.push(
-            `the archive hashes to ${archiveDigest}, not the ${receipt.artifactSha256} the receipt names`,
-          );
         }
         const host = hostArchitecture();
         if (receipt.architectures && !receipt.architectures.includes(host)) {
