@@ -479,10 +479,12 @@ private func isProtectedFixturePath(_ path: String) -> Bool {
 /// Writes a fixture payload through a verified handle.
 ///
 /// The payload never goes through a resolved path.  The trusted directory is
-/// resolved once, so no symlinked component can redirect the write, and it is
-/// then opened with `O_NOFOLLOW`, so a symlinked service root is refused, and
-/// it must be a private directory this user owns.  The entry is opened relative
-/// to that directory descriptor with `O_NOFOLLOW`, the opened handle is checked
+/// resolved once, so no symlinked component can redirect the write, and every
+/// directory component is then opened relative to the previous one with
+/// `O_NOFOLLOW`, so no component can be a symlink, and each one must be a
+/// directory owned by root or by this user.  The trusted directory itself must
+/// be a private directory this user owns.  The entry is opened relative to
+/// that directory descriptor with `O_NOFOLLOW`, the opened handle is checked
 /// with `fstat` (a regular, single-link file owned by this user), and its
 /// device and inode are compared with the listed path before anything is
 /// written.
@@ -503,9 +505,26 @@ private func writeFixtureFile(_ payload: String, to url: URL) throws {
     guard !isProtectedFixturePath(path), !isProtectedFixturePath(resolved) else {
         throw FixtureWriteRefusal.protectedPlace
     }
-    let directory = open(resolved, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW, 0)
+    // Every directory component is opened relative to the previous one with
+    // O_NOFOLLOW, so no component can be a symlink, and each one must be a
+    // directory owned by root or by this user.
+    var directory = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0)
     guard directory >= 0 else { throw FixtureWriteRefusal.trustedDirectory(errno) }
-    defer { Darwin.close(directory) }
+    var directories: [Int32] = [directory]
+    defer { for descriptor in directories { Darwin.close(descriptor) } }
+    for component in resolved.split(separator: "/", omittingEmptySubsequences: true).map(String.init) {
+        let next = component.withCString {
+            openat(directory, $0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW, 0)
+        }
+        guard next >= 0 else { throw FixtureWriteRefusal.ancestor(component, errno) }
+        directories.append(next)
+        directory = next
+        var info = stat()
+        guard fstat(next, &info) == 0, info.st_mode & S_IFMT == S_IFDIR,
+              info.st_uid == 0 || info.st_uid == geteuid() else {
+            throw FixtureWriteRefusal.ancestor(component, 0)
+        }
+    }
     var directoryInfo = stat()
     guard fstat(directory, &directoryInfo) == 0, directoryInfo.st_mode & S_IFMT == S_IFDIR else {
         throw FixtureWriteRefusal.trustedDirectory(0)
