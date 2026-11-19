@@ -13,9 +13,9 @@
 //     that the receipt claims, on the architecture this Mac runs;
 //   - the artifact is the unsigned development one, and it says so:  NOT DISTRIBUTABLE.
 //
-// What it never does:  it installs nothing, signs nothing, starts nothing, reads no Keychain item,
-// touches no service credential and publishes nothing.  Everything happens in a temporary directory
-// that is removed when the run ends.
+// What it never does:  it installs nothing, signs nothing, notarizes nothing, starts nothing, reads
+// no Keychain item, touches no service credential and publishes nothing.  Everything happens in a
+// temporary directory that is removed when the run ends.
 //
 // Usage: node scripts/native-host-package-smoke.mjs [--repo-root <path>] [--keep]
 //
@@ -23,16 +23,19 @@
 // release build uses, so the receipt carries a build that identifies the commit it came from.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { HOST_CODE_ID, sha256File } from "./native-host-artifact.mjs";
+import { z } from "zod";
+
+import { HOST_CODE_ID, sha256 } from "./native-host-artifact.mjs";
 import { committerDateFor, mergeStampFor } from "./mac-release-version.mjs";
 
 // The identity fields the packaged executable and the receipt must agree on, in the order the
-// packager writes them.
+// packager writes them.  The list is derived from the packager's own identity construction in the
+// test, so it cannot drift away from what the product writes.
 export const IDENTITY_KEYS = [
   "schemaVersion",
   "codeIdentifier",
@@ -43,6 +46,30 @@ export const IDENTITY_KEYS = [
   "distribution",
   "sourceDirty",
 ];
+
+// The receipt is written by another process, so it is parsed at the boundary and every field the
+// smoke reads is checked there.  A receipt that does not match this shape is refused, not repaired.
+export const IdentitySchema = z.object({
+  schemaVersion: z.literal(1),
+  codeIdentifier: z.literal(HOST_CODE_ID),
+  sourceCommit: z.string().regex(/^[0-9a-f]{40}$/),
+  build: z.string().regex(/^[0-9]{12}$/),
+  marketingVersion: z.literal("0.1.0"),
+  capabilities: z.array(z.string()),
+  distribution: z.enum(["unsigned-development", "developer-id"]),
+  sourceDirty: z.boolean(),
+});
+
+export const ReceiptSchema = z.object({
+  artifact: z.string().min(1),
+  artifactSha256: z.string().regex(/^[0-9a-f]{64}$/),
+  binarySha256: z.string().regex(/^[0-9a-f]{64}$/),
+  architectures: z.array(z.string()),
+  distributable: z.boolean(),
+  notice: z.string(),
+  signatureVerified: z.boolean(),
+  identity: IdentitySchema,
+});
 
 // The packager builds the host twice (arm64 and x86_64) from a clean export of the committed source,
 // so a cold run is a long one.  The budget is generous on purpose:  a refusal from the packager is
@@ -56,6 +83,11 @@ function defaultRun(command, args, options = {}) {
 /** The build number for one commit:  its Central stamp, twelve digits. */
 export function nativeHostSmokeBuildNumber(repoRoot, sha = "HEAD") {
   return mergeStampFor(committerDateFor(repoRoot, sha));
+}
+
+/** Node's architecture name is not the Mach-O slice name. */
+export function hostArchitecture(arch = process.arch) {
+  return arch === "x64" ? "x86_64" : arch;
 }
 
 /**
@@ -105,14 +137,22 @@ export function receiptProblems(receipt, expected = {}) {
 /**
  * What differs between the identity the receipt claims and the identity the packaged executable
  * reports, as a list of sentences.  The list is empty when they agree.
+ *
+ * A field that is missing on either side is a difference:  two sides that both say nothing have not
+ * agreed about anything, and the field-for-field claim would be false.
  */
 export function identityProblems(expected, actual) {
   const problems = [];
   if (expected === null || expected === undefined) return ["the receipt carries no identity"];
   for (const key of IDENTITY_KEYS) {
-    const claimed = expected[key];
-    const reported = actual === null || actual === undefined ? undefined : actual[key];
-    if (JSON.stringify(claimed) !== JSON.stringify(reported)) {
+    const expectedHasKey = Object.prototype.hasOwnProperty.call(expected, key);
+    const actualHasKey =
+      actual !== null &&
+      actual !== undefined &&
+      Object.prototype.hasOwnProperty.call(actual, key);
+    const claimed = expectedHasKey ? expected[key] : undefined;
+    const reported = actualHasKey ? actual[key] : undefined;
+    if (!expectedHasKey || !actualHasKey || JSON.stringify(claimed) !== JSON.stringify(reported)) {
       problems.push(
         `identity ${key} differs:  the receipt says ${JSON.stringify(claimed)}, ` +
           `the packaged executable says ${JSON.stringify(reported)}`,
@@ -134,6 +174,7 @@ export function runNativeHostPackageSmoke({
   platform = process.platform,
   run = defaultRun,
   keep = false,
+  build = null,
 } = {}) {
   if (platform !== "darwin") {
     return {
@@ -149,7 +190,7 @@ export function runNativeHostPackageSmoke({
   let packed = null;
   try {
     const source = run("git", ["-C", root, "rev-parse", "HEAD"]).trim();
-    const build = nativeHostSmokeBuildNumber(root);
+    const buildNumber = build === null ? nativeHostSmokeBuildNumber(root) : String(build);
     const output = join(work, "package");
     packed = run(
       process.execPath,
@@ -160,7 +201,7 @@ export function runNativeHostPackageSmoke({
         "--output",
         output,
         "--build",
-        build,
+        buildNumber,
         "--unsigned-dev",
       ],
       { timeout: PACKAGE_TIMEOUT_MS, cwd: root },
@@ -169,9 +210,25 @@ export function runNativeHostPackageSmoke({
     if (!existsSync(receiptPath)) {
       problems.push(`the packager wrote no receipt at ${receiptPath}`);
     } else {
-      receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+      let raw = null;
+      try {
+        raw = JSON.parse(readFileSync(receiptPath, "utf8"));
+      } catch (error) {
+        problems.push(`the receipt at ${receiptPath} is not JSON: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (raw !== null) {
+        const parsed = ReceiptSchema.safeParse(raw);
+        if (!parsed.success) {
+          const shape = parsed.error.issues
+            .map((issue) => `${issue.path.join(".") || "receipt"}: ${issue.message}`)
+            .join("; ");
+          problems.push(`the receipt does not match the expected shape: ${shape}`);
+        } else {
+          receipt = parsed.data;
+        }
+      }
     }
-    problems.push(...receiptProblems(receipt, { source, build }));
+    problems.push(...receiptProblems(receipt, { source, build: buildNumber }));
     if (receipt !== null) {
       const archive = join(output, receipt.artifact);
       if (!existsSync(archive)) {
@@ -183,24 +240,39 @@ export function runNativeHostPackageSmoke({
         if (!existsSync(executable)) {
           problems.push(`the archive carries no executable at ${executable}`);
         } else {
-          const reported = JSON.parse(run(executable, ["--identity"], { timeout: 120_000 }));
-          problems.push(...identityProblems(receipt.identity, reported));
-          const digest = sha256File(executable);
+          let reported = null;
+          try {
+            reported = JSON.parse(run(executable, ["--identity"], { timeout: 120_000 }));
+          } catch (error) {
+            problems.push(
+              `the packaged executable did not report an identity: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          if (reported !== null) {
+            const parsed = IdentitySchema.safeParse(reported);
+            if (!parsed.success) {
+              problems.push("the packaged executable reported an identity that does not match the expected shape");
+            } else {
+              problems.push(...identityProblems(receipt.identity, parsed.data));
+            }
+          }
+          const digest = sha256(readFileSync(executable));
           if (digest !== receipt.binarySha256) {
             problems.push(
               `the unpacked executable hashes to ${digest}, not the ${receipt.binarySha256} the receipt names`,
             );
           }
-          if (receipt.architectures && !receipt.architectures.includes(process.arch)) {
-            problems.push(
-              `the artifact carries ${receipt.architectures.join(", ")}, not the ${process.arch} this host runs`,
-            );
-          }
         }
-        const archiveDigest = sha256File(archive);
+        const archiveDigest = sha256(readFileSync(archive));
         if (archiveDigest !== receipt.artifactSha256) {
           problems.push(
             `the archive hashes to ${archiveDigest}, not the ${receipt.artifactSha256} the receipt names`,
+          );
+        }
+        const host = hostArchitecture();
+        if (receipt.architectures && !receipt.architectures.includes(host)) {
+          problems.push(
+            `the artifact carries ${receipt.architectures.join(", ")}, not the ${host} this host runs`,
           );
         }
       }
@@ -221,7 +293,9 @@ export function runNativeHostPackageSmoke({
 
 function isEntryModule() {
   try {
-    return resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+    // Both sides are resolved through realpath:  a symlinked invocation (the /var -> /private/var
+    // case) would otherwise compare two different strings and skip the work entirely.
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
   } catch {
     return false;
   }

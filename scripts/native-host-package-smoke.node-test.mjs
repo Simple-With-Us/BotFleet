@@ -5,14 +5,17 @@
 // on every host, so the rules are proved where CI can see them.
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { encodeHostIdentity } from "./native-host-artifact.mjs";
 import {
   IDENTITY_KEYS,
+  hostArchitecture,
   identityProblems,
   nativeHostSmokeBuildNumber,
   receiptProblems,
@@ -42,6 +45,7 @@ const RECEIPT = {
 };
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
+const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
 test("the build number is the commit's own Central stamp", () => {
   const root = mkdtempSync(join(tmpdir(), "bf-native-host-build-"));
@@ -132,7 +136,27 @@ test("an identity the packaged executable did not report at all is refused", () 
   assert.match(identityProblems(IDENTITY, null).join("\n"), /identity schemaVersion differs/);
 });
 
+test("an identity field that is missing on both sides is refused, not accepted", () => {
+  // Two sides that both say nothing have not agreed about anything, and the field-for-field claim
+  // would be false if this were accepted.
+  const reported = clone(IDENTITY);
+  delete reported.sourceDirty;
+  const problems = identityProblems(IDENTITY, reported).join("\n");
+  assert.match(problems, /identity sourceDirty differs/);
+});
+
+test("an identity field that is missing on the receipt's side is refused", () => {
+  const claimed = clone(IDENTITY);
+  delete claimed.build;
+  assert.match(identityProblems(claimed, clone(IDENTITY)).join("\n"), /identity build differs/);
+});
+
 test("the identity fields are the ones the packager writes", () => {
+  // Derived from the packager's own identity construction rather than copied here:  the packager
+  // writes the identity through encodeHostIdentity, which accepts exactly its own key set and
+  // refuses anything else, so this list cannot drift away from what the product writes.
+  const encoded = JSON.parse(encodeHostIdentity(IDENTITY).toString("utf8"));
+  assert.deepEqual(IDENTITY_KEYS, Object.keys(encoded));
   assert.deepEqual(IDENTITY_KEYS, [
     "schemaVersion",
     "codeIdentifier",
@@ -145,6 +169,11 @@ test("the identity fields are the ones the packager writes", () => {
   ]);
 });
 
+test("Node's architecture name is not the Mach-O slice name", () => {
+  assert.equal(hostArchitecture("x64"), "x86_64");
+  assert.equal(hostArchitecture("arm64"), "arm64");
+});
+
 test("a host that is not macOS skips with a reason, and builds nothing", () => {
   const report = runNativeHostPackageSmoke({
     platform: "linux",
@@ -153,6 +182,105 @@ test("a host that is not macOS skips with a reason, and builds nothing", () => {
   assert.equal(report.status, "skipped");
   assert.match(report.reason, /needs macOS/);
   assert.deepEqual(report.problems, []);
+});
+
+/** A stand-in for the product's packager, the archive it writes and the executable inside it. */
+function fakePackager({ source, build, identity, archiveBytes, binaryBytes, receiptOverrides = {} }) {
+  const calls = [];
+  const run = (command, args) => {
+    calls.push({ command, args });
+    if (args[0] === "--identity") return JSON.stringify(identity);
+    if (command === "git") return `${source}\n`;
+    if (command === "/usr/bin/ditto") {
+      const unpacked = args[3];
+      mkdirSync(join(unpacked, "payload", "bin"), { recursive: true });
+      writeFileSync(join(unpacked, "payload", "bin", "BotFleetNativeHost"), binaryBytes);
+      return "";
+    }
+    // The packager itself:  it writes the receipt and the archive it names.
+    const output = args[args.indexOf("--output") + 1];
+    mkdirSync(output, { recursive: true });
+    const name = `BotFleetNativeHost-0.1.0-${build}-UNSIGNED.zip`;
+    writeFileSync(join(output, name), archiveBytes);
+    const receipt = {
+      artifact: name,
+      artifactSha256: digest(archiveBytes),
+      binarySha256: digest(binaryBytes),
+      architectures: ["arm64", "x86_64"],
+      distributable: false,
+      notice: "NOT DISTRIBUTABLE",
+      signatureVerified: false,
+      identity,
+      ...receiptOverrides,
+    };
+    writeFileSync(join(output, "artifact.json"), JSON.stringify(receipt));
+    return `NOT DISTRIBUTABLE: ${name}\n`;
+  };
+  return { run, calls };
+}
+
+test("the macOS branch packages the checkout, opens the archive and asks the executable who it is", () => {
+  const source = "e".repeat(40);
+  const build = "202611181230";
+  const identity = { ...IDENTITY, sourceCommit: source, build };
+  const archiveBytes = Buffer.from("archive-bytes");
+  const binaryBytes = Buffer.from("executable-bytes");
+  const { run, calls } = fakePackager({ source, build, identity, archiveBytes, binaryBytes });
+
+  const report = runNativeHostPackageSmoke({ platform: "darwin", run, build });
+
+  assert.deepEqual(report.problems, []);
+  assert.equal(report.status, "passed");
+  assert.equal(report.receipt.identity.build, build);
+
+  // The packager is the product's own CLI, with the flags it accepts.
+  const packaged = calls.find((call) => call.args.includes("--unsigned-dev"));
+  assert.ok(packaged, "the packager was not called");
+  assert.equal(packaged.args[packaged.args.indexOf("--repo-root") + 1], process.cwd());
+  assert.equal(packaged.args[packaged.args.indexOf("--build") + 1], build);
+  assert.ok(packaged.args[packaged.args.indexOf("--output") + 1].endsWith("package"));
+
+  // The archive is opened again, and the executable inside it is asked for its own identity.
+  const extracted = calls.find((call) => call.command === "/usr/bin/ditto");
+  assert.ok(extracted, "the archive was not opened");
+  assert.deepEqual(extracted.args.slice(0, 3), ["-x", "-k", extracted.args[2]]);
+  assert.ok(calls.some((call) => call.args[0] === "--identity"), "the executable was not asked who it is");
+});
+
+test("a receipt that names another build fails the macOS branch", () => {
+  const source = "e".repeat(40);
+  const identity = { ...IDENTITY, sourceCommit: source, build: "202611181230" };
+  const { run } = fakePackager({
+    source,
+    build: "202611181230",
+    identity,
+    archiveBytes: Buffer.from("archive-bytes"),
+    binaryBytes: Buffer.from("executable-bytes"),
+    receiptOverrides: { identity: { ...identity, build: "202601010000" } },
+  });
+
+  const report = runNativeHostPackageSmoke({ platform: "darwin", run, build: "202611181230" });
+
+  assert.equal(report.status, "failed");
+  assert.match(report.problems.join("\n"), /the receipt says build 202601010000/);
+});
+
+test("an archive whose bytes are not the ones the receipt names fails the macOS branch", () => {
+  const source = "e".repeat(40);
+  const identity = { ...IDENTITY, sourceCommit: source, build: "202611181230" };
+  const { run } = fakePackager({
+    source,
+    build: "202611181230",
+    identity,
+    archiveBytes: Buffer.from("archive-bytes"),
+    binaryBytes: Buffer.from("executable-bytes"),
+    receiptOverrides: { artifactSha256: "f".repeat(64) },
+  });
+
+  const report = runNativeHostPackageSmoke({ platform: "darwin", run, build: "202611181230" });
+
+  assert.equal(report.status, "failed");
+  assert.match(report.problems.join("\n"), /the archive hashes to/);
 });
 
 test("the native-release chain runs this file, and hosted CI runs the chain", () => {

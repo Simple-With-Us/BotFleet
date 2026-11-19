@@ -23,6 +23,7 @@ This smoke runs the real path:
 | The receipt describes this commit | the receipt's source commit and build number are compared with the commit that was packaged | `the receipt says source`, `the receipt says build` |
 | The bytes are the bytes the receipt names | the unpacked executable and the archive are hashed and compared with the receipt | `hashes to` |
 | The artifact is the unsigned one and says so | the receipt must say `NOT DISTRIBUTABLE`, must not be distributable, must carry the `arm64` slice and must not claim a verified signature | `not distributable`, `no arm64 slice` |
+| The receipt and the reported identity are what the smoke expects | both go through a schema at the boundary, and every field the smoke reads is checked there | `does not match the expected shape` |
 
 ## Running It
 
@@ -40,7 +41,10 @@ at; without it the directory is removed when the run ends.
 
 The rules the smoke applies are proved on every host, macOS or not, by
 `scripts/native-host-package-smoke.node-test.mjs`, which the native-release
-chain runs.
+chain runs.  That file drives the macOS branch too:  a stand-in for the
+packager writes a receipt and an archive, the archive is opened again, the
+executable inside it is asked for its identity, and the receipt's build and
+the archive's own bytes are checked against what the smoke claims.
 
 ## What It Never Does
 
