@@ -208,6 +208,86 @@ final class ControlTests: XCTestCase {
         XCTAssertFalse(ManagedServices.canStopServer(statusAvailable: false, serverOutdated: false))
     }
 
+    /// BF-2527: while the status route answers (apiUnavailable false, which is
+    /// what a server older than Control produces), Start is not offered in any
+    /// installed state, while Stop still is for the outdated server.  This
+    /// pins the predicate's apiUnavailable input only; the mapping from the
+    /// outdated-server error to apiUnavailable false stays inline in the
+    /// AppKit target and is not covered here.
+    func testStartIsNotOfferedWhileTheStatusRouteAnswers() {
+        for installed in [InstalledServerState.notInstalled, .stopped, .running, .unknown] {
+            XCTAssertFalse(ManagedServices.canStartServer(startupPolicySupported: true,
+                                                          apiUnavailable: false,
+                                                          installedServerState: installed),
+                           "an answering status route is never offered Start (\(installed))")
+        }
+        XCTAssertTrue(ManagedServices.canStopServer(statusAvailable: false, serverOutdated: true))
+    }
+
+    func testStartIsOfferedForAProvenStoppedServer() {
+        XCTAssertTrue(ManagedServices.canStartServer(startupPolicySupported: true,
+                                                     apiUnavailable: true,
+                                                     installedServerState: .stopped))
+        XCTAssertFalse(ManagedServices.canStartServer(startupPolicySupported: false,
+                                                      apiUnavailable: true,
+                                                      installedServerState: .stopped))
+    }
+
+    func testStartIsNotOfferedForALoadedButUnresponsiveServer() {
+        for unavailable in [true, false] {
+            XCTAssertFalse(ManagedServices.canStartServer(startupPolicySupported: true,
+                                                          apiUnavailable: unavailable,
+                                                          installedServerState: .running))
+        }
+    }
+
+    func testStartIsNotOfferedWhenNotInstalledOrUnknown() {
+        for installed in [InstalledServerState.notInstalled, .unknown] {
+            for unavailable in [true, false] {
+                XCTAssertFalse(ManagedServices.canStartServer(startupPolicySupported: true,
+                                                              apiUnavailable: unavailable,
+                                                              installedServerState: installed),
+                               "\(installed) with apiUnavailable \(unavailable)")
+            }
+        }
+    }
+
+    func testAnAnsweringRunningServerIsNotOfferedStart() {
+        XCTAssertFalse(ManagedServices.canStartServer(startupPolicySupported: true,
+                                                      apiUnavailable: false,
+                                                      installedServerState: .running))
+    }
+
+    func testOfflineVMCreateNeedsAllFourConditions() {
+        XCTAssertTrue(ManagedServices.canCreateOfflineVM(apiUnavailable: true,
+                                                         installedServerState: .stopped,
+                                                         helperAvailable: true,
+                                                         sharedVMState: "missing"))
+        XCTAssertFalse(ManagedServices.canCreateOfflineVM(apiUnavailable: true,
+                                                          installedServerState: .stopped,
+                                                          helperAvailable: true,
+                                                          sharedVMState: "created"))
+        XCTAssertFalse(ManagedServices.canCreateOfflineVM(apiUnavailable: true,
+                                                          installedServerState: .stopped,
+                                                          helperAvailable: true,
+                                                          sharedVMState: nil))
+        XCTAssertFalse(ManagedServices.canCreateOfflineVM(apiUnavailable: true,
+                                                          installedServerState: .stopped,
+                                                          helperAvailable: false,
+                                                          sharedVMState: "missing"))
+        XCTAssertFalse(ManagedServices.canCreateOfflineVM(apiUnavailable: false,
+                                                          installedServerState: .stopped,
+                                                          helperAvailable: true,
+                                                          sharedVMState: "missing"))
+        for installed in [InstalledServerState.notInstalled, .running, .unknown] {
+            XCTAssertFalse(ManagedServices.canCreateOfflineVM(apiUnavailable: true,
+                                                              installedServerState: installed,
+                                                              helperAvailable: true,
+                                                              sharedVMState: "missing"),
+                           "\(installed) is not a proven stopped server")
+        }
+    }
+
     /// An outdated server proved alive by the health check is running for
     /// the fleet services too: the server row keeps its Stop and the MCP
     /// server stays wanted, instead of both reading unknown.

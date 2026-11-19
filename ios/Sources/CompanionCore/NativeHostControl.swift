@@ -2,7 +2,31 @@
 import Foundation
 import Darwin
 
-public enum NativeHostControlError: Error { case unsafeSocket, socketUnavailable }
+/// How a non-blocking connect result is read.  A pending connection and a full
+/// backlog both mean the listener is still live, so they are completed and
+/// verified before the channel is ever called unreachable.
+public enum NativeHostChannelProbe {
+    /// True when the connect result still allows a live listener.
+    public static func isReachable(connectResult: Int32, connectError: Int32) -> Bool {
+        if connectResult == 0 { return true }
+        return connectError == EINPROGRESS || connectError == EAGAIN
+    }
+}
+
+/// The foreground start sequence.  The announcement belongs to the sequence, so
+/// the executable holds no announcement of its own that could be moved ahead of
+/// the verification: the host is announced only after the control channel has
+/// verified it, and a failed verification writes nothing at all.
+public enum NativeHostStartSequence {
+    /// The only announcement the native host makes, and only for a verified start.
+    public static let runningMessage = "Native host running with service credential access unavailable.\n"
+
+    /// Verifies the start and announces it only when the verification succeeded.
+    public static func run(verify: () async throws -> Void, write: (String) -> Void) async throws {
+        try await verify()
+        write(runningMessage)
+    }
+}
 
 /// A private administrative channel; the production peer check always uses kernel credentials.
 public final class NativeHostControlServer: @unchecked Sendable {
@@ -79,6 +103,94 @@ public final class NativeHostControlServer: @unchecked Sendable {
 
     deinit { close() }
 
+    /// The start path is checked, never assumed.
+    ///
+    /// A caller may only report that the host came up after this channel has
+    /// published a real, validated running state and has answered a connection.
+    /// The published payload is the one the `status` verb serves, so the two can
+    /// never disagree, and the peer fence is untouched: the probe connects and
+    /// disconnects without ever sending a privileged request.
+    public func verifyStart() async throws -> NativeHeadlessHostState {
+        let state = await host.state
+        let payload = Self.statusPayload(state)
+        guard state == .running,
+              payload.contains("\"state\":\"\(NativeHeadlessHostState.running.rawValue)\"") else {
+            throw NativeHostControlError.startNotVerified(state: state.rawValue)
+        }
+        guard await channelAnswersOffExecutor(path: path) else {
+            throw NativeHostControlError.controlChannelUnreachable
+        }
+        return state
+    }
+
+    /// The probe blocks on a poll while a pending connection completes, so it
+    /// runs on a dispatch queue and never holds a cooperative executor thread.
+    private func channelAnswersOffExecutor(path: String) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            DispatchQueue.global(qos: .utility).async {
+                continuation.resume(returning: Self.channelAnswers(path: path))
+            }
+        }
+    }
+
+    /// A bare connection proves the listener is live.  No request is sent, so the
+    /// root-only peer check stays exactly as strict as it is in production.
+    ///
+    /// A non-blocking connect can be pending or refused by a full backlog, and
+    /// neither state means the listener is gone, so the result is read by errno
+    /// and a pending connection is completed before it is believed.
+    ///
+    /// The kernel's own result and errno are the only answer this path accepts.
+    /// There is no seam for a fabricated one, and the completion of a pending
+    /// connection is read from the descriptor itself, so nothing here can
+    /// report a connection the socket did not make.
+    static func channelAnswers(path: String) -> Bool {
+        var address: sockaddr_un
+        do { address = try Self.address(path) } catch { return false }
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { Darwin.close(fd) }
+        // A non-blocking connect can never wait on a full backlog.
+        _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+        var result: Int32 = 0
+        var connectError: Int32 = 0
+        result = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                let status = Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                if status != 0 { connectError = errno }
+                return status
+            }
+        }
+        return Self.channelIsLive(result: result, connectError: connectError, fd: fd)
+    }
+
+    /// Decides liveness from the kernel's own connect answer and the descriptor.
+    ///
+    /// The errno decides whether the listener can be live at all, and a pending
+    /// connect is believed only once the descriptor completed without a socket
+    /// error.  The descriptor is the only source of that completion, so a
+    /// pending answer can never stand in for a connection the socket did not
+    /// make.
+    static func channelIsLive(result: Int32, connectError: Int32, fd: Int32) -> Bool {
+        guard NativeHostChannelProbe.isReachable(connectResult: result, connectError: connectError) else { return false }
+        if result == 0 { return true }
+        return Self.connectionCompleted(fd)
+    }
+
+    /// Waits for a pending connection and reads the socket error the kernel kept
+    /// for it, so a pending connect is trusted only when it really connected.
+    ///
+    /// The socket error is read once, after the wait, because the kernel keeps
+    /// the outcome of a pending connect there and clears it when it is read.
+    static func connectionCompleted(_ fd: Int32) -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + 1
+        guard Self.wait(fd, events: Int16(POLLOUT), deadline: deadline) else { return false }
+        var socketError: Int32 = 0
+        var length = socklen_t(MemoryLayout<Int32>.size)
+        guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError, &length) == 0 else { return false }
+        return socketError == 0
+    }
+
     private func acceptConnections(_ listener: Int32) {
         // A bounded batch lets cancellation run even if clients keep connecting.
         for _ in 0..<16 {
@@ -115,8 +227,8 @@ public final class NativeHostControlServer: @unchecked Sendable {
     private func perform(_ verb: String, fd: Int32) async {
         defer { finishConnection(fd) }
         if verb == "status" {
-            let state = await host.state.rawValue
-            await replyOffExecutor(fd, "{\"ok\":true,\"state\":\"\(state)\"}\n")
+            let state = await host.state
+            await replyOffExecutor(fd, Self.statusPayload(state) + "\n")
             return
         }
         do {
@@ -126,8 +238,16 @@ public final class NativeHostControlServer: @unchecked Sendable {
             close()
             notifyStopped()
         } catch {
-            await replyOffExecutor(fd, "{\"ok\":false,\"error\":\"shutdownFailed\"}\n")
+            // The refusal keeps the stable error code and names the reason that stopped it.
+            let reason = NativeHostFailureReason.code(for: error)
+            await replyOffExecutor(fd, "{\"ok\":false,\"error\":\"shutdownFailed\",\"reason\":\"\(reason)\"}\n")
         }
+    }
+
+    /// The exact payload the `status` verb serves, so a checked start and a status
+    /// request can never disagree about the host's state.
+    static func statusPayload(_ state: NativeHeadlessHostState) -> String {
+        "{\"ok\":true,\"state\":\"\(state.rawValue)\"}"
     }
 
     private func replyOffExecutor(_ fd: Int32, _ text: String) async {

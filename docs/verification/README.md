@@ -27,6 +27,7 @@ Verification uses these isolated fixtures:
 - [Independent server controls](server-controls.md) — native menu bar controls, startup policy and protected VM shutdown
 - [Placement and ownership](placement.md) — shared job contract, local identity and sixteen required multi-host acceptance recipes
 - [Host headroom](headroom.md) — inventory, honest enforcement, pressure, storage isolation and authorized server fixture evidence
+- [Native host package smoke](native-host-package.md) — the real packager, the real archive and the packaged executable's own identity
 - [Staged candidate smoke test](staged-candidate-smoke.md) — the pre-activation probe that runs a candidate before anything live is touched
 - [Connector grants](connector-grants.md) — per-bot third-party tool authorization
 - [Saved data faults](saved-data.md) — unreadable bots, rooms, routines and settings files are set aside, never deleted
@@ -44,6 +45,7 @@ Many recipes are codified as unit tests or integration tests:
 - **Packaged server:** `scripts/smoke-packaged-server.mjs` proves the built server starts without repo node_modules.
 - **Quota fallback:** `server/turn-tools.test.ts` exercises provider failover.
 - **Mac updater:** `scripts/mac-update-transaction.node-test.mjs` simulates signed update delivery.
+- **Release-store provenance:** `scripts/release-provenance.node-test.mjs` proves a release tree against its commit's git objects.  See [Release-Store Provenance](mac-updater.md#release-store-provenance-pr-1539) for the recipe, the opt-in install qualification and the Mac checklist nobody has run yet.
 - **Staged candidate smoke:** `smokeStagedServer` boots a real signed bundle; see [staged-candidate-smoke.md](staged-candidate-smoke.md) for the recipe that runs it against the installed app.
 - **Connector grants:** `server/mcp-server.test.ts` and integration fixtures verify tool authorization per bot.
 - **Saved data faults:** `server/store-quarantine.test.ts`, `server/routines-quarantine.test.ts`, `server/config-salvage.test.ts` and `server/data-faults-boot.test.ts` cover each store and the real server; `tests/e2e/data-fault-banner.spec.ts` covers the bar.

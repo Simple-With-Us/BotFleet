@@ -145,7 +145,7 @@ struct NativeHostControlTests {
         defer { fixture.remove() }
         let host = try await fixture.start()
         let socket = fixture.root.appendingPathComponent(NativeHostControlServer.socketName)
-        try Data("untouched".utf8).write(to: socket)
+        try writeFixtureFile("untouched", to: socket)
         #expect(throws: (any Error).self) { _ = try NativeHostControlServer(host: host) }
         #expect(try String(contentsOf: socket, encoding: .utf8) == "untouched")
         try FileManager.default.removeItem(at: socket)
@@ -165,14 +165,14 @@ struct NativeHostControlTests {
     func foregroundExecutable() async throws {
         let fixture = try HostFixture(shortPath: true)
         defer { fixture.remove() }
-        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let executable = root.appendingPathComponent(".build/debug/BotFleetNativeHost")
+        let executable = nativeHostExecutable()
         #expect(FileManager.default.isExecutableFile(atPath: executable.path))
         let process = Process()
         process.executableURL = executable
         process.arguments = ["--service-data", fixture.root.path]
         process.environment = ["PATH": "/usr/bin:/bin", "HOME": fixture.parent.path, "TMPDIR": fixture.parent.path]
-        process.standardOutput = Pipe()
+        let runningOutput = Pipe()
+        process.standardOutput = runningOutput
         process.standardError = Pipe()
         try process.run()
         defer { if process.isRunning { kill(process.processIdentifier, SIGKILL); process.waitUntilExit() } }
@@ -182,7 +182,10 @@ struct NativeHostControlTests {
         if geteuid() != 0 { #expect(try await controlRequest(fixture, "stop\n").contains("denied")) }
         process.terminate()
         try await controlEventually { !process.isRunning }
+        // A start is announced only after the control channel verified the host.
+        let runningStdout = String(decoding: runningOutput.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         #expect(process.terminationStatus == 0)
+        #expect(runningStdout.contains("Native host running"))
         let paths = try NativeServicePaths(serviceData: fixture.root)
         try Data("{\"stopped\":true}\n".utf8).write(to: paths.stoppedMarker)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: paths.stoppedMarker.path)
@@ -191,15 +194,480 @@ struct NativeHostControlTests {
         automatic.executableURL = executable
         automatic.arguments = ["--service-data", fixture.root.path, "--automatic"]
         automatic.environment = ["PATH": "/usr/bin:/bin", "HOME": fixture.parent.path, "TMPDIR": fixture.parent.path]
-        automatic.standardOutput = Pipe()
+        let automaticOutput = Pipe()
+        automatic.standardOutput = automaticOutput
         automatic.standardError = Pipe()
         try automatic.run()
         defer { if automatic.isRunning { kill(automatic.processIdentifier, SIGKILL); automatic.waitUntilExit() } }
         try await controlEventually { !automatic.isRunning }
+        let automaticStdout = String(decoding: automaticOutput.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         #expect(automatic.terminationStatus == 0)
+        // The host did not come up, so the start is never reported as successful.
+        #expect(!automaticStdout.contains("Native host running"))
+        #expect(automaticStdout.contains("was not started"))
         #expect(try Data(contentsOf: fixture.database) == databaseBefore)
         #expect(FileManager.default.fileExists(atPath: paths.stoppedMarker.path))
     }
+
+    @Test("A checked start verifies the host through the control channel before it is reported as started")
+    func checkedStartVerifiesTheHost() async throws {
+        let fixture = try HostFixture(shortPath: true)
+        defer { fixture.remove() }
+        let host = try await fixture.start()
+        let server = try NativeHostControlServer(host: host, peerUID: { _ in 0 })
+        defer { server.close() }
+        // The checked start and the status verb can never disagree about the state.
+        #expect(try await server.verifyStart() == .running)
+        #expect(try await controlRequest(fixture, "status\n").contains("\"state\":\"running\""))
+        // A host that did not come up is never reported as started, and the reason is named.
+        try await host.shutdown()
+        var reason: String?
+        do {
+            _ = try await server.verifyStart()
+        } catch let error as NativeHostControlError {
+            reason = error.reasonCode
+        }
+        #expect(reason == "startNotVerified:stopped")
+    }
+
+    @Test("The checked start does not widen the peer fence")
+    func checkedStartKeepsThePeerFence() async throws {
+        let fixture = try HostFixture(shortPath: true)
+        defer { fixture.remove() }
+        let host = try await fixture.start()
+        // Every peer is unprivileged here, so the channel refuses them all.
+        let server = try NativeHostControlServer(host: host, peerUID: { _ in 501 })
+        defer { server.close() }
+        // The checked start never borrows a peer's privilege: it reads the host's own
+        // state and proves the listener answers, and nothing more.
+        #expect(try await server.verifyStart() == .running)
+        #expect(try await controlRequest(fixture, "status\n").contains("denied"))
+        #expect(try await controlRequest(fixture, "stop\n").contains("denied"))
+        #expect(await host.state == .running)
+        try await host.shutdown()
+    }
+
+    @Test("The start is announced only after the checked start succeeded")
+    func announcementFollowsTheCheckedStart() async throws {
+        var announcements: [String] = []
+        var checks = 0
+        // A check that fails announces nothing at all.
+        var failure: String?
+        do {
+            try await NativeHostStartSequence.run(
+                verify: { checks += 1; throw NativeHostControlError.controlChannelUnreachable },
+                write: { announcements.append($0) })
+        } catch let error as NativeHostControlError {
+            failure = error.reasonCode
+        }
+        #expect(failure == "controlChannelUnreachable")
+        #expect(checks == 1)
+        #expect(announcements.isEmpty)
+        // A check that succeeds announces exactly once, and only after it ran.
+        try await NativeHostStartSequence.run(
+            verify: { checks += 1 },
+            write: { announcements.append($0) })
+        #expect(checks == 2)
+        #expect(announcements.count == 1)
+        #expect(announcements.first == NativeHostStartSequence.runningMessage)
+    }
+
+    @Test("The executable never announces a start the control channel could not back")
+    func executableNeverAnnouncesWithoutAChannel() async throws {
+        let fixture = try HostFixture(shortPath: true)
+        defer { fixture.remove() }
+        let paths = try NativeServicePaths(serviceData: fixture.root)
+        // A foreign entry at the socket path is refused, so no channel can back a start.
+        let socket = paths.root.appendingPathComponent(NativeHostControlServer.socketName)
+        try writeFixtureFile("foreign", to: socket)
+        let executable = nativeHostExecutable()
+        #expect(FileManager.default.isExecutableFile(atPath: executable.path))
+        let run = try runNativeHost(executable, arguments: ["--service-data", fixture.root.path], fixture: fixture)
+        #expect(run.status != 0)
+        #expect(run.error.contains("reason=unsafeSocket"))
+        #expect(!run.output.contains("Native host running"))
+    }
+
+    @Test("The executable has no announcement path of its own")
+    func theExecutableHasNoAnnouncementOfItsOwn() throws {
+        let source = try String(contentsOf: nativeHostMainScript(), encoding: .utf8)
+        // The announcement belongs to the sequence, so the executable holds no
+        // announcement of its own that could be moved ahead of the verification:
+        // it neither carries the message nor reaches for it.
+        #expect(!source.contains("Native host running"))
+        #expect(!source.contains("runningMessage"))
+        // The channel check is the sequence's verification, and it is the only one.
+        #expect(source.components(separatedBy: "control.verifyStart()").count - 1 == 1)
+        let sequence = try #require(source.range(of: "NativeHostStartSequence.run("))
+        let verification = try #require(source.range(of: "control.verifyStart()"))
+        #expect(sequence.lowerBound < verification.lowerBound)
+    }
+
+    @Test("The real executable announces a verified start exactly once")
+    func theExecutableAnnouncesAVerifiedStartOnce() async throws {
+        let fixture = try HostFixture(shortPath: true)
+        defer { fixture.remove() }
+        let executable = nativeHostExecutable()
+        #expect(FileManager.default.isExecutableFile(atPath: executable.path))
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["--service-data", fixture.root.path]
+        process.environment = ["PATH": "/usr/bin:/bin", "HOME": fixture.parent.path, "TMPDIR": fixture.parent.path]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = Pipe()
+        try process.run()
+        defer { if process.isRunning { kill(process.processIdentifier, SIGKILL); process.waitUntilExit() } }
+        // The channel that backs the announcement is live and answers for the
+        // host, so the wait is for the answer and not for the socket file.
+        let status = try await controlEventuallyAnswering(fixture)
+        #expect(status.contains(geteuid() == 0 ? "\"state\":\"running\"" : "denied"))
+        process.terminate()
+        try await controlEventually { !process.isRunning }
+        let stdout = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        // The verified start is announced once and only once, so an announcement
+        // that came before the verification or from a second path would show up
+        // here as a missing or a repeated message.
+        #expect(stdout.components(separatedBy: "Native host running").count - 1 == 1)
+        #expect(stdout.contains(NativeHostStartSequence.runningMessage))
+    }
+
+    @Test("A failed start reports the reason and is never reported as successful")
+    func failedStartReportsTheReason() async throws {
+        let fixture = try HostFixture(shortPath: true)
+        defer { fixture.remove() }
+        // The running host owns the service root, so the next start cannot take it.
+        let host = try await fixture.start()
+        let executable = nativeHostExecutable()
+        #expect(FileManager.default.isExecutableFile(atPath: executable.path))
+        let run = try runNativeHost(executable, arguments: ["--service-data", fixture.root.path], fixture: fixture)
+        #expect(run.status != 0)
+        #expect(run.error.contains("reason=ownerAlreadyRunning"))
+        #expect(!run.error.contains("type(of:"))
+        #expect(!run.output.contains("Native host running"))
+        try await host.shutdown()
+    }
+
+    @Test("A pending non-blocking connect is treated as reachable and then verified")
+    func pendingConnectIsVerified() async throws {
+        // The decision a connect result makes: a connected socket, a pending
+        // connection and a full backlog all still mean the listener is live.
+        #expect(NativeHostChannelProbe.isReachable(connectResult: 0, connectError: 0))
+        #expect(NativeHostChannelProbe.isReachable(connectResult: -1, connectError: EINPROGRESS))
+        #expect(NativeHostChannelProbe.isReachable(connectResult: -1, connectError: EAGAIN))
+        // A refused or missing listener is not a live channel.
+        #expect(!NativeHostChannelProbe.isReachable(connectResult: -1, connectError: ENOENT))
+        #expect(!NativeHostChannelProbe.isReachable(connectResult: -1, connectError: ECONNREFUSED))
+        // The live channel answers the probe and a missing one does not.
+        let fixture = try HostFixture(shortPath: true)
+        defer { fixture.remove() }
+        let host = try await fixture.start()
+        let server = try NativeHostControlServer(host: host, peerUID: { _ in 0 })
+        defer { server.close() }
+        let socket = fixture.root.appendingPathComponent(NativeHostControlServer.socketName).path
+        #expect(NativeHostControlServer.channelAnswers(path: socket))
+        #expect(!NativeHostControlServer.channelAnswers(path: fixture.root.appendingPathComponent("absent.sock").path))
+        // A completed connection carries no socket error, and the client of the
+        // live channel is a real connection, so the kernel kept no error for it.
+        let connected = try controlConnect(fixture)
+        #expect(NativeHostControlServer.connectionCompleted(connected))
+        Darwin.close(connected)
+        try await host.shutdown()
+    }
+
+    @Test("A pending connect is believed only after the descriptor completed without a socket error")
+    func pendingConnectIsBelievedOnlyAfterCompletion() async throws {
+        let fixture = try HostFixture(shortPath: true)
+        defer { fixture.remove() }
+        let host = try await fixture.start()
+        let server = try NativeHostControlServer(host: host, peerUID: { _ in 0 })
+        defer { server.close() }
+        let socket = fixture.root.appendingPathComponent(NativeHostControlServer.socketName).path
+        // A pending connect that completed cleanly is a live channel, and the
+        // answer comes from the descriptor's own completion.  This assertion
+        // fails when the completion check is weakened, because the descriptor
+        // below never completes.
+        let completed = try controlConnect(fixture)
+        defer { Darwin.close(completed) }
+        #expect(NativeHostControlServer.channelIsLive(result: -1, connectError: EINPROGRESS, fd: completed))
+        // A pending connect whose descriptor never became writable is not a
+        // live channel, so the pending branch cannot be believed on the errno
+        // alone.  This assertion fails when the completion check is weakened,
+        // because the descriptor really never completes.
+        let blocked = try fixtureBlockedSocket()
+        defer { Darwin.close(blocked.descriptor) }
+        defer { Darwin.close(blocked.peer) }
+        #expect(!NativeHostControlServer.channelIsLive(result: -1, connectError: EINPROGRESS, fd: blocked.descriptor))
+        // The connected branch answers on the kernel's result alone, so the
+        // difference between the two answers is the pending branch consulting
+        // the descriptor rather than the pending errno.
+        #expect(NativeHostControlServer.channelIsLive(result: 0, connectError: 0, fd: blocked.descriptor))
+        // The production path reads the kernel's own answer and nothing else: a
+        // live listener answers and a missing one does not.
+        #expect(NativeHostControlServer.channelAnswers(path: socket))
+        let absent = fixture.root.appendingPathComponent("absent.sock").path
+        #expect(!NativeHostControlServer.channelAnswers(path: absent))
+        // The refusal is the kernel's own errno for the missing listener, so no
+        // fabricated outcome could have produced it.
+        let refusal = try fixtureConnectError(absent)
+        #expect(refusal == ENOENT)
+        try await host.shutdown()
+    }
+
+    @Test("A refused fixture write names the step that failed and never reports a success errno")
+    func refusalNamesTheFailedStep() throws {
+        // Every refusal names its own step, and only the cases that carry an
+        // errno carry one, so no refusal can report "Success" for a failed
+        // directory or ownership check.
+        let refusals: [FixtureWriteRefusal] = [
+            .ancestorOpen("service", ELOOP),
+            .ancestorStat("service", EIO),
+            .ancestorNotDirectory("service"),
+            .ancestorOwnership("service"),
+            .protectedPlace,
+            .trustedDirectory(ENOENT),
+            .trustedDirectoryStat(EIO),
+            .trustedDirectoryNotDirectory,
+            .trustedDirectoryOwnership,
+            .trustedDirectoryWritable,
+            .entry(EEXIST),
+            .handleStat(EIO),
+            .handleShape,
+            .listedStat(ENOENT),
+            .listedMismatch,
+            .writeFailed(ENOSPC),
+        ]
+        for refusal in refusals {
+            #expect(!refusal.description.contains("errno=0"))
+            #expect(!refusal.description.isEmpty)
+        }
+        // The errno cases carry the errno the call reported.
+        #expect(FixtureWriteRefusal.ancestorOpen("service", ELOOP).description.contains("errno=\(ELOOP)"))
+        // The ownership and type cases name the step instead of an errno.
+        #expect(FixtureWriteRefusal.ancestorOwnership("service").description.contains("not owned"))
+        #expect(FixtureWriteRefusal.ancestorNotDirectory("service").description.contains("not a directory"))
+        // A protected place is refused by name, before anything is opened.
+        let fixture = try HostFixture(shortPath: true)
+        defer { fixture.remove() }
+        let hidden = fixture.parent.appendingPathComponent(".hidden", isDirectory: true)
+        try FileManager.default.createDirectory(at: hidden, withIntermediateDirectories: false)
+        do {
+            try writeFixtureFile("payload", to: hidden.appendingPathComponent("control.sock"))
+            Issue.record("A protected place was written")
+        } catch let refusal as FixtureWriteRefusal {
+            #expect(refusal == .protectedPlace)
+        }
+    }
+
+    @Test("Every error type keeps its reason code on every platform")
+    func crossPlatformReasonCodes() throws {
+        // The classification is direct, not through a macOS-only path.
+        #expect(NativeHostFailureReason.code(for: NativeHostControlError.unsafeSocket) == "unsafeSocket")
+        #expect(NativeHostFailureReason.code(for: NativeHostControlError.socketUnavailable) == "socketUnavailable")
+        #expect(NativeHostFailureReason.code(for: NativeHostControlError.startNotVerified(state: "stopped")) == "startNotVerified:stopped")
+        #expect(NativeHostFailureReason.code(for: NativeHostControlError.controlChannelUnreachable) == "controlChannelUnreachable")
+        #expect(NativeHostFailureReason.code(for: NativeHostLaunchArgumentsError.invalidArguments) == "invalidArguments")
+        // Neither the error types nor the map hide a case behind a platform guard,
+        // so a build that does not run the host classifies them the same way.
+        let errors = try String(contentsOf: companionCoreSource("NativeHostErrors.swift"), encoding: .utf8)
+        let reasons = try String(contentsOf: companionCoreSource("NativeHostFailureReason.swift"), encoding: .utf8)
+        #expect(!errors.contains("#if os(macOS)"))
+        #expect(!reasons.contains("#if os(macOS)"))
+    }
+
+    @Test("Failure reasons are stable codes that never carry a message, a path or a token")
+    func stableFailureReasons() {
+        #expect(NativeHostFailureReason.code(for: NativeHeadlessHostError.ownerAlreadyRunning) == "ownerAlreadyRunning")
+        #expect(NativeHostFailureReason.code(for: NativeHeadlessHostError.stopMarkerFailed) == "stopMarkerFailed")
+        #expect(NativeHostFailureReason.code(for: NativeHostControlError.unsafeSocket) == "unsafeSocket")
+        #expect(NativeHostFailureReason.code(for: NativeHostControlError.startNotVerified(state: "stopped")) == "startNotVerified:stopped")
+        #expect(NativeHostFailureReason.code(for: DatabaseError.openFailed("/private/service-root/host.sqlite")) == "databaseOpenFailed")
+        #expect(NativeHostFailureReason.code(for: NativeHostLaunchArgumentsError.invalidArguments) == "invalidArguments")
+        let unclassified = NativeHostFailureReason.code(for: NSError(domain: "fixture", code: 7))
+        #expect(unclassified == "unclassified")
+        #expect(!unclassified.contains("fixture"))
+    }
+}
+
+private func iosRoot() -> URL {
+    URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+}
+
+private func companionCoreSource(_ name: String) -> URL {
+    iosRoot().appendingPathComponent("Sources/CompanionCore").appendingPathComponent(name)
+}
+
+private func nativeHostMainScript() -> URL {
+    iosRoot().appendingPathComponent("Scripts/BotFleetNativeHost/main.swift")
+}
+
+/// Why a fixture write was refused, so a failure names the step that failed.
+///
+/// A case that carries an errno carries the errno the call really reported, and
+/// a case that is not an errno condition carries no number at all, so a refusal
+/// can never name a success it did not have.
+private enum FixtureWriteRefusal: Error, Equatable, CustomStringConvertible {
+    case ancestorOpen(String, Int32)
+    case ancestorStat(String, Int32)
+    case ancestorNotDirectory(String)
+    case ancestorOwnership(String)
+    case protectedPlace
+    case trustedDirectory(Int32)
+    case trustedDirectoryStat(Int32)
+    case trustedDirectoryNotDirectory
+    case trustedDirectoryOwnership
+    case trustedDirectoryWritable
+    case entry(Int32)
+    case handleStat(Int32)
+    case handleShape
+    case listedStat(Int32)
+    case listedMismatch
+    case writeFailed(Int32)
+
+    var description: String {
+        switch self {
+        case .ancestorOpen(let component, let code): return "ancestor \(component) errno=\(code)"
+        case .ancestorStat(let component, let code): return "ancestor \(component) stat errno=\(code)"
+        case .ancestorNotDirectory(let component): return "ancestor \(component) is not a directory"
+        case .ancestorOwnership(let component): return "ancestor \(component) is not owned by root or this user"
+        case .protectedPlace: return "protected place"
+        case .trustedDirectory(let code): return "trusted directory errno=\(code)"
+        case .trustedDirectoryStat(let code): return "trusted directory stat errno=\(code)"
+        case .trustedDirectoryNotDirectory: return "trusted directory is not a directory"
+        case .trustedDirectoryOwnership: return "trusted directory is not owned by this user"
+        case .trustedDirectoryWritable: return "trusted directory is group or world writable"
+        case .entry(let code): return "entry errno=\(code)"
+        case .handleStat(let code): return "handle stat errno=\(code)"
+        case .handleShape: return "handle is not a regular single-link file owned by this user"
+        case .listedStat(let code): return "listed stat errno=\(code)"
+        case .listedMismatch: return "listed path is not the opened file"
+        case .writeFailed(let code): return "write errno=\(code)"
+        }
+    }
+}
+
+/// The repository's protected-place policy, mirrored for the fixture writer: a
+/// dotfile or dot directory, or anything under a credential or login
+/// directory, is never written to, whether the path names it or resolves to it.
+private func isProtectedFixturePath(_ path: String) -> Bool {
+    if path.split(separator: "/").contains(where: { $0.hasPrefix(".") }) { return true }
+    let folded = (path + "/").lowercased()
+    return ["/.ssh/", "/.secrets/", "/.gnupg/", "/.aws/", "/.config/gh/",
+            "/library/launchagents/", "/library/launchdaemons/"].contains { folded.contains($0) }
+}
+
+/// Writes a fixture payload through a verified handle.
+///
+/// The payload never goes through a resolved path.  The trusted directory is
+/// resolved once, so no symlinked component can redirect the write, and every
+/// directory component is then opened relative to the previous one with
+/// `O_NOFOLLOW`, so no component can be a symlink, and each one must be a
+/// directory owned by root or by this user.  The trusted directory itself must
+/// be a private directory this user owns.  The entry is opened relative to
+/// that directory descriptor with `O_NOFOLLOW`, the opened handle is checked
+/// with `fstat` (a regular, single-link file owned by this user), and its
+/// device and inode are compared with the listed path before anything is
+/// written.
+private func writeFixtureFile(_ payload: String, to url: URL) throws {
+    let path = url.path
+    let name = url.lastPathComponent
+    let directoryPath = url.deletingLastPathComponent().path
+    // The trusted directory is resolved once, so the symlinked components of a
+    // path such as the macOS /tmp link are resolved before anything is opened.
+    var resolvedBuffer = [CChar](repeating: 0, count: 4096)
+    let resolved = resolvedBuffer.withUnsafeMutableBufferPointer { pointer -> String in
+        guard let base = pointer.baseAddress, let resolvedPath = realpath(directoryPath, base) else { return "" }
+        return String(cString: resolvedPath)
+    }
+    guard !resolved.isEmpty else { throw FixtureWriteRefusal.trustedDirectory(errno) }
+    // The named path and the path it resolves to are both refused when either
+    // names a protected place.
+    guard !isProtectedFixturePath(path), !isProtectedFixturePath(resolved) else {
+        throw FixtureWriteRefusal.protectedPlace
+    }
+    // Every directory component is opened relative to the previous one with
+    // O_NOFOLLOW, so no component can be a symlink, and each one must be a
+    // directory owned by root or by this user.
+    var directory = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0)
+    guard directory >= 0 else { throw FixtureWriteRefusal.trustedDirectory(errno) }
+    var directories: [Int32] = [directory]
+    defer { for descriptor in directories { Darwin.close(descriptor) } }
+    for component in resolved.split(separator: "/", omittingEmptySubsequences: true).map(String.init) {
+        let next = component.withCString {
+            openat(directory, $0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW, 0)
+        }
+        guard next >= 0 else { throw FixtureWriteRefusal.ancestorOpen(component, errno) }
+        directories.append(next)
+        directory = next
+        var info = stat()
+        guard fstat(next, &info) == 0 else { throw FixtureWriteRefusal.ancestorStat(component, errno) }
+        guard info.st_mode & S_IFMT == S_IFDIR else { throw FixtureWriteRefusal.ancestorNotDirectory(component) }
+        guard info.st_uid == 0 || info.st_uid == geteuid() else { throw FixtureWriteRefusal.ancestorOwnership(component) }
+    }
+    var directoryInfo = stat()
+    guard fstat(directory, &directoryInfo) == 0 else { throw FixtureWriteRefusal.trustedDirectoryStat(errno) }
+    guard directoryInfo.st_mode & S_IFMT == S_IFDIR else { throw FixtureWriteRefusal.trustedDirectoryNotDirectory }
+    guard directoryInfo.st_uid == geteuid() else { throw FixtureWriteRefusal.trustedDirectoryOwnership }
+    guard directoryInfo.st_mode & 0o022 == 0 else { throw FixtureWriteRefusal.trustedDirectoryWritable }
+    let fd = name.withCString {
+        openat(directory, $0, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
+    }
+    guard fd >= 0 else { throw FixtureWriteRefusal.entry(errno) }
+    defer { Darwin.close(fd) }
+    var handle = stat()
+    guard fstat(fd, &handle) == 0 else { throw FixtureWriteRefusal.handleStat(errno) }
+    guard handle.st_mode & S_IFMT == S_IFREG, handle.st_nlink == 1, handle.st_uid == geteuid() else {
+        throw FixtureWriteRefusal.handleShape
+    }
+    var listed = stat()
+    guard lstat(path, &listed) == 0 else { throw FixtureWriteRefusal.listedStat(errno) }
+    guard listed.st_mode & S_IFMT == S_IFREG,
+          listed.st_dev == handle.st_dev, listed.st_ino == handle.st_ino else {
+        throw FixtureWriteRefusal.listedMismatch
+    }
+    let bytes = Array(payload.utf8)
+    guard !bytes.isEmpty else { return }
+    var written = 0
+    while written < bytes.count {
+        let offset = written
+        let count = bytes.withUnsafeBytes { raw -> Int in
+            guard let base = raw.baseAddress else { return 0 }
+            return Darwin.write(fd, base.advanced(by: offset), raw.count - offset)
+        }
+        if count > 0 { written = offset + count }
+        else if count < 0, errno == EINTR { continue }
+        else { throw FixtureWriteRefusal.writeFailed(errno) }
+    }
+}
+
+private func nativeHostExecutable() -> URL {
+    let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    return root.appendingPathComponent(".build/debug/BotFleetNativeHost")
+}
+
+private struct NativeHostRun {
+    let status: Int32
+    let output: String
+    let error: String
+}
+
+/// Runs the real foreground executable to completion and keeps both streams.
+private func runNativeHost(_ executable: URL, arguments: [String], fixture: HostFixture) throws -> NativeHostRun {
+    let process = Process()
+    process.executableURL = executable
+    process.arguments = arguments
+    process.environment = ["PATH": "/usr/bin:/bin", "HOME": fixture.parent.path, "TMPDIR": fixture.parent.path]
+    let output = Pipe()
+    let error = Pipe()
+    process.standardOutput = output
+    process.standardError = error
+    try process.run()
+    let outputData = output.fileHandleForReading.readDataToEndOfFile()
+    let errorData = error.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return NativeHostRun(status: process.terminationStatus,
+                         output: String(decoding: outputData, as: UTF8.self),
+                         error: String(decoding: errorData, as: UTF8.self))
 }
 
 private func controlEventually(_ predicate: () -> Bool) async throws {
@@ -208,6 +676,17 @@ private func controlEventually(_ predicate: () -> Bool) async throws {
         try await Task.sleep(nanoseconds: 20_000_000)
     }
     throw NativeHeadlessHostError.stopped
+}
+
+/// Waits until the control channel answers a request.  The server binds the
+/// socket before it listens, so the socket file can exist while the listener is
+/// not ready yet, and only an answer proves the channel is live.
+private func controlEventuallyAnswering(_ fixture: HostFixture) async throws -> String {
+    for _ in 0..<250 {
+        if let answer = try? await controlRequest(fixture, "status\n"), !answer.isEmpty { return answer }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    throw NativeHostControlError.socketUnavailable
 }
 
 private func controlStatusEventually(_ fixture: HostFixture) async throws {
@@ -256,6 +735,51 @@ private func controlConnect(_ fixture: HostFixture) throws -> Int32 {
     }
     guard result == 0 else { Darwin.close(fd); throw NativeHostControlError.socketUnavailable }
     return fd
+}
+
+/// A connected descriptor that never becomes writable, so it never reaches a
+/// completed connection.
+///
+/// The send buffer is filled and the peer never reads, so the descriptor stays
+/// unwritable, which is exactly the state a pending connect stays in while it
+/// has not completed.
+private func fixtureBlockedSocket() throws -> (descriptor: Int32, peer: Int32) {
+    var pair = [Int32](repeating: -1, count: 2)
+    let created = pair.withUnsafeMutableBufferPointer { buffer in
+        Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, buffer.baseAddress!)
+    }
+    guard created == 0 else { throw NativeHostControlError.socketUnavailable }
+    let descriptor = pair[0]
+    let peer = pair[1]
+    guard fcntl(descriptor, F_SETFL, O_NONBLOCK) == 0 else {
+        Darwin.close(descriptor); Darwin.close(peer)
+        throw NativeHostControlError.socketUnavailable
+    }
+    var noSignal: Int32 = 1
+    setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
+    // Fill the send buffer, so the descriptor is connected and not writable.
+    var buffer = [UInt8](repeating: 0, count: 65536)
+    while true {
+        let count = buffer.withUnsafeBytes { raw in Darwin.write(descriptor, raw.baseAddress, raw.count) }
+        if count < 0 { break }
+        if count == 0 { break }
+    }
+    return (descriptor, peer)
+}
+
+/// The errno the kernel reports for a real connect to a path with no listener.
+private func fixtureConnectError(_ path: String) throws -> Int32 {
+    let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { throw NativeHostControlError.socketUnavailable }
+    defer { Darwin.close(fd) }
+    var address = controlAddress(URL(fileURLWithPath: path))
+    let result = withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    if result == 0 { return 0 }
+    return errno
 }
 
 private func controlRequest(_ fixture: HostFixture, _ text: String) async throws -> String {

@@ -235,6 +235,20 @@ describe("report spool durability", () => {
     expect(() => spool.add(terminalMessage("lease-2", 1_005, "job-2"))).not.toThrow();
   });
 
+  it("reads one job's row by name, with its lease, and finds none for another job", () => {
+    const dir = fixtureDir();
+    const spool = new PlacementReportSpool(dir);
+    spool.add(terminalMessage("lease-1"));
+    spool.add(terminalMessage("lease-2", 1_006, "job-2"));
+    expect(spool.get("job-1")?.message).toMatchObject({ jobId: "job-1", leaseId: "lease-1" });
+    expect(spool.get("job-2")?.message).toMatchObject({ jobId: "job-2", leaseId: "lease-2" });
+    expect(spool.get("job-3")).toBeUndefined();
+    // a damaged row is no row, and asking about it counts nothing
+    writeFileSync(join(dir, "placement", "reports", "report-" + "0".repeat(32) + ".json"), "{ truncated", { mode: 0o600 });
+    expect(spool.get("job-1")?.message.leaseId).toBe("lease-1");
+    expect(spool.damaged()).toBe(0);
+  });
+
   it("a damaged row is skipped from delivery and counted, never crashed on", () => {
     const dir = fixtureDir();
     const spool = new PlacementReportSpool(dir);

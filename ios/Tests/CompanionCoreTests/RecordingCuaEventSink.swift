@@ -9,11 +9,15 @@ final class RecordingCuaEventSink: @unchecked Sendable {
     private var recorded: [CGEvent] = []
 
     func makeDriver() -> MacCuaDriver {
-        MacCuaDriver(eventSink: { [self] event in
+        let driver = MacCuaDriver(eventSink: { [self] event in
             lock.lock()
             defer { lock.unlock() }
             recorded.append(event)
         })
+        // Tests never post to the real desktop, so treat Accessibility as granted;
+        // the production default AXIsProcessTrusted() is false in the test runner.
+        driver.accessibilityProvider = { true }
+        return driver
     }
 
     var events: [CGEvent] {

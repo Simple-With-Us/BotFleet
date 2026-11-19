@@ -1,0 +1,49 @@
+{
+  "isFullyVerified": true,
+  "isParityVerified": true,
+  "mismatches": [],
+  "newlyInsertedMessages": 2048,
+  "orphanedMessageCount": 0,
+  "perThreadMessageCountsMatch": true,
+  "routineRequestReceipts": [
+    {
+      "action": "routine.create",
+      "appliedAt": 1760000000000,
+      "botId": "bot-synthetic-0001",
+      "fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "fingerprintVersion": 1,
+      "messageId": "msg-synthetic-0001",
+      "requestId": "req-synthetic-0001",
+      "resultId": "routine-synthetic-0001",
+      "threadId": "thread-synthetic-0001"
+    }
+  ],
+  "sourceBodyDigestSHA256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "sourceBotCount": 3,
+  "sourceMessageCount": 2048,
+  "sourceMessageMetadataDroppedCount": 0,
+  "sourceMessageMetadataPreservedCount": 6,
+  "sourceMessageMetadataPreservedDigestSHA256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "sourceMessageMetadataPreservedFields": [
+    "parentId",
+    "reactions"
+  ],
+  "sourceRoutineCount": 2,
+  "sourceRoutineRequestReceiptCount": 1,
+  "sourceRoutineRunCount": 5,
+  "sourceThreadCount": 12,
+  "sourceWebhookCount": 1,
+  "sourceWebhookDeliveryCount": 4,
+  "sourceWebhookDeliveryLedgerCount": 3,
+  "targetBodyDigestSHA256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "targetBotCount": 3,
+  "targetMessageCount": 2048,
+  "targetRoutineCount": 2,
+  "targetRoutineRequestReceiptCount": 1,
+  "targetRoutineRunCount": 5,
+  "targetThreadCount": 12,
+  "targetWebhookCount": 1,
+  "targetWebhookDeliveryCount": 4,
+  "targetWebhookDeliveryLedgerCount": 3,
+  "warnings": []
+}
