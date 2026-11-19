@@ -744,9 +744,9 @@ private func controlConnect(_ fixture: HostFixture) throws -> Int32 {
 /// unwritable, which is exactly the state a pending connect stays in while it
 /// has not completed.
 private func fixtureBlockedSocket() throws -> (descriptor: Int32, peer: Int32) {
-    var pair: [Int32] = [-1, -1]
-    let created = withUnsafeMutableBytes(of: &pair) { raw in
-        Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, raw.baseAddress!.assumingMemoryBound(to: Int32.self))
+    var pair = [Int32](repeating: -1, count: 2)
+    let created = pair.withUnsafeMutableBufferPointer { buffer in
+        Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, buffer.baseAddress!)
     }
     guard created == 0 else { throw NativeHostControlError.socketUnavailable }
     let descriptor = pair[0]
