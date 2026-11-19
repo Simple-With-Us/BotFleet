@@ -62,6 +62,15 @@ final class PlacementModeAvailabilityTests: XCTestCase {
             "Hetzner is running version 1.0.31, which has no placement routes.\u{00A0} Update the server to use this mode."
         )
         XCTAssertEqual(incompatible.options[2].disabledReason, missingRoutesReason)
+
+        XCTAssertEqual(
+            PlacementModeAvailability.missingPlacementRoutesReason(serverName: "  Hetzner  ", version: " 1.0.31\n"),
+            "Hetzner is running version 1.0.31, which has no placement routes.\u{00A0} Update the server to use this mode."
+        )
+        XCTAssertEqual(
+            PlacementModeAvailability.missingPlacementRoutesReason(serverName: "   ", version: "  "),
+            "The server is running an unknown version, which has no placement routes.\u{00A0} Update the server to use this mode."
+        )
     }
 
     func testVerifiedServerEnablesAllModesAndExposesOverflowOnServerFirst() throws {

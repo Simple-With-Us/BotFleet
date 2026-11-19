@@ -33,7 +33,11 @@ public struct PlacementModeAvailability: Equatable, Sendable {
     }
 
     public static func missingPlacementRoutesReason(serverName: String, version: String) -> String {
-        "\(serverName) is running version \(version), which has no placement routes.\u{00A0} Update the server to use this mode."
+        let trimmedName = serverName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedVersion = version.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = trimmedName.isEmpty ? "The server" : trimmedName
+        let versionDescription = trimmedVersion.isEmpty ? "an unknown version" : "version \(trimmedVersion)"
+        return "\(displayName) is running \(versionDescription), which has no placement routes.\u{00A0} Update the server to use this mode."
     }
 
     public let hasRemoteServer: Bool

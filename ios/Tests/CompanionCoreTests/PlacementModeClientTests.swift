@@ -440,6 +440,7 @@ final class PlacementModeClientTests: XCTestCase {
             XCTAssertEqual(ack.serverId, frameObj["serverId"] as? String)
             XCTAssertEqual(ack.allowOverflowToThisMac, frameObj["allowOverflowToThisMac"] as? Bool)
             XCTAssertEqual(ack.acknowledged, frameObj["acknowledged"] as? Bool)
+            XCTAssertEqual(ack.appliedAt, (frameObj["appliedAt"] as? NSNumber)?.doubleValue)
             XCTAssertEqual(ack.reason, frameObj["reason"] as? String)
         }
 
@@ -472,6 +473,7 @@ final class PlacementModeClientTests: XCTestCase {
             XCTAssertEqual(sentBody["allowOverflowToThisMac"] as? Bool, writeObj["allowOverflowToThisMac"] as? Bool)
             XCTAssertTrue(ack.acknowledged)
             XCTAssertEqual(ack.mode, mode)
+            XCTAssertEqual(ack.appliedAt, (ackObj["appliedAt"] as? NSNumber)?.doubleValue)
         }
 
         // 3. Verify 409 stale fence frame throws exact controller pair.
