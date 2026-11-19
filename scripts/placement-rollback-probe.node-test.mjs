@@ -286,6 +286,29 @@ function probe(fixture, options = {}) {
   return runPlacementRollbackFixtureProbe(fixture.candidate, { receiptDir: fixture.receipts, timeouts: FAST, ...options });
 }
 
+/**
+ * Append through the transient open failures a loaded runner can hand a plain
+ * write.  The ordering comes only from the phase callback that calls this, so
+ * the edit still lands exactly between the binding and the recheck;  the retry
+ * covers the write itself losing the system-wide file-table race (ENFILE, or
+ * EMFILE under fd pressure) that once turned this edit into an observer throw
+ * and an observer-failed blocker on hosted Linux CI instead of the drift the
+ * test exists to pin.
+ */
+function appendUnderLoad(path, text) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      appendFileSync(path, text);
+      return;
+    } catch (error) {
+      const code = error && error.code;
+      const transient = code === "ENFILE" || code === "EMFILE" || code === "EAGAIN" || code === "EBUSY";
+      if (!transient || attempt >= 5) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * attempt);
+    }
+  }
+}
+
 function onlyReceipt(fixture) {
   const names = readdirSync(fixture.receipts);
   assert.equal(names.length, 1, names.join(", "));
@@ -804,7 +827,7 @@ test("artifact bytes changed during the probe are caught by the recheck", { skip
     onPhase: ({ phase }) => {
       if (phase !== "before-recheck") return;
       execFileSync("chmod", ["-R", "u+w", fixture.releaseRoot]);
-      appendFileSync(join(fixture.releaseRoot, "server", "index.ts"), "// edited while the probe ran\n");
+      appendUnderLoad(join(fixture.releaseRoot, "server", "index.ts"), "// edited while the probe ran\n");
     },
   });
   assertNeverActivates(result);
@@ -817,7 +840,7 @@ test("runtime bytes changed during the probe are caught by the recheck", { skip:
   const runtimePath = copiedRuntime(realpathSync(fixture.root));
   fixture.candidate = { ...fixture.candidate, runtimePath };
   const result = await probe(fixture, {
-    onPhase: ({ phase }) => { if (phase === "before-recheck") appendFileSync(runtimePath, "changed while the probe ran\n"); },
+    onPhase: ({ phase }) => { if (phase === "before-recheck") appendUnderLoad(runtimePath, "changed while the probe ran\n"); },
   });
   assertNeverActivates(result);
   assert.deepEqual(result.blockers.map((entry) => [entry.code, entry.phase]), [["runtime-changed", "recheck"]]);
