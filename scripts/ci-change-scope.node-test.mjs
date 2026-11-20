@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
 
-import { classifyCIPaths, isIosPath, isPackagingPath } from "./ci-change-scope.mjs";
+import { classifyCIPaths, isIosPath, isMacAppPath, isPackagingPath } from "./ci-change-scope.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -16,6 +16,7 @@ test("only the explicit non-executable documentation paths take the fast path", 
     changedCount: 2,
     docsOnly: true,
     iosChanged: false,
+    macAppChanged: false,
     packagingChanged: false,
   });
   assert.equal(classifyCIPaths(["README.md", "SECURITY.md"]).docsOnly, true);
@@ -72,14 +73,18 @@ test("per-area outputs gate the expensive jobs on the paths that actually affect
     changedCount: 1,
     docsOnly: false,
     iosChanged: false,
+    macAppChanged: false,
     packagingChanged: false,
   });
-  assert.deepEqual(classifyCIPaths(["ios/App/BotFleetApp.swift", "server/index.ts"]), {
+  assert.deepEqual(classifyCIPaths(["ios/MacApp/BotFleetMacApp.swift", "server/index.ts"]), {
     changedCount: 2,
     docsOnly: false,
     iosChanged: true,
+    macAppChanged: true,
     packagingChanged: false,
   });
+  assert.equal(isMacAppPath("ios/MacUpdater/NativeMacUpdater.swift"), true);
+  assert.equal(isMacAppPath("server/index.ts"), false);
 
   // No signal (an empty list, the same fallback the workflow's schedule,
   // dispatch, and missing-base-SHA branches use directly) runs every area,
@@ -88,6 +93,7 @@ test("per-area outputs gate the expensive jobs on the paths that actually affect
     changedCount: 0,
     docsOnly: false,
     iosChanged: true,
+    macAppChanged: true,
     packagingChanged: true,
   });
 });
@@ -103,7 +109,7 @@ test("the CLI emits only GitHub outputs for a NUL-delimited path list", () => {
   assert.equal(result.stderr, "");
   assert.equal(
     result.stdout,
-    "docs_only=true\nchanged_count=2\nios_changed=false\npackaging_changed=false\n",
+    "docs_only=true\nchanged_count=2\nios_changed=false\nmac_app_changed=false\npackaging_changed=false\n",
   );
 });
 
@@ -222,7 +228,7 @@ test("no Linux packaging job remains in ci.yml (BF-2500 clean break)", () => {
   assert.equal(workflow.jobs.test.steps.some((step) => /_changed/.test(step.if ?? "")), false);
 
   const classifier = workflow.jobs.changes.steps.find((step) => step.id === "scope");
-  for (const output of ["ios_changed", "packaging_changed"]) {
+  for (const output of ["ios_changed", "mac_app_changed", "packaging_changed"]) {
     assert.equal(workflow.jobs.changes.outputs[output], `\${{ steps.scope.outputs.${output} }}`);
     // Scheduled/dispatched runs and an unresolvable base SHA both fall back
     // to the full gate -- every area reported changed, not skipped.

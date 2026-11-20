@@ -29,6 +29,7 @@ jobs:
     outputs:
       docs_only: ${{ steps.scope.outputs.docs_only }}
       ios_changed: ${{ steps.scope.outputs.ios_changed }}
+      mac_app_changed: ${{ steps.scope.outputs.mac_app_changed }}
       packaging_changed: ${{ steps.scope.outputs.packaging_changed }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -53,6 +54,7 @@ jobs:
               echo "docs_only=false"
               echo "changed_count=0"
               echo "ios_changed=true"
+              echo "mac_app_changed=true"
               echo "packaging_changed=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
@@ -74,6 +76,7 @@ jobs:
               echo "docs_only=false"
               echo "changed_count=0"
               echo "ios_changed=true"
+              echo "mac_app_changed=true"
               echo "packaging_changed=true"
             } >> "$GITHUB_OUTPUT"
           fi
@@ -261,7 +264,7 @@ jobs:
   mac-native-build:
     name: Mac app composition build (xcode-27, unsigned)
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.mac_app_changed == 'true' }}
     runs-on: xcode-27
     timeout-minutes: 25
     env:

@@ -59,6 +59,20 @@ export function isPackagingPath(path) {
   );
 }
 
+/** The Mac app composition compiles in its own ci.yml job (mac-native-build,
+ * BF-2628).  Its sources and xcodegen inputs are tracked so a wiring change
+ * triggers exactly that job, and the classifier itself is a member:  an edit
+ * that narrows the classification must not take the new job's skip path.
+ */
+export function isMacAppPath(path) {
+  return (
+    path.startsWith("ios/MacApp/") ||
+    path.startsWith("ios/MacUpdater/") ||
+    path === "ios/project.yml" ||
+    path === "scripts/ci-change-scope.mjs"
+  );
+}
+
 /** The Mac pre-merge packaging gate (scripts/mac-package-gate.mjs) reuses
  * `isPackagingPath` and widens it.  Kept separate from `isPackagingPath` so a
  * widening only affects the gate, never the ci.yml jobs that consume the
@@ -93,6 +107,7 @@ export function classifyCIPaths(paths) {
     changedCount: changedPaths.length,
     docsOnly: hasChanges && changedPaths.every(isDocumentationPath),
     iosChanged: !hasChanges || changedPaths.some(isIosPath),
+    macAppChanged: !hasChanges || changedPaths.some(isMacAppPath),
     packagingChanged: !hasChanges || changedPaths.some(isPackagingPath),
   };
 }
@@ -110,6 +125,7 @@ function main() {
     `docs_only=${result.docsOnly}\n` +
       `changed_count=${result.changedCount}\n` +
       `ios_changed=${result.iosChanged}\n` +
+      `mac_app_changed=${result.macAppChanged}\n` +
       `packaging_changed=${result.packagingChanged}\n`,
   );
 }

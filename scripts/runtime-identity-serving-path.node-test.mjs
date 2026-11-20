@@ -66,9 +66,10 @@ function withoutLineComments(source) {
       continue;
     }
     if (char === "/" && next === "*") {
+      // Replaced with the empty string so `name/*note*/(` keeps the
+      // token adjacency the call-site counting relies on.
       const end = source.indexOf("*/", index + 2);
       index = end === -1 ? source.length : end + 2;
-      out += " ";
       continue;
     }
     if (char === "/" && next === "/") {
@@ -117,8 +118,16 @@ test("no other server module reaches the fingerprint walk or its modules", () =>
     if (/hashStaticUi|readSourceBuildIdentity/.test(source)) offenders.push(`${module} calls a walking reader`);
     if (/scripts\/source-build-identity\.mjs/.test(source)) offenders.push(`${module} imports source-build-identity.mjs`);
     if (/scripts\/release-provenance\.mjs/.test(source)) offenders.push(`${module} imports release-provenance.mjs (the dependency-tree walk)`);
-    if (/electron\/runtime-identity\.mjs/.test(source) && !/authorizedRuntime|validBuildIdentity|buildCompatibility/.test(source)) {
-      offenders.push(`${module} imports electron/runtime-identity.mjs without naming a non-walking export`);
+    // The electron module's walk is pinned by name:  an importer passes only
+    // when every name it imports from that module is a non-walking export,
+    // so a dead allowed-name string cannot keep the walk on a route.
+    if (/electron\/runtime-identity\.mjs/.test(source)) {
+      const imported = [...source.matchAll(/import\s*\{([^}]*)\}\s*from\s*["'][^"']*electron\/runtime-identity\.mjs["']/g)]
+        .flatMap((entry) => entry[1].split(",").map((name) => name.trim().split(/\s+as\s+/)[0].trim()).filter(Boolean));
+      const nonWalking = new Set(["authorizedRuntime", "validBuildIdentity", "buildCompatibility"]);
+      if (imported.length === 0 || !imported.every((name) => nonWalking.has(name))) {
+        offenders.push(`${module} imports electron/runtime-identity.mjs beyond its non-walking exports`);
+      }
     }
   }
   assert.deepEqual(offenders, [], "the fingerprint walk must be reachable only through server/runtime-identity.ts at module load");
