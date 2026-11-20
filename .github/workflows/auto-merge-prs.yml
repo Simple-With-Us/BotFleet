@@ -1,0 +1,144 @@
+name: Auto-merge PRs
+
+# Thin caller for the fleet's shared auto-merge armer
+# (AI-Fleet-Coordinator/.github/workflows/auto-merge-reusable.yml, docs in
+# AFC docs/AUTO-MERGE.md).  Repo policy lives in the inputs below.
+#
+# The merge credential is the dedicated fleet merge service App
+# swu-merge-automation (never an agent seat, never a personal PAT).  The App
+# id and private key are passed as reusable-workflow SECRETS; the reusable's
+# classify and arm jobs mint their own per-job installation token (scoped to
+# this repository, revoked automatically at job end; classify mint is
+# read-only) - no token ever crosses a job boundary.  Arming never falls
+# back to GITHUB_TOKEN (a bot-attributed merge dispatches no workflow
+# events - no CI on main), and the reusable probes the token and verifies
+# its principal via GraphQL viewer.login against expected_merge_actor.
+#
+# The sweep is the fallback for every eventless transition: check-run
+# completion, a settled autofix run, or a Kody review that arrived without
+# re-triggering this workflow (Dependabot events additionally carry no
+# secrets).  On schedule it lists every open non-draft SAME-REPO PR
+# (paginated) and re-classifies each through the reusable's existing
+# rearm_pr_number mode - every gate runs identically (current-head checks,
+# review gate, holds incl. the timeline gate, draft), so an idle mergeable
+# PR is picked up within one sweep.  No PR code is ever checked out or
+# executed (rearm pins the default branch for gate sources).  Fork PRs stay
+# excluded by the reusable's own same-repo rule - that gate is not weakened.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, ready_for_review, unlabeled]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+# checks/actions/issues reads feed the reusable's in-flight gates and the
+# hold-guard timeline reads (a called workflow's GITHUB_TOKEN is capped by
+# the caller's grants).  issues: write is REQUIRED at startup: the reusable's
+# ensure-hold-labels job requests it, and GitHub refuses the whole workflow
+# at startup when a called job's permissions exceed the caller's grants
+# (this exact failure kept ST's auto-merge dead at pin e63954cd).
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  actions: read
+  issues: write
+
+# Wave-level serialization: a concurrency group holds 1 running + 1 pending
+# and a new arrival displaces the PENDING one, so this must NOT sit on the
+# matrix job (siblings share one group value and would cancel each other).
+# At workflow level each RUN gets one group: sweep waves serialize per repo,
+# event runs are unique and never interfere.  Idempotent rearm under the
+# gates covers any residual overlap between a wave and an event run.
+concurrency:
+  group: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('fleet-auto-merge-sweep-{0}', github.repository) || format('fleet-auto-merge-event-{0}-{1}', github.repository, github.run_id) }}
+  cancel-in-progress: false
+
+jobs:
+  auto-merge:
+    # Caller-level same-repo guard: fork PR events never invoke the reusable
+    # at all (secrets are already unavailable to fork runs; this removes the
+    # wasted privileged invocation and keeps untrusted execution out of the
+    # lane entirely).  The reusable's own same-repo rule stays as defense in
+    # depth.  pull_request_target is deliberately NOT used: it would expose
+    # secrets to fork contexts, the opposite of the goal.
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'pull_request_review')
+      && github.event.pull_request.head.repo.full_name == github.repository
+    uses: Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/auto-merge-reusable.yml@ec5eb78e0ec0566fcd3fcc8aa6d84ce531203869
+    with:
+      expected_merge_actor: "swu-merge-automation[bot]"
+      self_guard_paths: .github/workflows/auto-merge-prs.yml
+    secrets:
+      merge_app_id: ${{ vars.SWU_MERGE_AUTOMATION_APP_ID }}
+      merge_app_private_key: ${{ secrets.SWU_MERGE_AUTOMATION_APP_PRIVATE_KEY }}
+
+  # Trusted-base re-arm sweep (see header).  Secrets-bearing schedule /
+  # dispatch events only; lists PR numbers, merges nothing itself.
+  # concurrency: one sweep/rearm wave per repo at a time; a fire that finds
+  # a wave running waits, and at most one wave queues (the next 15-min tick
+  # recovers anything skipped).
+  sweep:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # Least privilege: the list step only enumerates open PRs.  Job-level
+    # permissions override the top-level write union, which exists for the
+    # reusable-call jobs (their called workflow requests issues: write and
+    # the merge writes).  This job never merges and never calls the reusable.
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      prs: ${{ steps.list.outputs.prs }}
+    steps:
+      - name: List open non-draft same-repo PRs (paginated, capped, rotating)
+        id: list
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Raw pages (no --slurp/--jq on gh): jq owns the reduction.
+          # 15-minute clock ticks: strictly advancing per sweep regardless
+          # of how many event-path runs interleave (SWEEP_OFFSET override
+          # exists for tests only; the workflow never sets it).
+          off="${SWEEP_OFFSET:-$(( $(date +%s) / 900 ))}"
+          pages="$(gh api --paginate "repos/$REPO/pulls?state=open&per_page=100")"
+          [ -n "$pages" ] || { echo "::error::PR list fetch returned no data"; exit 1; }
+          # Same-repo, non-draft only (fork PRs stay excluded by the
+          # reusable's own same-repo rule).  Per-tick fan-out cap: a sweep
+          # re-arms at most 50 PRs per tick, well under the 256-job matrix
+          # limit and, with max-parallel 4, a bounded queue/API load; when
+          # more are open the window rotates by clock tick so no PR waits
+          # behind the first page across successive clock ticks. Scheduled runs
+          # can be delayed or dropped, so there is no hard full-pass time bound.
+          prs="$(printf '%s' "$pages" | jq -sc --arg repo "$REPO" --argjson off "$off" '
+            [ .[][] | select((.draft | not) and .head.repo.full_name == $repo) | .number ]
+            | sort
+            | . as $all
+            | ($all | length) as $n
+            | if $n <= 50 then [$all[] | tostring]
+              else [range(0; 50) | $all[((($off * 50) + .) % $n)] | tostring]
+              end')"
+          printf '%s' "$prs" | jq -e 'type == "array"' > /dev/null
+          echo "prs=$prs" >> "$GITHUB_OUTPUT"
+
+  rearm-open-prs:
+    needs: sweep
+    if: needs.sweep.outputs.prs != '[]'
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        pr: ${{ fromJSON(needs.sweep.outputs.prs) }}
+    uses: Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/auto-merge-reusable.yml@ec5eb78e0ec0566fcd3fcc8aa6d84ce531203869
+    with:
+      rearm_pr_number: ${{ matrix.pr }}
+      expected_merge_actor: "swu-merge-automation[bot]"
+      self_guard_paths: .github/workflows/auto-merge-prs.yml
+    secrets:
+      merge_app_id: ${{ vars.SWU_MERGE_AUTOMATION_APP_ID }}
+      merge_app_private_key: ${{ secrets.SWU_MERGE_AUTOMATION_APP_PRIVATE_KEY }}
