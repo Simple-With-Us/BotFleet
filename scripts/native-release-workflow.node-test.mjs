@@ -194,17 +194,15 @@ test("the Sparkle signing branch can actually run", () => {
   assert.match(workflow, /command -v sign_update > \/dev\/null \|\| \{/);
   assert.match(workflow, /::error::sign_update is not installed/);
   // This round runs both key-format interpretations on the live dispatch (the signer produced no
-  // output last time), so the guard pins the diagnostic's own contract:  both key files are
-  // created under umask 077, both attempts are logged verbatim, the files are removed together
-  // before any exit, and the empty-signature failure names both formats.
-  assert.match(workflow, /printf '%s' "\$SPARKLE_EDDSA_PRIVATE_KEY_B64" > "\$key"/);
-  assert.match(workflow, /printf '%s' "\$SPARKLE_EDDSA_PRIVATE_KEY_B64" \| base64 --decode > "\$keyraw"/);
-  assert.match(workflow, /umask 077/);
-  assert.match(workflow, /"--text-format attempt exited \$??"|text-format attempt exited/);
-  assert.match(workflow, /cat "\$RUNNER_TEMP\/su-text.txt"/);
-  assert.match(workflow, /cat "\$RUNNER_TEMP\/su-raw.txt"/);
-  assert.match(workflow, /rm -f "\$key" "\$keyraw"/);
-  assert.match(workflow, /::error::sign_update produced no signature in either key format/);
+  // output last time), so the guard pins the diagnostic's own contract as ONE ordered block:
+  // both key files are created under umask 077, both attempts are logged verbatim, the files are
+  // removed together before any exit, and the empty-signature failure names both formats.  No
+  // GitHub fallback for signing material anywhere in this step.
+  assert.match(
+    workflow,
+    /old_umask=\$\(umask\)[\s\S]*?umask 077[\s\S]*?printf '%s' "\$SPARKLE_EDDSA_PRIVATE_KEY_B64" > "\$key"[\s\S]*?printf '%s' "\$SPARKLE_EDDSA_PRIVATE_KEY_B64" \| base64 --decode > "\$keyraw"[\s\S]*?umask "\$old_umask"[\s\S]*?rm -f "\$key" "\$keyraw"[\s\S]*?::error::sign_update produced no signature in either key format/,
+  );
+  assert.doesNotMatch(workflow, /GH_FALLBACK_APPLE_API_KEY/);
 });
 
 // The key never stays at a path: it is decoded into a private file, that
