@@ -85,9 +85,10 @@ jobs:
           token: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
           # The read token is scoped to prod /botfleet-server, and the ASC trio now lives in that
           # same folder (synced from prod root, which is the copy ios-ship reads with its own
-          # token).  Infisical stays the authoritative source:  no GitHub fallback for signing
-          # material, because a fallback would silently prefer a possibly-stale value over the
-          # vault for exactly the credentials that sign releases.
+          # token), so the fetch names the folder.  Infisical stays the authoritative source:  no
+          # GitHub fallback for signing material, because a fallback would silently prefer a
+          # possibly-stale value over the vault for exactly the credentials that sign releases.
+          secret-path: /botfleet-server
       - id: pin
         run: |
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
