@@ -1,0 +1,39 @@
+{
+  "engines": [
+    {
+      "engineId": "claude",
+      "family": "claude",
+      "fixtureCount": 1,
+      "fixtures": [
+        {
+          "executable": "/usr/bin/env",
+          "eventsMatched": true,
+          "family": "claude",
+          "fixtureId": "claude-001",
+          "passed": true,
+          "spawnSpecMatched": true,
+          "stdinGuardHeld": true,
+          "title": "the recorded turn replayed byte for byte"
+        }
+      ],
+      "isFullyVerified": true,
+      "measured": true,
+      "passedCount": 1
+    },
+    {
+      "engineId": "dsh",
+      "fixtureCount": 0,
+      "fixtures": [],
+      "isFullyVerified": false,
+      "measured": false,
+      "passedCount": 0,
+      "unmeasuredReason": "no replay family drives this engine, so no fixture could be run for it"
+    }
+  ],
+  "isFullyVerified": false,
+  "requestedEngines": [
+    "claude",
+    "dsh"
+  ],
+  "version": 1
+}

@@ -638,7 +638,7 @@ test("a remote choice that fails is not saved, so the next launch asks again", a
     const calls = [];
     const result = await resolveEnrolledServerTarget({
       readEnrollment: () => null,
-    forceChoice: true,
+      forceChoice: true,
       chooseMode: () => "remote",
       writeEnrollment: (mode) => calls.push(`write:${mode}`),
       readRemoteTarget: () => resolveServerTarget({ readToken }),
@@ -681,20 +681,6 @@ test("remote setup is persisted only after the scoped vault read works", async (
   assert.deepEqual(calls, ["choose", "token", "vault", "write:remote"]);
 });
 
-test("a remote choice that fails is not saved, so the next launch asks again", async () => {
-  for (const readToken of [async () => null, async () => { throw new Error("fixture keychain unavailable"); }]) {
-    const calls = [];
-    const result = await resolveEnrolledServerTarget({
-      readEnrollment: () => null,
-    forceChoice: true,
-      chooseMode: () => "remote",
-      writeEnrollment: (mode) => calls.push(`write:${mode}`),
-      readRemoteTarget: () => resolveServerTarget({ readToken }),
-    });
-    assert.equal(result.mode, "error");
-    assert.deepEqual(calls, []);
-  }
-});
 
 test("a non-interactive launch with no choice runs on this Mac and saves nothing", async () => {
   const calls = [];

@@ -639,10 +639,6 @@ fi
 case "$startup_mode" in
   remote) log "starting with the Infisical bootstrap"; load_infisical_identity ;;
   local) log "starting this Mac without Infisical bootstrap" ;;
-  missing)
-    log "startup setup is required; open BotFleet to choose this Mac or Infisical server settings"
-    exit 0
-    ;;
   *)
     log_err "startup choice could not be read; open BotFleet Server Setup before starting"
     exit 1
