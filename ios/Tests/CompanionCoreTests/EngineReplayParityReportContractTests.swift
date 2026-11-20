@@ -75,13 +75,12 @@ struct EngineReplayParityReportContractTests {
         // fixture agrees.  A report that claimed fully verified while an
         // engine failed would decode — Codable cannot know the rule — but the
         // comparison the contract tests make must catch it on both sides.
-        let drifted = String(data: try fixtureData(), encoding: .utf8)!
-            .replacingOccurrences(
-                of: "\"isFullyVerified\": false,\n  \"requestedEngines\"",
-                with: "\"isFullyVerified\": true,\n  \"requestedEngines\""
-            )
-        #expect(drifted != String(data: try fixtureData(), encoding: .utf8)!)
-        let report = try JSONDecoder().decode(EngineReplayParityReport.self, from: Data(drifted.utf8))
+        // The flag is flipped on the parsed object, not on fixture bytes, so
+        // the test survives any reformat of the fixture.
+        var driftedObject = try jsonObject(try fixtureData())
+        driftedObject["isFullyVerified"] = true
+        let drifted = try JSONSerialization.data(withJSONObject: driftedObject)
+        let report = try JSONDecoder().decode(EngineReplayParityReport.self, from: drifted)
         #expect(report.isFullyVerified)
         #expect(report.isFullyVerified != EngineReplayParityReport.aggregateFullyVerified(engines: report.engines))
     }
@@ -140,12 +139,14 @@ struct EngineReplayParityReportContractTests {
             // The nested per-fixture payloads are pinned the same way:
             // `EngineReplayOutcome` carries optional stored fields, and a key
             // renamed or dropped there must fail this test rather than drift.
+            // `zip` bounds the iteration, so a count mismatch surfaces as the
+            // failed expectation above instead of an index trap.
             let fixtureFixtures = try #require(fixtureEngines[index]["fixtures"] as? [[String: Any]])
             let encodedFixtures = try #require(entry["fixtures"] as? [[String: Any]])
             #expect(encodedFixtures.count == fixtureFixtures.count)
-            for (fixtureIndex, outcome) in encodedFixtures.enumerated() {
-                let outcomeKeys = Set(outcome.keys)
-                let fixtureOutcomeKeys = Set(fixtureFixtures[fixtureIndex].keys)
+            for (fixtureIndex, (encodedOutcome, fixtureOutcome)) in zip(encodedFixtures, fixtureFixtures).enumerated() {
+                let outcomeKeys = Set(encodedOutcome.keys)
+                let fixtureOutcomeKeys = Set(fixtureOutcome.keys)
                 #expect(
                     outcomeKeys == fixtureOutcomeKeys,
                     "engine \(index) fixture \(fixtureIndex) encoded-only keys: \(outcomeKeys.subtracting(fixtureOutcomeKeys).sorted()), fixture-only keys: \(fixtureOutcomeKeys.subtracting(outcomeKeys).sorted())"
