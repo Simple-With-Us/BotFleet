@@ -186,7 +186,7 @@ test("the Sparkle signing branch can actually run", () => {
   // brew's sparkle cask has been disabled (Gatekeeper, 2026-09-01), so the signer comes from
   // Sparkle's own pinned 2.10.1 release (NOTICE's pin) with the archive hash checked before use, the PATH wiring that makes bare `sign_update` resolve, and a key with
   // no working tool remains a hard error, not a warning.
-  assert.match(workflow, /sparkle-project\/Sparkle\/releases\/download\/2\.9\.6\/Sparkle-2\.9\.6\.tar\.xz/);
+  assert.match(workflow, /sparkle-project\/Sparkle\/releases\/download\/2\.10\.1\/Sparkle-2\.10\.1\.tar\.xz/);
   assert.match(workflow, /shasum -a 256 --check --status/);
   assert.match(workflow, /test -x "\$sparkle_bin\/sign_update" \|\| \{/);
   assert.match(workflow, /echo "\$sparkle_bin" >> "\$GITHUB_PATH"/);
