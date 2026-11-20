@@ -195,10 +195,11 @@ test("the Sparkle signing branch can actually run", () => {
   assert.match(workflow, /::error::sign_update is not installed/);
   // This round runs both key-format interpretations on the live dispatch (the signer produced no
   // output last time), so the guard pins the diagnostic's own contract as ONE ordered block:  the
-  // EXIT trap is installed before the umask-guarded writes, both attempts are filtered to
-  // signature-shaped lines only (raw tool output never reaches the log), the files are removed
-  // and the umask restored together before any exit, and the empty-signature failure names both
-  // formats.  The no-GitHub-fallback rule is scoped to this step:  the certificate and
+  // EXIT trap is installed before the umask-guarded writes, the text attempt's log is safe to emit fully (the
+  // vault values are add-mask::ed so key text renders masked), the raw attempt is summarized as
+  // a digest only (its bytes are not covered by that mask), the files are removed and the umask
+  // restored together before any exit, and the format label branches explicitly instead of a
+  // parameter expansion that would emit the signature value.  The no-GitHub-fallback rule is scoped to this step:  the certificate and
   // notarization steps' fallbacks are their own sanctioned design.
   // The whole key contract is asserted in ORDER by walking the workflow text:  a reordered,
   // duplicated or externally added key write fails the walk instead of passing loose scans.
@@ -214,10 +215,12 @@ test("the Sparkle signing branch can actually run", () => {
     "umask 077",
     "printf '%s' \"$SPARKLE_EDDSA_PRIVATE_KEY_B64\" > \"$key\"",
     "printf '%s' \"$SPARKLE_EDDSA_PRIVATE_KEY_B64\" | base64 --decode > \"$keyraw\"",
-    "echo \"--- text-format attempt output ---\"",
+    "echo \"--- text-format attempt output (key text renders masked) ---\"",
     "cat \"$RUNNER_TEMP/su-text.txt\" || true",
-    "echo \"--- raw-format attempt output ---\"",
-    "cat \"$RUNNER_TEMP/su-raw.txt\" || true",
+    "echo \"--- raw-format attempt output: sha256 digest only ---\"",
+    "shasum -a 256 \"$RUNNER_TEMP/su-raw.txt\" || true",
+    "if [ -n \"$sig_text\" ]; then",
+    "elif [ -n \"$sig_raw\" ]; then",
     "::error::sign_update produced no signature in either key format",
   ];
   for (const needle of ordered) {

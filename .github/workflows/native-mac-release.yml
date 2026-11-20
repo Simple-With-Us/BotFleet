@@ -381,18 +381,29 @@ jobs:
             set +x
             sig_text=$(sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p' "$RUNNER_TEMP/su-text.txt")
             sig_raw=$(sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p' "$RUNNER_TEMP/su-raw.txt")
-            # Full attempt logs are safe here:  the Infisical action add-mask::es the vault values,
-            # so any occurrence of the key text in these files renders as *** in the log, and the
-            # decoded raw bytes are binary that prints as unusable mojibake.  The error text is
-            # what this diagnostic needs.
-            echo "--- text-format attempt output ---"
+            # The text attempt's file is safe to log fully:  the Infisical action add-mask::es the
+            # vault values, so any occurrence of the base64 key text in it renders as *** in the
+            # log.  The raw attempt's file is only summarized as a digest:  its decoded bytes are
+            # NOT covered by that mask, so the file itself never reaches the log.  The format
+            # label branches explicitly — a ${sig_text:-raw} style expansion would append the
+            # signature value itself when the text attempt wins.
+            echo "--- text-format attempt output (key text renders masked) ---"
             cat "$RUNNER_TEMP/su-text.txt" || true
-            echo "--- raw-format attempt output ---"
-            cat "$RUNNER_TEMP/su-raw.txt" || true
-            signature="${sig_text:-${sig_raw:-}}"
-            test -n "$signature" || { echo "::error::sign_update produced no signature in either key format"; exit 1; }
+            echo "--- raw-format attempt output: sha256 digest only ---"
+            shasum -a 256 "$RUNNER_TEMP/su-raw.txt" || true
+            if [ -n "$sig_text" ]; then
+              fmt="text"
+              signature="$sig_text"
+            elif [ -n "$sig_raw" ]; then
+              fmt="raw"
+              signature="$sig_raw"
+            else
+              fmt="none"
+              signature=""
+            fi
+            test -n "$signature" || { echo "::error::sign_update produced no signature in either key format (fmt: $fmt)"; exit 1; }
             printf '%s' "$signature" > "$zip.edsig"
-            echo "Sparkle update signed (format: ${sig_text:+text}${sig_text:-raw})"
+            echo "Sparkle update signed (format: $fmt)"
           else
             test "$UNSIGNED_DRAFT" = true || { echo "::error::trusted artifacts require Sparkle signing"; exit 1; }
             echo "::warning::UNVERIFIED DRAFT: not activatable and cannot be attached to a release"
