@@ -160,6 +160,7 @@ import {
   isMutatingHarnessApiRequest,
   NAMED_TUNNEL_MUTATION_FORBIDDEN,
 } from "./named-tunnel-gate.ts";
+import { isTunnelWebhookPath, proxyTunnelWebhook } from "./hooks-tunnel-proxy.ts";
 import { botOffError, botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
 import {
   BOT_OFF_CODE,
@@ -13778,6 +13779,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (mutatingApiRequest && arrivedViaCloudflareTunnel(req)) {
       return json(res, 403, { error: NAMED_TUNNEL_MUTATION_FORBIDDEN });
     }
+    // Webhook deliveries ride the same named tunnel, because cloudflared
+    // cannot path-route: botfleet.jays.services/hooks/* lands on this harness
+    // instead of on the webhook ingress.  Stream exactly those paths to the
+    // loopback ingress, which keeps enforcing its own 1 MB body cap and
+    // authenticates the capability secret (BF-2129).  Everything else the
+    // tunnel carries keeps the refusal above and the rules below.
+    if (arrivedViaCloudflareTunnel(req) && isTunnelWebhookPath(method, path)) {
+      return proxyTunnelWebhook(req, res, { port: WEBHOOK_PORT });
+    }
     // A bridge offers diagnostics and an update check, but cannot install a
     // replacement that would escape the immutable hold without artifact proof.
     if (placementRollbackReadOnly && mutatingApiRequest && !path.startsWith("/api/placement/") &&
@@ -19200,17 +19210,17 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const keys = stsKeyStatus((candidate) => stsProviderCredential(candidate));
       const refusal = stsUnavailableReason(provider, keys);
       if (refusal) return json(res, refusal.status, { error: refusal.error });
-      const apiKey = stsProviderCredential(provider);
+      const providerAuth = stsProviderCredential(provider);
       // SAFETY: `stsUnavailableReason` returned null, which only happens when
       // `keys[provider]` was true, so this read is a non-empty string.
-      if (!apiKey) return json(res, 503, { error: "Could not read the voice provider key on this computer." });
+      if (!providerAuth) return json(res, 503, { error: "Could not read the voice provider key on this computer." });
       // Each mint is a real call to a paid vendor endpoint.  An unthrottled
       // loop from a paired device would spend someone's quota.
       if (!stsMints.take(provider)) {
         return json(res, 429, { error: "Wait a moment before asking for another call token." });
       }
       try {
-        const minted = await mintStsToken(provider, apiKey);
+        const minted = await mintStsToken(provider, providerAuth);
         telemetry.trackAux(stsSessionTelemetry(provider));
         return json(res, 200, minted);
       } catch (error) {
