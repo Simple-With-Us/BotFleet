@@ -360,11 +360,17 @@ jobs:
             command -v sign_update > /dev/null || {
               echo "::error::sign_update is not installed; cannot sign the appcast"; exit 1; }
             key="$RUNNER_TEMP/sparkle-ed-key"
-            echo "$SPARKLE_EDDSA_PRIVATE_KEY_B64" | base64 --decode > "$key"
+            # sign_update reads the key file as a UTF-8 string of the base64 key text (the format
+            # generate_keys writes), not as decoded raw bytes.  The file is created owner-only (the
+            # runner is shared) and removed before any exit, successful or not.
+            old_umask=$(umask)
+            umask 077
+            printf '%s' "$SPARKLE_EDDSA_PRIVATE_KEY_B64" > "$key"
+            umask "$old_umask"
             signature=$(sign_update --ed-key-file "$key" "$zip" | sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p')
+            rm -f "$key"
             test -n "$signature" || { echo "::error::sign_update produced no signature"; exit 1; }
             printf '%s' "$signature" > "$zip.edsig"
-            rm "$key"
             echo "Sparkle update signed"
           else
             test "$UNSIGNED_DRAFT" = true || { echo "::error::trusted artifacts require Sparkle signing"; exit 1; }
