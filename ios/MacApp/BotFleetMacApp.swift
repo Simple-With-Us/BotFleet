@@ -61,6 +61,7 @@ struct BotFleetMacApp: App {
     /// below, and Sparkle owns scheduling, verification and installation.
     private let updater: NativeMacUpdater
 
+    @MainActor
     init() {
         // Sentry first, so a crash in session startup is captured; it stays
         // inert without a stamped DSN (BF-2541).  Notifications are NEVER

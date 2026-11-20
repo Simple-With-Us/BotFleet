@@ -273,6 +273,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Assert stable Xcode 27.0
         run: bash scripts/ios-assert-xcode.sh 27.0
+      - name: Restore Mac composition build cache
+        uses: actions/cache@v4
+        with:
+          path: ios/.derived-data-mac
+          key: mac-composition-${{ runner.os }}-xcode27-${{ hashFiles('ios/project.yml', 'ios/**/Package.resolved', 'ios/**/*.swift', 'ios/**/*.plist') }}
+          restore-keys: |
+            mac-composition-${{ runner.os }}-xcode27-
       - name: Generate the Xcode project
         run: |
           bash scripts/ios-install-xcodegen.sh
@@ -284,6 +291,7 @@ jobs:
           xcodebuild \
             -project BotFleet.xcodeproj \
             -scheme BotFleetMac \
+            -derivedDataPath .derived-data-mac \
             -destination 'generic/platform=macOS' \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
