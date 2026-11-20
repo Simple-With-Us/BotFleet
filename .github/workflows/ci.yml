@@ -254,6 +254,39 @@ jobs:
           if-no-files-found: ignore
 
 
+  # BF-2628:  the native Mac app's composition is compiled here so a wiring
+  # mistake fails this job instead of surfacing on a release build.  It is
+  # deliberately NOT a ruleset context and nothing `needs` it:  until the
+  # scheme has a green history, a first-run failure must not block merges.
+  mac-native-build:
+    name: Mac app composition build (xcode-27, unsigned)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true' }}
+    runs-on: xcode-27
+    timeout-minutes: 25
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Assert stable Xcode 27.0
+        run: bash scripts/ios-assert-xcode.sh 27.0
+      - name: Generate the Xcode project
+        run: |
+          bash scripts/ios-install-xcodegen.sh
+          cd ios
+          xcodegen generate
+      - name: Build the Mac app (unsigned)
+        run: |
+          cd ios
+          xcodebuild \
+            -project BotFleet.xcodeproj \
+            -scheme BotFleetMac \
+            -destination 'generic/platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+
   ios:
     name: Swift tests + iOS build
     needs: [changes, ios-build]

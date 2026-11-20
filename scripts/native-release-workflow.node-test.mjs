@@ -76,6 +76,29 @@ function runShell(script) {
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
+test("the Mac app composition retains one updater and starts its service once (BF-2628)", () => {
+  // The rollout doc's composition contract:  the app retains exactly one
+  // `NativeMacUpdater`, invokes `updater.service.start()` once at startup,
+  // and installs `NativeUpdatesCommands(service: updater.service)`.  The
+  // updater type itself is compile-checked;  this pins the composition so a
+  // refactor cannot drop the start or duplicate the updater silently.
+  const app = readFileSync(join(ROOT, "ios/MacApp/BotFleetMacApp.swift"), "utf8");
+  assert.equal(app.match(/NativeMacUpdater\(\)/g)?.length, 1, "the app must retain exactly one NativeMacUpdater");
+  assert.match(app, /private let updater: NativeMacUpdater/);
+  assert.equal(app.match(/updater\.service\.start\(\)/g)?.length, 1, "service.start() must be invoked exactly once");
+  assert.match(app, /NativeUpdatesCommands\(service: updater\.service\)/);
+});
+
+test("ci.yml compiles the Mac app composition out of the required gate (BF-2628)", () => {
+  const ci = readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8");
+  assert.match(ci, /mac-native-build:/);
+  assert.match(ci, /-scheme BotFleetMac/);
+  assert.match(ci, /generic\/platform=macOS/);
+  // Kept out of the required gate:  nothing may `needs` this job, so a
+  // first-run failure cannot block merges.
+  assert.doesNotMatch(ci, /needs:[^\n]*mac-native-build/);
+});
+
 test("the native workflow is dispatch-only and never publishes", () => {
   assert.match(workflow, /workflow_dispatch:/);
   assert.doesNotMatch(workflow, /^\s+push:/m);
