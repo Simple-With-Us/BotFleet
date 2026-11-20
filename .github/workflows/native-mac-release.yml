@@ -389,8 +389,8 @@ jobs:
             # signature value itself when the text attempt wins.
             echo "--- text-format attempt output (key text renders masked) ---"
             cat "$RUNNER_TEMP/su-text.txt" || true
-            echo "--- raw-format attempt output: sha256 digest only ---"
-            shasum -a 256 "$RUNNER_TEMP/su-raw.txt" || true
+            echo "--- raw-format attempt output ---"
+            cat "$RUNNER_TEMP/su-raw.txt" || true
             if [ -n "$sig_text" ]; then
               fmt="text"
               signature="$sig_text"
