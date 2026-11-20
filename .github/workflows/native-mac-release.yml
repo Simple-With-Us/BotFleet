@@ -368,7 +368,7 @@ jobs:
             # created owner-only and an EXIT trap removes them and restores the umask on every path
             # out of this step.
             cleanup_keys() {
-              rm -f "$key" "$keyraw"
+              rm -f "$key" "$keyraw" "$RUNNER_TEMP/su-text.txt" "$RUNNER_TEMP/su-raw.txt"
               umask "$old_umask"
             }
             trap cleanup_keys EXIT
@@ -381,16 +381,13 @@ jobs:
             set +x
             sig_text=$(sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p' "$RUNNER_TEMP/su-text.txt")
             sig_raw=$(sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p' "$RUNNER_TEMP/su-raw.txt")
-            # The text attempt's file is safe to log fully:  the Infisical action add-mask::es the
-            # vault values, so any occurrence of the base64 key text in it renders as *** in the
-            # log.  The raw attempt's file is only summarized as a digest:  its decoded bytes are
-            # NOT covered by that mask, so the file itself never reaches the log.  The format
-            # label branches explicitly — a ${sig_text:-raw} style expansion would append the
-            # signature value itself when the text attempt wins.
-            echo "--- text-format attempt output (key text renders masked) ---"
-            cat "$RUNNER_TEMP/su-text.txt" || true
-            echo "--- raw-format attempt output: sha256 digest only ---"
-            shasum -a 256 "$RUNNER_TEMP/su-raw.txt" || true
+            # Both signer responses may contain diagnostic key material. Never
+            # publish either response body; only fixed labels and digests leave here.
+            # Signature extraction above is consumed as the output artifact, not logged.
+            echo "--- text-format attempt digest ---"
+            shasum -a 256 "$RUNNER_TEMP/su-text.txt"
+            echo "--- raw-format attempt digest ---"
+            shasum -a 256 "$RUNNER_TEMP/su-raw.txt"
             if [ -n "$sig_text" ]; then
               fmt="text"
               signature="$sig_text"
