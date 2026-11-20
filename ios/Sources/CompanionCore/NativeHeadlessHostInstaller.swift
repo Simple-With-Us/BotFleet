@@ -10,6 +10,9 @@ public enum NativeHeadlessHostInstallerError: Error, Equatable, Sendable {
     case invalidExecutable
     case signatureValidationFailed
     case identityMismatch
+    case stampMissing
+    case stampSchemaUnsupported
+    case stampCapabilityMismatch
     case invalidDataRoot
     case dataRootOwnershipFailed
     case invalidPlistDestination
@@ -97,6 +100,29 @@ public protocol NativeHostDataRootOwnershipApplying: Sendable {
     func applyOwnership(of url: URL, userName: String) throws
 }
 
+/// The artifact stamp a packaged host carries, reduced to the fields the installer gates on.
+/// The packaging side writes the stamp in `scripts/native-host-artifact.mjs` (`HOST_CAPABILITIES`
+/// and the schema version), and its node contract test holds this installer's required set to
+/// that list, so a capability renamed on either side fails a test instead of drifting.
+public struct NativeHostArtifactStamp: Equatable, Sendable {
+    public let schemaVersion: Int
+    public let capabilities: [String]
+
+    public init(schemaVersion: Int, capabilities: [String]) {
+        self.schemaVersion = schemaVersion
+        self.capabilities = capabilities
+    }
+}
+
+/// Reads the artifact stamp embedded in a packaged host executable.  `nil` means the
+/// executable carries no stamp at all — an unsigned or pre-stamp build — which the
+/// installer refuses rather than guesses about.  Injected so tests exercise the gate
+/// without native tools;  the production reader wraps the BotFleetNativeHost target's
+/// signed-section reader (`NativeHostArtifactIdentity`).
+public protocol NativeHostStampReading: Sendable {
+    func stamp(ofExecutableAt url: URL) -> NativeHostArtifactStamp?
+}
+
 public struct SystemNativeHostDataRootOwnershipApplier: NativeHostDataRootOwnershipApplying {
     public init() {}
 
@@ -140,18 +166,30 @@ public struct NativeHeadlessHostInstaller: Sendable {
     public let configuration: NativeHeadlessHostInstallConfiguration
     private let inspector: any NativeHostSignatureInspecting
     private let ownershipApplier: any NativeHostDataRootOwnershipApplying
+    private let stampReader: any NativeHostStampReading
     /// Stable ownership marker written into every rendered plist; launchd ignores unknown keys.
     static let managedMarkerKey = "BotFleetInstallerManaged"
+    /// The capability contract a stamped host must declare before this installer touches it:
+    /// automatic start whose reboot path preserves an owner Stop, and the checked local
+    /// control channel.  `native-host-artifact.node-test.mjs` holds this set to the list the
+    /// packaging side writes, and `uninstall()` runs the same gate, so a host whose stamp is
+    /// missing, too old, or missing a capability is never installed or removed by mistake.
+    static let requiredHostCapabilities: Set<String> = ["automatic-start-v1", "checked-control-v1"]
+    /// The stamp schema this installer understands.  A host stamped by a newer packager is
+    /// refused rather than read loosely;  anything below one predates the contract entirely.
+    static let minimumStampSchemaVersion = 1
     // Test-only fault seams, exercised by CompanionCoreTests to prove rollback.  Nil in production.
     var beforeCommitHook: (@Sendable () throws -> Void)?
     var afterBackupHook: (@Sendable () throws -> Void)?
 
     public init(configuration: NativeHeadlessHostInstallConfiguration,
                 inspector: any NativeHostSignatureInspecting = SecCodeNativeHostSignatureInspector(),
-                ownershipApplier: any NativeHostDataRootOwnershipApplying = SystemNativeHostDataRootOwnershipApplier()) {
+                ownershipApplier: any NativeHostDataRootOwnershipApplying = SystemNativeHostDataRootOwnershipApplier(),
+                stampReader: any NativeHostStampReading) {
         self.configuration = configuration
         self.inspector = inspector
         self.ownershipApplier = ownershipApplier
+        self.stampReader = stampReader
     }
 
     // MARK: - Validation (read-only)
@@ -173,6 +211,7 @@ public struct NativeHeadlessHostInstaller: Sendable {
               identity.codeIdentifier == config.expectedCodeIdentifier,
               identity.teamIdentifier == config.expectedTeamIdentifier
         else { throw NativeHeadlessHostInstallerError.identityMismatch }
+        try Self.validatedStamp(ofExecutableAt: executable, stampReader: stampReader)
         let serviceUID = try resolvedServiceUID()
         let dataRoot = try Self.validatedDataRoot(config.serviceDataRoot, serviceUID: serviceUID)
         let destination = try Self.validatedDestination(config.plistDestination, label: config.label)
@@ -204,6 +243,23 @@ public struct NativeHeadlessHostInstaller: Sendable {
               info.st_mode & 0o100 != 0
         else { throw NativeHeadlessHostInstallerError.invalidExecutable }
         return standardized
+    }
+
+    /// The artifact-stamp gate:  a host whose embedded stamp is missing, carries a schema
+    /// this installer does not understand, or lacks any capability of its own contract is
+    /// refused here.  `uninstall()` runs `validate()` first, so the same gate fails closed
+    /// before a deletion is authorized.
+    static func validatedStamp(ofExecutableAt url: URL, stampReader: any NativeHostStampReading) throws {
+        guard let stamp = stampReader.stamp(ofExecutableAt: url) else {
+            throw NativeHeadlessHostInstallerError.stampMissing
+        }
+        guard stamp.schemaVersion >= minimumStampSchemaVersion else {
+            throw NativeHeadlessHostInstallerError.stampSchemaUnsupported
+        }
+        let declared = Set(stamp.capabilities)
+        guard requiredHostCapabilities.isSubset(of: declared) else {
+            throw NativeHeadlessHostInstallerError.stampCapabilityMismatch
+        }
     }
 
     /// Mirrors `NativeServicePaths` without creating anything: an existing root must already be
@@ -374,8 +430,8 @@ public struct NativeHeadlessHostInstaller: Sendable {
 
     /// Removes exactly the plist this installer wrote.  Returns false when nothing is
     /// installed.  Service data under the data root is always left in place.  Uninstall runs
-    /// the same executable, signature, and identity validation as install and fails closed:
-    /// an unvalidated executable never authorizes a deletion.
+    /// the same executable, signature, identity, and artifact-stamp validation as install and
+    /// fails closed:  an unvalidated or understamped executable never authorizes a deletion.
     @discardableResult
     public func uninstall() throws -> Bool {
         let validation = try validate()

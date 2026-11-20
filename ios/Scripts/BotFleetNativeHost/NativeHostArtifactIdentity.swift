@@ -4,7 +4,7 @@ import MachO
 
 /// Read only the running image's signed section; never an editable bundle or sidecar dictionary.
 enum NativeHostArtifactIdentity {
-    static let capabilities = ["identity-v1", "foreground-service-data-v1", "signal-drain-v1"]
+    static let capabilities = ["identity-v1", "foreground-service-data-v1", "signal-drain-v1", "automatic-start-v1", "checked-control-v1"]
     private static let keys: Set<String> = ["schemaVersion", "codeIdentifier", "sourceCommit", "build",
                                           "marketingVersion", "capabilities", "distribution", "sourceDirty"]
     private struct Stamp: Decodable {

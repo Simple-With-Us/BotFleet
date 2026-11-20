@@ -99,7 +99,8 @@ struct NativeHeadlessHostInstallerTests {
     func refusalOnUnsignedExecutable() throws {
         let fixture = try InstallerFixture()
         defer { fixture.remove() }
-        let installer = NativeHeadlessHostInstaller(configuration: fixture.configuration())
+        let installer = NativeHeadlessHostInstaller(configuration: fixture.configuration(),
+            stampReader: FixtureStampReader())
         #expect(throws: NativeHeadlessHostInstallerError.signatureValidationFailed) { _ = try installer.install() }
         #expect(!FileManager.default.fileExists(atPath: fixture.destination.path))
     }
@@ -200,7 +201,8 @@ struct NativeHeadlessHostInstallerTests {
         let wrongTeam = fixture.installer(inspector: FakeSignatureInspector(identity:
             NativeHostSigningIdentity(codeIdentifier: "BotFleetNativeHost", teamIdentifier: "WRONGTEAM99", signingFlags: 0)))
         #expect(throws: NativeHeadlessHostInstallerError.identityMismatch) { _ = try wrongTeam.uninstall() }
-        let unsigned = NativeHeadlessHostInstaller(configuration: fixture.configuration())
+        let unsigned = NativeHeadlessHostInstaller(configuration: fixture.configuration(),
+            stampReader: FixtureStampReader())
         #expect(throws: NativeHeadlessHostInstallerError.signatureValidationFailed) { _ = try unsigned.uninstall() }
         #expect(FileManager.default.fileExists(atPath: fixture.destination.path))
         #expect(try fixture.installer().uninstall())
@@ -249,6 +251,53 @@ struct NativeHeadlessHostInstallerTests {
         #expect(!FileManager.default.fileExists(atPath: fixture.dataRoot.path))
     }
 
+    @Test("A host with no artifact stamp is refused before anything is written")
+    func missingStampRefused() throws {
+        let fixture = try InstallerFixture()
+        defer { fixture.remove() }
+        let installer = fixture.installer(stampReader: FixtureStampReader(stamp: nil))
+        #expect(throws: NativeHeadlessHostInstallerError.stampMissing) { _ = try installer.validate() }
+        #expect(throws: NativeHeadlessHostInstallerError.stampMissing) { _ = try installer.install() }
+        #expect(throws: NativeHeadlessHostInstallerError.stampMissing) { _ = try installer.uninstall() }
+        #expect(!FileManager.default.fileExists(atPath: fixture.destination.path))
+        #expect(!FileManager.default.fileExists(atPath: fixture.dataRoot.path))
+    }
+
+    @Test("A stamp from an older schema generation is refused")
+    func oldStampSchemaRefused() throws {
+        let fixture = try InstallerFixture()
+        defer { fixture.remove() }
+        let outdated = fixture.installer(stampReader: FixtureStampReader(stamp:
+            NativeHostArtifactStamp(schemaVersion: 0,
+                capabilities: ["identity-v1", "foreground-service-data-v1", "signal-drain-v1",
+                               "automatic-start-v1", "checked-control-v1"])))
+        #expect(throws: NativeHeadlessHostInstallerError.stampSchemaUnsupported) { _ = try outdated.validate() }
+        #expect(throws: NativeHeadlessHostInstallerError.stampSchemaUnsupported) { _ = try outdated.install() }
+        #expect(throws: NativeHeadlessHostInstallerError.stampSchemaUnsupported) { _ = try outdated.uninstall() }
+        #expect(!FileManager.default.fileExists(atPath: fixture.destination.path))
+    }
+
+    @Test("A stamp missing a contract capability is refused on install and on uninstall")
+    func stampCapabilityMismatchRefused() throws {
+        let fixture = try InstallerFixture()
+        defer { fixture.remove() }
+        let reduced = fixture.installer(stampReader: FixtureStampReader(stamp:
+            NativeHostArtifactStamp(schemaVersion: 1,
+                capabilities: ["identity-v1", "foreground-service-data-v1", "signal-drain-v1"])))
+        #expect(throws: NativeHeadlessHostInstallerError.stampCapabilityMismatch) { _ = try reduced.validate() }
+        #expect(throws: NativeHeadlessHostInstallerError.stampCapabilityMismatch) { _ = try reduced.install() }
+        #expect(!FileManager.default.fileExists(atPath: fixture.destination.path))
+        #expect(!FileManager.default.fileExists(atPath: fixture.dataRoot.path))
+        // A healthy install, then a host whose stamp lacks the contract's own capabilities:
+        // uninstall fails closed and the installed definition survives.
+        _ = try fixture.installer().install()
+        let replaced = fixture.installer(stampReader: FixtureStampReader(stamp:
+            NativeHostArtifactStamp(schemaVersion: 1,
+                capabilities: ["identity-v1", "foreground-service-data-v1", "signal-drain-v1"])))
+        #expect(throws: NativeHeadlessHostInstallerError.stampCapabilityMismatch) { _ = try replaced.uninstall() }
+        #expect(FileManager.default.fileExists(atPath: fixture.destination.path))
+    }
+
     @Test("An interactive data root is refused")
     func interactiveRootRefused() throws {
         let fixture = try InstallerFixture()
@@ -269,6 +318,16 @@ private final class FakeOwnershipApplier: NativeHostDataRootOwnershipApplying, @
     init(uid: uid_t?) { self.uid = uid }
     func serviceUID(forUserName name: String) -> uid_t? { uid }
     func applyOwnership(of url: URL, userName: String) throws { applied.append((url, userName)) }
+}
+
+/// The stamp a healthy packaged host carries:  the current schema version and every
+/// capability the installer's contract requires.
+private struct FixtureStampReader: NativeHostStampReading {
+    var stamp: NativeHostArtifactStamp? = NativeHostArtifactStamp(
+        schemaVersion: 1,
+        capabilities: ["identity-v1", "foreground-service-data-v1", "signal-drain-v1",
+                       "automatic-start-v1", "checked-control-v1"])
+    func stamp(ofExecutableAt url: URL) -> NativeHostArtifactStamp? { stamp }
 }
 
 private struct FakeSignatureInspector: NativeHostSignatureInspecting {
@@ -313,10 +372,11 @@ private struct InstallerFixture {
                    inspector: any NativeHostSignatureInspecting = FakeSignatureInspector(identity:
                        NativeHostSigningIdentity(codeIdentifier: "BotFleetNativeHost",
                                                  teamIdentifier: "TEAMFIXTURE1", signingFlags: 0)),
-                   ownershipApplier: any NativeHostDataRootOwnershipApplying = FakeOwnershipApplier(uid: 9999))
+                   ownershipApplier: any NativeHostDataRootOwnershipApplying = FakeOwnershipApplier(uid: 9999),
+                   stampReader: any NativeHostStampReading = FixtureStampReader())
         -> NativeHeadlessHostInstaller {
         NativeHeadlessHostInstaller(configuration: configuration(executable: override, serviceUserName: serviceUserName),
-                                    inspector: inspector, ownershipApplier: ownershipApplier)
+                                    inspector: inspector, ownershipApplier: ownershipApplier, stampReader: stampReader)
     }
 
     func launchdContents() throws -> [String] {
