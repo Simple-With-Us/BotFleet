@@ -287,13 +287,14 @@ function probe(fixture, options = {}) {
 }
 
 /**
- * Append through the transient open failures a loaded runner can hand a plain
- * write.  The ordering comes only from the phase callback that calls this, so
- * the edit still lands exactly between the binding and the recheck;  the retry
- * covers the write itself losing the system-wide file-table race (ENFILE, or
- * EMFILE under fd pressure) that once turned this edit into an observer throw
- * and an observer-failed blocker on hosted Linux CI instead of the drift the
- * test exists to pin.
+ * Append through the transient failures a loaded Linux runner can hand a
+ * write to an executable the probe just ran:  ETXTBSY while the kernel is
+ * still releasing the text lock of the runtime copy the candidate executed,
+ * plus the file-table races (ENFILE, EMFILE under fd pressure) that turn the
+ * edit into an observer throw and an observer-failed blocker on hosted CI
+ * instead of the drift the test exists to pin.  The ordering comes only from
+ * the phase callback that calls this, so the edit still lands exactly between
+ * the binding and the recheck.
  */
 function appendUnderLoad(path, text) {
   for (let attempt = 1; ; attempt += 1) {
@@ -302,9 +303,9 @@ function appendUnderLoad(path, text) {
       return;
     } catch (error) {
       const code = error && error.code;
-      const transient = code === "ENFILE" || code === "EMFILE" || code === "EAGAIN" || code === "EBUSY";
-      if (!transient || attempt >= 5) throw error;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * attempt);
+      const transient = code === "ENFILE" || code === "EMFILE" || code === "EAGAIN" || code === "EBUSY" || code === "ETXTBSY";
+      if (!transient || attempt >= 6) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50 * attempt);
     }
   }
 }
