@@ -35,12 +35,18 @@ function read(relative) {
   return readFileSync(join(ROOT, relative), "utf8");
 }
 
-/** Source with `//` line comments removed, so a comment that mentions a
- *  walking reader is not miscounted as a call site. */
+/** Source with block and `//` comments removed, so a comment that mentions a
+ *  walking reader is not miscounted as a call site.  Full-line comments
+ *  disappear entirely;  trailing comments are cut from their line, keeping
+ *  any code before them (a `://` inside a URL is left alone). */
 function withoutLineComments(source) {
   return source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
     .split("\n")
-    .filter((line) => !line.trimStart().startsWith("//"))
+    .map((line) => {
+      const stripped = line.trimStart().startsWith("//") ? "" : line.replace(/(^|[^:])\/\/.*$/, "$1");
+      return stripped === line && line.trim() === "" ? "" : stripped;
+    })
     .join("\n");
 }
 
