@@ -381,16 +381,14 @@ jobs:
             set +x
             sig_text=$(sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p' "$RUNNER_TEMP/su-text.txt")
             sig_raw=$(sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p' "$RUNNER_TEMP/su-raw.txt")
-            # The text attempt's file is safe to log fully:  the Infisical action add-mask::es the
-            # vault values, so any occurrence of the base64 key text in it renders as *** in the
-            # log.  The raw attempt's file is only summarized as a digest:  its decoded bytes are
-            # NOT covered by that mask, so the file itself never reaches the log.  The format
-            # label branches explicitly — a ${sig_text:-raw} style expansion would append the
-            # signature value itself when the text attempt wins.
-            echo "--- text-format attempt output (key text renders masked) ---"
-            cat "$RUNNER_TEMP/su-text.txt" || true
-            echo "--- raw-format attempt output ---"
-            cat "$RUNNER_TEMP/su-raw.txt" || true
+            # The attempt files carry the signer's error text but could also carry key material on
+            # a format error, so they are NOT printed:  they survive this step and are uploaded as
+            # private-repo workflow artifacts (access-controlled, downloadable by the owner) by the
+            # steps that follow this job.  Only the extracted signature lines reach the log.
+            echo "--- text-format attempt: signature extracted? ${sig_text:+yes} ---"
+            grep -o 'sparkle:edSignature="[^"]*"' "$RUNNER_TEMP/su-text.txt" || true
+            echo "--- raw-format attempt: signature extracted? ${sig_raw:+yes} ---"
+            grep -o 'sparkle:edSignature="[^"]*"' "$RUNNER_TEMP/su-raw.txt" || true
             if [ -n "$sig_text" ]; then
               fmt="text"
               signature="$sig_text"
@@ -421,6 +419,18 @@ jobs:
           path: native-upload/
           if-no-files-found: error
           retention-days: 14
+      # The signer attempt files carry the diagnostic for the key-format question;  they are kept
+      # out of the log (they could echo key material on a format error) and shipped as a
+      # private-repo artifact the owner can download instead.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: signer-attempt-logs
+          path: |
+            ${{ runner.temp }}/su-text.txt
+            ${{ runner.temp }}/su-raw.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
   assemble:
     name: Verify the native asset set

@@ -215,13 +215,17 @@ test("the Sparkle signing branch can actually run", () => {
     "umask 077",
     "printf '%s' \"$SPARKLE_EDDSA_PRIVATE_KEY_B64\" > \"$key\"",
     "printf '%s' \"$SPARKLE_EDDSA_PRIVATE_KEY_B64\" | base64 --decode > \"$keyraw\"",
-    "echo \"--- text-format attempt output (key text renders masked) ---\"",
-    "cat \"$RUNNER_TEMP/su-text.txt\" || true",
-    "echo \"--- raw-format attempt output ---\"",
-    "cat \"$RUNNER_TEMP/su-raw.txt\" || true",
+    "echo \"--- text-format attempt: signature extracted? ${sig_text:+yes} ---\"",
+    "grep -o 'sparkle:edSignature=\"[^\"]*\"' \"$RUNNER_TEMP/su-text.txt\" || true",
+    "echo \"--- raw-format attempt: signature extracted? ${sig_raw:+yes} ---\"",
+    "grep -o 'sparkle:edSignature=\"[^\"]*\"' \"$RUNNER_TEMP/su-raw.txt\" || true",
     "if [ -n \"$sig_text\" ]; then",
     "elif [ -n \"$sig_raw\" ]; then",
-    "::error::sign_update produced no signature in either key format",
+    "::error::sign_update produced no signature in either key format (fmt: $fmt)",
+    "actions/upload-artifact",
+    "name: signer-attempt-logs",
+  ]; then",
+    "elif [ -n \"$sig_raw\" ]; then",
   ];
   for (const needle of ordered) {
     const at = workflow.indexOf(needle, pos);
