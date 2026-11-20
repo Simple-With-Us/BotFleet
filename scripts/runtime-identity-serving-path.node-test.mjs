@@ -35,19 +35,51 @@ function read(relative) {
   return readFileSync(join(ROOT, relative), "utf8");
 }
 
-/** Source with block and `//` comments removed, so a comment that mentions a
- *  walking reader is not miscounted as a call site.  Full-line comments
- *  disappear entirely;  trailing comments are cut from their line, keeping
- *  any code before them (a `://` inside a URL is left alone). */
+/** Source with comments removed, so a comment that mentions a walking reader
+ *  is not miscounted as a call site.  This is a small string-aware scanner,
+ *  not a regex:  quoted contents (single, double and template) are copied
+ *  verbatim — a `//` or `/*` inside a string or a URL never starts a
+ *  comment — while line and block comments outside strings are dropped.
+ *  Line comments keep their trailing newline so line structure survives. */
 function withoutLineComments(source) {
-  return source
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .split("\n")
-    .map((line) => {
-      const stripped = line.trimStart().startsWith("//") ? "" : line.replace(/(^|[^:])\/\/.*$/, "$1");
-      return stripped === line && line.trim() === "" ? "" : stripped;
-    })
-    .join("\n");
+  let out = "";
+  let index = 0;
+  let quote = null;
+  while (index < source.length) {
+    const char = source[index];
+    const next = source[index + 1];
+    if (quote !== null) {
+      out += char;
+      if (char === "\\") {
+        out += next ?? "";
+        index += 2;
+        continue;
+      }
+      if (char === quote) quote = null;
+      index += 1;
+      continue;
+    }
+    if (char === "\"" || char === "'" || char === "`") {
+      quote = char;
+      out += char;
+      index += 1;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      const end = source.indexOf("*/", index + 2);
+      index = end === -1 ? source.length : end + 2;
+      out += " ";
+      continue;
+    }
+    if (char === "/" && next === "/") {
+      const end = source.indexOf("\n", index);
+      index = end === -1 ? source.length : end;
+      continue;
+    }
+    out += char;
+    index += 1;
+  }
+  return out;
 }
 
 /** Every TypeScript module under server/ at any depth, tests excluded. */
