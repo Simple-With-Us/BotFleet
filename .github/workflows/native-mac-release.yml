@@ -83,6 +83,13 @@ jobs:
           required: APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
           token: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
+        env:
+          # The read token is scoped to prod /botfleet-server (the signing key's folder);  the ASC
+          # material lives at prod root, which the token does not reach, so the same-named GitHub
+          # secrets carry the values the same way the packaging steps' fallbacks do.
+          GH_FALLBACK_APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          GH_FALLBACK_APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          GH_FALLBACK_APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
       - id: pin
         run: |
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
