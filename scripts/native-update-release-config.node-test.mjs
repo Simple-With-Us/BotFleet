@@ -17,9 +17,9 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 function fixture({ grant = {}, rows, imports, fetchError } = {}) {
   const calls = [];
   const metadata = { workspace: projectId, permissions: ["read"], expiresAt: null,
-    scopes: [{ environment: "prod", secretPath: "/" }], ...grant };
+    scopes: [{ environment: "prod", secretPath: "/botfleet-server" }], ...grant };
   const secrets = rows ?? names.map((name, index) => ({ secretKey: name,
-    secretValue: [feed, key][index], workspace: projectId, environment: "prod", secretPath: "/", secretValueHidden: false }));
+    secretValue: [feed, key][index], workspace: projectId, environment: "prod", secretPath: "/botfleet-server", secretValueHidden: false }));
   return { calls, fetchImpl: async (url, options) => {
     calls.push({ url: new URL(url), options });
     if (fetchError) throw new Error("sensitive-response-body");
@@ -41,19 +41,19 @@ for (const mirrors of [{}, Object.fromEntries(names.map((name, i) => [`MIRROR_${
     const query = fake.calls[1].url.searchParams;
     assert.equal(query.get("workspaceId"), projectId);
     assert.equal(query.get("environment"), "prod");
-    assert.equal(query.get("secretPath"), "/");
+    assert.equal(query.get("secretPath"), "/botfleet-server");
     for (const name of ["expandSecretReferences", "include_imports", "recursive"]) assert.equal(query.get(name), "false");
   });
 }
 
 const validRows = () => names.map((name, index) => ({ secretKey: name, secretValue: [feed, key][index],
-  workspace: projectId, environment: "prod", secretValueHidden: false, secretPath: "/" }));
+  workspace: projectId, environment: "prod", secretValueHidden: false, secretPath: "/botfleet-server" }));
 const invalidCases = [
   ["missing canonical name", { rows: validRows().slice(0, 1) }],
   ["imported values", { rows: [], imports: [{ secrets: validRows() }] }],
   ["wrong project grant", { grant: { workspace: "other" } }],
   ["write grant", { grant: { permissions: ["read", "write"] } }],
-  ["wrong environment grant", { grant: { scopes: [{ environment: "dev", secretPath: "/" }] } }],
+  ["wrong environment grant", { grant: { scopes: [{ environment: "dev", secretPath: "/botfleet-server" }] } }],
   ["wrong folder grant", { grant: { scopes: [{ environment: "prod", secretPath: "/other" }] } }],
   ["malformed grant", { grant: { permissions: "read" } }],
   ["fetch failure", { fetchError: true }],
