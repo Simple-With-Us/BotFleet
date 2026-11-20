@@ -306,6 +306,12 @@ jobs:
           required: ${{ !inputs.unsigned-draft && 'SPARKLE_EDDSA_PRIVATE_KEY_B64' || '' }}
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
           token: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
+          # The signing key lives at prod /botfleet-server (the folder the owner gate reads), and
+          # INFISICAL_NATIVE_RELEASE_READ_TOKEN is a read-only service token scoped to exactly that
+          # path, so this step — the one step whose secret has no GitHub fallback — names the folder
+          # it fetches from.  The other steps read prod root and resolve through their
+          # GH_FALLBACK_<NAME> values when the token's scope does not reach them.
+          secret-path: /botfleet-server
       - name: Generate and verify the appcast over the final bytes
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
