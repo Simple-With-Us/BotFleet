@@ -74,6 +74,8 @@ CRON_SCHEDULES = {
     "Vercel production catch-up": "41 * * * *",
     "CI": "17 9 * * 1",
     "iOS TestFlight ship (GitHub-hosted macOS)": "18,48 * * * *",
+    # auto-merge-prs.yml: fleet auto-merge sweep (15 min).
+    "Auto-merge PRs": "*/15 * * * *",
 }
 
 # Workflows whose production job also runs outside the cron tick.  GitHub
