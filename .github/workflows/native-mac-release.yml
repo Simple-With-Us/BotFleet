@@ -306,6 +306,10 @@ jobs:
           required: ${{ !inputs.unsigned-draft && 'SPARKLE_EDDSA_PRIVATE_KEY_B64' || '' }}
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
           token: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
+          # The signing key lives at prod /botfleet-server (the same folder the owner gate reads),
+          # and the read token is scoped to exactly that path, so the fetch must name the folder
+          # instead of the root.
+          secret-path: /botfleet-server
       - name: Generate and verify the appcast over the final bytes
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
