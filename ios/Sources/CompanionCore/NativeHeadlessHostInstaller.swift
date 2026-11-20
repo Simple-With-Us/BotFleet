@@ -253,7 +253,7 @@ public struct NativeHeadlessHostInstaller: Sendable {
         guard let stamp = stampReader.stamp(ofExecutableAt: url) else {
             throw NativeHeadlessHostInstallerError.stampMissing
         }
-        guard stamp.schemaVersion >= minimumStampSchemaVersion else {
+        guard stamp.schemaVersion == minimumStampSchemaVersion else {
             throw NativeHeadlessHostInstallerError.stampSchemaUnsupported
         }
         let declared = Set(stamp.capabilities)

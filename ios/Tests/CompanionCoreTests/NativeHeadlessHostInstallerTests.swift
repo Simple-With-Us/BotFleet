@@ -277,6 +277,20 @@ struct NativeHeadlessHostInstallerTests {
         #expect(!FileManager.default.fileExists(atPath: fixture.destination.path))
     }
 
+    @Test("A stamp from a future schema generation is refused")
+    func futureStampSchemaRefused() throws {
+        let fixture = try InstallerFixture()
+        defer { fixture.remove() }
+        let future = fixture.installer(stampReader: FixtureStampReader(stamp:
+            NativeHostArtifactStamp(schemaVersion: 2,
+                capabilities: ["identity-v1", "foreground-service-data-v1", "signal-drain-v1",
+                               "automatic-start-v1", "checked-control-v1"])))
+        #expect(throws: NativeHeadlessHostInstallerError.stampSchemaUnsupported) { _ = try future.validate() }
+        #expect(throws: NativeHeadlessHostInstallerError.stampSchemaUnsupported) { _ = try future.install() }
+        #expect(throws: NativeHeadlessHostInstallerError.stampSchemaUnsupported) { _ = try future.uninstall() }
+        #expect(!FileManager.default.fileExists(atPath: fixture.destination.path))
+    }
+
     @Test("A stamp missing a contract capability is refused on install and on uninstall")
     func stampCapabilityMismatchRefused() throws {
         let fixture = try InstallerFixture()
