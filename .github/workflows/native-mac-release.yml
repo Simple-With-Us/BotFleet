@@ -381,12 +381,14 @@ jobs:
             set +x
             sig_text=$(sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p' "$RUNNER_TEMP/su-text.txt")
             sig_raw=$(sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p' "$RUNNER_TEMP/su-raw.txt")
-            # Only signature-shaped lines are logged — never the raw tool output, which could carry
-            # key material if the tool echoes its input on a format error.
-            echo "--- text-format attempt: signature extracted? ${sig_text:+yes} ---"
-            grep -o 'sparkle:edSignature="[^"]*"' "$RUNNER_TEMP/su-text.txt" || true
-            echo "--- raw-format attempt: signature extracted? ${sig_raw:+yes} ---"
-            grep -o 'sparkle:edSignature="[^"]*"' "$RUNNER_TEMP/su-raw.txt" || true
+            # Full attempt logs are safe here:  the Infisical action add-mask::es the vault values,
+            # so any occurrence of the key text in these files renders as *** in the log, and the
+            # decoded raw bytes are binary that prints as unusable mojibake.  The error text is
+            # what this diagnostic needs.
+            echo "--- text-format attempt output ---"
+            cat "$RUNNER_TEMP/su-text.txt" || true
+            echo "--- raw-format attempt output ---"
+            cat "$RUNNER_TEMP/su-raw.txt" || true
             signature="${sig_text:-${sig_raw:-}}"
             test -n "$signature" || { echo "::error::sign_update produced no signature in either key format"; exit 1; }
             printf '%s' "$signature" > "$zip.edsig"

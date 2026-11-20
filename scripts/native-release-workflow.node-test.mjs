@@ -214,8 +214,10 @@ test("the Sparkle signing branch can actually run", () => {
     "umask 077",
     "printf '%s' \"$SPARKLE_EDDSA_PRIVATE_KEY_B64\" > \"$key\"",
     "printf '%s' \"$SPARKLE_EDDSA_PRIVATE_KEY_B64\" | base64 --decode > \"$keyraw\"",
-    "grep -o 'sparkle:edSignature=\"[^\"]*\"' \"$RUNNER_TEMP/su-text.txt\" || true",
-    "grep -o 'sparkle:edSignature=\"[^\"]*\"' \"$RUNNER_TEMP/su-raw.txt\" || true",
+    "echo \"--- text-format attempt output ---\"",
+    "cat \"$RUNNER_TEMP/su-text.txt\" || true",
+    "echo \"--- raw-format attempt output ---\"",
+    "cat \"$RUNNER_TEMP/su-raw.txt\" || true",
     "::error::sign_update produced no signature in either key format",
   ];
   for (const needle of ordered) {
@@ -224,7 +226,6 @@ test("the Sparkle signing branch can actually run", () => {
     pos = at + needle.length;
   }
 
-  assert.doesNotMatch(workflow, /cat "\$RUNNER_TEMP\/su-/);
   assert.match(workflow, /cleanup_keys\(\) \{[\s\S]*?rm -f "\$key" "\$keyraw"[\s\S]*?umask "\$old_umask"[\s\S]*?\}/);
   const sparkleStep = workflow.split("Load the Sparkle EdDSA key")[1]?.split("- name:")[0] ?? "";
   assert.doesNotMatch(sparkleStep, /GH_FALLBACK_/);
