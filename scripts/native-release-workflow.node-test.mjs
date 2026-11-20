@@ -193,13 +193,15 @@ test("the Sparkle signing branch can actually run", () => {
   assert.match(workflow, /export PATH="\$sparkle_bin:\$PATH"/);
   assert.match(workflow, /command -v sign_update > \/dev\/null \|\| \{/);
   assert.match(workflow, /::error::sign_update is not installed/);
-  // The signing key never lands world-readable and never survives a failed sign:  the write is
-  // umask-guarded to owner-only and the key file is removed before the empty-signature exit.
-  assert.match(workflow, /umask 077/);
-  assert.match(workflow, /printf '%s' "\$SPARKLE_EDDSA_PRIVATE_KEY_B64" > "\$key"/);
+  // The signing key never lands world-readable and never survives a failed sign:  the whole key
+  // contract is asserted as ONE ordered block — umask-guarded write, removal, then the
+  // empty-signature check — so a reordered, duplicated or externally added key write outside
+  // this sequence fails the guard instead of passing a global scan.
+  assert.match(
+    workflow,
+    /old_umask=\$\(umask\)[\s\S]*?umask 077[\s\S]*?printf '%s' "\$SPARKLE_EDDSA_PRIVATE_KEY_B64" > "\$key"[\s\S]*?umask "\$old_umask"[\s\S]*?signature=\$\(sign_update --ed-key-file "\$key"[\s\S]*?rm -f "\$key"[\s\S]*?test -n "\$signature"/,
+  );
   assert.doesNotMatch(workflow, /base64 --decode > "\$key"/);
-  assert.match(workflow, /rm -f "\$key"/);
-  assert.match(workflow, /rm -f "\$key"[\s\S]*?test -n "\$signature"/);
 });
 
 // The key never stays at a path: it is decoded into a private file, that
