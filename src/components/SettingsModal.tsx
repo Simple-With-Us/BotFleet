@@ -188,8 +188,12 @@ function CustomIngressFields() {
   // to "on" so a config written by an older build keeps applying its URL.
   const persistedEnabled = state.config?.ingress?.enabled !== false;
   const persistedUrl = state.config?.ingress?.publicUrl ?? "";
+  const persistedWebhookEnabled = state.config?.ingress?.webhookEnabled !== false;
+  const persistedWebhookUrl = state.config?.ingress?.webhookPublicUrl ?? "";
   const [publicUrl, setPublicUrl] = useState(persistedUrl);
   const [enabled, setEnabled] = useState(persistedEnabled);
+  const [webhookUrl, setWebhookUrl] = useState(persistedWebhookUrl);
+  const [webhookEnabled, setWebhookEnabled] = useState(persistedWebhookEnabled);
   // "dirty" means the user has typed or toggled something the server has
   // not yet seen.  Only the Save button publishes; the input never autosaves
   // on blur anymore.
@@ -246,7 +250,9 @@ function CustomIngressFields() {
     if (dirty) return;
     setPublicUrl(persistedUrl);
     setEnabled(persistedEnabled);
-  }, [persistedUrl, persistedEnabled, dirty]);
+    setWebhookUrl(persistedWebhookUrl);
+    setWebhookEnabled(persistedWebhookEnabled);
+  }, [persistedUrl, persistedEnabled, persistedWebhookUrl, persistedWebhookEnabled, dirty]);
 
   const save = async () => {
     if (saving) return;
@@ -264,9 +270,12 @@ function CustomIngressFields() {
             // reads an *absent* publicUrl as "no change" (so a stray
             // `|| undefined` here silently dropped the field from the JSON
             // body and clearing the input never reached disk), but an
-            // explicit "" is the documented clear-the-URL path.
+            // explicit "" is the documented clear-the-URL path.  The
+            // dedicated webhook URL follows the same contract.
             publicUrl: trimmed,
             enabled,
+            webhookPublicUrl: webhookUrl.trim(),
+            webhookEnabled,
           },
         }),
       });
@@ -344,6 +353,14 @@ function CustomIngressFields() {
     setSaveErrorDetail(null);
   };
 
+  const toggleWebhookEnabled = () => {
+    const next = !webhookEnabled;
+    setWebhookEnabled(next);
+    setDirty(true);
+    setSaveError(null);
+    setSaveErrorDetail(null);
+  };
+
   const toggleFreeUrl = () => {
     const next = !useFreeUrl;
     setUseFreeUrl(next);
@@ -391,6 +408,39 @@ function CustomIngressFields() {
           {enabled
             ? "If you run your own Cloudflare Tunnel (e.g. bots.botfleet.app), enter its public URL here to route webhooks."
             : `When this is off, the saved URL is kept on disk but BotFleet advertises its local webhook receiver instead.${"\u00A0 "}Flip the switch back on to apply it again.`}
+        </div>
+      </div>
+
+      <label className="flex items-center gap-2 text-[13px] text-ink">
+        <input
+          type="checkbox"
+          checked={webhookEnabled}
+          onChange={toggleWebhookEnabled}
+          className="accent-ink"
+          aria-label="Enable Webhook Public URL"
+        />
+        Enable Webhook Public URL
+      </label>
+
+      <div className="flex flex-col gap-1.5">
+        <input
+          type="url"
+          value={webhookUrl}
+          onChange={(e) => {
+            setWebhookUrl(e.target.value);
+            setDirty(true);
+            setSaveError(null);
+            setSaveErrorDetail(null);
+          }}
+          placeholder="https://hooks.botfleet.app"
+          disabled={!enabled || !webhookEnabled || useFreeUrl}
+          className={inputClass}
+          aria-label="Webhook Public URL"
+        />
+        <div className="text-[12px] text-ink-secondary leading-relaxed">
+          {webhookEnabled
+            ? `A dedicated public URL advertised only in webhook credentials, for senders that cannot reach the Remote URL above.${"\u00A0 "}Leave it empty to keep advertising that one.`
+            : `When this is off, the saved webhook URL is kept on disk but webhook credentials advertise the Remote URL instead.${"\u00A0 "}Flip the switch back on to apply it again.`}
         </div>
       </div>
 
@@ -1249,6 +1299,8 @@ export function SettingsModal() {
   // gets no address and renders its setup sentence instead.
   const ingress = state.config?.ingress;
   const remoteAccessUrl = ingress?.enabled === false ? null : (ingress?.publicUrl ?? null);
+  const remoteAccessWebhookUrl =
+    ingress?.enabled === false || ingress?.webhookEnabled === false ? null : (ingress?.webhookPublicUrl ?? null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const [query, setQuery] = useState("");
   const trimmedQuery = query.trim();
@@ -1622,7 +1674,7 @@ export function SettingsModal() {
                 </Card>
               )}
 
-              {section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} highlightClass={highlightClass} />}
+              {section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} webhookUrl={remoteAccessWebhookUrl} highlightClass={highlightClass} />}
 
               {section === "engines" && (
                 <Card

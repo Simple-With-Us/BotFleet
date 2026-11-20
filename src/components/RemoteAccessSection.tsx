@@ -8,6 +8,7 @@ import {
   REMOTE_ACCESS_UNCONFIGURED_BLURB,
   REMOTE_URL_LABEL,
   sentenceGapHtml,
+  WEBHOOK_PUBLIC_URL_LABEL,
 } from "@/lib/remote-access";
 import { Card, CopyableValue } from "./SettingsPrimitives";
 
@@ -128,12 +129,16 @@ export function TestConnectionControl({
   );
 }
 
-export function RemoteAccessSection({ configuredUrl, highlightClass }: { configuredUrl?: string | null; highlightClass?: (domId: string) => string | undefined }) {
+export function RemoteAccessSection({ configuredUrl, webhookUrl: configuredWebhookUrl, highlightClass }: { configuredUrl?: string | null; webhookUrl?: string | null; highlightClass?: (domId: string) => string | undefined }) {
   const [test, setTest] = useState<RemoteAccessTestResult | null>(null);
   // This install's own address, or null.  There is no fallback host: an
   // install that has not configured remote access gets the setup sentence
   // and no probe button, rather than a link into somebody else's tunnel.
   const remoteUrl = normalizeRemoteUrl(configuredUrl);
+  // The dedicated base webhook credentials advertise, when one is set and
+  // switched on.  Empty stays hidden: the credentials then name the Remote
+  // URL above, and a second row would only repeat it.
+  const webhookUrl = normalizeRemoteUrl(configuredWebhookUrl);
 
   const runTest = async () => {
     if (!remoteUrl) return;
@@ -165,6 +170,7 @@ export function RemoteAccessSection({ configuredUrl, highlightClass }: { configu
     <Card id="setting-remote-access" className={highlightClass?.("setting-remote-access")} title={REMOTE_ACCESS_HEADING} subtitle={sentenceGapHtml(REMOTE_ACCESS_BLURB)}>
       <div className="flex flex-col gap-3">
         <CopyableValue label={REMOTE_URL_LABEL} value={remoteUrl} />
+        {webhookUrl ? <CopyableValue label={WEBHOOK_PUBLIC_URL_LABEL} value={webhookUrl} /> : null}
         <div className="flex flex-wrap items-center gap-3">
           <TestConnectionControl test={test} onRunTest={() => void runTest()} />
         </div>
