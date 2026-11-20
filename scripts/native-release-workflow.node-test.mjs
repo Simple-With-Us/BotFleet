@@ -193,15 +193,41 @@ test("the Sparkle signing branch can actually run", () => {
   assert.match(workflow, /export PATH="\$sparkle_bin:\$PATH"/);
   assert.match(workflow, /command -v sign_update > \/dev\/null \|\| \{/);
   assert.match(workflow, /::error::sign_update is not installed/);
-  // The signing key never lands world-readable and never survives a failed sign:  the whole key
-  // contract is asserted as ONE ordered block — umask-guarded write, removal, then the
-  // empty-signature check — so a reordered, duplicated or externally added key write outside
-  // this sequence fails the guard instead of passing a global scan.
-  assert.match(
-    workflow,
-    /old_umask=\$\(umask\)[\s\S]*?umask 077[\s\S]*?printf '%s' "\$SPARKLE_EDDSA_PRIVATE_KEY_B64" > "\$key"[\s\S]*?umask "\$old_umask"[\s\S]*?signature=\$\(sign_update --ed-key-file "\$key"[\s\S]*?rm -f "\$key"[\s\S]*?test -n "\$signature"/,
-  );
-  assert.doesNotMatch(workflow, /base64 --decode > "\$key"/);
+  // This round runs both key-format interpretations on the live dispatch (the signer produced no
+  // output last time), so the guard pins the diagnostic's own contract as ONE ordered block:  the
+  // EXIT trap is installed before the umask-guarded writes, both attempts are filtered to
+  // signature-shaped lines only (raw tool output never reaches the log), the files are removed
+  // and the umask restored together before any exit, and the empty-signature failure names both
+  // formats.  The no-GitHub-fallback rule is scoped to this step:  the certificate and
+  // notarization steps' fallbacks are their own sanctioned design.
+  // The whole key contract is asserted in ORDER by walking the workflow text:  a reordered,
+  // duplicated or externally added key write fails the walk instead of passing loose scans.
+  // The cleanup lives in the trap body the walk passes through, so every exit path removes both
+  // key files and restores the umask.
+  let pos = 0;
+  const ordered = [
+    "old_umask=$(umask)",
+    "cleanup_keys() {",
+    "rm -f \"$key\" \"$keyraw\"",
+    "umask \"$old_umask\"",
+    "trap cleanup_keys EXIT",
+    "umask 077",
+    "printf '%s' \"$SPARKLE_EDDSA_PRIVATE_KEY_B64\" > \"$key\"",
+    "printf '%s' \"$SPARKLE_EDDSA_PRIVATE_KEY_B64\" | base64 --decode > \"$keyraw\"",
+    "grep -o 'sparkle:edSignature=\"[^\"]*\"' \"$RUNNER_TEMP/su-text.txt\" || true",
+    "grep -o 'sparkle:edSignature=\"[^\"]*\"' \"$RUNNER_TEMP/su-raw.txt\" || true",
+    "::error::sign_update produced no signature in either key format",
+  ];
+  for (const needle of ordered) {
+    const at = workflow.indexOf(needle, pos);
+    assert.notEqual(at, -1, `missing or reordered in the workflow: ${needle}`);
+    pos = at + needle.length;
+  }
+
+  assert.doesNotMatch(workflow, /cat "\$RUNNER_TEMP\/su-/);
+  assert.match(workflow, /cleanup_keys\(\) \{[\s\S]*?rm -f "\$key" "\$keyraw"[\s\S]*?umask "\$old_umask"[\s\S]*?\}/);
+  const sparkleStep = workflow.split("Load the Sparkle EdDSA key")[1]?.split("- name:")[0] ?? "";
+  assert.doesNotMatch(sparkleStep, /GH_FALLBACK_/);
 });
 
 // The key never stays at a path: it is decoded into a private file, that
