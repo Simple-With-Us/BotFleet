@@ -177,7 +177,7 @@ public struct NativeHeadlessHostInstaller: Sendable {
     static let requiredHostCapabilities: Set<String> = ["automatic-start-v1", "checked-control-v1"]
     /// The stamp schema this installer understands.  A host stamped by a newer packager is
     /// refused rather than read loosely;  anything below one predates the contract entirely.
-    static let minimumStampSchemaVersion = 1
+    static let supportedStampSchemaVersion = 1
     // Test-only fault seams, exercised by CompanionCoreTests to prove rollback.  Nil in production.
     var beforeCommitHook: (@Sendable () throws -> Void)?
     var afterBackupHook: (@Sendable () throws -> Void)?
@@ -253,7 +253,7 @@ public struct NativeHeadlessHostInstaller: Sendable {
         guard let stamp = stampReader.stamp(ofExecutableAt: url) else {
             throw NativeHeadlessHostInstallerError.stampMissing
         }
-        guard stamp.schemaVersion == minimumStampSchemaVersion else {
+        guard stamp.schemaVersion == supportedStampSchemaVersion else {
             throw NativeHeadlessHostInstallerError.stampSchemaUnsupported
         }
         let declared = Set(stamp.capabilities)
