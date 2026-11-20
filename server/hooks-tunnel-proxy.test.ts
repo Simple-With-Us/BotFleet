@@ -11,7 +11,7 @@
 
 import type { ChildProcess } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { createServer, request, type Server } from "node:http";
+import { createServer, request, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -44,12 +44,14 @@ describe("isTunnelWebhookPath", () => {
   });
 });
 
+type SeenDelivery = { method?: string; url?: string; body: Buffer; headers: IncomingMessage["headers"] };
+
 describe("proxyTunnelWebhook", () => {
   let upstream: Server;
   let upstreamPort: number;
   let front: Server;
   let frontPort: number;
-  let seen: { method?: string; url?: string; body: Buffer; headers: Record<string, unknown> };
+  let seen: SeenDelivery;
 
   beforeAll(async () => {
     upstream = createServer((req, res) => {
@@ -62,11 +64,15 @@ describe("proxyTunnelWebhook", () => {
       });
     });
     await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    // SAFETY: `listen` has resolved, so the server is bound and `address()`
+    // is an `AddressInfo` carrying the port it was given.
     upstreamPort = (upstream.address() as AddressInfo).port;
     front = createServer((req, res) => {
       void proxyTunnelWebhook(req, res, { port: upstreamPort });
     });
     await new Promise<void>((resolve) => front.listen(0, "127.0.0.1", resolve));
+    // SAFETY: `listen` has resolved, so the server is bound and `address()`
+    // is an `AddressInfo` carrying the port it was given.
     frontPort = (front.address() as AddressInfo).port;
   });
 
@@ -127,6 +133,8 @@ describe("proxyTunnelWebhook", () => {
       void proxyTunnelWebhook(req, res, { port: 1 });
     });
     await new Promise<void>((resolve) => deadFront.listen(0, "127.0.0.1", resolve));
+    // SAFETY: `listen` has resolved, so the server is bound and `address()`
+    // is an `AddressInfo` carrying the port it was given.
     const deadPort = (deadFront.address() as AddressInfo).port;
     const deadAnswer = await new Promise<{ status: number; body: string }>((resolve, reject) => {
       const req = request(
