@@ -193,6 +193,13 @@ test("the Sparkle signing branch can actually run", () => {
   assert.match(workflow, /export PATH="\$sparkle_bin:\$PATH"/);
   assert.match(workflow, /command -v sign_update > \/dev\/null \|\| \{/);
   assert.match(workflow, /::error::sign_update is not installed/);
+  // The signing key never lands world-readable and never survives a failed sign:  the write is
+  // umask-guarded to owner-only and the key file is removed before the empty-signature exit.
+  assert.match(workflow, /umask 077/);
+  assert.match(workflow, /printf '%s' "\$SPARKLE_EDDSA_PRIVATE_KEY_B64" > "\$key"/);
+  assert.doesNotMatch(workflow, /base64 --decode > "\$key"/);
+  assert.match(workflow, /rm -f "\$key"/);
+  assert.match(workflow, /rm -f "\$key"[\s\S]*?test -n "\$signature"/);
 });
 
 // The key never stays at a path: it is decoded into a private file, that
