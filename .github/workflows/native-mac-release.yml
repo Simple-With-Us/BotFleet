@@ -125,7 +125,10 @@ jobs:
   mac-native:
     name: BotFleetMac (sign, notarize, staple)
     needs: prepare
-    runs-on: macos-26
+    # The ios package requires Swift tools 6.4 (Xcode 27), the same requirement ci.yml's iOS job
+    # declares (runs-on: xcode-27 there);  the macos-26 image ships Swift 6.3.3 and cannot archive
+    # a 6.4 package.
+    runs-on: xcode-27
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
