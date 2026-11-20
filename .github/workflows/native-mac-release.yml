@@ -360,7 +360,9 @@ jobs:
             command -v sign_update > /dev/null || {
               echo "::error::sign_update is not installed; cannot sign the appcast"; exit 1; }
             key="$RUNNER_TEMP/sparkle-ed-key"
-            echo "$SPARKLE_EDDSA_PRIVATE_KEY_B64" | base64 --decode > "$key"
+            # sign_update reads the key file as a UTF-8 string of the base64 key text (the format
+            # generate_keys writes), not as decoded raw bytes.
+            printf '%s' "$SPARKLE_EDDSA_PRIVATE_KEY_B64" > "$key"
             signature=$(sign_update --ed-key-file "$key" "$zip" | sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p')
             test -n "$signature" || { echo "::error::sign_update produced no signature"; exit 1; }
             printf '%s' "$signature" > "$zip.edsig"
