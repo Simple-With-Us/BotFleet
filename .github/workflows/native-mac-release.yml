@@ -340,16 +340,23 @@ jobs:
           if [ -n "${SPARKLE_EDDSA_PRIVATE_KEY_B64:-}" ]; then
             # sign_update is NOT part of the macOS runner image, so without
             # this install the signing branch can never run and a
-            # provisioned key would still produce an unsigned feed.  The
-            # install is best effort, but a key with no tool is a hard
-            # error: an unsigned appcast that looks signed is the failure
-            # this pipeline exists to prevent.
-            brew install sparkle || echo "::warning::brew install sparkle failed"
-            sparkle_bin="$(brew --prefix 2>/dev/null)/bin"
-            if [ -x "$sparkle_bin/sign_update" ]; then
-              echo "$sparkle_bin" >> "$GITHUB_PATH"
-              export PATH="$sparkle_bin:$PATH"
-            fi
+            # provisioned key would still produce an unsigned feed.  brew's
+            # sparkle cask has been disabled (Gatekeeper, 2026-09-01), so the
+            # signer comes from Sparkle's own pinned 2.10.1 release — the
+            # version this repo already pins in NOTICE — with the archive
+            # hash checked before anything runs.  A key with no working
+            # signer is a hard error: an unsigned appcast that looks signed
+            # is the failure this pipeline exists to prevent.
+            curl -fsSL -o "$RUNNER_TEMP/sparkle.tar.xz" \
+              "https://github.com/sparkle-project/Sparkle/releases/download/2.10.1/Sparkle-2.10.1.tar.xz"
+            echo "1a856d2a9edb8e628de88121d7be04cf0e2167f8641650b78fca00b14244cf27  $RUNNER_TEMP/sparkle.tar.xz" | shasum -a 256 --check --status || {
+              echo "::error::the Sparkle 2.10.1 archive failed its sha256 check"; exit 1; }
+            tar -xf "$RUNNER_TEMP/sparkle.tar.xz" -C "$RUNNER_TEMP"
+            sparkle_bin="$RUNNER_TEMP/bin"
+            test -x "$sparkle_bin/sign_update" || {
+              echo "::error::sign_update missing from the Sparkle archive"; exit 1; }
+            echo "$sparkle_bin" >> "$GITHUB_PATH"
+            export PATH="$sparkle_bin:$PATH"
             command -v sign_update > /dev/null || {
               echo "::error::sign_update is not installed; cannot sign the appcast"; exit 1; }
             key="$RUNNER_TEMP/sparkle-ed-key"
