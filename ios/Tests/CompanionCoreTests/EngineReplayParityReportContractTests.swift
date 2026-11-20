@@ -66,6 +66,24 @@ struct EngineReplayParityReportContractTests {
         // the aggregation says false because one named engine did not hold.
         #expect(!report.isFullyVerified)
         #expect(!EngineReplayParityReport.aggregateFullyVerified(engines: report.engines))
+        #expect(report.isFullyVerified == EngineReplayParityReport.aggregateFullyVerified(engines: report.engines))
+    }
+
+    @Test("A stored flag that disagrees with the engines' verdicts is detectable")
+    func contradictoryStoredFlagIsDetectable() throws {
+        // The probe writes the flag from the aggregation, so the golden
+        // fixture agrees.  A report that claimed fully verified while an
+        // engine failed would decode — Codable cannot know the rule — but the
+        // comparison the contract tests make must catch it on both sides.
+        let drifted = String(data: try fixtureData(), encoding: .utf8)!
+            .replacingOccurrences(
+                of: "\"isFullyVerified\": false,\n  \"requestedEngines\"",
+                with: "\"isFullyVerified\": true,\n  \"requestedEngines\""
+            )
+        #expect(drifted != String(data: try fixtureData(), encoding: .utf8)!)
+        let report = try JSONDecoder().decode(EngineReplayParityReport.self, from: Data(drifted.utf8))
+        #expect(report.isFullyVerified)
+        #expect(report.isFullyVerified != EngineReplayParityReport.aggregateFullyVerified(engines: report.engines))
     }
 
     @Test("The aggregation is computed out of the engines' own verdicts")
@@ -119,6 +137,20 @@ struct EngineReplayParityReportContractTests {
                 entryKeys == fixtureEngineKeys,
                 "engine \(index) encoded-only keys: \(entryKeys.subtracting(fixtureEngineKeys).sorted()), fixture-only keys: \(fixtureEngineKeys.subtracting(entryKeys).sorted())"
             )
+            // The nested per-fixture payloads are pinned the same way:
+            // `EngineReplayOutcome` carries optional stored fields, and a key
+            // renamed or dropped there must fail this test rather than drift.
+            let fixtureFixtures = try #require(fixtureEngines[index]["fixtures"] as? [[String: Any]])
+            let encodedFixtures = try #require(entry["fixtures"] as? [[String: Any]])
+            #expect(encodedFixtures.count == fixtureFixtures.count)
+            for (fixtureIndex, outcome) in encodedFixtures.enumerated() {
+                let outcomeKeys = Set(outcome.keys)
+                let fixtureOutcomeKeys = Set(fixtureFixtures[fixtureIndex].keys)
+                #expect(
+                    outcomeKeys == fixtureOutcomeKeys,
+                    "engine \(index) fixture \(fixtureIndex) encoded-only keys: \(outcomeKeys.subtracting(fixtureOutcomeKeys).sorted()), fixture-only keys: \(fixtureOutcomeKeys.subtracting(outcomeKeys).sorted())"
+                )
+            }
         }
         #expect(encodedEngines[0].keys.contains("family") && !encodedEngines[0].keys.contains("unmeasuredReason"))
         #expect(encodedEngines[1].keys.contains("unmeasuredReason") && !encodedEngines[1].keys.contains("family"))
