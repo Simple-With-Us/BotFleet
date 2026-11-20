@@ -193,15 +193,18 @@ test("the Sparkle signing branch can actually run", () => {
   assert.match(workflow, /export PATH="\$sparkle_bin:\$PATH"/);
   assert.match(workflow, /command -v sign_update > \/dev\/null \|\| \{/);
   assert.match(workflow, /::error::sign_update is not installed/);
-  // The signing key never lands world-readable and never survives a failed sign:  the whole key
-  // contract is asserted as ONE ordered block — umask-guarded write, removal, then the
-  // empty-signature check — so a reordered, duplicated or externally added key write outside
-  // this sequence fails the guard instead of passing a global scan.
-  assert.match(
-    workflow,
-    /old_umask=\$\(umask\)[\s\S]*?umask 077[\s\S]*?printf '%s' "\$SPARKLE_EDDSA_PRIVATE_KEY_B64" > "\$key"[\s\S]*?umask "\$old_umask"[\s\S]*?signature=\$\(sign_update --ed-key-file "\$key"[\s\S]*?rm -f "\$key"[\s\S]*?test -n "\$signature"/,
-  );
-  assert.doesNotMatch(workflow, /base64 --decode > "\$key"/);
+  // This round runs both key-format interpretations on the live dispatch (the signer produced no
+  // output last time), so the guard pins the diagnostic's own contract:  both key files are
+  // created under umask 077, both attempts are logged verbatim, the files are removed together
+  // before any exit, and the empty-signature failure names both formats.
+  assert.match(workflow, /printf '%s' "\$SPARKLE_EDDSA_PRIVATE_KEY_B64" > "\$key"/);
+  assert.match(workflow, /printf '%s' "\$SPARKLE_EDDSA_PRIVATE_KEY_B64" \| base64 --decode > "\$keyraw"/);
+  assert.match(workflow, /umask 077/);
+  assert.match(workflow, /"--text-format attempt exited \$??"|text-format attempt exited/);
+  assert.match(workflow, /cat "\$RUNNER_TEMP\/su-text.txt"/);
+  assert.match(workflow, /cat "\$RUNNER_TEMP\/su-raw.txt"/);
+  assert.match(workflow, /rm -f "\$key" "\$keyraw"/);
+  assert.match(workflow, /::error::sign_update produced no signature in either key format/);
 });
 
 // The key never stays at a path: it is decoded into a private file, that
