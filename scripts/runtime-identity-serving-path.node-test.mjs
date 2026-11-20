@@ -35,39 +35,51 @@ function read(relative) {
   return readFileSync(join(ROOT, relative), "utf8");
 }
 
-/** Every TypeScript module under server/, tests excluded. */
+/** Source with `//` line comments removed, so a comment that mentions a
+ *  walking reader is not miscounted as a call site. */
+function withoutLineComments(source) {
+  return source
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("//"))
+    .join("\n");
+}
+
+/** Every TypeScript module under server/ at any depth, tests excluded. */
 function serverModules() {
-  return readdirSync(join(ROOT, "server"))
-    .filter((name) => name.endsWith(".ts") && !name.endsWith(".test.ts"))
+  return readdirSync(join(ROOT, "server"), { recursive: true })
+    .map((name) => String(name).replaceAll("\\", "/"))
+    .filter((name) => /\.(?:ts|mts|mjs)$/.test(name) && !/\.test\.(?:ts|mts|mjs)$/.test(name))
     .map((name) => `server/${name}`);
 }
 
 test("the runtime identity module computes both fingerprints exactly once, at module load", () => {
-  const source = read("server/runtime-identity.ts");
+  const source = withoutLineComments(read("server/runtime-identity.ts"));
   // The identity object is a top-level const, not a function a route could
   // call again:  the load-time evaluation is what keeps the walk off every
-  // request.
+  // request.  The pins are tolerant of reformatting — they hold the shape
+  // (a top-level const initialized from the two walking readers), not the
+  // exact bytes.
   assert.match(source, /const sourceIdentity: BuildIdentity = import\.meta\.url\.endsWith\("\.ts"\)/);
-  assert.match(source, /const runtimeBuildIdentity = \{ \.\.\.sourceIdentity, uiHash: hashStaticUi\(process\.env\.OMB_STATIC_DIR\) \};/);
+  assert.match(source, /const runtimeBuildIdentity = \{[^}]*hashStaticUi\(process\.env\.OMB_STATIC_DIR\)[^}]*\};/s);
   // Each walking reader is called exactly once — the load-time line above is
-  // the only call site in the module.
+  // the only call site in the module, counted with comments stripped.
   assert.equal(source.match(/hashStaticUi\(/g)?.length, 1, "hashStaticUi must be called exactly once, at module load");
   assert.equal(source.match(/readSourceBuildIdentity\(/g)?.length, 1, "readSourceBuildIdentity must be called exactly once, at module load");
   // The module exports the precomputed object and two pure helpers — no
   // function that re-runs a walk is exported to callers.
   assert.match(source, /export const runtimeBuildIdentity/);
-  assert.doesNotMatch(source, /export (async )?function (hashStaticUi|readSourceBuildIdentity|recompute|refresh)/);
+  assert.doesNotMatch(source, /export (?:async )?function (?:hashStaticUi|readSourceBuildIdentity|recompute|refresh)/);
 });
 
 test("no other server module reaches the fingerprint walk or its modules", () => {
   const offenders = [];
   for (const module of serverModules()) {
     if (module === "server/runtime-identity.ts") continue;
-    const source = read(module);
+    const source = withoutLineComments(read(module));
     if (/hashStaticUi|readSourceBuildIdentity/.test(source)) offenders.push(`${module} calls a walking reader`);
-    if (/\.\.\/scripts\/source-build-identity\.mjs/.test(source)) offenders.push(`${module} imports source-build-identity.mjs`);
-    if (/\.\.\/scripts\/release-provenance\.mjs/.test(source)) offenders.push(`${module} imports release-provenance.mjs (the dependency-tree walk)`);
-    if (/\.\.\/electron\/runtime-identity\.mjs/.test(source) && !/authorizedRuntime|validBuildIdentity|buildCompatibility/.test(source)) {
+    if (/scripts\/source-build-identity\.mjs/.test(source)) offenders.push(`${module} imports source-build-identity.mjs`);
+    if (/scripts\/release-provenance\.mjs/.test(source)) offenders.push(`${module} imports release-provenance.mjs (the dependency-tree walk)`);
+    if (/electron\/runtime-identity\.mjs/.test(source) && !/authorizedRuntime|validBuildIdentity|buildCompatibility/.test(source)) {
       offenders.push(`${module} imports electron/runtime-identity.mjs without naming a non-walking export`);
     }
   }
@@ -75,8 +87,9 @@ test("no other server module reaches the fingerprint walk or its modules", () =>
 });
 
 test("the serving entry reads the precomputed identity object and never re-derives it", () => {
-  const index = read("server/index.ts");
-  assert.match(index, /import \{ runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent \} from "\.\/runtime-identity\.ts";/);
+  const index = withoutLineComments(read("server/index.ts"));
+  // The import relationship is pinned by name, not by exact line formatting.
+  assert.match(index, /import \{[^}]*runtimeBuildIdentity[^}]*\} from "\.\/runtime-identity\.ts";/);
   // Every reference is a property read of the precomputed object.  A call
   // would mean the route recomputes identity per request.
   assert.doesNotMatch(index, /runtimeBuildIdentity\(/);
