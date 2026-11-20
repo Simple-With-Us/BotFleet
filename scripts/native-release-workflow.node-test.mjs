@@ -183,8 +183,12 @@ test("the notarization output is printed before the failure", () => {
 // sign_update is not on the runner image, so the Sparkle branch could never
 // run: a provisioned key still produced an unsigned feed, silently.
 test("the Sparkle signing branch can actually run", () => {
-  assert.match(workflow, /brew install sparkle/);
-  // A key with no tool is a hard error, not a warning.
+  // brew's sparkle cask has been disabled (Gatekeeper, 2026-09-01), so the signer comes from
+  // Sparkle's own pinned 2.9.6 release with the archive hash checked before use, and a key with
+  // no working tool remains a hard error, not a warning.
+  assert.match(workflow, /sparkle-project\/Sparkle\/releases\/download\/2\.9\.6\/Sparkle-2\.9\.6\.tar\.xz/);
+  assert.match(workflow, /shasum -a 256 --check --status/);
+  assert.match(workflow, /test -x "\$sparkle_bin\/sign_update" \|\| \{/);
   assert.match(workflow, /command -v sign_update > \/dev\/null \|\| \{/);
   assert.match(workflow, /::error::sign_update is not installed/);
 });
