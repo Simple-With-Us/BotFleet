@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { encodeHostIdentity } from "./native-host-artifact.mjs";
+import { encodeHostIdentity, HOST_CAPABILITIES } from "./native-host-artifact.mjs";
 import {
   IDENTITY_KEYS,
   hostArchitecture,
@@ -29,7 +29,7 @@ const IDENTITY = {
   sourceCommit: "c".repeat(40),
   build: "202611181230",
   marketingVersion: "0.1.0",
-  capabilities: ["identity-v1", "foreground-service-data-v1", "signal-drain-v1"],
+  capabilities: [...HOST_CAPABILITIES],
   distribution: "unsigned-development",
   sourceDirty: false,
 };
@@ -337,4 +337,10 @@ test("the native-release chain runs this file, and hosted CI runs the chain", ()
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   assert.match(pkg.scripts["test:native-release"], /scripts\/native-host-package-smoke\.node-test\.mjs/);
   assert.match(pkg.scripts.test, /pnpm test:native-release/);
+});
+
+test("obsolete capability fixtures are rejected by the packager contract", () => {
+  const obsolete = clone(IDENTITY);
+  obsolete.capabilities = ["identity-v1", "foreground-service-data-v1", "signal-drain-v1"];
+  assert.throws(() => encodeHostIdentity(obsolete), /verification refused/);
 });
