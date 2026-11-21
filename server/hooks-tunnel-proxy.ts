@@ -47,7 +47,7 @@ const TUNNEL_WEBHOOK_TIMEOUT_MS = 30_000;
 
 /** The request headers worth forwarding: end-to-end headers only, with the
  *  headers the `connection` token list nominates stripped as well. */
-function forwardedRequestHeaders(req: IncomingMessage): Record<string, number | string | string[]> {
+function forwardedRequestHeaders(req: IncomingMessage) {
   const connectionTokens = new Set<string>();
   const connection = req.headers.connection;
   const raw = Array.isArray(connection) ? connection.join(",") : connection ?? "";

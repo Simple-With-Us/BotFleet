@@ -13791,8 +13791,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // example an upstream header node refuses to write) must land as a
       // logged warning, never as an unhandled rejection.  Log the message
       // only, never request inputs or environment.
-      void proxyTunnelWebhook(req, res, { port: WEBHOOK_PORT }).catch((error: unknown) => {
-        console.warn(`hooks tunnel proxy: delivery failed (${error instanceof Error ? error.message : "unknown error"})`);
+      void proxyTunnelWebhook(req, res, { port: WEBHOOK_PORT }).catch((cause: unknown) => {
+        console.warn(`hooks tunnel proxy: delivery failed (${cause instanceof Error ? cause.message : "unknown error"})`);
       });
       return;
     }

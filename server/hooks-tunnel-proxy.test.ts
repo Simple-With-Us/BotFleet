@@ -68,8 +68,8 @@ describe("proxyTunnelWebhook", () => {
     // is an `AddressInfo` carrying the port it was given.
     upstreamPort = (upstream.address() as AddressInfo).port;
     front = createServer((req, res) => {
-      void proxyTunnelWebhook(req, res, { port: upstreamPort }).catch((error: unknown) => {
-        console.warn("test proxy failure:", error instanceof Error ? error.message : "unknown error");
+      void proxyTunnelWebhook(req, res, { port: upstreamPort }).catch((cause: unknown) => {
+        console.warn("test proxy failure:", cause instanceof Error ? cause.message : "unknown error");
       });
     });
     await new Promise<void>((resolve) => front.listen(0, "127.0.0.1", resolve));
@@ -144,8 +144,8 @@ describe("proxyTunnelWebhook", () => {
     // is an `AddressInfo` carrying the port it was given.
     const stallingPort = (stalling.address() as AddressInfo).port;
     const slowFront = createServer((req, res) => {
-      void proxyTunnelWebhook(req, res, { port: stallingPort, timeoutMs: 100 }).catch((error: unknown) => {
-        console.warn("test proxy failure:", error instanceof Error ? error.message : "unknown error");
+      void proxyTunnelWebhook(req, res, { port: stallingPort, timeoutMs: 100 }).catch((cause: unknown) => {
+        console.warn("test proxy failure:", cause instanceof Error ? cause.message : "unknown error");
       });
     });
     await new Promise<void>((resolve) => slowFront.listen(0, "127.0.0.1", resolve));
@@ -174,8 +174,8 @@ describe("proxyTunnelWebhook", () => {
   it("answers 502 when the ingress is not listening", async () => {
     // This front targets a port nothing listens on.
     const deadFront = createServer((req, res) => {
-      void proxyTunnelWebhook(req, res, { port: 1 }).catch((error: unknown) => {
-        console.warn("test proxy failure:", error instanceof Error ? error.message : "unknown error");
+      void proxyTunnelWebhook(req, res, { port: 1 }).catch((cause: unknown) => {
+        console.warn("test proxy failure:", cause instanceof Error ? cause.message : "unknown error");
       });
     });
     await new Promise<void>((resolve) => deadFront.listen(0, "127.0.0.1", resolve));
