@@ -78,6 +78,7 @@ export function proxyTunnelWebhook(
   const host = target.host ?? "127.0.0.1";
   const timeoutMs = target.timeoutMs ?? TUNNEL_WEBHOOK_TIMEOUT_MS;
   return new Promise((resolve) => {
+    let settled = false;
     const upstream = httpRequest(
       {
         host,
@@ -94,17 +95,26 @@ export function proxyTunnelWebhook(
         }
         res.writeHead(up.statusCode ?? 502, headers);
         up.pipe(res);
-        up.on("end", () => resolve());
+        up.on("end", () => finish());
         up.on("error", () => {
           res.destroy();
-          resolve();
+          finish();
         });
       },
     );
+    /** Settles the delivery exactly once and disarms the stall timeout: a
+     *  late fire must never tear down a response that already finished. */
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      upstream.setTimeout(0);
+      resolve();
+    };
     // A stalled sender or a stalled ingress must not hold both sockets open.
     // On timeout the exchange is torn down; the delivery gets a plain 504
     // only when no part of the proxied answer has streamed yet.
     upstream.setTimeout(timeoutMs, () => {
+      if (settled) return;
       upstream.destroy();
       req.destroy();
       if (res.headersSent) {
@@ -113,7 +123,7 @@ export function proxyTunnelWebhook(
         res.writeHead(504, { "content-type": "application/json", "cache-control": "no-store" });
         res.end(JSON.stringify({ error: "webhook receiver timed out" }));
       }
-      resolve();
+      finish();
     });
     upstream.on("error", () => {
       // The ingress is down or never came up: answer plainly rather than hang
@@ -126,11 +136,11 @@ export function proxyTunnelWebhook(
         res.writeHead(502, { "content-type": "application/json", "cache-control": "no-store" });
         res.end(JSON.stringify({ error: "webhook receiver unavailable" }));
       }
-      resolve();
+      finish();
     });
     req.on("error", () => {
       upstream.destroy();
-      resolve();
+      finish();
     });
     req.pipe(upstream);
   });

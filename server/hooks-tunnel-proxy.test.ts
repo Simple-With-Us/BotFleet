@@ -11,7 +11,7 @@
 
 import type { ChildProcess } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { createServer, request, type IncomingMessage, type Server } from "node:http";
+import { Agent, createServer, request, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -133,6 +133,43 @@ describe("proxyTunnelWebhook", () => {
     expect(seen.headers["host"]).toBe(`127.0.0.1:${upstreamPort}`);
     // The hop-by-hop header `connection` nominated never reached the ingress.
     expect(seen.headers["x-hop-fixture"]).toBeUndefined();
+  });
+
+  it("leaves a finished delivery alone once the timeout window passes", async () => {
+    // Regression for the late-timeout bug: a completed delivery must not be
+    // torn down when the stall timer would have fired.  keepAlive holds the
+    // client socket open, so only the proxy destroying the finished response
+    // could close it inside the window.
+    let clientSocketClosed = false;
+    const calmFront = createServer((req, res) => {
+      void proxyTunnelWebhook(req, res, { port: upstreamPort, timeoutMs: 50 }).catch((cause: unknown) => {
+        console.warn("test proxy failure:", cause instanceof Error ? cause.message : "unknown error");
+      });
+    });
+    await new Promise<void>((resolve) => calmFront.listen(0, "127.0.0.1", resolve));
+    // SAFETY: `listen` has resolved, so the server is bound and `address()`
+    // is an `AddressInfo` carrying the port it was given.
+    const calmPort = (calmFront.address() as AddressInfo).port;
+    const agent = new Agent({ keepAlive: true });
+    const answer = await new Promise<{ status: number }>((resolve, reject) => {
+      const req = request(
+        { host: "127.0.0.1", port: calmPort, method: "POST", path: "/hooks/wh_calm/secret", agent },
+        (res) => {
+          res.socket.on("close", () => {
+            clientSocketClosed = true;
+          });
+          res.resume();
+          res.on("end", () => resolve({ status: res.statusCode ?? 0 }));
+        },
+      );
+      req.on("error", reject);
+      req.end("{}");
+    });
+    expect(answer.status).toBe(202);
+    await new Promise((r) => setTimeout(r, 150));
+    expect(clientSocketClosed).toBe(false);
+    agent.destroy();
+    await new Promise<void>((resolve) => calmFront.close(() => resolve()));
   });
 
   it("answers 504 when the ingress stalls past the proxy timeout", async () => {
