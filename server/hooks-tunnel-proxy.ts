@@ -3,7 +3,7 @@ import { request as httpRequest, type IncomingMessage, type ServerResponse } fro
 /** The paths the webhook ingress owns: `/hooks/<endpoint>/<secret>` capability
  *  URLs and Zulip outgoing webhooks.  Keep these shapes in step with the
  *  receivers in server/webhook-ingress.ts — a path the ingress would not
- *  recognize is not worth proxying. */
+ *  recognize is not worth proxying itself. */
 const HOOKS_CAPABILITY_PATH = /^\/hooks\/wh_[A-Za-z0-9_-]+(?:\/[^/]+)?$/;
 const ZULIP_OUTGOING_PATH = /^\/zulip\/outgoing\/[A-Z0-9][A-Z0-9_-]{0,47}$/;
 
