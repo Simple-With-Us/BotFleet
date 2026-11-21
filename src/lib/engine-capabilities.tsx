@@ -521,7 +521,6 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       { id: "gemini-4-hydrogen-high", display: "Gemini 4 Hydrogen (High)", ctxTokens: 1_000_000 },
       { id: "gemini-4-hydrogen-medium", display: "Gemini 4 Hydrogen (Medium)", ctxTokens: 1_000_000 },
       { id: "gemini-4-hydrogen-low", display: "Gemini 4 Hydrogen (Low)", ctxTokens: 1_000_000 },
-      { id: "gemini-4-argon", display: "Gemini 4 Argon", ctxTokens: 1_000_000 },
       { id: "gemini-4-argon-high", display: "Gemini 4 Argon (High)", ctxTokens: 1_000_000 },
       { id: "gemini-4-argon-medium", display: "Gemini 4 Argon (Medium)", ctxTokens: 1_000_000 },
       { id: "gemini-4-argon-low", display: "Gemini 4 Argon (Low)", ctxTokens: 1_000_000 },
