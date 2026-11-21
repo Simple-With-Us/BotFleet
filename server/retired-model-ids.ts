@@ -4,7 +4,11 @@
 // that reaches it burns a spawn on "unknown model option" before the
 // rejection registry can learn.  Map those ids onto the live replacement
 // the product already ships so resolveModel / selectTurnFallback / store
-// load never hand a dead spelling to an engine.
+// load never hand a dead spelling to an engine.  The same map is the
+// authority for the paths that meet an id outside saved chains: catalog
+// discovery drops rows it names (a provider's live list keeps serving a
+// retired model after the picker drops it), and per-model usage stats
+// fold its banked rows onto the live replacement.
 import type { ModelSelection } from "./contracts.ts";
 
 /** Exact retired picker ids → the live catalog id that replaced them.
@@ -35,16 +39,33 @@ const RETIRED_MODEL_REPLACEMENTS: Readonly<Record<string, string>> = {
 };
 
 /** Live replacement for a retired model id, or the input when it is still
- *  current.  Exact match only — MiniMax-M3.1-Flash and
- *  MiniMax-M2.7-highspeed must not match the retired stems. */
+ *  current.  The bare id must match exactly — MiniMax-M3.1-Flash and
+ *  MiniMax-M2.7-highspeed must not match the retired stems.  A
+ *  provider-qualified spelling (`minimax-coding-plan/MiniMax-M3`, as a
+ *  discovered catalog spells the models it routes) names the bare id
+ *  after its last `/`: the retired model is the same product whichever
+ *  route serves it, so the match runs on that bare id and the
+ *  replacement keeps the qualifier, landing on the same route's live
+ *  row (`minimax-coding-plan/MiniMax-M3.1-Flash`). */
 export function rewriteRetiredModelId(model: string): string {
-  return RETIRED_MODEL_REPLACEMENTS[model] ?? model;
+  const bare = retiredBareId(model);
+  if (bare === null) return model;
+  return model.slice(0, model.length - bare.length) + RETIRED_MODEL_REPLACEMENTS[bare]!;
 }
 
 /** True when the model id is one the product has already retired from
- *  every catalog that used to advertise it. */
+ *  every catalog that used to advertise it — bare, or provider-qualified
+ *  with a retired bare id after the last `/`. */
 export function isRetiredModelId(model: string): boolean {
-  return Object.prototype.hasOwnProperty.call(RETIRED_MODEL_REPLACEMENTS, model);
+  return retiredBareId(model) !== null;
+}
+
+/** The retired bare id a model id names, or null when it names none:
+ *  the id itself, or the segment after its last `/` for a
+ *  provider-qualified spelling. */
+function retiredBareId(model: string): string | null {
+  const bare = model.slice(model.lastIndexOf("/") + 1);
+  return Object.prototype.hasOwnProperty.call(RETIRED_MODEL_REPLACEMENTS, bare) ? bare : null;
 }
 
 /** Rewrite primary + nested fallbacks.  Effort and instanceId stay put —
