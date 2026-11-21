@@ -43,10 +43,14 @@ const RETIRED_MODEL_REPLACEMENTS: Readonly<Record<string, string>> = {
  *  MiniMax-M2.7-highspeed must not match the retired stems.  A
  *  provider-qualified spelling (`minimax-coding-plan/MiniMax-M3`, as a
  *  discovered catalog spells the models it routes) names the bare id
- *  after its last `/`: the retired model is the same product whichever
- *  route serves it, so the match runs on that bare id and the
- *  replacement keeps the qualifier, landing on the same route's live
- *  row (`minimax-coding-plan/MiniMax-M3.1-Flash`). */
+ *  after its last `/`, but only under a qualifier that is itself a
+ *  route to these vendors' models (see RETIRED_MODEL_QUALIFIERS): the
+ *  retired model is the same product on those routes, so the match
+ *  runs on that bare id and the replacement keeps the qualifier,
+ *  landing on the same route's live row
+ *  (`minimax-coding-plan/MiniMax-M3.1-Flash`).  Any other qualifier is
+ *  a different route whose trailing segment merely shares the text,
+ *  and its ids are left alone. */
 export function rewriteRetiredModelId(model: string): string {
   const bare = retiredBareId(model);
   if (bare === null) return model;
@@ -55,17 +59,27 @@ export function rewriteRetiredModelId(model: string): string {
 
 /** True when the model id is one the product has already retired from
  *  every catalog that used to advertise it — bare, or provider-qualified
- *  with a retired bare id after the last `/`. */
+ *  under a known route qualifier with a retired bare id after the last
+ *  `/`. */
 export function isRetiredModelId(model: string): boolean {
   return retiredBareId(model) !== null;
 }
 
+/** Provider qualifiers under which a qualified spelling names one of the
+ *  retired models themselves: OpenCode's MiniMax Coding Plan route
+ *  (`minimax-coding-plan/MiniMax-M3`) and the DSH engine's provider
+ *  spelling (`minimax/MiniMax-M3.1-Flash`). */
+const RETIRED_MODEL_QUALIFIERS: ReadonlySet<string> = new Set(["minimax", "minimax-coding-plan"]);
+
 /** The retired bare id a model id names, or null when it names none:
- *  the id itself, or the segment after its last `/` for a
- *  provider-qualified spelling. */
+ *  the id itself, or — under a known route qualifier — the segment
+ *  after its last `/`. */
 function retiredBareId(model: string): string | null {
-  const bare = model.slice(model.lastIndexOf("/") + 1);
-  return Object.prototype.hasOwnProperty.call(RETIRED_MODEL_REPLACEMENTS, bare) ? bare : null;
+  const slash = model.lastIndexOf("/");
+  const bare = model.slice(slash + 1);
+  if (!Object.prototype.hasOwnProperty.call(RETIRED_MODEL_REPLACEMENTS, bare)) return null;
+  if (slash !== -1 && !RETIRED_MODEL_QUALIFIERS.has(model.slice(0, slash))) return null;
+  return bare;
 }
 
 /** Rewrite primary + nested fallbacks.  Effort and instanceId stay put —
