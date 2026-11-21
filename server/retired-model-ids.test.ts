@@ -85,6 +85,18 @@ describe("provider-qualified spellings", () => {
     expect(rewriteRetiredModelId("minimax-coding-plan/MiniMax-M3.1-Flash")).toBe("minimax-coding-plan/MiniMax-M3.1-Flash");
     expect(isRetiredModelId("minimax-coding-plan/MiniMax-M3.1-Flash")).toBe(false);
   });
+
+  it("rewrites the DSH engine's provider spelling of a retired id", () => {
+    expect(rewriteRetiredModelId("minimax/MiniMax-M3")).toBe("minimax/MiniMax-M3.1-Flash");
+    expect(isRetiredModelId("minimax/MiniMax-M3")).toBe(true);
+  });
+
+  it("leaves a spelling under an unrelated qualifier alone", () => {
+    // A different route whose trailing segment merely shares the text is
+    // not the retired model: its ids are neither rewritten nor dropped.
+    expect(rewriteRetiredModelId("some-other-route/MiniMax-M3")).toBe("some-other-route/MiniMax-M3");
+    expect(isRetiredModelId("some-other-route/MiniMax-M3")).toBe(false);
+  });
 });
 
 describe("rewriteModelSelection", () => {
