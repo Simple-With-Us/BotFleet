@@ -463,7 +463,13 @@ describe("Store.reconcileModelLineage", () => {
       text: "done",
       modelSelection: { instanceId: "minimax", model: "MiniMax-M3" },
     });
-    reconcile(store);
+    store.reconcileModelLineage({
+      contextFor: (id) =>
+        id === "minimax"
+          ? { driverKind: "minimax", offeredIds: ["MiniMax-M3.1-Flash"], customIds: [], authoritative: true }
+          : lineageContextFor(instance(id)),
+      nameFor: (id, model) => modelNameFor(instance(id)?.models, model),
+    });
 
     const task = store.tasks("b")[0]!;
     // The retired row merged into its successor: totals add, and the
@@ -481,16 +487,46 @@ describe("Store.reconcileModelLineage", () => {
     });
   });
 
-  it("banks a turn reported under a retired id onto the live successor", () => {
-    seedBots([{ id: "b", modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5" } }]);
+  it("keeps a retired-spelling stats row an instance's own custom catalog still offers", () => {
+    seedBots([
+      {
+        id: "b",
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5" },
+        tasks: [
+          // SAFETY: the seed task carries only the fields this test reads;
+          // the Store supplies the rest of TaskRecord on load, the same
+          // reliance as the sibling seeds in this suite.
+          {
+            threadId: "thread-b",
+            title: "Main",
+            createdAt: 1,
+            resumeCursors: {},
+            usageByInstance: {
+              dshCustom: {
+                input: 9,
+                output: 1,
+                costUsd: null,
+                turns: 2,
+                engineId: "dshAgent",
+                byModel: { "MiniMax-M3": { input: 9, output: 1, costUsd: null, turns: 2 } },
+              },
+            },
+          } as never,
+        ],
+      },
+    ]);
     const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
-    store.addTaskUsage("b", "thread-b", { input: 10, output: 3, costUsd: null }, "minimax", {
-      engineId: "minimax",
-      model: "MiniMax-M3",
+    store.reconcileModelLineage({
+      contextFor: (id) =>
+        id === "dshCustom"
+          ? { driverKind: "dshAgent", offeredIds: ["MiniMax-M3"], customIds: ["MiniMax-M3"], authoritative: true }
+          : lineageContextFor(instance(id)),
+      nameFor: (id, model) => modelNameFor(instance(id)?.models, model),
     });
-    const task = store.tasks("b")[0]!;
-    expect(task.usageByInstance!.minimax!.byModel).toEqual({
-      "MiniMax-M3.1-Flash": { input: 10, output: 3, costUsd: null, turns: 1 },
+    // The custom row is the operator's own model on that instance: its
+    // stats row stays under its own spelling, like its selection does.
+    expect(store.tasks("b")[0]!.usageByInstance!.dshCustom!.byModel).toEqual({
+      "MiniMax-M3": { input: 9, output: 1, costUsd: null, turns: 2 },
     });
   });
 
