@@ -1,6 +1,7 @@
 // The load-time model-lineage migration (Store.reconcileModelLineage):
 // owner-directed Latest flags once, retired and superseded ids forward on
-// every pass, one notice per moved bot, and recorded usage left alone.
+// every pass, one notice per moved bot, message rows left alone, and
+// retired per-model usage folded forward.
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -410,6 +411,83 @@ describe("Store.reconcileModelLineage", () => {
     expect(notices(store, store.bot("b")!)[0]!.tool!.name).toBe(
       "Model update: primary Grok 4.5 → Latest Grok (Grok 4.7) (task “Main”)",
     );
+  });
+
+  it("folds banked per-model usage for retired ids onto the live successor, keeping message rows as ran", () => {
+    seedBots([
+      {
+        id: "b",
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5" },
+        roomUsageByInstance: {
+          dsh: {
+            input: 7,
+            output: 0,
+            costUsd: null,
+            turns: 1,
+            engineId: "dshAgent",
+            byModel: { "MiniMax-M3": { input: 7, output: 0, costUsd: null, turns: 1 } },
+          },
+        },
+        tasks: [
+          {
+            threadId: "thread-b",
+            title: "Main",
+            createdAt: 1,
+            resumeCursors: {},
+            usage: { input: 150, output: 15, costUsd: 0.5, turns: 5 },
+            usageByInstance: {
+              minimax: {
+                input: 150,
+                output: 15,
+                costUsd: 0.5,
+                turns: 5,
+                engineId: "minimax",
+                byModel: {
+                  "MiniMax-M3": { input: 100, output: 10, cachedInput: 40, costUsd: 0.5, turns: 3 },
+                  "MiniMax-M3.1-Flash": { input: 50, output: 5, costUsd: null, turns: 2 },
+                },
+              },
+            },
+          } as never,
+        ],
+      },
+    ]);
+    const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
+    const reply = store.appendMessage("thread-b", {
+      role: "bot",
+      kind: "text",
+      text: "done",
+      modelSelection: { instanceId: "minimax", model: "MiniMax-M3" },
+    });
+    reconcile(store);
+
+    const task = store.tasks("b")[0]!;
+    // The retired row merged into its successor: totals add, and the
+    // successor's null cost does not zero the folded row's real cost.
+    expect(task.usageByInstance!.minimax!.byModel).toEqual({
+      "MiniMax-M3.1-Flash": { input: 150, output: 15, cachedInput: 40, costUsd: 0.5, turns: 5 },
+    });
+    expect(store.bot("b")!.roomUsageByInstance!.dsh!.byModel).toEqual({
+      "MiniMax-M3.1-Flash": { input: 7, output: 0, costUsd: null, turns: 1 },
+    });
+    // Message rows are history, not stats: the reply keeps the slug that ran.
+    expect(store.messagesFor("thread-b").find((m) => m.id === reply.id)!.modelSelection).toEqual({
+      instanceId: "minimax",
+      model: "MiniMax-M3",
+    });
+  });
+
+  it("banks a turn reported under a retired id onto the live successor", () => {
+    seedBots([{ id: "b", modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5" } }]);
+    const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
+    store.addTaskUsage("b", "thread-b", { input: 10, output: 3, costUsd: null }, "minimax", {
+      engineId: "minimax",
+      model: "MiniMax-M3",
+    });
+    const task = store.tasks("b")[0]!;
+    expect(task.usageByInstance!.minimax!.byModel).toEqual({
+      "MiniMax-M3.1-Flash": { input: 10, output: 3, costUsd: null, turns: 1 },
+    });
   });
 
   it("drops a fallback the move made identical to the primary but keeps a placeholder", () => {
