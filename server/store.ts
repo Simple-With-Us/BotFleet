@@ -518,13 +518,8 @@ function mergeInstanceUsage(
   const engineId = meta?.engineId ?? prev?.engineId;
   if (engineId) out.engineId = engineId;
   if (meta?.model) {
-    // Bank under the live successor when the turn was reported under a
-    // retired spelling: per-model stats fold retired ids forward (see
-    // reconcileModelLineage), so a retired model never accrues a stats
-    // row of its own again.
-    const bankedModel = rewriteRetiredModelId(meta.model);
     out.byModel = { ...(prev?.byModel ?? {}) };
-    out.byModel[bankedModel] = mergeTaskUsage(prev?.byModel?.[bankedModel], turn);
+    out.byModel[meta.model] = mergeTaskUsage(prev?.byModel?.[meta.model], turn);
   } else if (prev?.byModel) {
     out.byModel = prev.byModel;
   }
@@ -532,14 +527,17 @@ function mergeInstanceUsage(
 }
 
 /** Sum two banked per-model usage rows into one.  Totals add; cost stays
- *  null only while both sides are null (a row that never priced does not
+ *  null only while both sides are unpriced — null, or absent on a row
+ *  written before the field existed (a row that never priced does not
  *  zero one that did); the last-turn markers (lastInput, contextWindow)
  *  keep the surviving row's values, falling back to the folded row's. */
 function sumBankedModelUsage(into: TaskUsage, from: TaskUsage): TaskUsage {
+  const intoCost = into.costUsd ?? null;
+  const fromCost = from.costUsd ?? null;
   const out: TaskUsage = {
     input: into.input + from.input,
     output: into.output + from.output,
-    costUsd: into.costUsd === null && from.costUsd === null ? null : (into.costUsd ?? 0) + (from.costUsd ?? 0),
+    costUsd: intoCost === null && fromCost === null ? null : (intoCost ?? 0) + (fromCost ?? 0),
     turns: into.turns + from.turns,
   };
   if (into.cachedInput !== undefined || from.cachedInput !== undefined) {
@@ -556,12 +554,19 @@ function sumBankedModelUsage(into: TaskUsage, from: TaskUsage): TaskUsage {
 
 /** Fold every retired id's banked row in a per-model breakdown onto its
  *  live successor (retired-model-ids.ts), merging with the successor's
- *  own row when one exists.  Returns whether anything moved. */
-function foldRetiredModelUsage(byModel: Record<string, TaskUsage> | undefined): boolean {
+ *  own row when one exists.  A row the caller's guard claims — an
+ *  instance's own custom catalog row that reuses the retired spelling —
+ *  is left alone, mirroring the selection rewrite's custom skip.
+ *  Returns whether anything moved. */
+function foldRetiredModelUsage(
+  byModel: Record<string, TaskUsage> | undefined,
+  skip?: (model: string) => boolean,
+): boolean {
   if (!byModel) return false;
   let changed = false;
   for (const model of Object.keys(byModel)) {
     if (!isRetiredModelId(model)) continue;
+    if (skip?.(model)) continue;
     const row = byModel[model]!;
     delete byModel[model];
     const successor = rewriteRetiredModelId(model);
@@ -2909,7 +2914,10 @@ export class Store {
    * MiniMax-M3's banked lifetime row kept reading as current use months
    * after the last M3 turn ran (owner ruling, 2026-11-21).  Message
    * rows keep the slug that actually ran, and a superseded-but-not-
-   * retired id keeps its stats row: only the retired map folds.
+   * retired id keeps its stats row: only the retired map folds.  A row
+   * an instance's own custom catalog still offers under the retired
+   * spelling is the operator's own model and keeps its row, exactly as
+   * its selection does.
    *
    * `ownerDirective` also applies the one-time owner-directed flags (every
    * Sonnet and every Luna becomes Latest), gated on a marker file so a
@@ -3032,11 +3040,22 @@ export class Store {
       // Per-model usage stats fold retired ids onto their live successor
       // in the same pass (see the doc comment above): rows banked before
       // a retirement merge forward instead of presenting the retired
-      // model as in use.
+      // model as in use.  The fold honors the selection path's guard: a
+      // row an instance's own custom catalog still offers under the
+      // retired spelling is the operator's own model and keeps its row,
+      // exactly as its selection does.
       for (const task of bot.tasks ?? []) {
-        for (const bucket of Object.values(task.usageByInstance ?? {})) foldRetiredModelUsage(bucket.byModel);
+        for (const [bucketKey, bucket] of Object.entries(task.usageByInstance ?? {})) {
+          // A forked bucket key is `instanceId~engineId`; the lineage
+          // context is keyed by the instance id alone.
+          const instanceId = bucketKey.split("~")[0]!;
+          foldRetiredModelUsage(bucket.byModel, (model) => skipRetired({ instanceId, model }));
+        }
       }
-      for (const bucket of Object.values(bot.roomUsageByInstance ?? {})) foldRetiredModelUsage(bucket.byModel);
+      for (const [bucketKey, bucket] of Object.entries(bot.roomUsageByInstance ?? {})) {
+        const instanceId = bucketKey.split("~")[0]!;
+        foldRetiredModelUsage(bucket.byModel, (model) => skipRetired({ instanceId, model }));
+      }
       if (bot.modelSelection?.instanceId) {
         const saved = bot.modelSelection;
         const next = pass(saved, { botId: bot.id, scope: "bot" });
@@ -3068,7 +3087,7 @@ export class Store {
           task.activeModelSelection = pass(task.activeModelSelection).selection;
         }
       }
-      if (JSON.stringify([bot.modelSelection, bot.activeModelSelection, bot.tasks]) === before) continue;
+      if (JSON.stringify([bot.modelSelection, bot.activeModelSelection, bot.tasks, bot.roomUsageByInstance]) === before) continue;
       dirty = true;
       const notice = notices.length ? notices.join(" · ") : null;
       if (notice) {
