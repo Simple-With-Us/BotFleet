@@ -536,21 +536,22 @@ function mergeInstanceUsage(
  *  zero one that did); the last-turn markers (lastInput, contextWindow)
  *  keep the surviving row's values, falling back to the folded row's. */
 function sumBankedModelUsage(into: TaskUsage, from: TaskUsage): TaskUsage {
-  return {
+  const out: TaskUsage = {
     input: into.input + from.input,
     output: into.output + from.output,
-    ...(into.cachedInput !== undefined || from.cachedInput !== undefined
-      ? { cachedInput: (into.cachedInput ?? 0) + (from.cachedInput ?? 0) }
-      : {}),
     costUsd: into.costUsd === null && from.costUsd === null ? null : (into.costUsd ?? 0) + (from.costUsd ?? 0),
     turns: into.turns + from.turns,
-    ...(into.lastInput !== undefined || from.lastInput !== undefined
-      ? { lastInput: into.lastInput ?? from.lastInput }
-      : {}),
-    ...(into.contextWindow !== undefined || from.contextWindow !== undefined
-      ? { contextWindow: into.contextWindow ?? from.contextWindow }
-      : {}),
   };
+  if (into.cachedInput !== undefined || from.cachedInput !== undefined) {
+    out.cachedInput = (into.cachedInput ?? 0) + (from.cachedInput ?? 0);
+  }
+  if (into.lastInput !== undefined || from.lastInput !== undefined) {
+    out.lastInput = into.lastInput ?? from.lastInput;
+  }
+  if (into.contextWindow !== undefined || from.contextWindow !== undefined) {
+    out.contextWindow = into.contextWindow ?? from.contextWindow;
+  }
+  return out;
 }
 
 /** Fold every retired id's banked row in a per-model breakdown onto its
