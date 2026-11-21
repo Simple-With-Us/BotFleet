@@ -21,6 +21,14 @@ describe("the dedicated webhook public URL", () => {
     expect(webhookPublicIngressUrl({ ingress: { webhookPublicUrl: "http://agents.jays.services" } })).toBeNull();
   });
 
+  it("trims whitespace and strips trailing slashes so credential paths never get a double slash", () => {
+    expect(
+      webhookPublicIngressUrl({
+        ingress: { webhookPublicUrl: "  https://hooks.example.com/  " },
+      }),
+    ).toBe("https://hooks.example.com");
+  });
+
   it("webhookPublicIngressUrlEffective falls back to publicUrl when the dedicated URL is switched off", () => {
     expect(
       webhookPublicIngressUrlEffective({
