@@ -76,6 +76,13 @@ test("per-area outputs gate the expensive jobs on the paths that actually affect
     macAppChanged: false,
     packagingChanged: false,
   });
+  assert.deepEqual(classifyCIPaths(["ios/App/BotFleetApp.swift", "server/index.ts"]), {
+    changedCount: 2,
+    docsOnly: false,
+    iosChanged: true,
+    macAppChanged: false,
+    packagingChanged: false,
+  });
   assert.deepEqual(classifyCIPaths(["ios/MacApp/BotFleetMacApp.swift", "server/index.ts"]), {
     changedCount: 2,
     docsOnly: false,
@@ -537,4 +544,25 @@ test("a documentation-only change still runs the effort ledger guard", () => {
     "the guard runs after the scope outputs are written",
   );
   assert.equal(classifyCIPaths(["docs/EFFORT-LOG.md"]).docsOnly, true);
+});
+
+
+test("Mac composition inputs include its package, resources and CI proof without iOS-only app views", () => {
+  for (const path of [
+    "ios/MacApp/BotFleetMacApp.swift", "ios/MacUpdater/NativeMacUpdater.swift",
+    "ios/Assets.xcassets/AppIcon.appiconset/Contents.json",
+    "ios/Sources/CompanionCore/NativeHeadlessHostInstaller.swift",
+    "ios/Package.swift", "ios/Package.resolved",
+    "ios/BotFleet.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+    "ios/project.yml", ".github/workflows/ci.yml", "scripts/ci-change-scope.mjs",
+    "scripts/ci-scope-diff.sh", "scripts/ios-assert-xcode.sh", "scripts/ios-install-xcodegen.sh",
+    "scripts/ios-xcodegen-post.sh",
+  ]) assert.equal(isMacAppPath(path), true, path);
+  for (const path of ["ios/App/BotFleetApp.swift", "ios/Widgets/BotFleetWidgets.swift", "server/index.ts"])
+    assert.equal(isMacAppPath(path), false, path);
+  const project = parse(readFileSync(join(ROOT, "ios/project.yml"), "utf8"));
+  for (const entry of project.targets.BotFleetMac.sources)
+    assert.equal(isMacAppPath(`ios/${entry.path}/fixture.swift`), true, entry.path);
+  assert.ok(project.targets.BotFleetMac.dependencies.some((entry) => entry.package === "CompanionCore"));
+  assert.equal(isMacAppPath("ios/Sources/CompanionCore/fixture.swift"), true);
 });

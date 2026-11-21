@@ -68,8 +68,15 @@ export function isMacAppPath(path) {
   return (
     path.startsWith("ios/MacApp/") ||
     path.startsWith("ios/MacUpdater/") ||
+    path.startsWith("ios/Assets.xcassets/") ||
+    path.startsWith("ios/Sources/CompanionCore/") ||
+    path === "ios/Package.swift" ||
+    (path.startsWith("ios/") && path.endsWith("/Package.resolved")) ||
     path === "ios/project.yml" ||
-    path === "scripts/ci-change-scope.mjs"
+    path === "scripts/ci-change-scope.mjs" ||
+    path === "scripts/ci-scope-diff.sh" ||
+    path === ".github/workflows/ci.yml" ||
+    path.startsWith("scripts/ios-")
   );
 }
 
