@@ -47,7 +47,7 @@ import {
 } from "../shared/model-lineage.ts";
 import { mergeTaskStats, type TurnStatsSample } from "./turn-stats.ts";
 import { customModelSkip } from "./model-lineage.ts";
-import { rewriteModelSelection } from "./retired-model-ids.ts";
+import { isRetiredModelId, rewriteModelSelection, rewriteRetiredModelId } from "./retired-model-ids.ts";
 import { automationRolloverSeedText } from "./automation-rollover.ts";
 import type { ToolPolicy } from "./tool-policy.ts";
 
@@ -518,12 +518,57 @@ function mergeInstanceUsage(
   const engineId = meta?.engineId ?? prev?.engineId;
   if (engineId) out.engineId = engineId;
   if (meta?.model) {
+    // Bank under the live successor when the turn was reported under a
+    // retired spelling: per-model stats fold retired ids forward (see
+    // reconcileModelLineage), so a retired model never accrues a stats
+    // row of its own again.
+    const bankedModel = rewriteRetiredModelId(meta.model);
     out.byModel = { ...(prev?.byModel ?? {}) };
-    out.byModel[meta.model] = mergeTaskUsage(prev?.byModel?.[meta.model], turn);
+    out.byModel[bankedModel] = mergeTaskUsage(prev?.byModel?.[bankedModel], turn);
   } else if (prev?.byModel) {
     out.byModel = prev.byModel;
   }
   return out;
+}
+
+/** Sum two banked per-model usage rows into one.  Totals add; cost stays
+ *  null only while both sides are null (a row that never priced does not
+ *  zero one that did); the last-turn markers (lastInput, contextWindow)
+ *  keep the surviving row's values, falling back to the folded row's. */
+function sumBankedModelUsage(into: TaskUsage, from: TaskUsage): TaskUsage {
+  return {
+    input: into.input + from.input,
+    output: into.output + from.output,
+    ...(into.cachedInput !== undefined || from.cachedInput !== undefined
+      ? { cachedInput: (into.cachedInput ?? 0) + (from.cachedInput ?? 0) }
+      : {}),
+    costUsd: into.costUsd === null && from.costUsd === null ? null : (into.costUsd ?? 0) + (from.costUsd ?? 0),
+    turns: into.turns + from.turns,
+    ...(into.lastInput !== undefined || from.lastInput !== undefined
+      ? { lastInput: into.lastInput ?? from.lastInput }
+      : {}),
+    ...(into.contextWindow !== undefined || from.contextWindow !== undefined
+      ? { contextWindow: into.contextWindow ?? from.contextWindow }
+      : {}),
+  };
+}
+
+/** Fold every retired id's banked row in a per-model breakdown onto its
+ *  live successor (retired-model-ids.ts), merging with the successor's
+ *  own row when one exists.  Returns whether anything moved. */
+function foldRetiredModelUsage(byModel: Record<string, TaskUsage> | undefined): boolean {
+  if (!byModel) return false;
+  let changed = false;
+  for (const model of Object.keys(byModel)) {
+    if (!isRetiredModelId(model)) continue;
+    const row = byModel[model]!;
+    delete byModel[model];
+    const successor = rewriteRetiredModelId(model);
+    const existing = byModel[successor];
+    byModel[successor] = existing ? sumBankedModelUsage(existing, row) : row;
+    changed = true;
+  }
+  return changed;
 }
 
 /** Everything the BOT authored is scrubbed of content-shaped secrets before
@@ -2856,9 +2901,14 @@ export class Store {
    * every task's modelSelection and activeModelSelection: retired ids onto
    * the newest member of their successor class, "Latest <Class>" entries
    * onto the newest member the instance offers, and pinned older members
-   * forward when the price band allows.  Only saved SELECTIONS move.
-   * Message rows, usage buckets, and per-model stats keep the slug that
-   * actually ran — the owner's no-aliasing rule.
+   * forward when the price band allows.  Saved SELECTIONS move, and the
+   * per-model usage stats fold too: a row banked under a retired id
+   * (retired-model-ids.ts) merges onto its live successor in the same
+   * pass, so a model the product retired never presents as in use —
+   * MiniMax-M3's banked lifetime row kept reading as current use months
+   * after the last M3 turn ran (owner ruling, 2026-11-21).  Message
+   * rows keep the slug that actually ran, and a superseded-but-not-
+   * retired id keeps its stats row: only the retired map folds.
    *
    * `ownerDirective` also applies the one-time owner-directed flags (every
    * Sonnet and every Luna becomes Latest), gated on a marker file so a
@@ -2976,8 +3026,16 @@ export class Store {
       if (wanted && !wanted.has(bot.id)) continue;
       if (opts.skipBusy && bot.busy) continue;
       visited.add(bot.id);
-      const before = JSON.stringify([bot.modelSelection, bot.activeModelSelection, bot.tasks]);
+      const before = JSON.stringify([bot.modelSelection, bot.activeModelSelection, bot.tasks, bot.roomUsageByInstance]);
       const notices: string[] = [];
+      // Per-model usage stats fold retired ids onto their live successor
+      // in the same pass (see the doc comment above): rows banked before
+      // a retirement merge forward instead of presenting the retired
+      // model as in use.
+      for (const task of bot.tasks ?? []) {
+        for (const bucket of Object.values(task.usageByInstance ?? {})) foldRetiredModelUsage(bucket.byModel);
+      }
+      for (const bucket of Object.values(bot.roomUsageByInstance ?? {})) foldRetiredModelUsage(bucket.byModel);
       if (bot.modelSelection?.instanceId) {
         const saved = bot.modelSelection;
         const next = pass(saved, { botId: bot.id, scope: "bot" });
