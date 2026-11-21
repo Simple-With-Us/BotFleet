@@ -1,3 +1,4 @@
+#if os(macOS)
 import Foundation
 
 /// Pure byte-level parser for the artifact stamp a packaged native host carries in its
@@ -299,7 +300,6 @@ enum NativeHostMachOStampParsing {
     }
 }
 
-#if os(macOS)
 import Darwin
 
 /// The production stamp reader.  It opens the configured target executable itself, on a
@@ -364,7 +364,9 @@ public struct MachONativeHostStampReader: NativeHostStampReading {
         var buffer = [UInt8](repeating: 0, count: 1 << 16)
         while data.count < expectedSize {
             let wanted = min(buffer.count, expectedSize - data.count)
-            let count = Darwin.read(fd, &buffer, wanted)
+            let count = buffer.withUnsafeMutableBytes { rawBuffer in
+                Darwin.read(fd, rawBuffer.baseAddress, wanted)
+            }
             if count > 0 {
                 data.append(contentsOf: buffer[..<count])
             } else if count < 0, errno == EINTR {
