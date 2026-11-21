@@ -11768,6 +11768,9 @@ function configStatus() {
       // Absent flag means on; the toggle is opt-out so a config written by
       // an older build keeps applying its URL.
       enabled: cfg.ingress?.enabled !== false,
+      webhookPublicUrl: cfg.ingress?.webhookPublicUrl || "",
+      // Same opt-out shape as the remote URL toggle above.
+      webhookEnabled: cfg.ingress?.webhookEnabled !== false,
     },
     localVm: {
       mode: cfg.localVm?.mode ?? "shared",
@@ -19200,17 +19203,17 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const keys = stsKeyStatus((candidate) => stsProviderCredential(candidate));
       const refusal = stsUnavailableReason(provider, keys);
       if (refusal) return json(res, refusal.status, { error: refusal.error });
-      const apiKey = stsProviderCredential(provider);
+      const providerAuth = stsProviderCredential(provider);
       // SAFETY: `stsUnavailableReason` returned null, which only happens when
       // `keys[provider]` was true, so this read is a non-empty string.
-      if (!apiKey) return json(res, 503, { error: "Could not read the voice provider key on this computer." });
+      if (!providerAuth) return json(res, 503, { error: "Could not read the voice provider key on this computer." });
       // Each mint is a real call to a paid vendor endpoint.  An unthrottled
       // loop from a paired device would spend someone's quota.
       if (!stsMints.take(provider)) {
         return json(res, 429, { error: "Wait a moment before asking for another call token." });
       }
       try {
-        const minted = await mintStsToken(provider, apiKey);
+        const minted = await mintStsToken(provider, providerAuth);
         telemetry.trackAux(stsSessionTelemetry(provider));
         return json(res, 200, minted);
       } catch (error) {

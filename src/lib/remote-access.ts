@@ -17,6 +17,7 @@ const REMOTE_URL_PATTERN = /^https?:\/\/[^\s/?#]+(?:[/?#][^\s]*)?$/i;
 
 export const REMOTE_ACCESS_HEADING = "Remote Access";
 export const REMOTE_URL_LABEL = "Remote URL";
+export const WEBHOOK_PUBLIC_URL_LABEL = "Webhook Public URL";
 export const REMOTE_ACCESS_BLURB =
   "Opens BotFleet on this Mac at the address below, through the tunnel this Mac is configured to use.  " +
   "Sign in with whatever your tunnel puts in front of it.  The health check stays public.";
