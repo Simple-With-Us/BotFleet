@@ -17,7 +17,8 @@ name: Auto-merge PRs
 # The sweep is the fallback for every eventless transition: check-run
 # completion, a settled autofix run, or a Kody review that arrived without
 # re-triggering this workflow (Dependabot events additionally carry no
-# secrets).  On schedule it lists every open non-draft SAME-REPO PR
+# secrets).  On schedule it lists every open non-draft (or armed draft)
+# SAME-REPO PR
 # (paginated) and re-classifies each through the reusable's existing
 # rearm_pr_number mode - every gate runs identically (current-head checks,
 # review gate, holds incl. the timeline gate, draft), so an idle mergeable
@@ -95,6 +96,10 @@ jobs:
           off="${SWEEP_OFFSET:-$(( $(date +%s) / 900 ))}"
           pages="$(gh api --paginate "repos/$REPO/pulls?state=open&per_page=100")"
           [ -n "$pages" ] || { echo "::error::PR list fetch returned no data"; exit 1; }
+          # Drafts that still carry an armed auto-merge are included so the
+          # reusable's rearm classifier (skip "rearm PR is a draft") runs its
+          # disarm job; GitHub keeps auto-merge armed through a draft
+          # conversion, and no pull_request event remains to disarm it.
           # Same-repo, non-draft only (fork PRs stay excluded by the
           # reusable's own same-repo rule).  Per-tick fan-out cap: a sweep
           # re-arms at most 50 PRs per tick, well under the 256-job matrix
@@ -103,7 +108,7 @@ jobs:
           # behind the first page across successive clock ticks. Scheduled runs
           # can be delayed or dropped, so there is no hard full-pass time bound.
           prs="$(printf '%s' "$pages" | jq -sc --arg repo "$REPO" --argjson off "$off" '
-            [ .[][] | select((.draft | not) and .head.repo.full_name == $repo) | .number ]
+            [ .[][] | select(((.draft | not) or .auto_merge != null) and .head.repo.full_name == $repo) | .number ]
             | sort
             | . as $all
             | ($all | length) as $n
