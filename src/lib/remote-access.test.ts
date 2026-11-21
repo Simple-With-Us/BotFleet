@@ -103,11 +103,15 @@ describe("Remote Access copy", () => {
     // opens keeps the full "Remote Access" heading.
     expect(nav).toContain('label: "Remote"');
     expect(nav).not.toContain('label: "Remote Access"');
-    expect(settings).toContain('<RemoteAccessSection configuredUrl={remoteAccessUrl} highlightClass={highlightClass} />');
-    expect(settings).toContain('section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} highlightClass={highlightClass} />');
+    expect(settings).toContain('<RemoteAccessSection configuredUrl={remoteAccessUrl} webhookUrl={remoteAccessWebhookUrl} highlightClass={highlightClass} />');
+    expect(settings).toContain('section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} webhookUrl={remoteAccessWebhookUrl} highlightClass={highlightClass} />');
     // The address is the saved per-install one, read from the config the
-    // harness already publishes — not a constant.
+    // harness already publishes — not a constant.  The dedicated webhook
+    // base is the same: it renders only from the saved config, gated by its
+    // own toggle.
     expect(settings).toContain("ingress?.publicUrl");
+    expect(settings).toContain("ingress?.webhookPublicUrl");
+    expect(settings).toContain("ingress?.webhookEnabled === false ? null");
   });
 
   it("shows Companion Gateway on the Phone section, not mixed into Remote Access", () => {

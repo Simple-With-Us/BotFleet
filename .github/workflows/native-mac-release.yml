@@ -75,7 +75,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       # The shared planner consults App Store Connect, so this job loads
-      # the ASC key with INFISICAL_NATIVE_RELEASE_READ_TOKEN (BF-2588).
+      # the ASC key with the Infisical read token (BF-2588).
       - name: Load the App Store Connect credentials
         uses: ./.github/actions/infisical-secrets
         with:
@@ -83,6 +83,12 @@ jobs:
           required: APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
           token: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
+          # The read token is scoped to prod /botfleet-server, and the ASC trio now lives in that
+          # same folder (synced from prod root, which is the copy ios-ship reads with its own
+          # token), so the fetch names the folder.  Infisical stays the authoritative source:  no
+          # GitHub fallback for signing material, because a fallback would silently prefer a
+          # possibly-stale value over the vault for exactly the credentials that sign releases.
+          secret-path: /botfleet-server
       - id: pin
         run: |
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -119,14 +125,23 @@ jobs:
   mac-native:
     name: BotFleetMac (sign, notarize, staple)
     needs: prepare
-    runs-on: macos-26
+    # The ios package requires Swift tools 6.4 (Xcode 27), the same requirement ci.yml's iOS job
+    # declares (runs-on: xcode-27 there);  the macos-26 image ships Swift 6.3.3 and cannot archive
+    # a 6.4 package.  DEVELOPER_DIR pins stable Xcode 27.0 — the image also carries 27.x betas,
+    # which App Store review rejects — and the first build step asserts the version exactly the
+    # way ci.yml and ios-ship.yml do.
+    runs-on: xcode-27
     timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Assert the pinned Xcode
+        run: bash scripts/ios-assert-xcode.sh 27.0
       - name: Refuse a beta Xcode
         run: |
           xcodebuild -version
@@ -233,10 +248,11 @@ jobs:
           required: APPLE_API_KEY_P8_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER_ID
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
           token: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
-        env:
-          GH_FALLBACK_APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
-          GH_FALLBACK_APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          GH_FALLBACK_APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          # The notarization step must use the same credentials the pin and signing steps use:  the
+          # trio lives at prod /botfleet-server (synced from root), the read token covers exactly
+          # that folder, and naming it keeps prepare and notarize on one authoritative source with
+          # no GitHub fallback for signing material.
+          secret-path: /botfleet-server
       - name: Notarize and staple the app
         env:
           APPLE_API_KEY_P8_BASE64: ${{ env.APPLE_API_KEY_P8_BASE64 }}
@@ -306,6 +322,12 @@ jobs:
           required: ${{ !inputs.unsigned-draft && 'SPARKLE_EDDSA_PRIVATE_KEY_B64' || '' }}
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
           token: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
+          # The signing key lives at prod /botfleet-server (the folder the owner gate reads), and
+          # INFISICAL_NATIVE_RELEASE_READ_TOKEN is a read-only service token scoped to exactly that
+          # path, so this step — the one step whose secret has no GitHub fallback — names the folder
+          # it fetches from.  The other steps read prod root and resolve through their
+          # same-named GitHub fallback values when the token's scope does not reach them.
+          secret-path: /botfleet-server
       - name: Generate and verify the appcast over the final bytes
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -318,25 +340,67 @@ jobs:
           if [ -n "${SPARKLE_EDDSA_PRIVATE_KEY_B64:-}" ]; then
             # sign_update is NOT part of the macOS runner image, so without
             # this install the signing branch can never run and a
-            # provisioned key would still produce an unsigned feed.  The
-            # install is best effort, but a key with no tool is a hard
-            # error: an unsigned appcast that looks signed is the failure
-            # this pipeline exists to prevent.
-            brew install sparkle || echo "::warning::brew install sparkle failed"
-            sparkle_bin="$(brew --prefix 2>/dev/null)/bin"
-            if [ -x "$sparkle_bin/sign_update" ]; then
-              echo "$sparkle_bin" >> "$GITHUB_PATH"
-              export PATH="$sparkle_bin:$PATH"
-            fi
+            # provisioned key would still produce an unsigned feed.  brew's
+            # sparkle cask has been disabled (Gatekeeper, 2026-09-01), so the
+            # signer comes from Sparkle's own pinned 2.10.1 release — the
+            # version this repo already pins in NOTICE — with the archive
+            # hash checked before anything runs.  A key with no working
+            # signer is a hard error: an unsigned appcast that looks signed
+            # is the failure this pipeline exists to prevent.
+            curl -fsSL -o "$RUNNER_TEMP/sparkle.tar.xz" \
+              "https://github.com/sparkle-project/Sparkle/releases/download/2.10.1/Sparkle-2.10.1.tar.xz"
+            echo "1a856d2a9edb8e628de88121d7be04cf0e2167f8641650b78fca00b14244cf27  $RUNNER_TEMP/sparkle.tar.xz" | shasum -a 256 --check --status || {
+              echo "::error::the Sparkle 2.10.1 archive failed its sha256 check"; exit 1; }
+            tar -xf "$RUNNER_TEMP/sparkle.tar.xz" -C "$RUNNER_TEMP"
+            sparkle_bin="$RUNNER_TEMP/bin"
+            test -x "$sparkle_bin/sign_update" || {
+              echo "::error::sign_update missing from the Sparkle archive"; exit 1; }
+            echo "$sparkle_bin" >> "$GITHUB_PATH"
+            export PATH="$sparkle_bin:$PATH"
             command -v sign_update > /dev/null || {
               echo "::error::sign_update is not installed; cannot sign the appcast"; exit 1; }
             key="$RUNNER_TEMP/sparkle-ed-key"
-            echo "$SPARKLE_EDDSA_PRIVATE_KEY_B64" | base64 --decode > "$key"
-            signature=$(sign_update --ed-key-file "$key" "$zip" | sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p')
-            test -n "$signature" || { echo "::error::sign_update produced no signature"; exit 1; }
+            keyraw="$RUNNER_TEMP/sparkle-ed-key.raw"
+            old_umask=$(umask)
+            # sign_update reads the key file as a UTF-8 string of the base64 key text (the format
+            # generate_keys writes), not as decoded raw bytes.  This round runs both interpretations
+            # on the live dispatch to learn which one Sparkle 2.10.1 accepts;  both key files are
+            # created owner-only and an EXIT trap removes them and restores the umask on every path
+            # out of this step.
+            cleanup_keys() {
+              rm -f "$key" "$keyraw" "$RUNNER_TEMP/su-text.txt" "$RUNNER_TEMP/su-raw.txt"
+              umask "$old_umask"
+            }
+            trap cleanup_keys EXIT
+            umask 077
+            printf '%s' "$SPARKLE_EDDSA_PRIVATE_KEY_B64" > "$key"
+            printf '%s' "$SPARKLE_EDDSA_PRIVATE_KEY_B64" | base64 --decode > "$keyraw"
+            set -x
+            "$sparkle_bin/sign_update" --ed-key-file "$key" "$zip" > "$RUNNER_TEMP/su-text.txt" 2>&1 || echo "text-format attempt exited $?"
+            "$sparkle_bin/sign_update" --ed-key-file "$keyraw" "$zip" > "$RUNNER_TEMP/su-raw.txt" 2>&1 || echo "raw-format attempt exited $?"
+            set +x
+            sig_text=$(sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p' "$RUNNER_TEMP/su-text.txt")
+            sig_raw=$(sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p' "$RUNNER_TEMP/su-raw.txt")
+            # Both signer responses may contain diagnostic key material. Never
+            # publish either response body; only fixed labels and digests leave here.
+            # Signature extraction above is consumed as the output artifact, not logged.
+            echo "--- text-format attempt digest ---"
+            shasum -a 256 "$RUNNER_TEMP/su-text.txt"
+            echo "--- raw-format attempt digest ---"
+            shasum -a 256 "$RUNNER_TEMP/su-raw.txt"
+            if [ -n "$sig_text" ]; then
+              fmt="text"
+              signature="$sig_text"
+            elif [ -n "$sig_raw" ]; then
+              fmt="raw"
+              signature="$sig_raw"
+            else
+              fmt="none"
+              signature=""
+            fi
+            test -n "$signature" || { echo "::error::sign_update produced no signature in either key format (fmt: $fmt)"; exit 1; }
             printf '%s' "$signature" > "$zip.edsig"
-            rm "$key"
-            echo "Sparkle update signed"
+            echo "Sparkle update signed (format: $fmt)"
           else
             test "$UNSIGNED_DRAFT" = true || { echo "::error::trusted artifacts require Sparkle signing"; exit 1; }
             echo "::warning::UNVERIFIED DRAFT: not activatable and cannot be attached to a release"

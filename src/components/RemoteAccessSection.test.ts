@@ -16,6 +16,7 @@ import {
   REMOTE_ACCESS_UNCONFIGURED_BLURB,
   REMOTE_URL_LABEL,
   sentenceGapHtml,
+  WEBHOOK_PUBLIC_URL_LABEL,
 } from "@/lib/remote-access";
 
 /** A host only this install would ever configure. */
@@ -44,6 +45,19 @@ describe("RemoteAccessSection", () => {
       }));
       expect(html).toContain('id="setting-remote-access"');
       expect(html).toContain("search-focus-ring");
+    }
+  });
+
+  it("shows the dedicated Webhook Public URL only when it is https and distinct from the Remote URL", () => {
+    const WEBHOOK = "https://hooks.this-install.example.test";
+    const shown = renderToStaticMarkup(createElement(RemoteAccessSection, { configuredUrl: CONFIGURED, webhookUrl: WEBHOOK }));
+    expect(shown).toContain(WEBHOOK_PUBLIC_URL_LABEL);
+    expect(shown).toContain(WEBHOOK);
+    // Plain-http is one the server ignores (it would leak the path secret),
+    // and a duplicate of the Remote URL is a second row repeating the first.
+    for (const webhookUrl of ["http://hooks.this-install.example.test", CONFIGURED, `${CONFIGURED}/`]) {
+      const html = renderToStaticMarkup(createElement(RemoteAccessSection, { configuredUrl: CONFIGURED, webhookUrl }));
+      expect(html).not.toContain(WEBHOOK_PUBLIC_URL_LABEL);
     }
   });
 
