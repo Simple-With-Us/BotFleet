@@ -29,6 +29,7 @@ jobs:
     outputs:
       docs_only: ${{ steps.scope.outputs.docs_only }}
       ios_changed: ${{ steps.scope.outputs.ios_changed }}
+      mac_app_changed: ${{ steps.scope.outputs.mac_app_changed }}
       packaging_changed: ${{ steps.scope.outputs.packaging_changed }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -53,6 +54,7 @@ jobs:
               echo "docs_only=false"
               echo "changed_count=0"
               echo "ios_changed=true"
+              echo "mac_app_changed=true"
               echo "packaging_changed=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
@@ -74,6 +76,7 @@ jobs:
               echo "docs_only=false"
               echo "changed_count=0"
               echo "ios_changed=true"
+              echo "mac_app_changed=true"
               echo "packaging_changed=true"
             } >> "$GITHUB_OUTPUT"
           fi
@@ -252,6 +255,47 @@ jobs:
             artifacts/ios-tvface-preview.png
           retention-days: 7
           if-no-files-found: ignore
+
+
+  # BF-2628:  the native Mac app's composition is compiled here so a wiring
+  # mistake fails this job instead of surfacing on a release build.  It is
+  # deliberately NOT a ruleset context and nothing `needs` it:  until the
+  # scheme has a green history, a first-run failure must not block merges.
+  mac-native-build:
+    name: Mac app composition build (xcode-27, unsigned)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.mac_app_changed == 'true' }}
+    runs-on: xcode-27
+    timeout-minutes: 25
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Assert stable Xcode 27.0
+        run: bash scripts/ios-assert-xcode.sh 27.0
+      - name: Restore Mac composition build cache
+        uses: actions/cache@v4
+        with:
+          path: ios/.derived-data-mac
+          key: mac-composition-${{ runner.os }}-xcode27-${{ hashFiles('ios/project.yml', 'ios/**/Package.resolved', 'ios/**/*.swift', 'ios/**/*.plist') }}
+          restore-keys: |
+            mac-composition-${{ runner.os }}-xcode27-
+      - name: Generate the Xcode project
+        run: |
+          bash scripts/ios-install-xcodegen.sh
+          cd ios
+          xcodegen generate
+      - name: Build the Mac app (unsigned)
+        run: |
+          cd ios
+          xcodebuild \
+            -project BotFleet.xcodeproj \
+            -scheme BotFleetMac \
+            -derivedDataPath .derived-data-mac \
+            -destination 'generic/platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
 
 
   ios:

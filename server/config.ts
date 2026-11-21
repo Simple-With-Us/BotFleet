@@ -548,6 +548,11 @@ const appConfigSchema = z.object({
      * for the next time the toggle is flipped on, but the webhook receiver
      * does not advertise it. */
     enabled: z.boolean().optional(),
+    /** Whether the dedicated webhook URL is applied. Off keeps the stored
+     * URL on disk, but the advertised webhook base falls back to
+     * `publicUrl` (and then to the local receiver), the same way an unset
+     * `webhookPublicUrl` behaves. */
+    webhookEnabled: z.boolean().optional(),
   }).optional(),
   localVm: localVmConfigSchema.optional(),
   qdrant: z.object({
@@ -858,7 +863,7 @@ export interface AppConfig {
     allowedSenders?: string[];
     allowVoiceByDefault?: boolean;
   };
-  ingress?: { publicUrl?: string; enabled?: boolean; webhookPublicUrl?: string };
+  ingress?: { publicUrl?: string; enabled?: boolean; webhookPublicUrl?: string; webhookEnabled?: boolean };
   /** The Zulip source (docs/zulip.md, server/zulip/types.ts). */
   zulip?: import("./zulip/types.ts").ZulipSettings;
   /** Shared preserves the historical singleton. Per-bot gives every bot a
@@ -1087,6 +1092,10 @@ export function parseConfigPatch(value: JsonValue): ConfigPatch {
   if (ingestUrl !== undefined && ingestUrl.trim() && !isAbsoluteHttpUrl(ingestUrl)) {
     throw Object.assign(new Error("usage.ingestUrl must be an absolute http(s) URL"), { status: 400 });
   }
+  const webhookPublicUrl = rest.ingress?.webhookPublicUrl;
+  if (webhookPublicUrl !== undefined && webhookPublicUrl.trim() && !isHttpsUrl(webhookPublicUrl)) {
+    throw Object.assign(new Error("ingress.webhookPublicUrl must be an absolute https:// URL"), { status: 400 });
+  }
   // An empty or whitespace DSN is the documented "clear the stored key"
   // path, so it passes; anything else has to be a real DSN.
   const sentryDsn = rest.observability?.sentryDsn;
@@ -1183,7 +1192,9 @@ export function publicIngressUrl(cfg: AppConfig): string | null {
 
 export function webhookPublicIngressUrl(cfg: AppConfig): string | null {
   const dedicated = cfg.ingress?.webhookPublicUrl?.trim();
-  const raw = dedicated && isAbsoluteHttpUrl(dedicated) ? dedicated : cfg.ingress?.publicUrl?.trim();
+  // The dedicated URL is preferred only over https: the capability secret
+  // rides in the path, so a plain-http override would leak it.
+  const raw = dedicated && isHttpsUrl(dedicated) ? dedicated : cfg.ingress?.publicUrl?.trim();
   return raw && isAbsoluteHttpUrl(raw) ? raw.replace(/\/+$/, "") : null;
 }
 
@@ -1199,6 +1210,9 @@ export function publicIngressUrlEffective(cfg: AppConfig): string | null {
 
 export function webhookPublicIngressUrlEffective(cfg: AppConfig): string | null {
   if (cfg.ingress?.enabled === false) return null;
+  // A switched-off dedicated URL stays on disk but stops overriding the
+  // advertised base, which falls back to the general public URL.
+  if (cfg.ingress?.webhookEnabled === false) return publicIngressUrl(cfg);
   return webhookPublicIngressUrl(cfg);
 }
 

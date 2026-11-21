@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
 
-import { classifyCIPaths, isIosPath, isPackagingPath } from "./ci-change-scope.mjs";
+import { classifyCIPaths, isIosPath, isMacAppPath, isPackagingPath } from "./ci-change-scope.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -16,6 +16,7 @@ test("only the explicit non-executable documentation paths take the fast path", 
     changedCount: 2,
     docsOnly: true,
     iosChanged: false,
+    macAppChanged: false,
     packagingChanged: false,
   });
   assert.equal(classifyCIPaths(["README.md", "SECURITY.md"]).docsOnly, true);
@@ -72,14 +73,25 @@ test("per-area outputs gate the expensive jobs on the paths that actually affect
     changedCount: 1,
     docsOnly: false,
     iosChanged: false,
+    macAppChanged: false,
     packagingChanged: false,
   });
   assert.deepEqual(classifyCIPaths(["ios/App/BotFleetApp.swift", "server/index.ts"]), {
     changedCount: 2,
     docsOnly: false,
     iosChanged: true,
+    macAppChanged: false,
     packagingChanged: false,
   });
+  assert.deepEqual(classifyCIPaths(["ios/MacApp/BotFleetMacApp.swift", "server/index.ts"]), {
+    changedCount: 2,
+    docsOnly: false,
+    iosChanged: true,
+    macAppChanged: true,
+    packagingChanged: false,
+  });
+  assert.equal(isMacAppPath("ios/MacUpdater/NativeMacUpdater.swift"), true);
+  assert.equal(isMacAppPath("server/index.ts"), false);
 
   // No signal (an empty list, the same fallback the workflow's schedule,
   // dispatch, and missing-base-SHA branches use directly) runs every area,
@@ -88,6 +100,7 @@ test("per-area outputs gate the expensive jobs on the paths that actually affect
     changedCount: 0,
     docsOnly: false,
     iosChanged: true,
+    macAppChanged: true,
     packagingChanged: true,
   });
 });
@@ -103,7 +116,7 @@ test("the CLI emits only GitHub outputs for a NUL-delimited path list", () => {
   assert.equal(result.stderr, "");
   assert.equal(
     result.stdout,
-    "docs_only=true\nchanged_count=2\nios_changed=false\npackaging_changed=false\n",
+    "docs_only=true\nchanged_count=2\nios_changed=false\nmac_app_changed=false\npackaging_changed=false\n",
   );
 });
 
@@ -222,7 +235,7 @@ test("no Linux packaging job remains in ci.yml (BF-2500 clean break)", () => {
   assert.equal(workflow.jobs.test.steps.some((step) => /_changed/.test(step.if ?? "")), false);
 
   const classifier = workflow.jobs.changes.steps.find((step) => step.id === "scope");
-  for (const output of ["ios_changed", "packaging_changed"]) {
+  for (const output of ["ios_changed", "mac_app_changed", "packaging_changed"]) {
     assert.equal(workflow.jobs.changes.outputs[output], `\${{ steps.scope.outputs.${output} }}`);
     // Scheduled/dispatched runs and an unresolvable base SHA both fall back
     // to the full gate -- every area reported changed, not skipped.
@@ -531,4 +544,25 @@ test("a documentation-only change still runs the effort ledger guard", () => {
     "the guard runs after the scope outputs are written",
   );
   assert.equal(classifyCIPaths(["docs/EFFORT-LOG.md"]).docsOnly, true);
+});
+
+
+test("Mac composition inputs include its package, resources and CI proof without iOS-only app views", () => {
+  for (const path of [
+    "ios/MacApp/BotFleetMacApp.swift", "ios/MacUpdater/NativeMacUpdater.swift",
+    "ios/Assets.xcassets/AppIcon.appiconset/Contents.json",
+    "ios/Sources/CompanionCore/NativeHeadlessHostInstaller.swift",
+    "ios/Package.swift", "ios/Package.resolved",
+    "ios/BotFleet.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+    "ios/project.yml", ".github/workflows/ci.yml", "scripts/ci-change-scope.mjs",
+    "scripts/ci-scope-diff.sh", "scripts/ios-assert-xcode.sh", "scripts/ios-install-xcodegen.sh",
+    "scripts/ios-xcodegen-post.sh",
+  ]) assert.equal(isMacAppPath(path), true, path);
+  for (const path of ["ios/App/BotFleetApp.swift", "ios/Widgets/BotFleetWidgets.swift", "server/index.ts"])
+    assert.equal(isMacAppPath(path), false, path);
+  const project = parse(readFileSync(join(ROOT, "ios/project.yml"), "utf8"));
+  for (const entry of project.targets.BotFleetMac.sources)
+    assert.equal(isMacAppPath(`ios/${entry.path}/fixture.swift`), true, entry.path);
+  assert.ok(project.targets.BotFleetMac.dependencies.some((entry) => entry.package === "CompanionCore"));
+  assert.equal(isMacAppPath("ios/Sources/CompanionCore/fixture.swift"), true);
 });

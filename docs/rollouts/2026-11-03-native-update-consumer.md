@@ -20,6 +20,8 @@ Trusted release verification now checks the appcast signature cryptographically 
 
 The Mac app composition must retain one `NativeMacUpdater`, invoke `updater.service.start()` once at startup, and install `NativeUpdatesCommands(service: updater.service)` in its command groups.  The command observes live availability and displays the safe status as help text.  Automatic checks can be changed explicitly through `service.setAutomaticChecksEnabled`; Sparkle retains that preference.  The composition remains a coordinated handoff to its current owner, and the adapter alone is not evidence that these calls are installed.
 
+**November 20, 2026 (BF-2628):** the composition now exists and is compiled in CI.  `BotFleetMacApp` retains one `NativeMacUpdater`, invokes `updater.service.start()` once at startup after Sentry, and installs `NativeUpdatesCommands(service: updater.service)` in its command groups.  `ci.yml` carries a `mac-native-build` job (xcode-27, unsigned `BotFleetMac` build) so the composition compiles on every iOS-scoped change;  it is deliberately not a ruleset context and nothing `needs` it, so a first-run failure cannot block merges.  `scripts/native-release-workflow.node-test.mjs` pins the composition and the job's placement.  This changes no feed URL, key, or signing input:  those remain owner-gated, and without a configured feed the app simply reports updates unavailable.
+
 The upstream distribution's copyright and license text is included as the `Sparkle-LICENSE.txt` app resource, with whitespace formatting only.  Sparkle is linked only to the native Mac app target, not the phone or headless host.
 
 ## Validation Boundary

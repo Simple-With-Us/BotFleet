@@ -1415,6 +1415,7 @@
     {"path":"server/harness/registry.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/health-readiness.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/helpers/tracker.ts","category":"runtime","reason":"Import from server/index.ts"},
+    {"path":"server/hooks-tunnel-proxy.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/host-dispatch-hot.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/host-id.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/host-resources.ts","category":"runtime","reason":"Import from server/index.ts"},

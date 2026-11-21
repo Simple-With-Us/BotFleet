@@ -35,7 +35,7 @@ export async function resolveNativeUpdateReleaseConfig({ env = {}, fetchImpl = f
   let canonical;
   try {
     canonical = await listSecretsRaw({ siteUrl: "https://app.infisical.com", token,
-      projectId: NATIVE_UPDATE_PROJECT, environment: "prod", secretPath: "/",
+      projectId: NATIVE_UPDATE_PROJECT, environment: "prod", secretPath: "/botfleet-server",
       names: NATIVE_UPDATE_NAMES, fetchImpl, log: () => {} });
   } catch {
     // Request errors may echo credentials or response bodies; never forward them.

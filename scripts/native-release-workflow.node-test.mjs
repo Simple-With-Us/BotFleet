@@ -76,6 +76,29 @@ function runShell(script) {
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
+test("the Mac app composition retains one updater and starts its service once (BF-2628)", () => {
+  // The rollout doc's composition contract:  the app retains exactly one
+  // `NativeMacUpdater`, invokes `updater.service.start()` once at startup,
+  // and installs `NativeUpdatesCommands(service: updater.service)`.  The
+  // updater type itself is compile-checked;  this pins the composition so a
+  // refactor cannot drop the start or duplicate the updater silently.
+  const app = readFileSync(join(ROOT, "ios/MacApp/BotFleetMacApp.swift"), "utf8");
+  assert.equal(app.match(/NativeMacUpdater\(\)/g)?.length, 1, "the app must retain exactly one NativeMacUpdater");
+  assert.match(app, /private let updater: NativeMacUpdater/);
+  assert.equal(app.match(/updater\.service\.start\(\)/g)?.length, 1, "service.start() must be invoked exactly once");
+  assert.match(app, /NativeUpdatesCommands\(service: updater\.service\)/);
+});
+
+test("ci.yml compiles the Mac app composition out of the required gate (BF-2628)", () => {
+  const ci = readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8");
+  assert.match(ci, /mac-native-build:/);
+  assert.match(ci, /-scheme BotFleetMac/);
+  assert.match(ci, /generic\/platform=macOS/);
+  // Kept out of the required gate:  nothing may `needs` this job, so a
+  // first-run failure cannot block merges.
+  assert.doesNotMatch(ci, /needs:[^\n]*mac-native-build/);
+});
+
 test("the native workflow is dispatch-only and never publishes", () => {
   assert.match(workflow, /workflow_dispatch:/);
   assert.doesNotMatch(workflow, /^\s+push:/m);
@@ -183,10 +206,56 @@ test("the notarization output is printed before the failure", () => {
 // sign_update is not on the runner image, so the Sparkle branch could never
 // run: a provisioned key still produced an unsigned feed, silently.
 test("the Sparkle signing branch can actually run", () => {
-  assert.match(workflow, /brew install sparkle/);
-  // A key with no tool is a hard error, not a warning.
+  // brew's sparkle cask has been disabled (Gatekeeper, 2026-09-01), so the signer comes from
+  // Sparkle's own pinned 2.10.1 release (NOTICE's pin) with the archive hash checked before use, the PATH wiring that makes bare `sign_update` resolve, and a key with
+  // no working tool remains a hard error, not a warning.
+  assert.match(workflow, /sparkle-project\/Sparkle\/releases\/download\/2\.10\.1\/Sparkle-2\.10\.1\.tar\.xz/);
+  assert.match(workflow, /shasum -a 256 --check --status/);
+  assert.match(workflow, /test -x "\$sparkle_bin\/sign_update" \|\| \{/);
+  assert.match(workflow, /echo "\$sparkle_bin" >> "\$GITHUB_PATH"/);
+  assert.match(workflow, /export PATH="\$sparkle_bin:\$PATH"/);
   assert.match(workflow, /command -v sign_update > \/dev\/null \|\| \{/);
   assert.match(workflow, /::error::sign_update is not installed/);
+  // This round runs both key-format interpretations on the live dispatch (the signer produced no
+  // output last time), so the guard pins the diagnostic's own contract as ONE ordered block:  the
+  // EXIT trap is installed before the umask-guarded writes, both attempt responses are summarized as
+  // digests only (tool diagnostics may include decoded key material), the files are removed and the umask
+  // restored together before any exit, and the format label branches explicitly instead of a
+  // parameter expansion that would emit the signature value.  The no-GitHub-fallback rule is scoped to this step:  the certificate and
+  // notarization steps' fallbacks are their own sanctioned design.
+  // The whole key contract is asserted in ORDER by walking the workflow text:  a reordered,
+  // duplicated or externally added key write fails the walk instead of passing loose scans.
+  // The cleanup lives in the trap body the walk passes through, so every exit path removes both
+  // key files and restores the umask.
+  let pos = 0;
+  const ordered = [
+    "old_umask=$(umask)",
+    "cleanup_keys() {",
+    "rm -f \"$key\" \"$keyraw\"",
+    "umask \"$old_umask\"",
+    "trap cleanup_keys EXIT",
+    "umask 077",
+    "printf '%s' \"$SPARKLE_EDDSA_PRIVATE_KEY_B64\" > \"$key\"",
+    "printf '%s' \"$SPARKLE_EDDSA_PRIVATE_KEY_B64\" | base64 --decode > \"$keyraw\"",
+    "echo \"--- text-format attempt digest ---\"",
+    "shasum -a 256 \"$RUNNER_TEMP/su-text.txt\"",
+    "echo \"--- raw-format attempt digest ---\"",
+    "shasum -a 256 \"$RUNNER_TEMP/su-raw.txt\"",
+    "if [ -n \"$sig_text\" ]; then",
+    "elif [ -n \"$sig_raw\" ]; then",
+    "::error::sign_update produced no signature in either key format",
+  ];
+  for (const needle of ordered) {
+    const at = workflow.indexOf(needle, pos);
+    assert.notEqual(at, -1, `missing or reordered in the workflow: ${needle}`);
+    pos = at + needle.length;
+  }
+
+  assert.doesNotMatch(workflow, /name: signer-attempt-logs/);
+  assert.doesNotMatch(workflow, /cat "\$RUNNER_TEMP\/su-(?:raw|text)\.txt"/);
+  assert.match(workflow, /cleanup_keys\(\) \{[\s\S]*?rm -f "\$key" "\$keyraw"[\s\S]*?umask "\$old_umask"[\s\S]*?\}/);
+  const sparkleStep = workflow.split("Load the Sparkle EdDSA key")[1]?.split("- name:")[0] ?? "";
+  assert.doesNotMatch(sparkleStep, /GH_FALLBACK_/);
 });
 
 // The key never stays at a path: it is decoded into a private file, that

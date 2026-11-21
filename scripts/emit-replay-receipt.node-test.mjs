@@ -496,3 +496,26 @@ test("the CLI runs when the script is invoked through a symlink", () => {
   assert.match(proc.stderr, /emit-replay-receipt refused/);
   assert.notEqual(proc.status, 0);
 });
+
+test("the golden Swift fixture decodes as the report the receipt reads", () => {
+  // BF-2647:  the fixture lives next to the Swift contract test, which
+  // decodes it as the public `EngineReplayParityReport`.  Reading the same
+  // file here holds the node side of that contract to the same example, so a
+  // key renamed on either side fails the side it was renamed on.
+  const fixturePath = fileURLToPath(new URL("../ios/Tests/CompanionCoreTests/Fixtures/replay-parity-report.json", import.meta.url));
+  const report = readReplayReport(fixturePath);
+  assert.equal(report.version, 1);
+  assert.deepEqual(report.requestedEngines, ["claude", "dsh"]);
+  // The stored flag agrees with the engines' own verdicts, which is what the
+  // Swift aggregation writes.
+  assert.equal(report.isFullyVerified, report.engines.every((entry) => entry.isFullyVerified));
+  assert.equal(replayVerdict(report, "claude"), true);
+  assert.equal(replayVerdict(report, "dsh"), false);
+  // The nil optionals are omitted on the Swift side, and the schema still
+  // reads both engines cleanly without them.
+  const measured = report.engines.find((entry) => entry.engineId === "claude");
+  assert.equal(measured.measured, true);
+  const unmeasured = report.engines.find((entry) => entry.engineId === "dsh");
+  assert.equal("family" in unmeasured, false);
+  assert.equal(unmeasured.measured, false);
+});

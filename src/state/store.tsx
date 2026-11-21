@@ -578,7 +578,7 @@ export interface ConfigStatus {
      * `selfHostedVps` is false. */
     vpsMode?: "shared" | "per-bot" | null;
   };
-  ingress?: { publicUrl?: string; enabled?: boolean };
+  ingress?: { publicUrl?: string; enabled?: boolean; webhookPublicUrl?: string; webhookEnabled?: boolean };
   localVm: {
     mode: "shared" | "per-bot";
     maxInstances: number;
