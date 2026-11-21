@@ -424,11 +424,15 @@ describe("Store.reconcileModelLineage", () => {
             output: 0,
             costUsd: null,
             turns: 1,
+            lastAt: 1,
             engineId: "dshAgent",
             byModel: { "MiniMax-M3": { input: 7, output: 0, costUsd: null, turns: 1 } },
           },
         },
         tasks: [
+          // SAFETY: the seed task carries only the fields this test reads;
+          // the Store supplies the rest of TaskRecord on load, the same
+          // reliance as the sibling seeds in this suite.
           {
             threadId: "thread-b",
             title: "Main",
