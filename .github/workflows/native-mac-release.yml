@@ -444,7 +444,13 @@ jobs:
             node scripts/verify-native-release.mjs assets "$VERSION" --build "$BUILD"
           else
             node scripts/native-update-release-config.mjs --output "$RUNNER_TEMP/assembled-native-update.env"
-            while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/assembled-native-update.env"
+            # Split each line on its FIRST '=' only:  the canonical public key's base64
+            # value ends in '=', and a plain IFS='=' read strips that trailing padding
+            # under bash, so the verifier would see a 43-character key and refuse the
+            # shape before any signature crypto runs.
+            while IFS= read -r config_line; do
+              export "${config_line%%=*}=${config_line#*=}"
+            done < "$RUNNER_TEMP/assembled-native-update.env"
             node scripts/verify-native-release.mjs assets "$VERSION" --build "$BUILD" --require-signature --public-key "$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"
           fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
