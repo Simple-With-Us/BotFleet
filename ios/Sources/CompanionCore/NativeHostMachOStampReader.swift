@@ -331,7 +331,9 @@ import Darwin
 /// If a future artifact ships arm64e, the packaging gate changes first and this reader
 /// follows it.
 public struct MachONativeHostStampReader: NativeHostStampReading {
-    static let maximumFileBytes = 512 * 1024 * 1024
+    // Bounded whole-file parsing is intentional for this small installer input.
+    // Refuse oversized artifacts before any reserve or read, including direct seam calls.
+    static let maximumFileBytes = 64 * 1024 * 1024
 
     public init() {}
 
@@ -358,7 +360,7 @@ public struct MachONativeHostStampReader: NativeHostStampReading {
     /// is never parsed as a splice and never buffered past the inspected size.  Internal
     /// seam so tests can drive the size discipline through a pipe.
     static func readAll(fd: Int32, expectedSize: Int) -> Data? {
-        guard expectedSize > 0 else { return nil }
+        guard expectedSize > 0, expectedSize <= maximumFileBytes else { return nil }
         var data = Data()
         data.reserveCapacity(expectedSize)
         var buffer = [UInt8](repeating: 0, count: 1 << 16)

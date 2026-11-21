@@ -453,6 +453,14 @@ struct NativeHostMachOStampReaderTests {
         #expect(reader.stamp(ofExecutableAt: url) == nil)
     }
 
+    @Test("The read seam refuses invalid and oversized lengths before allocation or I/O")
+    func readBoundsRefused() {
+        #expect(MachONativeHostStampReader.maximumFileBytes == 64 * 1024 * 1024)
+        for size in [-1, 0, MachONativeHostStampReader.maximumFileBytes + 1, Int.max] {
+            #expect(MachONativeHostStampReader.readAll(fd: -1, expectedSize: size) == nil)
+        }
+    }
+
     @Test("The read discipline refuses a file that grows mid-read")
     func growingReadRefused() throws {
         var endpoints: [Int32] = [0, 0]
