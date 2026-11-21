@@ -66,9 +66,10 @@ function withoutLineComments(source) {
       continue;
     }
     if (char === "/" && next === "*") {
+      // Replaced with the empty string so `name/*note*/(` keeps the
+      // token adjacency the call-site counting relies on.
       const end = source.indexOf("*/", index + 2);
       index = end === -1 ? source.length : end + 2;
-      out += " ";
       continue;
     }
     if (char === "/" && next === "/") {
@@ -81,6 +82,26 @@ function withoutLineComments(source) {
   }
   return out;
 }
+
+function safeRuntimeIdentityImports(source) {
+  const allowed = new Set(['authorizedRuntime', 'validBuildIdentity', 'buildCompatibility']);
+  let count = 0;
+  const rest = source.replace(/import\s*\{([^}]*)\}\s*from\s*["'][^"']*electron\/runtime-identity\.mjs["']\s*;?/g, (statement, specifiers) => {
+    const names = specifiers.split(',').map(s => s.trim()).filter(Boolean).map(s => s.split(/\s+as\s+/)[0]);
+    if (!names.length || !names.every(n => allowed.has(n))) return statement;
+    count++; return '';
+  });
+  return count > 0 && !/electron\/runtime-identity\.mjs/.test(rest);
+}
+
+test('walking calls separated by comments remain counted', () => {
+  const source = withoutLineComments('hashStaticUi/*note*/(x); hashStaticUi (y)');
+  assert.equal(source.match(/hashStaticUi\s*\(/g)?.length, 2);
+});
+test('only named non-walking imports pass, dead allowed-name strings do not', () => {
+  assert.equal(safeRuntimeIdentityImports('import { authorizedRuntime as a } from "../electron/runtime-identity.mjs";'), true);
+  for (const source of ['import { hashStaticUi } from "../electron/runtime-identity.mjs"; const s="authorizedRuntime";', 'import * as identity from "../electron/runtime-identity.mjs"; const s="validBuildIdentity";', 'import { authorizedRuntime, hashStaticUi } from "../electron/runtime-identity.mjs";']) assert.equal(safeRuntimeIdentityImports(source), false);
+});
 
 /** Every TypeScript module under server/ at any depth, tests excluded. */
 function serverModules() {
@@ -101,8 +122,8 @@ test("the runtime identity module computes both fingerprints exactly once, at mo
   assert.match(source, /const runtimeBuildIdentity = \{[^}]*hashStaticUi\(process\.env\.OMB_STATIC_DIR\)[^}]*\};/s);
   // Each walking reader is called exactly once — the load-time line above is
   // the only call site in the module, counted with comments stripped.
-  assert.equal(source.match(/hashStaticUi\(/g)?.length, 1, "hashStaticUi must be called exactly once, at module load");
-  assert.equal(source.match(/readSourceBuildIdentity\(/g)?.length, 1, "readSourceBuildIdentity must be called exactly once, at module load");
+  assert.equal(source.match(/hashStaticUi\s*\(/g)?.length, 1, "hashStaticUi must be called exactly once, at module load");
+  assert.equal(source.match(/readSourceBuildIdentity\s*\(/g)?.length, 1, "readSourceBuildIdentity must be called exactly once, at module load");
   // The module exports the precomputed object and two pure helpers — no
   // function that re-runs a walk is exported to callers.
   assert.match(source, /export const runtimeBuildIdentity/);
@@ -117,8 +138,8 @@ test("no other server module reaches the fingerprint walk or its modules", () =>
     if (/hashStaticUi|readSourceBuildIdentity/.test(source)) offenders.push(`${module} calls a walking reader`);
     if (/scripts\/source-build-identity\.mjs/.test(source)) offenders.push(`${module} imports source-build-identity.mjs`);
     if (/scripts\/release-provenance\.mjs/.test(source)) offenders.push(`${module} imports release-provenance.mjs (the dependency-tree walk)`);
-    if (/electron\/runtime-identity\.mjs/.test(source) && !/authorizedRuntime|validBuildIdentity|buildCompatibility/.test(source)) {
-      offenders.push(`${module} imports electron/runtime-identity.mjs without naming a non-walking export`);
+    if (/electron\/runtime-identity\.mjs/.test(source) && !safeRuntimeIdentityImports(source)) {
+      offenders.push(`${module} imports electron/runtime-identity.mjs outside the named non-walking export allowlist`);
     }
   }
   assert.deepEqual(offenders, [], "the fingerprint walk must be reachable only through server/runtime-identity.ts at module load");

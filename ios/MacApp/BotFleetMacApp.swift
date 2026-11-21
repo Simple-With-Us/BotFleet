@@ -57,12 +57,20 @@ private struct WindowAccessor: NSViewRepresentable {
 struct BotFleetMacApp: App {
     @StateObject private var session = MacSession()
     @NSApplicationDelegateAdaptor(BotFleetMacAppDelegate.self) private var appDelegate
+    /// One updater for the app lifetime (BF-2628).  The service starts once,
+    /// below, and Sparkle owns scheduling, verification and installation.
+    private let updater: NativeMacUpdater
 
+    @MainActor
     init() {
         // Sentry first, so a crash in session startup is captured; it stays
         // inert without a stamped DSN (BF-2541).  Notifications are NEVER
         // requested at launch.
         MacSentryTelemetry.start()
+        updater = NativeMacUpdater()
+        // The service start is fail-soft:  without a configured feed the app
+        // simply reports updates unavailable (BF-2628).  Invoked exactly once.
+        updater.service.start()
     }
 
     var body: some Scene {
@@ -105,6 +113,7 @@ struct BotFleetMacApp: App {
         .defaultSize(width: 1120, height: 760)
         .commands {
             SidebarCommands()
+            NativeUpdatesCommands(service: updater.service)
 
             CommandGroup(replacing: .appInfo) {
                 Button("About BotFleet") {
