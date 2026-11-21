@@ -61,7 +61,28 @@ test("trusted native assets are cryptographically verified with the canonical pu
   assert.match(assemble.run, /--require-signature --public-key "\$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"/);
   assert.match(localScript, /--require-signature --public-key "\$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"/);
   assert.ok(localScript.indexOf("Sparkle signing key file and sign_update") < localScript.indexOf("xcodebuild archive"));
+  assert.equal(
+    runEnvImport(assemble.run, "BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY=Abcdef1234567890Abcdef1234567890Abcdef1234="),
+    "Abcdef1234567890Abcdef1234567890Abcdef1234=",
+    "the env import must keep base64 padding: bash strips a trailing '=' when IFS='=' splits the value",
+  );
 });
+
+/** Run the workflow's assembled-config import loop in real bash against one env
+ *  line and print the exported value, so the shipped text — not a copy of it —
+ *  is what the regression check exercises. */
+function runEnvImport(stepRun, envLine) {
+  const importLoop = stepRun.match(/while IFS= read -r config_line; do[\s\S]*?done < "\$RUNNER_TEMP\/assembled-native-update\.env"/);
+  assert.ok(importLoop, "the assemble step must import the config with a first-'=' split that keeps padded values");
+  const result = runShell(
+    `${importLoop[0].replaceAll("$RUNNER_TEMP", "/tmp")}\n` +
+    `printf '%s\\n' '${envLine}' > /tmp/assembled-native-update.env\n` +
+    `${importLoop[0].replaceAll("$RUNNER_TEMP", "/tmp")}\n` +
+    `printf '%s' "$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"`,
+  );
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout;
+}
 
 /** One top-level shell function, taken verbatim out of the script. */
 function shellFunction(source, name) {
