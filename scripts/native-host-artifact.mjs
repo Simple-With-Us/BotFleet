@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 
 export const HOST_CODE_ID = "BotFleetNativeHost";
 export const HOST_TEAM = "CC8UTF7ATG";
-export const HOST_CAPABILITIES = ["identity-v1", "foreground-service-data-v1", "signal-drain-v1"];
+export const HOST_CAPABILITIES = ["identity-v1", "foreground-service-data-v1", "signal-drain-v1", "automatic-start-v1", "checked-control-v1"];
 const KEYS = ["schemaVersion", "codeIdentifier", "sourceCommit", "build", "marketingVersion", "capabilities", "distribution", "sourceDirty"];
 const fail = () => { throw new Error("Native host artifact verification refused."); };
 export const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");

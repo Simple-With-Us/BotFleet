@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { z } from "zod";
-import { inspectHostMachO, verifyNativeHostArtifact, sha256 } from "./native-host-artifact.mjs";
+import { HOST_CAPABILITIES, inspectHostMachO, verifyNativeHostArtifact, sha256 } from "./native-host-artifact.mjs";
 import { nativeHostNotaryCredentials, packageNativeHost } from "./package-native-host.mjs";
 import { build, identity, source, thin, universal } from "./native-host-macho.fixture.mjs";
 
@@ -48,7 +48,7 @@ test("the binary stamp, both architecture signatures and artifact digest are ver
 });
 for (const [label, change] of [["unknown source", { sourceCommit: "0".repeat(40) }], ["dirty", { sourceDirty: true }],
   ["numeric build", { build: Number(build) }], ["wrong marketing", { marketingVersion: "1.0.0" }],
-  ["unsupported control", { capabilities: [...identity().capabilities, "checked-control-v1"] }],
+  ["unsupported control", { capabilities: [...identity().capabilities, "queued-jobs-v1"] }],
   ["extra field", { ignored: "not permitted" }], ["wrong code id", { codeIdentifier: "foreign" }]]) {
   test(`${label} cannot become a trusted identity`, () => {
     const f = fixture(universal(thin({ stamp: identity(change) }), thin({ arch: "x86_64", stamp: identity(change) })));
@@ -213,6 +213,18 @@ test("the native-release chain runs this proof, and hosted CI runs the chain", (
   assert.match(pkg.scripts.test, /pnpm test:native-release/);
   const ci = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
   assert.match(ci, /run: pnpm test$/m);
+});
+test("the Swift stamp mirror names exactly the capabilities the packaging gate writes", () => {
+  // BF-2605:  `NativeHostArtifactIdentity` (BotFleetNativeHost) reads the same
+  // signed stamp this gate verifies, and its capability list was held to
+  // HOST_CAPABILITIES only by convention.  This test reads the Swift source
+  // and holds the literal list to the TypeScript one, so a capability added,
+  // renamed or dropped on either side fails here before it can ship.
+  const swift = readFileSync(new URL("../ios/Scripts/BotFleetNativeHost/NativeHostArtifactIdentity.swift", import.meta.url), "utf8");
+  const match = swift.match(/static let capabilities = \[([^\]]*)\]/);
+  assert.ok(match, "the Swift capability literal was not found");
+  const swiftCapabilities = [...match[1].matchAll(/"([^"]+)"/g)].map((entry) => entry[1]);
+  assert.deepEqual(swiftCapabilities, HOST_CAPABILITIES);
 });
 test("packaging refuses a symlinked output parent or dangling output before invoking a build", async () => {
   const root = mkdtempSync(join(tmpdir(), "bf-host-output-"));

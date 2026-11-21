@@ -3,7 +3,7 @@ export const source = "1234567890abcdef1234567890abcdef12345678";
 export const build = "202611031000";
 export function identity(changes = {}) {
   return { schemaVersion: 1, codeIdentifier: "BotFleetNativeHost", sourceCommit: source, build,
-    marketingVersion: "0.1.0", capabilities: ["identity-v1", "foreground-service-data-v1", "signal-drain-v1"],
+    marketingVersion: "0.1.0", capabilities: ["identity-v1", "foreground-service-data-v1", "signal-drain-v1", "automatic-start-v1", "checked-control-v1"],
     distribution: "developer-id", sourceDirty: false, ...changes };
 }
 function stringCommand(command, value, prefix) {
