@@ -13793,6 +13793,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // only, never request inputs or environment.
       void proxyTunnelWebhook(req, res, { port: WEBHOOK_PORT }).catch((cause: unknown) => {
         console.warn(`hooks tunnel proxy: delivery failed (${cause instanceof Error ? cause.message : "unknown error"})`);
+        // The backstop also owes the client an answer: without one, a throw
+        // would leave the delivery hanging until the socket times out.
+        if (!res.headersSent) {
+          res.writeHead(502, { "content-type": "application/json", "cache-control": "no-store" });
+          res.end(JSON.stringify({ error: "webhook receiver unavailable" }));
+        } else if (!res.writableEnded) {
+          res.end();
+        }
       });
       return;
     }
