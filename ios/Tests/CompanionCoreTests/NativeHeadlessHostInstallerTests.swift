@@ -199,10 +199,10 @@ struct NativeHeadlessHostInstallerTests {
         defer { fixture.remove() }
         _ = try fixture.installer().install()
         let wrongTeam = fixture.installer(inspector: FakeSignatureInspector(identity:
-            NativeHostSigningIdentity(codeIdentifier: "BotFleetNativeHost", teamIdentifier: "WRONGTEAM99", signingFlags: 0)))
+            NativeHostSigningIdentity(codeIdentifier: "BotFleetNativeHost", teamIdentifier: "WRONGTEAM99", signingFlags: 0)), stampReader: FixtureStampReader(stamp: nil))
         #expect(throws: NativeHeadlessHostInstallerError.identityMismatch) { _ = try wrongTeam.uninstall() }
         let unsigned = NativeHeadlessHostInstaller(configuration: fixture.configuration(),
-            stampReader: FixtureStampReader())
+            stampReader: FixtureStampReader(stamp: nil))
         #expect(throws: NativeHeadlessHostInstallerError.signatureValidationFailed) { _ = try unsigned.uninstall() }
         #expect(FileManager.default.fileExists(atPath: fixture.destination.path))
         #expect(try fixture.installer().uninstall())
@@ -258,9 +258,10 @@ struct NativeHeadlessHostInstallerTests {
         let installer = fixture.installer(stampReader: FixtureStampReader(stamp: nil))
         #expect(throws: NativeHeadlessHostInstallerError.stampMissing) { _ = try installer.validate() }
         #expect(throws: NativeHeadlessHostInstallerError.stampMissing) { _ = try installer.install() }
-        #expect(throws: NativeHeadlessHostInstallerError.stampMissing) { _ = try installer.uninstall() }
         #expect(!FileManager.default.fileExists(atPath: fixture.destination.path))
         #expect(!FileManager.default.fileExists(atPath: fixture.dataRoot.path))
+        _ = try fixture.installer().install()
+        #expect(try installer.uninstall())
     }
 
     @Test("A stamp from an older schema generation is refused")
@@ -273,7 +274,8 @@ struct NativeHeadlessHostInstallerTests {
                                "automatic-start-v1", "checked-control-v1"])))
         #expect(throws: NativeHeadlessHostInstallerError.stampSchemaUnsupported) { _ = try outdated.validate() }
         #expect(throws: NativeHeadlessHostInstallerError.stampSchemaUnsupported) { _ = try outdated.install() }
-        #expect(throws: NativeHeadlessHostInstallerError.stampSchemaUnsupported) { _ = try outdated.uninstall() }
+        _ = try fixture.installer().install()
+        #expect(try outdated.uninstall())
         #expect(!FileManager.default.fileExists(atPath: fixture.destination.path))
     }
 
@@ -287,11 +289,12 @@ struct NativeHeadlessHostInstallerTests {
                                "automatic-start-v1", "checked-control-v1"])))
         #expect(throws: NativeHeadlessHostInstallerError.stampSchemaUnsupported) { _ = try future.validate() }
         #expect(throws: NativeHeadlessHostInstallerError.stampSchemaUnsupported) { _ = try future.install() }
-        #expect(throws: NativeHeadlessHostInstallerError.stampSchemaUnsupported) { _ = try future.uninstall() }
+        _ = try fixture.installer().install()
+        #expect(try future.uninstall())
         #expect(!FileManager.default.fileExists(atPath: fixture.destination.path))
     }
 
-    @Test("A stamp missing a contract capability is refused on install and on uninstall")
+    @Test("A stamp missing a capability blocks installation but not validated legacy removal")
     func stampCapabilityMismatchRefused() throws {
         let fixture = try InstallerFixture()
         defer { fixture.remove() }
@@ -303,13 +306,31 @@ struct NativeHeadlessHostInstallerTests {
         #expect(!FileManager.default.fileExists(atPath: fixture.destination.path))
         #expect(!FileManager.default.fileExists(atPath: fixture.dataRoot.path))
         // A healthy install, then a host whose stamp lacks the contract's own capabilities:
-        // uninstall fails closed and the installed definition survives.
+        // removal preserves the pre-stamp validation boundary and does not strand the plist.
         _ = try fixture.installer().install()
         let replaced = fixture.installer(stampReader: FixtureStampReader(stamp:
             NativeHostArtifactStamp(schemaVersion: 1,
                 capabilities: ["identity-v1", "foreground-service-data-v1", "signal-drain-v1"])))
-        #expect(throws: NativeHeadlessHostInstallerError.stampCapabilityMismatch) { _ = try replaced.uninstall() }
-        #expect(FileManager.default.fileExists(atPath: fixture.destination.path))
+        #expect(try replaced.uninstall())
+        #expect(!FileManager.default.fileExists(atPath: fixture.destination.path))
+    }
+
+    @Test("A mismatched stamp identifier blocks install and verification, not owned removal")
+    func stampIdentifierMismatchStillAllowsOwnedRemoval() throws {
+        let fixture = try InstallerFixture()
+        defer { fixture.remove() }
+        let mismatched = fixture.installer(stampReader: FixtureStampReader(stamp:
+            NativeHostArtifactStamp(schemaVersion: 1,
+                capabilities: ["automatic-start-v1", "checked-control-v1"],
+                codeIdentifier: "AnotherHost")))
+        #expect(throws: NativeHeadlessHostInstallerError.identityMismatch) { _ = try mismatched.validate() }
+        #expect(throws: NativeHeadlessHostInstallerError.identityMismatch) { _ = try mismatched.install() }
+        #expect(!FileManager.default.fileExists(atPath: fixture.destination.path))
+        _ = try fixture.installer().install()
+        #expect(!mismatched.verifyInstalled())
+        #expect(try mismatched.uninstall())
+        #expect(!FileManager.default.fileExists(atPath: fixture.destination.path))
+        #expect(FileManager.default.fileExists(atPath: fixture.dataRoot.path))
     }
 
     @Test("An interactive data root is refused")

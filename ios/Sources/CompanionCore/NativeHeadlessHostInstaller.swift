@@ -107,18 +107,26 @@ public protocol NativeHostDataRootOwnershipApplying: Sendable {
 public struct NativeHostArtifactStamp: Equatable, Sendable {
     public let schemaVersion: Int
     public let capabilities: [String]
+    /// The code identifier the stamp claims.  The installer holds it to the configured
+    /// expectation and to the verified signing identity, so a stamp is bound to the
+    /// signature it was checked under.  Defaults to the packaging side's pinned value,
+    /// which the production reader also requires.
+    public let codeIdentifier: String
 
-    public init(schemaVersion: Int, capabilities: [String]) {
+    public init(schemaVersion: Int, capabilities: [String], codeIdentifier: String = "BotFleetNativeHost") {
         self.schemaVersion = schemaVersion
         self.capabilities = capabilities
+        self.codeIdentifier = codeIdentifier
     }
 }
 
 /// Reads the artifact stamp embedded in a packaged host executable.  `nil` means the
-/// executable carries no stamp at all — an unsigned or pre-stamp build — which the
+/// executable carries no stamp at all:  an unsigned or pre-stamp build, which the
 /// installer refuses rather than guesses about.  Injected so tests exercise the gate
-/// without native tools;  the production reader wraps the BotFleetNativeHost target's
-/// signed-section reader (`NativeHostArtifactIdentity`).
+/// without native tools.  The production default is `MachONativeHostStampReader`, which
+/// parses the configured target executable's own bytes (NativeHostMachOStampReader.swift);
+/// the BotFleetNativeHost target's `NativeHostArtifactIdentity` reads the running image's
+/// stamp and is not usable for a target path.
 public protocol NativeHostStampReading: Sendable {
     func stamp(ofExecutableAt url: URL) -> NativeHostArtifactStamp?
 }
@@ -172,8 +180,8 @@ public struct NativeHeadlessHostInstaller: Sendable {
     /// The capability contract a stamped host must declare before this installer touches it:
     /// automatic start whose reboot path preserves an owner Stop, and the checked local
     /// control channel.  `native-host-artifact.node-test.mjs` holds this set to the list the
-    /// packaging side writes, and `uninstall()` runs the same gate, so a host whose stamp is
-    /// missing, too old, or missing a capability is never installed or removed by mistake.
+    /// packaging side writes. Installation requires the stamp; removal preserves the prior
+    /// executable/signature/ownership checks without stranding a legacy unstamped host.
     static let requiredHostCapabilities: Set<String> = ["automatic-start-v1", "checked-control-v1"]
     /// The stamp schema this installer understands.  A host stamped by a newer packager is
     /// refused rather than read loosely;  anything below one predates the contract entirely.
@@ -185,7 +193,7 @@ public struct NativeHeadlessHostInstaller: Sendable {
     public init(configuration: NativeHeadlessHostInstallConfiguration,
                 inspector: any NativeHostSignatureInspecting = SecCodeNativeHostSignatureInspector(),
                 ownershipApplier: any NativeHostDataRootOwnershipApplying = SystemNativeHostDataRootOwnershipApplier(),
-                stampReader: any NativeHostStampReading) {
+                stampReader: any NativeHostStampReading = MachONativeHostStampReader()) {
         self.configuration = configuration
         self.inspector = inspector
         self.ownershipApplier = ownershipApplier
@@ -195,6 +203,10 @@ public struct NativeHeadlessHostInstaller: Sendable {
     // MARK: - Validation (read-only)
 
     public func validate() throws -> NativeHeadlessHostInstallValidation {
+        try validate(requireArtifactStamp: true)
+    }
+
+    private func validate(requireArtifactStamp: Bool) throws -> NativeHeadlessHostInstallValidation {
         let config = configuration
         guard !config.label.isEmpty,
               config.label.range(of: #"^[A-Za-z0-9._-]+$"#, options: .regularExpression) != nil
@@ -211,7 +223,10 @@ public struct NativeHeadlessHostInstaller: Sendable {
               identity.codeIdentifier == config.expectedCodeIdentifier,
               identity.teamIdentifier == config.expectedTeamIdentifier
         else { throw NativeHeadlessHostInstallerError.identityMismatch }
-        try Self.validatedStamp(ofExecutableAt: executable, stampReader: stampReader)
+        if requireArtifactStamp {
+            try Self.validatedStamp(ofExecutableAt: executable, stampReader: stampReader,
+                                    signingIdentity: identity, expectedCodeIdentifier: config.expectedCodeIdentifier)
+        }
         let serviceUID = try resolvedServiceUID()
         let dataRoot = try Self.validatedDataRoot(config.serviceDataRoot, serviceUID: serviceUID)
         let destination = try Self.validatedDestination(config.plistDestination, label: config.label)
@@ -247,12 +262,19 @@ public struct NativeHeadlessHostInstaller: Sendable {
 
     /// The artifact-stamp gate:  a host whose embedded stamp is missing, carries a schema
     /// this installer does not understand, or lacks any capability of its own contract is
-    /// refused here.  `uninstall()` runs `validate()` first, so the same gate fails closed
-    /// before a deletion is authorized.
-    static func validatedStamp(ofExecutableAt url: URL, stampReader: any NativeHostStampReading) throws {
+    /// refused here before installation or installed-state verification. Removal keeps
+    /// the pre-stamp validation boundary so an older managed definition is removable.
+    static func validatedStamp(ofExecutableAt url: URL, stampReader: any NativeHostStampReading,
+                               signingIdentity: NativeHostSigningIdentity, expectedCodeIdentifier: String) throws {
         guard let stamp = stampReader.stamp(ofExecutableAt: url) else {
             throw NativeHeadlessHostInstallerError.stampMissing
         }
+        // Bind the stamp to the signature it was verified under:  a stamp naming a code
+        // identifier other than the configured expectation or the verified signing
+        // identity proves nothing about this executable.
+        guard stamp.codeIdentifier == expectedCodeIdentifier,
+              stamp.codeIdentifier == signingIdentity.codeIdentifier
+        else { throw NativeHeadlessHostInstallerError.identityMismatch }
         guard stamp.schemaVersion == supportedStampSchemaVersion else {
             throw NativeHeadlessHostInstallerError.stampSchemaUnsupported
         }
@@ -430,11 +452,13 @@ public struct NativeHeadlessHostInstaller: Sendable {
 
     /// Removes exactly the plist this installer wrote.  Returns false when nothing is
     /// installed.  Service data under the data root is always left in place.  Uninstall runs
-    /// the same executable, signature, identity, and artifact-stamp validation as install and
-    /// fails closed:  an unvalidated or understamped executable never authorizes a deletion.
+    /// every pre-stamp executable, signature, identity, service-user, data-root and
+    /// destination check. Only the newer installation stamp gate is excluded.
     @discardableResult
     public func uninstall() throws -> Bool {
-        let validation = try validate()
+        // Preserve every pre-stamp deletion boundary. A stamp gates installing new code,
+        // not removing an otherwise validated legacy definition that we already own.
+        let validation = try validate(requireArtifactStamp: false)
         let destination = validation.plistDestination
         guard FileManager.default.fileExists(atPath: destination.path) else { return false }
         guard let existing = Self.parsedPlist(at: destination), isOurPlist(existing) else {
