@@ -13780,11 +13780,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, 403, { error: NAMED_TUNNEL_MUTATION_FORBIDDEN });
     }
     // Webhook deliveries ride the same named tunnel, because cloudflared
-    // cannot path-route: botfleet.jays.services/hooks/* lands on this harness
-    // instead of on the webhook ingress.  Stream exactly those paths to the
-    // loopback ingress, which keeps enforcing its own 1 MB body cap and
-    // authenticates the capability secret (BF-2129).  Everything else the
-    // tunnel carries keeps the refusal above and the rules below.
+    // cannot path-route: a request for /hooks/* on the public tunnel URL
+    // lands on this harness instead of on the webhook ingress.  Stream
+    // exactly those paths to the loopback ingress, which keeps enforcing its
+    // own 1 MB body cap and authenticates the capability secret (BF-2129).
+    // Everything else the tunnel carries keeps the refusal above and the
+    // rules below.
     if (arrivedViaCloudflareTunnel(req) && isTunnelWebhookPath(method, path)) {
       return proxyTunnelWebhook(req, res, { port: WEBHOOK_PORT });
     }
