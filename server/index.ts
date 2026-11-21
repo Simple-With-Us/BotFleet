@@ -13794,12 +13794,19 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       void proxyTunnelWebhook(req, res, { port: WEBHOOK_PORT }).catch((cause: unknown) => {
         console.warn(`hooks tunnel proxy: delivery failed (${cause instanceof Error ? cause.message : "unknown error"})`);
         // The backstop also owes the client an answer: without one, a throw
-        // would leave the delivery hanging until the socket times out.
-        if (!res.headersSent) {
-          res.writeHead(502, { "content-type": "application/json", "cache-control": "no-store" });
-          res.end(JSON.stringify({ error: "webhook receiver unavailable" }));
-        } else if (!res.writableEnded) {
-          res.end();
+        // would leave the delivery hanging until the socket times out.  Once
+        // part of the proxied answer has streamed, a clean end would make a
+        // truncated body look complete, so the response is cut instead.
+        try {
+          if (res.destroyed) return;
+          if (!res.headersSent) {
+            res.writeHead(502, { "content-type": "application/json", "cache-control": "no-store" });
+            res.end(JSON.stringify({ error: "webhook receiver unavailable" }));
+          } else if (!res.writableEnded) {
+            res.destroy();
+          }
+        } catch {
+          // The client aborted mid-answer: nothing left to answer on.
         }
       });
       return;
