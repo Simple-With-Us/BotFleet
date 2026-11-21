@@ -160,6 +160,7 @@ import {
   isMutatingHarnessApiRequest,
   NAMED_TUNNEL_MUTATION_FORBIDDEN,
 } from "./named-tunnel-gate.ts";
+import { isTunnelWebhookPath, proxyTunnelWebhook } from "./hooks-tunnel-proxy.ts";
 import { botOffError, botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
 import {
   BOT_OFF_CODE,
@@ -13780,6 +13781,38 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // until a dedicated remote-auth seam lands (BF-2129).
     if (mutatingApiRequest && arrivedViaCloudflareTunnel(req)) {
       return json(res, 403, { error: NAMED_TUNNEL_MUTATION_FORBIDDEN });
+    }
+    // Webhook deliveries ride the same named tunnel, because cloudflared
+    // cannot path-route: a request for /hooks/* on the public tunnel URL
+    // lands on this harness instead of on the webhook ingress.  Stream
+    // exactly those paths to the loopback ingress, which keeps enforcing its
+    // own 1 MB body cap and authenticates the capability secret (BF-2129).
+    // Everything else the tunnel carries keeps the refusal above and the
+    // rules below.
+    if (arrivedViaCloudflareTunnel(req) && isTunnelWebhookPath(method, path)) {
+      // Fire-and-forget with a backstop: a throw inside the proxy (for
+      // example an upstream header node refuses to write) must land as a
+      // logged warning, never as an unhandled rejection.  Log the message
+      // only, never request inputs or environment.
+      void proxyTunnelWebhook(req, res, { port: WEBHOOK_PORT }).catch((cause: unknown) => {
+        console.warn(`hooks tunnel proxy: delivery failed (${cause instanceof Error ? cause.message : "unknown error"})`);
+        // The backstop also owes the client an answer: without one, a throw
+        // would leave the delivery hanging until the socket times out.  Once
+        // part of the proxied answer has streamed, a clean end would make a
+        // truncated body look complete, so the response is cut instead.
+        try {
+          if (res.destroyed) return;
+          if (!res.headersSent) {
+            res.writeHead(502, { "content-type": "application/json", "cache-control": "no-store" });
+            res.end(JSON.stringify({ error: "webhook receiver unavailable" }));
+          } else if (!res.writableEnded) {
+            res.destroy();
+          }
+        } catch {
+          // The client aborted mid-answer: nothing left to answer on.
+        }
+      });
+      return;
     }
     // A bridge offers diagnostics and an update check, but cannot install a
     // replacement that would escape the immutable hold without artifact proof.
