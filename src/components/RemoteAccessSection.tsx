@@ -136,8 +136,9 @@ export function RemoteAccessSection({ configuredUrl, webhookUrl: configuredWebho
   // and no probe button, rather than a link into somebody else's tunnel.
   const remoteUrl = normalizeRemoteUrl(configuredUrl);
   // The dedicated base webhook credentials advertise, when one is set and
-  // switched on.  Empty stays hidden: the credentials then name the Remote
-  // URL above, and a second row would only repeat it.
+  // switched on.  Hidden when empty, when plain-http (the server refuses a
+  // cleartext secret path and falls back to the Remote URL), or when it
+  // matches the Remote URL above: a second row would only repeat it.
   const webhookUrl = normalizeRemoteUrl(configuredWebhookUrl);
 
   const runTest = async () => {
@@ -170,7 +171,9 @@ export function RemoteAccessSection({ configuredUrl, webhookUrl: configuredWebho
     <Card id="setting-remote-access" className={highlightClass?.("setting-remote-access")} title={REMOTE_ACCESS_HEADING} subtitle={sentenceGapHtml(REMOTE_ACCESS_BLURB)}>
       <div className="flex flex-col gap-3">
         <CopyableValue label={REMOTE_URL_LABEL} value={remoteUrl} />
-        {webhookUrl ? <CopyableValue label={WEBHOOK_PUBLIC_URL_LABEL} value={webhookUrl} /> : null}
+        {webhookUrl && webhookUrl.startsWith("https://") && webhookUrl !== remoteUrl ? (
+          <CopyableValue label={WEBHOOK_PUBLIC_URL_LABEL} value={webhookUrl} />
+        ) : null}
         <div className="flex flex-wrap items-center gap-3">
           <TestConnectionControl test={test} onRunTest={() => void runTest()} />
         </div>
