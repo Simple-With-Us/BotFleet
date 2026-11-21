@@ -68,7 +68,9 @@ describe("proxyTunnelWebhook", () => {
     // is an `AddressInfo` carrying the port it was given.
     upstreamPort = (upstream.address() as AddressInfo).port;
     front = createServer((req, res) => {
-      void proxyTunnelWebhook(req, res, { port: upstreamPort });
+      void proxyTunnelWebhook(req, res, { port: upstreamPort }).catch((error: unknown) => {
+        console.warn("test proxy failure:", error instanceof Error ? error.message : "unknown error");
+      });
     });
     await new Promise<void>((resolve) => front.listen(0, "127.0.0.1", resolve));
     // SAFETY: `listen` has resolved, so the server is bound and `address()`
@@ -98,6 +100,10 @@ describe("proxyTunnelWebhook", () => {
             "content-type": "application/json",
             "cf-ray": "fixture-ray",
             "x-github-delivery": "fixture-delivery-1",
+            // Hop-by-hop headers the edge may set: the proxy must strip them
+            // (and anything `connection` nominates) before the loopback hop.
+            connection: "x-hop-fixture",
+            "x-hop-fixture": "must-not-forward",
           },
         },
         (res) => {
@@ -125,12 +131,52 @@ describe("proxyTunnelWebhook", () => {
     expect(seen.headers["cf-ray"]).toBe("fixture-ray");
     expect(seen.headers["x-github-delivery"]).toBe("fixture-delivery-1");
     expect(seen.headers["host"]).toBe(`127.0.0.1:${upstreamPort}`);
+    // The hop-by-hop header `connection` nominated never reached the ingress.
+    expect(seen.headers["x-hop-fixture"]).toBeUndefined();
+  });
+
+  it("answers 504 when the ingress stalls past the proxy timeout", async () => {
+    const stalling = createServer(() => {
+      // Never answers: the proxy timeout is what saves the delivery.
+    });
+    await new Promise<void>((resolve) => stalling.listen(0, "127.0.0.1", resolve));
+    // SAFETY: `listen` has resolved, so the server is bound and `address()`
+    // is an `AddressInfo` carrying the port it was given.
+    const stallingPort = (stalling.address() as AddressInfo).port;
+    const slowFront = createServer((req, res) => {
+      void proxyTunnelWebhook(req, res, { port: stallingPort, timeoutMs: 100 }).catch((error: unknown) => {
+        console.warn("test proxy failure:", error instanceof Error ? error.message : "unknown error");
+      });
+    });
+    await new Promise<void>((resolve) => slowFront.listen(0, "127.0.0.1", resolve));
+    // SAFETY: `listen` has resolved, so the server is bound and `address()`
+    // is an `AddressInfo` carrying the port it was given.
+    const slowPort = (slowFront.address() as AddressInfo).port;
+    const answer = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = request(
+        { host: "127.0.0.1", port: slowPort, method: "POST", path: "/hooks/wh_slow/secret" },
+        (res) => {
+          let text = "";
+          res.setEncoding("utf8");
+          res.on("data", (chunk) => (text += chunk));
+          res.on("end", () => resolve({ status: res.statusCode ?? 0, body: text }));
+        },
+      );
+      req.on("error", reject);
+      req.end("{}");
+    });
+    await new Promise<void>((resolve) => slowFront.close(() => resolve()));
+    await new Promise<void>((resolve) => stalling.close(() => resolve()));
+    expect(answer.status).toBe(504);
+    expect(JSON.parse(answer.body).error).toMatch(/timed out/);
   });
 
   it("answers 502 when the ingress is not listening", async () => {
     // This front targets a port nothing listens on.
     const deadFront = createServer((req, res) => {
-      void proxyTunnelWebhook(req, res, { port: 1 });
+      void proxyTunnelWebhook(req, res, { port: 1 }).catch((error: unknown) => {
+        console.warn("test proxy failure:", error instanceof Error ? error.message : "unknown error");
+      });
     });
     await new Promise<void>((resolve) => deadFront.listen(0, "127.0.0.1", resolve));
     // SAFETY: `listen` has resolved, so the server is bound and `address()`

@@ -13787,7 +13787,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // Everything else the tunnel carries keeps the refusal above and the
     // rules below.
     if (arrivedViaCloudflareTunnel(req) && isTunnelWebhookPath(method, path)) {
-      return proxyTunnelWebhook(req, res, { port: WEBHOOK_PORT });
+      // Fire-and-forget with a backstop: a throw inside the proxy (for
+      // example an upstream header node refuses to write) must land as a
+      // logged warning, never as an unhandled rejection.  Log the message
+      // only, never request inputs or environment.
+      void proxyTunnelWebhook(req, res, { port: WEBHOOK_PORT }).catch((error: unknown) => {
+        console.warn(`hooks tunnel proxy: delivery failed (${error instanceof Error ? error.message : "unknown error"})`);
+      });
+      return;
     }
     // A bridge offers diagnostics and an update check, but cannot install a
     // replacement that would escape the immutable hold without artifact proof.
