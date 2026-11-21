@@ -517,6 +517,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     defaultModels: [
       { id: "gemini-3.8-flash-high", display: "Gemini 3.8 Flash (High)", ctxTokens: 1_000_000 },
       { id: "gemini-3.8-flash", display: "Gemini 3.8 Flash", ctxTokens: 1_000_000 },
+      { id: "gemini-4-hydrogen", display: "Gemini 4 Hydrogen", ctxTokens: 1_000_000 },
       { id: "gemini-4-hydrogen-xhigh", display: "Gemini 4 Hydrogen (XHigh)", ctxTokens: 1_000_000 },
       { id: "gemini-4-hydrogen-high", display: "Gemini 4 Hydrogen (High)", ctxTokens: 1_000_000 },
       { id: "gemini-4-hydrogen-medium", display: "Gemini 4 Hydrogen (Medium)", ctxTokens: 1_000_000 },
