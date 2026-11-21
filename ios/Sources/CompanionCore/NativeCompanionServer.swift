@@ -86,7 +86,7 @@ public struct CompanionHTTPResponse: Sendable, Equatable {
 
     public init(
         statusCode: Int,
-        headers: [String: String] = ["Content-Type": "application/json; charset=utf-8"],
+        headers: [String: String] = NativeCompanionServer.defaultJSONResponseHeaders,
         body: Data
     ) {
         self.statusCode = statusCode
@@ -151,6 +151,76 @@ public struct CompanionEndpointAdvertisement: Sendable, Equatable {
         self.serverName = serverName
         self.hosts = hosts
         self.endpoints = endpoints
+    }
+
+    /// Builds an ordered endpoint advertisement from explicit host inputs,
+    /// matching `companionEndpointCandidates` in `companion/src/endpoints.ts`.
+    /// LAN routes are included only when `allowCleartextLAN` is enabled.
+    public static func build(
+        serverName: String,
+        port: UInt16,
+        hostedURL: String? = nil,
+        tailnetHost: String? = nil,
+        lanHosts: [String] = [],
+        allowCleartextLAN: Bool = false
+    ) -> CompanionEndpointAdvertisement {
+        var endpoints: [CompanionEndpoint] = []
+        var hosts: [String] = []
+        var seenHosts = Set<String>()
+
+        if let hostedURL {
+            let trimmed = hostedURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let endpoint = CompanionEndpoint(url: trimmed, kind: .hosted, priority: 0) {
+                endpoints.append(endpoint)
+            }
+        }
+
+        if port > 0, let tailnetHost, let cleaned = cleanCandidateHost(tailnetHost) {
+            if let endpoint = CompanionEndpoint.direct(
+                host: cleaned,
+                port: Int(port),
+                kind: .tailnet,
+                priority: 100
+            ) {
+                endpoints.append(endpoint)
+                if seenHosts.insert(cleaned).inserted {
+                    hosts.append(cleaned)
+                }
+            }
+        }
+
+        if allowCleartextLAN, port > 0 {
+            for (index, rawHost) in lanHosts.enumerated() {
+                guard let cleaned = cleanCandidateHost(rawHost) else { continue }
+                let inferred = CompanionEndpoint.inferredDirectKind(cleaned)
+                let directKind: CompanionEndpointKind = inferred == .bonjour ? .bonjour : .lan
+                if let endpoint = CompanionEndpoint.direct(
+                    host: cleaned,
+                    port: Int(port),
+                    kind: directKind,
+                    priority: 200 + index
+                ) {
+                    endpoints.append(endpoint)
+                    if seenHosts.insert(cleaned).inserted {
+                        hosts.append(cleaned)
+                    }
+                }
+            }
+        }
+
+        return NativeCompanionServer.sanitizedAdvertisement(
+            CompanionEndpointAdvertisement(serverName: serverName, hosts: hosts, endpoints: endpoints)
+        )
+    }
+
+    private static func cleanCandidateHost(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.utf8.count <= 253,
+              !trimmed.contains(where: { $0.isWhitespace || "/?#".contains($0) }) else {
+            return nil
+        }
+        return trimmed
     }
 }
 
@@ -389,6 +459,10 @@ public actor NativeAPNsProvider {
         }
     }
 
+    public var isKeyRejected: Bool {
+        keyRejected != nil
+    }
+
     public func healthSnapshot(tokensRegistered: Int) -> PushSenderHealth {
         PushSenderHealth(
             configured: true,
@@ -473,15 +547,66 @@ private struct NativeWaitCreatePayload: Decodable {
     let timeoutSeconds: Double?
 }
 
+/// Snapshot of an open pairing window for desktop UI display and verification.
+/// Never written to disk.
+public struct NativePairingWindow: Equatable, Sendable {
+    public let code: String
+    public let qrCredential: String?
+    public let expiresAt: Date
+    public let attemptsRemaining: Int
+
+    public init(code: String, qrCredential: String?, expiresAt: Date, attemptsRemaining: Int) {
+        self.code = code
+        self.qrCredential = qrCredential
+        self.expiresAt = expiresAt
+        self.attemptsRemaining = attemptsRemaining
+    }
+}
+
+private struct SSEHelloPayload: Encodable {
+    let kind: String
+    let cursor: String
+    let resumed: Bool
+}
+
+private struct SSEMessageItemPayload: Encodable {
+    let id: String
+    let role: String
+    let kind: String
+    let at: Double
+    let text: String
+}
+
+private struct SSEMessageFramePayload: Encodable {
+    let kind: String
+    let seq: Int
+    let threadId: String
+    let message: SSEMessageItemPayload
+}
+
+private struct SSEThreadInterruptedPayload: Encodable {
+    let kind: String
+    let seq: Int
+    let threadId: String
+}
+
+private struct SSENotifyFramePayload: Encodable {
+    let kind: String
+    let seq: Int
+    let notification: NotificationFrame
+}
+
 /// Pure-Swift HTTP and SSE companion server actor built on `Network.framework`.
 /// Enforces the default-deny allowlist from `companion/src/routes.ts`, constant-time
 /// Bearer token verification, and both BF-2489 security gates on `POST /api/desktop/open`.
 public actor NativeCompanionServer {
+    public typealias APNsTransport = @Sendable (URLRequest) async throws -> (statusCode: Int, body: Data)
+
     private let database: DatabaseService
     /// The injecting app composition owns this shared runtime; listener activation does not transfer lifetime ownership.
     private let nativeRuntime: NativeRuntimeServices?
-    /// The paired fleet, held only as token digests.  When
-    /// `deviceStoreURL` is set the fleet is durable across restarts, as
+    /// The paired fleet, held only as token digests and per-device push tokens.
+    /// When `deviceStoreURL` is set the fleet is durable across restarts, as
     /// `companion/src/devices.ts` keeps it; without one it is memory-only,
     /// which is what direct unit tests get.
     private var deviceRegistry: CompanionDeviceRegistry
@@ -512,10 +637,12 @@ public actor NativeCompanionServer {
     private let clock: @Sendable () -> Date
     private var config: CompanionServerConfig
     private var bots: [CompanionBotRecord]
-    private var pushTokens: Set<String> = []
-    private var liveActivityTokens: Set<String> = []
     private var apnsProvider: NativeAPNsProvider?
+    private let apnsTransport: APNsTransport
     private var interruptedThreadIds: Set<String> = []
+    private let streamId: String = String(UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: "").prefix(12))
+    private var lastEventSeq: Int = 0
+    private var sseReplayBuffer: [(seq: Int, frame: String)] = []
     /// One live SSE subscription.  `deviceId` is the paired device whose
     /// credential opened the stream (`nil` for an in-process `subscribeSSE()`
     /// caller), so revoking a device can finish exactly its streams.
@@ -528,6 +655,22 @@ public actor NativeCompanionServer {
     public private(set) var desktopOpenCount: Int = 0
     public private(set) var shutdownRequested: Bool = false
     public private(set) var stoppedMarkerPath: String?
+
+    /// Cache-control and CDN headers matching `PRIVATE_RESPONSE_HEADERS` in
+    /// `companion/src/proxy.ts` so companion payloads never enter shared caches.
+    public static let privateResponseHeaders: [String: String] = [
+        "Cache-Control": "private, no-store",
+        "CDN-Cache-Control": "no-store",
+        "Cloudflare-CDN-Cache-Control": "no-store",
+        "Pragma": "no-cache",
+        "Vary": "Authorization",
+    ]
+
+    public static let defaultJSONResponseHeaders: [String: String] = {
+        var merged = privateResponseHeaders
+        merged["Content-Type"] = "application/json; charset=utf-8"
+        return merged
+    }()
 
     /// A pairing window lives for two minutes and tolerates five wrong guesses
     /// before it burns, matching `companion/src/devices.ts`
@@ -559,9 +702,10 @@ public actor NativeCompanionServer {
     /// peer must not be able to grow the process's memory.
     public static let maxRequestBytes: Int = 256 * 1024
 
-    /// How many SSE frames are kept for a subscriber that is not reading.
-    /// The newest frames win, so a slow client cannot grow the buffer.
+    /// How many SSE frames are kept for a subscriber that is not reading, and
+    /// how many recent frames are kept for `<streamId>:<seq>` reconnect replay.
     public static let sseBufferCapacity: Int = 256
+    public static let sseReplayBufferCapacity: Int = 256
 
     /// The address returned for a peer whose endpoint kind this server does not
     /// recognise.  It is deliberately not a loopback address: an unclassified
@@ -596,6 +740,7 @@ public actor NativeCompanionServer {
         config: CompanionServerConfig = CompanionServerConfig(),
         bots: [CompanionBotRecord] = [],
         apnsProvider: NativeAPNsProvider? = nil,
+        apnsTransport: APNsTransport? = nil,
         nativeRuntime: NativeRuntimeServices? = nil,
         endpointAdvertisement: CompanionEndpointAdvertisement = CompanionEndpointAdvertisement(),
         onDesktopOpen: (@Sendable () async throws -> Void)? = nil,
@@ -625,6 +770,11 @@ public actor NativeCompanionServer {
         self.config = config
         self.bots = bots
         self.apnsProvider = apnsProvider
+        self.apnsTransport = apnsTransport ?? { request in
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            return (status, data)
+        }
         self.nativeRuntime = nativeRuntime
         self.onDesktopOpen = onDesktopOpen
         self.onShutdown = onShutdown
@@ -713,6 +863,58 @@ public actor NativeCompanionServer {
     public static func makePairingQRCredential() -> String {
         let bytes = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
         return "omb_pair_" + NativeAPNsProvider.base64URLEncode(bytes)
+    }
+
+    /// Mints a random six-digit manual pairing code using the system CSPRNG.
+    public static func makePairingCode() -> String {
+        var rng = SystemRandomNumberGenerator()
+        let value = Int.random(in: 0..<1_000_000, using: &rng)
+        return String(format: "%06d", value)
+    }
+
+    /// Builds a `botfleet-ios://pair?...` invite URL that round-trips through
+    /// `PairingInvite.parse(_:)`, matching the desktop QR invite shape.
+    public static func makePairingInviteURL(
+        window: NativePairingWindow,
+        advertisement: CompanionEndpointAdvertisement,
+        fallbackAddress: String? = nil
+    ) -> URL? {
+        let primaryAddress = advertisement.endpoints.first?.url ?? fallbackAddress
+        guard let address = primaryAddress?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !address.isEmpty,
+              Connection.parse(address) != nil else {
+            return nil
+        }
+
+        var items = [URLQueryItem(name: "address", value: address)]
+        if let token = window.qrCredential, !token.isEmpty {
+            items.append(URLQueryItem(name: "token", value: token))
+        } else if !window.code.isEmpty {
+            items.append(URLQueryItem(name: "code", value: window.code))
+        } else {
+            return nil
+        }
+
+        let trimmedName = advertisement.serverName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedName.isEmpty {
+            items.append(URLQueryItem(name: "name", value: trimmedName))
+        }
+        if !advertisement.hosts.isEmpty {
+            items.append(URLQueryItem(name: "hosts", value: advertisement.hosts.joined(separator: ",")))
+        }
+        if !advertisement.endpoints.isEmpty,
+           let data = try? JSONEncoder().encode(advertisement.endpoints) {
+            let encoded = NativeAPNsProvider.base64URLEncode(data)
+            if encoded.utf8.count <= 8_192 {
+                items.append(URLQueryItem(name: "endpoints", value: encoded))
+            }
+        }
+
+        var components = URLComponents()
+        components.scheme = CompanionURLScheme.primary
+        components.host = "pair"
+        components.queryItems = items
+        return components.url
     }
 
     /// Bounds the app's advertisement at the network boundary, as
@@ -859,6 +1061,29 @@ public actor NativeCompanionServer {
         endpointAdvertisement = Self.sanitizedAdvertisement(advertisement)
     }
 
+    /// Opens a fresh pairing window with generated manual and QR credentials.
+    @discardableResult
+    public func openPairingWindow(
+        ttl: TimeInterval = NativeCompanionServer.pairingWindowTTL,
+        maxAttempts: Int = NativeCompanionServer.pairingMaxAttempts
+    ) -> NativePairingWindow {
+        let code = Self.makePairingCode()
+        let qrCredential = Self.makePairingQRCredential()
+        let expiresAt = clock().addingTimeInterval(ttl)
+        let attempts = max(1, maxAttempts)
+        pairingReplay = nil
+        pairingCode = code
+        pairingQRCredential = qrCredential
+        pairingCodeExpiresAt = expiresAt
+        pairingAttemptsRemaining = attempts
+        return NativePairingWindow(
+            code: code,
+            qrCredential: qrCredential,
+            expiresAt: expiresAt,
+            attemptsRemaining: attempts
+        )
+    }
+
     /// Opens a pairing window for the Mac side to show on its own loopback
     /// page.  The code, and the QR credential when there is one, are
     /// credentials for `pairingWindowTTL` seconds; the first device that
@@ -876,6 +1101,21 @@ public actor NativeCompanionServer {
         pairingQRCredential = qrCredential
         pairingCodeExpiresAt = clock().addingTimeInterval(ttl)
         pairingAttemptsRemaining = max(1, maxAttempts)
+    }
+
+    /// Returns the active pairing window snapshot, or `nil` when closed or expired.
+    public func activePairingWindow() -> NativePairingWindow? {
+        guard let expiry = pairingCodeExpiresAt, hasPairingCredential else { return nil }
+        if clock() >= expiry {
+            discardPairingWindow()
+            return nil
+        }
+        return NativePairingWindow(
+            code: pairingCode ?? "",
+            qrCredential: pairingQRCredential,
+            expiresAt: expiry,
+            attemptsRemaining: pairingAttemptsRemaining
+        )
     }
 
     /// Closes the open pairing window, so a code that is still on screen stops
@@ -900,6 +1140,67 @@ public actor NativeCompanionServer {
         !(pairingCode ?? "").isEmpty || !(pairingQRCredential ?? "").isEmpty
     }
 
+    /// Validates the `<streamId>:<seq>` cursor shape matching `SseCursorSchema` in `server/index.ts`.
+    public static func isValidSSECursor(_ cursor: String) -> Bool {
+        guard let colon = cursor.firstIndex(of: ":"),
+              cursor.index(after: colon) < cursor.endIndex else { return false }
+        let streamPart = cursor[..<colon]
+        let seqPart = cursor[cursor.index(after: colon)...]
+        guard !streamPart.isEmpty,
+              streamPart.utf8.allSatisfy({
+                  (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) ||
+                      $0 == 45 || $0 == 95
+              }),
+              !seqPart.isEmpty,
+              seqPart.utf8.allSatisfy({ (48...57).contains($0) }) else {
+            return false
+        }
+        return Int(seqPart) != nil
+    }
+
+    private func parseSinceCursor(_ request: CompanionHTTPRequest) -> Result<Int?, CompanionHTTPResponse> {
+        let rawCursor = request.queryItems["since"] ?? request.headerValue(for: "Last-Event-ID")
+        guard let rawCursor, !rawCursor.isEmpty else {
+            return .success(nil)
+        }
+        guard Self.isValidSSECursor(rawCursor) else {
+            return .failure(.error(400, "invalid_cursor"))
+        }
+        guard let colon = rawCursor.firstIndex(of: ":") else {
+            return .failure(.error(400, "invalid_cursor"))
+        }
+        let streamPart = String(rawCursor[..<colon])
+        let seqPart = String(rawCursor[rawCursor.index(after: colon)...])
+        guard streamPart == streamId, let seq = Int(seqPart) else {
+            return .success(nil)
+        }
+        return .success(seq)
+    }
+
+    private func makeSSEHandshake(sinceSeq: Int?) -> (helloFrame: String, replayedFrames: [String]) {
+        let resumed = sinceSeq != nil &&
+            sinceSeq! <= lastEventSeq &&
+            (sseReplayBuffer.isEmpty ? sinceSeq! == lastEventSeq : sseReplayBuffer[0].seq <= sinceSeq! + 1)
+        let hello = SSEHelloPayload(
+            kind: "hello",
+            cursor: "\(streamId):\(lastEventSeq)",
+            resumed: resumed
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let jsonData = (try? encoder.encode(hello)) ??
+            Data("{\"cursor\":\"\(streamId):\(lastEventSeq)\",\"kind\":\"hello\",\"resumed\":false}".utf8)
+        let jsonText = String(data: jsonData, encoding: .utf8) ?? "{}"
+        let helloFrame = "data: \(jsonText)\n\n"
+        var replayedFrames: [String] = []
+        if resumed, let sinceSeq {
+            replayedFrames = sseReplayBuffer
+                .filter { $0.seq > sinceSeq }
+                .map(\.frame)
+        }
+        return (helloFrame, replayedFrames)
+    }
+
     /// Subscribes to Server-Sent Events emitted by the companion server.
     public func subscribeSSE() -> AsyncStream<String> {
         subscribeSSEWithIdentifier().stream
@@ -914,11 +1215,15 @@ public actor NativeCompanionServer {
     /// Subscribes to Server-Sent Events and returns the subscriber's id, so a
     /// caller that owns the transport can retire the subscription itself
     /// instead of waiting for the stream to terminate.
-    func subscribeSSEWithIdentifier(deviceId: String? = nil) -> (stream: AsyncStream<String>, id: UUID) {
+    func subscribeSSEWithIdentifier(deviceId: String? = nil, sinceSeq: Int? = nil) -> (stream: AsyncStream<String>, id: UUID) {
         let id = UUID()
+        let handshake = makeSSEHandshake(sinceSeq: sinceSeq)
         let stream = AsyncStream<String>(bufferingPolicy: .bufferingNewest(Self.sseBufferCapacity)) { continuation in
             sseContinuationById[id] = SSESubscriber(deviceId: deviceId, continuation: continuation)
-            continuation.yield("event: connected\ndata: {\"ok\":true}\n\n")
+            continuation.yield(handshake.helloFrame)
+            for replayed in handshake.replayedFrames {
+                continuation.yield(replayed)
+            }
             continuation.onTermination = { [weak self] _ in
                 Task {
                     await self?.removeSSESubscriber(id: id)
@@ -932,21 +1237,24 @@ public actor NativeCompanionServer {
         sseContinuationById.removeValue(forKey: id)
     }
 
-    private func broadcastSSE(event: String, jsonPayload: String) {
-        let frame = "event: \(event)\ndata: \(jsonPayload)\n\n"
+    @discardableResult
+    private func broadcastEncodableSSE<T: Encodable>(_ buildPayload: (Int) -> T) -> Int {
+        lastEventSeq += 1
+        let seq = lastEventSeq
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let payload = buildPayload(seq)
+        let data = (try? encoder.encode(payload)) ?? Data("{}".utf8)
+        let jsonText = String(data: data, encoding: .utf8) ?? "{}"
+        let frame = "id: \(streamId):\(seq)\ndata: \(jsonText)\n\n"
+        sseReplayBuffer.append((seq: seq, frame: frame))
+        if sseReplayBuffer.count > Self.sseReplayBufferCapacity {
+            sseReplayBuffer.removeFirst(sseReplayBuffer.count - Self.sseReplayBufferCapacity)
+        }
         for subscriber in sseContinuationById.values {
             subscriber.continuation.yield(frame)
         }
-    }
-
-    /// Serializes an SSE payload with `JSONSerialization` so a client-supplied
-    /// value cannot break the JSON body or forge an extra event frame.
-    static func ssePayload(_ payload: [String: String]) -> String {
-        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
-              let text = String(data: data, encoding: .utf8) else {
-            return "{}"
-        }
-        return text
+        return seq
     }
 
     /// The one Origin gate every request path shares - the router and the
@@ -966,7 +1274,7 @@ public actor NativeCompanionServer {
     /// exactly as in `handleRequest`; the socket path must not bypass it
     /// by streaming directly.
     enum EventsAuthorization {
-        case authorized(deviceId: String)
+        case authorized(deviceId: String, sinceSeq: Int?)
         case rejected(CompanionHTTPResponse)
     }
 
@@ -980,7 +1288,12 @@ public actor NativeCompanionServer {
                 "pair this device from Phone settings in BotFleet on your computer"
             ))
         }
-        return .authorized(deviceId: device.id)
+        switch parseSinceCursor(request) {
+        case .success(let sinceSeq):
+            return .authorized(deviceId: device.id, sinceSeq: sinceSeq)
+        case .failure(let response):
+            return .rejected(response)
+        }
     }
 
     // MARK: - HTTP Request Router (Default-Deny Allowlist)
@@ -1016,7 +1329,7 @@ public actor NativeCompanionServer {
         }
 
         // 2. Bearer authentication check for all non-open routes
-        guard isAuthenticated(request) else {
+        guard let device = authenticatedDevice(request) else {
             return .error(401, "pair this device from Phone settings in BotFleet on your computer")
         }
 
@@ -1038,11 +1351,11 @@ public actor NativeCompanionServer {
             return handlePutConfig(request)
 
         case ("POST", "/api/companion/push-token"):
-            return handleRegisterPushToken(request, isLiveActivity: false)
+            return handleRegisterPushToken(request, deviceId: device.id, isLiveActivity: false)
 
         case ("POST", "/api/companion/live-activity"),
              ("POST", "/api/companion/live-activity-token"):
-            return handleRegisterPushToken(request, isLiveActivity: true)
+            return handleRegisterPushToken(request, deviceId: device.id, isLiveActivity: true)
 
         case ("GET", "/api/companion/push-health"):
             return await handlePushHealth()
@@ -1063,18 +1376,22 @@ public actor NativeCompanionServer {
             return await handleCreateNativeWait(request)
 
         case ("GET", "/api/events"):
-            // The socket path streams `subscribeSSE()` frames and keeps the
-            // connection open (see `streamEvents`).  This branch answers an
-            // in-process caller with one well-formed frame.
-            return CompanionHTTPResponse(
-                statusCode: 200,
-                headers: [
-                    "Content-Type": "text/event-stream",
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                ],
-                body: Data("event: connected\ndata: {\"ok\":true}\n\n".utf8)
-            )
+            switch parseSinceCursor(request) {
+            case .failure(let errorResponse):
+                return errorResponse
+            case .success(let sinceSeq):
+                let handshake = makeSSEHandshake(sinceSeq: sinceSeq)
+                let frames = ([handshake.helloFrame] + handshake.replayedFrames).joined()
+                var headers = Self.privateResponseHeaders
+                headers["Content-Type"] = "text/event-stream"
+                headers["Cache-Control"] = "private, no-cache, no-store"
+                headers["Connection"] = "keep-alive"
+                return CompanionHTTPResponse(
+                    statusCode: 200,
+                    headers: headers,
+                    body: Data(frames.utf8)
+                )
+            }
 
         default:
             if method == "DELETE", let waitId = matchNativeWaitDeleteRoute(path: path) {
@@ -1271,7 +1588,7 @@ public actor NativeCompanionServer {
         let summary = FleetSummary(
             bots: bots,
             pairedDevices: deviceRegistry.count,
-            pushTokensRegistered: pushTokens.count
+            pushTokensRegistered: deviceRegistry.pushTokens().count
         )
         return .json(200, summary)
     }
@@ -1329,38 +1646,70 @@ public actor NativeCompanionServer {
         return .json(200, config)
     }
 
-    private func handleRegisterPushToken(_ request: CompanionHTTPRequest, isLiveActivity: Bool) -> CompanionHTTPResponse {
+    private func handleRegisterPushToken(
+        _ request: CompanionHTTPRequest,
+        deviceId: String,
+        isLiveActivity: Bool
+    ) -> CompanionHTTPResponse {
         guard let body = request.body,
               let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
             return .error(400, "invalid_json")
         }
-        let unsupportedKey = json.keys.first(where: { $0 != "token" })
-        if let unsupportedKey {
-            return .error(400, "\(unsupportedKey) is not part of a token registration")
+        if isLiveActivity {
+            let unsupportedKey = json.keys.first(where: { $0 != "token" && $0 != "kind" })
+            if let unsupportedKey {
+                return .error(400, "\(unsupportedKey) is not part of a Live Activity token registration")
+            }
+            if let rawKind = json["kind"] {
+                guard let kind = rawKind as? String else {
+                    return .error(400, "kind must be a string")
+                }
+                guard kind == LiveActivityTokenKind.pushToStart.rawValue else {
+                    return .error(400, "only push-to-start Live Activity tokens are supported")
+                }
+            }
+        } else {
+            let unsupportedKey = json.keys.first(where: { $0 != "token" })
+            if let unsupportedKey {
+                return .error(400, "\(unsupportedKey) is not part of a token registration")
+            }
         }
-        guard let token = json["token"] as? String, !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard let token = json["token"] as? String,
+              !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return .error(400, "token must be a non-empty string")
         }
         guard token.utf8.count <= CompanionFieldLimits.pushToken else {
             return .error(400, "token_too_long")
         }
-        if isLiveActivity {
-            liveActivityTokens.insert(token)
-        } else {
-            pushTokens.insert(token)
+        guard CompanionDeviceRegistry.normalizedPushToken(token) != nil else {
+            return .error(400, "that push token is not usable")
+        }
+        let before = deviceRegistry
+        let updated = isLiveActivity
+            ? deviceRegistry.setLiveActivityToken(id: deviceId, token: token)
+            : deviceRegistry.setPushToken(id: deviceId, token: token)
+        guard updated else {
+            return .error(400, "that push token is not usable")
+        }
+        do {
+            try persistDevices()
+        } catch {
+            deviceRegistry = before
+            return .error(500, "push_token_persist_failed")
         }
         return .json(200, ["ok": true])
     }
 
     private func handlePushHealth() async -> CompanionHTTPResponse {
+        let count = deviceRegistry.pushTokens().count
         if let provider = apnsProvider {
-            let snapshot = await provider.healthSnapshot(tokensRegistered: pushTokens.count)
+            let snapshot = await provider.healthSnapshot(tokensRegistered: count)
             return .json(200, snapshot)
         }
         let unconfigured = PushSenderHealth(
             configured: false,
             production: nil,
-            tokensRegistered: pushTokens.count,
+            tokensRegistered: count,
             sent: 0,
             failed: 0,
             lastSentAt: nil,
@@ -1370,6 +1719,115 @@ public actor NativeCompanionServer {
             dropped: 0
         )
         return .json(200, unconfigured)
+    }
+
+    /// Builds an APNs alert payload matching `apnsPayload` in `companion/src/apns.ts`
+    /// so iOS `PushDeliveryLedger` correlates closed-app alerts with replayed SSE frames.
+    public static func buildAPNsAlertPayload(notification: NotificationFrame, seq: Int) -> [String: Any] {
+        let category = NotificationCategoryIdentifier.forKind(notification.kind)
+        let interruptionLevel = notification.isBlocking ? "time-sensitive" : "active"
+        let relevanceScore: Double
+        switch notification.kind {
+        case "approval": relevanceScore = 1.0
+        case "question": relevanceScore = 0.9
+        case "takeover": relevanceScore = 0.7
+        case "routine-failed": relevanceScore = 0.6
+        case "done": relevanceScore = 0.4
+        default: relevanceScore = 0.3
+        }
+        var aps: [String: Any] = [
+            "alert": [
+                "title": notification.title,
+                "body": notification.body,
+            ],
+            "sound": "default",
+            "category": category,
+            "interruption-level": interruptionLevel,
+            "relevance-score": relevanceScore,
+            "mutable-content": 1,
+            "content-available": 1,
+        ]
+        if !notification.threadId.isEmpty {
+            aps["thread-id"] = notification.threadId
+        }
+        var payload: [String: Any] = [
+            "aps": aps,
+            "threadId": notification.threadId,
+            "botId": notification.botId,
+            "kind": notification.kind,
+            "seq": seq,
+        ]
+        if let requestId = notification.requestId, !requestId.isEmpty {
+            payload["requestId"] = requestId
+        }
+        if let tool = notification.tool, !tool.isEmpty {
+            payload["tool"] = tool
+        }
+        return payload
+    }
+
+    private static func parseAPNsErrorReason(from data: Data) -> String? {
+        guard !data.isEmpty,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let reason = json["reason"] as? String,
+              !reason.isEmpty else {
+            return nil
+        }
+        return reason
+    }
+
+    /// Broadcasts a `notify` SSE frame to active streams and dispatches APNs
+    /// alerts to paired devices that do not hold an open event stream.
+    @discardableResult
+    public func publishNotification(_ notification: NotificationFrame) async -> Int {
+        let seq = broadcastEncodableSSE {
+            SSENotifyFramePayload(kind: "notify", seq: $0, notification: notification)
+        }
+        guard let provider = apnsProvider else { return seq }
+        guard !(await provider.isKeyRejected) else { return seq }
+
+        let connectedDeviceIds = Set(sseContinuationById.values.compactMap(\.deviceId))
+        let targets = deviceRegistry.pushTokens().filter { !connectedDeviceIds.contains($0.deviceId) }
+        guard !targets.isEmpty else { return seq }
+
+        let payload = Self.buildAPNsAlertPayload(notification: notification, seq: seq)
+        let priority = notification.isBlocking ? 10 : 5
+        for entry in targets {
+            do {
+                let request = try await provider.buildPushRequest(
+                    deviceToken: entry.token,
+                    payload: payload,
+                    pushType: "alert",
+                    priority: priority,
+                    now: clock()
+                )
+                let (status, data) = try await apnsTransport(request)
+                if (200...299).contains(status) {
+                    await provider.recordSendSuccess(at: clock())
+                    continue
+                }
+                let appleReason = Self.parseAPNsErrorReason(from: data)
+                let summary = appleReason.map { "\(status) \($0)" } ?? "HTTP \(status)"
+                let keyFault = status == 403 && appleReason == "InvalidProviderToken"
+                await provider.recordSendFailure(reason: summary, isKeyRejected: keyFault, at: clock())
+                if keyFault {
+                    break
+                }
+                if status == 410 ||
+                    (status == 400 && (appleReason == "Unregistered" || appleReason == "BadDeviceToken" || appleReason == "DeviceTokenNotForTopic")) {
+                    if deviceRegistry.clearPushToken(id: entry.deviceId, rejected: entry.token) {
+                        persistDevicesBestEffort()
+                    }
+                }
+            } catch {
+                await provider.recordSendFailure(
+                    reason: error.localizedDescription,
+                    isKeyRejected: false,
+                    at: clock()
+                )
+            }
+        }
+        return seq
     }
 
     /// Enforces both BF-2489 security gates on `POST /api/desktop/open` and
@@ -1649,10 +2107,21 @@ public actor NativeCompanionServer {
                     createdAt: now
                 )
                 try await database.insertMessage(record)
-                broadcastSSE(
-                    event: "message.created",
-                    jsonPayload: Self.ssePayload(["id": messageId, "threadId": threadId])
-                )
+                let normalizedSSERole = record.role == "assistant" ? "bot" : record.role
+                broadcastEncodableSSE {
+                    SSEMessageFramePayload(
+                        kind: "message",
+                        seq: $0,
+                        threadId: threadId,
+                        message: SSEMessageItemPayload(
+                            id: messageId,
+                            role: normalizedSSERole,
+                            kind: record.kind,
+                            at: now * 1000.0,
+                            text: record.content
+                        )
+                    )
+                }
                 return .json(201, [
                     "id": messageId,
                     "threadId": threadId,
@@ -1669,7 +2138,9 @@ public actor NativeCompanionServer {
                 let threadId: String
             }
             interruptedThreadIds.insert(threadId)
-            broadcastSSE(event: "thread.interrupted", jsonPayload: Self.ssePayload(["threadId": threadId]))
+            broadcastEncodableSSE {
+                SSEThreadInterruptedPayload(kind: "thread.interrupted", seq: $0, threadId: threadId)
+            }
             return .json(200, InterruptPayload(ok: true, threadId: threadId))
         }
     }
@@ -1928,23 +2399,32 @@ public actor NativeCompanionServer {
         })
     }
 
-    /// Streams `subscribeSSE()` frames onto an accepted socket and keeps the
-    /// connection open, so `message.created` and `thread.interrupted` actually
-    /// reach a network client.
+    /// Streams `subscribeSSEWithIdentifier()` frames onto an accepted socket and
+    /// keeps the connection open, so `hello`, replays, `message`, `notify`, and
+    /// `thread.interrupted` frames reach network clients.
     private func streamEvents(over connection: NWConnection, request: CompanionHTTPRequest) {
         let deviceId: String
+        let sinceSeq: Int?
         switch authorizeEventsStream(request) {
-        case .authorized(let authorizedDeviceId):
+        case .authorized(let authorizedDeviceId, let parsedSinceSeq):
             deviceId = authorizedDeviceId
+            sinceSeq = parsedSinceSeq
         case .rejected(let response):
             connection.send(content: Self.serializeHTTPResponse(response), completion: .contentProcessed { _ in
                 connection.cancel()
             })
             return
         }
-        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
+        let head = "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: text/event-stream\r\n" +
+            "Cache-Control: private, no-cache, no-store\r\n" +
+            "CDN-Cache-Control: no-store\r\n" +
+            "Cloudflare-CDN-Cache-Control: no-store\r\n" +
+            "Pragma: no-cache\r\n" +
+            "Vary: Authorization\r\n" +
+            "Connection: keep-alive\r\n\r\n"
         connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in })
-        let subscription = subscribeSSEWithIdentifier(deviceId: deviceId)
+        let subscription = subscribeSSEWithIdentifier(deviceId: deviceId, sinceSeq: sinceSeq)
         Task.detached { [weak self] in
             for await frame in subscription.stream {
                 // A write that fails means the peer is gone.  The loop ends
@@ -2048,11 +2528,34 @@ public actor NativeCompanionServer {
         )
     }
 
+    private static func reasonPhrase(for statusCode: Int) -> String {
+        switch statusCode {
+        case 200: return "OK"
+        case 201: return "Created"
+        case 400: return "Bad Request"
+        case 401: return "Unauthorized"
+        case 403: return "Forbidden"
+        case 404: return "Not Found"
+        case 409: return "Conflict"
+        case 413: return "Payload Too Large"
+        case 415: return "Unsupported Media Type"
+        case 429: return "Too Many Requests"
+        case 500: return "Internal Server Error"
+        case 501: return "Not Implemented"
+        case 503: return "Service Unavailable"
+        default: return "OK"
+        }
+    }
+
     public static func serializeHTTPResponse(_ response: CompanionHTTPResponse) -> Data {
-        var head = "HTTP/1.1 \(response.statusCode) OK\r\n"
+        var head = "HTTP/1.1 \(response.statusCode) \(reasonPhrase(for: response.statusCode))\r\n"
         var headers = response.headers
+        for (key, value) in privateResponseHeaders
+        where !headers.keys.contains(where: { $0.lowercased() == key.lowercased() }) {
+            headers[key] = value
+        }
         headers["Content-Length"] = "\(response.body.count)"
-        for (k, v) in headers {
+        for (k, v) in headers.sorted(by: { $0.key < $1.key }) {
             head += "\(k): \(v)\r\n"
         }
         head += "\r\n"

@@ -727,8 +727,9 @@ describe("the Live Activity token body", () => {
   // the checker's own result is made.
   const check = (body: Record<string, unknown>) => companionLiveActivityTokenDenial(body as JsonObject);
 
-  it("accepts the one field it exists for", () => {
+  it("accepts token alone or with kind push-to-start", () => {
     expect(check({ token: hex })).toBeNull();
+    expect(check({ token: hex, kind: "push-to-start" })).toBeNull();
   });
 
   it("refuses a body that is not the shape, rather than coercing it", () => {
@@ -739,6 +740,8 @@ describe("the Live Activity token body", () => {
     expect(check({ token: [1, 2] })?.error).toBe("token must be a string");
     expect(check({ token: null })?.error).toBe("token must be a string");
     expect(check({})?.error).toBe("a Live Activity token is required");
+    expect(check({ token: hex, kind: 12 })?.error).toBe("kind must be a string");
+    expect(check({ token: hex, kind: "update" })?.error).toBe("only push-to-start Live Activity tokens are supported");
     expect(check({ token: hex, environment: "production" })?.status).toBe(400);
     expect(check({ environment: "production" })?.error).toContain("environment");
   });

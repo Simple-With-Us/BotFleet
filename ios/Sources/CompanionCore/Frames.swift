@@ -24,6 +24,26 @@ public struct NotificationFrame: Codable, Hashable, Sendable {
     /// The tool name, display/telemetry only — nothing depends on it.
     public var tool: String?
 
+    public init(
+        kind: String,
+        botId: String,
+        botName: String,
+        threadId: String,
+        title: String,
+        body: String,
+        requestId: String? = nil,
+        tool: String? = nil
+    ) {
+        self.kind = kind
+        self.botId = botId
+        self.botName = botName
+        self.threadId = threadId
+        self.title = title
+        self.body = body
+        self.requestId = requestId
+        self.tool = tool
+    }
+
     /// A bot blocked on you, as opposed to one reporting in.
     public var isBlocking: Bool { kind == "approval" || kind == "question" }
 

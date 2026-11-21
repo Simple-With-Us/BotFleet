@@ -18,6 +18,10 @@ public struct CompanionDeviceRecord: Codable, Sendable, Equatable, Identifiable 
     /// Full interactive access to a bot's cloud desktop.  Off on every new
     /// and migrated device until the computer owner enables it.
     public var cloudDesktopAccess: Bool
+    /// Hex APNs device token for closed-app wakes.  Never exposed on `publicDevice`.
+    public var pushToken: String?
+    /// Hex APNs push-to-start token for Live Activities.  Never exposed on `publicDevice`.
+    public var liveActivityToken: String?
 
     public init(
         id: String,
@@ -25,7 +29,9 @@ public struct CompanionDeviceRecord: Codable, Sendable, Equatable, Identifiable 
         tokenHash: String,
         createdAt: Double,
         lastSeenAt: Double,
-        cloudDesktopAccess: Bool = false
+        cloudDesktopAccess: Bool = false,
+        pushToken: String? = nil,
+        liveActivityToken: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -33,6 +39,8 @@ public struct CompanionDeviceRecord: Codable, Sendable, Equatable, Identifiable 
         self.createdAt = createdAt
         self.lastSeenAt = lastSeenAt
         self.cloudDesktopAccess = cloudDesktopAccess
+        self.pushToken = pushToken
+        self.liveActivityToken = liveActivityToken
     }
 
     /// The device as the phone and the settings UI may see it: no secret.
@@ -168,6 +176,80 @@ public struct CompanionDeviceRegistry: Sendable, Equatable {
         return true
     }
 
+    /// Normalizes a hex APNs token (strips whitespace, lowercases) and verifies
+    /// it meets the 64-hex-character floor matching `companion/src/devices.ts`.
+    public static func normalizedPushToken(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let cleaned = raw.components(separatedBy: .whitespacesAndNewlines).joined().lowercased()
+        guard cleaned.utf8.count >= 64,
+              cleaned.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+            return nil
+        }
+        return cleaned
+    }
+
+    /// Stores a paired device's alert APNs token.
+    @discardableResult
+    public mutating func setPushToken(id: String, token: String) -> Bool {
+        guard let cleaned = Self.normalizedPushToken(token),
+              let index = devices.firstIndex(where: { $0.id == id }) else { return false }
+        devices[index].pushToken = cleaned
+        return true
+    }
+
+    /// Clears a paired device's alert APNs token, optionally only when it still
+    /// matches the rejected token so a concurrent re-registration is preserved.
+    @discardableResult
+    public mutating func clearPushToken(id: String, rejected: String? = nil) -> Bool {
+        guard let index = devices.firstIndex(where: { $0.id == id }),
+              let current = devices[index].pushToken else { return false }
+        if let rejected {
+            let cleaned = rejected.components(separatedBy: .whitespacesAndNewlines).joined().lowercased()
+            guard current == cleaned else { return false }
+        }
+        devices[index].pushToken = nil
+        return true
+    }
+
+    /// All paired devices holding an alert APNs token.
+    public func pushTokens() -> [(deviceId: String, token: String)] {
+        devices.compactMap { device in
+            guard let token = device.pushToken else { return nil }
+            return (deviceId: device.id, token: token)
+        }
+    }
+
+    /// Stores a paired device's push-to-start Live Activity APNs token.
+    @discardableResult
+    public mutating func setLiveActivityToken(id: String, token: String) -> Bool {
+        guard let cleaned = Self.normalizedPushToken(token),
+              let index = devices.firstIndex(where: { $0.id == id }) else { return false }
+        devices[index].liveActivityToken = cleaned
+        return true
+    }
+
+    /// Clears a paired device's Live Activity token, optionally matching only
+    /// the rejected token.
+    @discardableResult
+    public mutating func clearLiveActivityToken(id: String, rejected: String? = nil) -> Bool {
+        guard let index = devices.firstIndex(where: { $0.id == id }),
+              let current = devices[index].liveActivityToken else { return false }
+        if let rejected {
+            let cleaned = rejected.components(separatedBy: .whitespacesAndNewlines).joined().lowercased()
+            guard current == cleaned else { return false }
+        }
+        devices[index].liveActivityToken = nil
+        return true
+    }
+
+    /// All paired devices holding a Live Activity push-to-start APNs token.
+    public func liveActivityTokens() -> [(deviceId: String, token: String)] {
+        devices.compactMap { device in
+            guard let token = device.liveActivityToken else { return nil }
+            return (deviceId: device.id, token: token)
+        }
+    }
+
     // MARK: - Persistence
 
     private struct DevicesFile: Codable {
@@ -198,6 +280,8 @@ public struct CompanionDeviceRegistry: Sendable, Equatable {
         if !(record.lastSeenAt > 0) || !record.lastSeenAt.isFinite {
             record.lastSeenAt = record.createdAt
         }
+        record.pushToken = Self.normalizedPushToken(record.pushToken)
+        record.liveActivityToken = Self.normalizedPushToken(record.liveActivityToken)
         return record
     }
 

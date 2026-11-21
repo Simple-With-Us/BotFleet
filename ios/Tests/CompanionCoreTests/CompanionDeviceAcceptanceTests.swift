@@ -301,11 +301,11 @@ struct CompanionDeviceAcceptanceTests {
         #expect(noTokenResponse.statusCode == 403)
 
         // A native request (no Origin) with a good credential is authorized
-        // as its device and actually streams the connected frame.
+        // as its device and actually streams the hello handshake frame.
         let good = await server.authorizeEventsStream(
             Self.authedRequest(path: "/api/events", token: token)
         )
-        guard case .authorized(let deviceId) = good else {
+        guard case .authorized(let deviceId, _) = good else {
             Issue.record("native events request with a paired token must be authorized")
             return
         }
@@ -313,7 +313,8 @@ struct CompanionDeviceAcceptanceTests {
         let stream = await server.subscribeSSE(deviceId: deviceId)
         var iterator = stream.makeAsyncIterator()
         let first = await iterator.next()
-        #expect(first?.contains("event: connected") == true)
+        #expect(first?.contains("\"kind\":\"hello\"") == true)
+        #expect(first?.contains("\"cursor\":") == true)
     }
 
     @Test("Revoking a device finishes its SSE stream and leaves another device's stream live")
@@ -329,8 +330,8 @@ struct CompanionDeviceAcceptanceTests {
         let survivorStream = await server.subscribeSSE(deviceId: survivor.id)
         var victimIterator = victimStream.makeAsyncIterator()
         var survivorIterator = survivorStream.makeAsyncIterator()
-        #expect(await victimIterator.next()?.contains("event: connected") == true)
-        #expect(await survivorIterator.next()?.contains("event: connected") == true)
+        #expect(await victimIterator.next()?.contains("\"kind\":\"hello\"") == true)
+        #expect(await survivorIterator.next()?.contains("\"kind\":\"hello\"") == true)
 
         #expect(await server.revokeDevice(id: victim.id))
 
