@@ -2786,13 +2786,19 @@ export class Store {
     const turns = previous?.usage?.turns ?? 0;
     const messages = previousThreadId ? this.messageCountFor(previousThreadId) : 0;
     const title = opts?.title?.trim() || previous?.title || "Automation";
-    const previousTitle = previous?.title;
     // BF-2556: the replacement takes the live title, so a predecessor that
     // still carries it would leave the task list holding two threads with
-    // the exact same name.  Retire the old one under a dated archived name
-    // (the clear below persists the rename with the key removal).
+    // the exact same name.  Retire the old one under a dated archived name,
+    // disambiguated when a same-day predecessor already took that name.
+    // createTask below persists the rename with the new task.
     if (previous && previous.title === title) {
-      previous.title = `${title} (archived ${new Date().toISOString().slice(0, 10)})`;
+      const baseArchivedTitle = `${title} (archived ${new Date().toISOString().slice(0, 10)})`;
+      const takenTitles = new Set((bot.tasks ?? []).filter((task) => task !== previous).map((task) => task.title));
+      let archivedTitle = baseArchivedTitle;
+      for (let n = 2; takenTitles.has(archivedTitle); n += 1) {
+        archivedTitle = `${baseArchivedTitle} (${n})`;
+      }
+      previous.title = archivedTitle;
     }
     this.clearAutomationKey(botId, automationKey);
     const activate = opts?.activate ?? true;
@@ -2805,7 +2811,7 @@ export class Store {
         kind: "text",
         text: automationRolloverSeedText({
           previousThreadId,
-          previousTitle,
+          previousTitle: previous?.title,
           turns,
           messages,
         }),
