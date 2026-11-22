@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -83,9 +83,12 @@ function runEnvImport(stepRun, envLine) {
   const directory = mkdtempSync(join(tmpdir(), "botfleet-native-env-"));
   const envPath = join(directory, "assembled-native-update.env");
   try {
+    // The fixture is written as a file, not through the shell: an env value or
+    // a path carrying a quote would otherwise terminate the quoting and
+    // corrupt the fixture the loop is about to read.
+    writeFileSync(envPath, `${envLine}\n`);
     const loop = importLoop[0].replaceAll("$RUNNER_TEMP", directory);
     const result = runShell(
-      `printf '%s\n' '${envLine}' > '${envPath}'\n` +
       `${loop}\n` +
       `printf '%s' "$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"`,
     );
