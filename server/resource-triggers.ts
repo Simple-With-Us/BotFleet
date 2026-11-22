@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, mkdirSync, readFileSync, statfsSync } from "node:fs";
+import { statfs as statfsAsync } from "node:fs/promises";
 import { cpus, freemem, loadavg, totalmem } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
@@ -376,7 +377,7 @@ export async function sampleHostAsync(now = Date.now()): Promise<HostSample> {
   const diskPromise: Promise<{ freeGb: number; usedPct: number }> = (async () => {
     if (process.platform === "win32") {
       try {
-        const stats = statfsSync(process.cwd().slice(0, 3));
+        const stats = await statfsAsync(process.cwd().slice(0, 3));
         const totalBytes = stats.blocks * stats.bsize;
         const freeBytes = stats.bavail * stats.bsize;
         if (totalBytes > 0) return { freeGb: freeBytes / (1024 * 1024 * 1024), usedPct: ((totalBytes - freeBytes) / totalBytes) * 100 };
@@ -398,7 +399,7 @@ export async function sampleHostAsync(now = Date.now()): Promise<HostSample> {
       }
     }
     try {
-      const stats = statfsSync("/");
+      const stats = await statfsAsync("/");
       const totalBytes = stats.blocks * stats.bsize;
       const freeBytes = stats.bavail * stats.bsize;
       if (totalBytes > 0) return { freeGb: freeBytes / (1024 * 1024 * 1024), usedPct: ((totalBytes - freeBytes) / totalBytes) * 100 };
