@@ -320,6 +320,75 @@ test("a benign Code-suffixed field survives the round trip", () => {
   assert.equal(decision.window.decode, "utf8");
 });
 
+test("a credential-shaped value under an allowlisted name is dropped", () => {
+  // The allowlist rescues a name, never a value: a caller that renames a
+  // cleartext credential into a benign field still loses it.
+  const window = {
+    ...openWindow(),
+    statusCode: PROOF,
+    encode: "123456",
+    postcode: "st." + "a".repeat(20),
+    unicode: "Bearer " + "b".repeat(12),
+  };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  for (const key of ["statusCode", "encode", "postcode", "unicode"]) {
+    assert.ok(!(key in decision.window), `${key} must not keep a credential value`);
+  }
+});
+
+test("a benign value under an allowlisted name survives", () => {
+  const window = { ...openWindow(), statusCode: 200, postcode: "60601", unicode: "yes", encode: "utf8" };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.equal(decision.window.statusCode, 200);
+  assert.equal(decision.window.postcode, "60601");
+  assert.equal(decision.window.unicode, "yes");
+  assert.equal(decision.window.encode, "utf8");
+});
+
+test("a credential-shaped value under a credential name is dropped", () => {
+  const window = { ...openWindow(), pairingtoken: PROOF, token: "123456", secret: "st." + "a".repeat(20) };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  for (const key of ["pairingtoken", "token", "secret"]) {
+    assert.ok(!(key in decision.window), `${key} must not survive a redeem`);
+  }
+});
+
+test("the credential names drop and the benign names keep their value", () => {
+  const window = {
+    ...openWindow(),
+    APIToken: "a",
+    SMSCode: "b",
+    JWTToken: "c",
+    TOKENValue: "d",
+    pairingtoken: "e",
+    authtoken: "f",
+    token123: "g",
+    smscode: "h",
+    shipping: "ship",
+    mapping: "map",
+    coping: "cope",
+    customCount: 7,
+    hostname: "host",
+    duration: 12,
+    deviceId: "d-1",
+  };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  for (const key of ["APIToken", "SMSCode", "JWTToken", "TOKENValue", "pairingtoken", "authtoken", "token123", "smscode"]) {
+    assert.ok(!(key in decision.window), `${key} must not survive a redeem`);
+  }
+  assert.equal(decision.window.shipping, "ship");
+  assert.equal(decision.window.mapping, "map");
+  assert.equal(decision.window.coping, "cope");
+  assert.equal(decision.window.customCount, 7);
+  assert.equal(decision.window.hostname, "host");
+  assert.equal(decision.window.duration, 12);
+  assert.equal(decision.window.deviceId, "d-1");
+});
+
 test("device credentials match digests only, under a concrete id", () => {
   const devices = [
     { id: "d-1", tokenDigest: sha256Hex(PROOF) },

@@ -253,7 +253,9 @@ const CREDENTIAL_EDGE_FIELD_WORDS = new Set(['pin']);
  * a credential that survives costs the cleartext itself. The list is exact
  * and finite on purpose, so a name is either listed here or it is not, and
  * a prefixed variant such as httpStatusCode is not listed, so it is
- * dropped.
+ * dropped. The allowlist rescues a name and never rescues a credential
+ * value: a field on this list still drops when its value is a credential,
+ * because the value check runs on every value the bridge keeps.
  */
 const BENIGN_FIELD_NAMES = new Set([
   'statuscode',
@@ -314,6 +316,10 @@ function hasEdgeCredentialWord(lowered) {
  * readings of the name follow: the credential words at the edges of the
  * name, and the credential words anywhere in the run. A cleartext value
  * therefore cannot ride back out of a stored window under any name.
+ *
+ * The allowlist rescues a name and never rescues a credential value, so
+ * this answer is only half of the decision: the value check runs on the
+ * value as well, whatever the name says.
  */
 function isCredentialFieldName(key) {
   const name = String(key ?? '');
@@ -329,6 +335,38 @@ function isCredentialFieldName(key) {
 }
 
 /**
+ * The credential shapes a caller value can take, and the only shapes this
+ * check knows. They are the shapes the module and its sibling handle: the
+ * pairing token this module mints, the six digit pairing code, an
+ * Infisical service token, and an authorization header value. A generic
+ * length test is not used, because it would drop a benign value such as a
+ * sha256 digest, and the point of the benign allowlist is to keep benign
+ * metadata. None of these patterns carries the global flag, because a
+ * global pattern keeps its lastIndex between calls.
+ */
+const CREDENTIAL_VALUE_PATTERNS = [
+  OMB_PAIR_TOKEN,
+  /^\d{6}$/,
+  /\bst\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})*/,
+  /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/i,
+  /^[A-Za-z][A-Za-z0-9-]{2,}\s+[A-Za-z0-9._~+/=-]{12,}$/,
+];
+
+/**
+ * Whether one caller value carries a credential. A name can be guessed by
+ * whoever persists the window; a value cannot be renamed out of the way, so
+ * this check runs on every value the bridge is about to keep, under any
+ * name at all.
+ */
+function isCredentialFieldValue(value) {
+  const text = String(value ?? '');
+  for (const pattern of CREDENTIAL_VALUE_PATTERNS) {
+    if (pattern.test(text)) return true;
+  }
+  return false;
+}
+
+/**
  * Normalize one stored window, preserving a bounded set of unknown caller
  * fields. Callers may attach small metadata to the object they persist;
  * dropping it on read would silently lose it the first time the bridge
@@ -339,7 +377,9 @@ function isCredentialFieldName(key) {
  * whose name carries a credential never travels at all, so a cleartext token
  * or code persisted on a window is dropped on the way out. The benign names
  * that keep their value are listed in the module, so the rule stays an
- * explicit finite list rather than a judgement call.
+ * explicit finite list rather than a judgement call. That list rescues a
+ * name only: a value that is one of the credential shapes the module
+ * handles is dropped under any name, allowlisted or not.
  */
 function normalizeWindow(window) {
   let source = window ?? {};
@@ -355,6 +395,7 @@ function normalizeWindow(window) {
     if (key === 'codeDigest' || key === 'tokenDigest' || key === 'expiresAtMs' || key === 'attemptsLeft' || key === 'spent' || key === 'replay') continue;
     if (isCredentialFieldName(key)) continue;
     if (kept >= MAX_WINDOW_METADATA_KEYS) break;
+    if (isCredentialFieldValue(source[key])) continue;
     let size = 0;
     try {
       size = JSON.stringify(source[key] ?? null)?.length ?? 0;
