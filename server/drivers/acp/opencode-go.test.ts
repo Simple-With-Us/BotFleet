@@ -61,6 +61,21 @@ describe("OpenCode catalog", () => {
     ]);
   });
 
+  it("drops a retired model the CLI still lists, keeping its live successor", () => {
+    // The MiniMax Coding Plan still lists MiniMax-M3 next to its
+    // successor; the product retired M3 (retired-model-ids.ts), so the
+    // discovered catalog must not offer it even though the CLI serves
+    // it — every other engine's catalog already excludes it.
+    const models = parseOpenCodeModelsOutput([
+      "minimax-coding-plan/MiniMax-M3",
+      JSON.stringify({ name: "MiniMax M3", status: "active" }, null, 2),
+      "minimax-coding-plan/MiniMax-M3.1-Flash",
+      JSON.stringify({ name: "MiniMax M3.1 Flash", status: "active" }, null, 2),
+    ].join("\n"));
+    expect(models?.options.map((option) => option.id)).toEqual(["minimax-coding-plan/MiniMax-M3.1-Flash"]);
+    expect(models?.default).toBe("minimax-coding-plan/MiniMax-M3.1-Flash");
+  });
+
   it("defaults to a first-party Zen model rather than the first listed", () => {
     // The catalog used to resolve its default through a hardcoded id that the
     // CLI has since deprecated, so a bot with no saved model inherited a model

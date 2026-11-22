@@ -4,7 +4,11 @@
 // that reaches it burns a spawn on "unknown model option" before the
 // rejection registry can learn.  Map those ids onto the live replacement
 // the product already ships so resolveModel / selectTurnFallback / store
-// load never hand a dead spelling to an engine.
+// load never hand a dead spelling to an engine.  The same map is the
+// authority for the paths that meet an id outside saved chains: catalog
+// discovery drops rows it names (a provider's live list keeps serving a
+// retired model after the picker drops it), and per-model usage stats
+// fold its banked rows onto the live replacement.
 import type { ModelSelection } from "./contracts.ts";
 
 /** Exact retired picker ids → the live catalog id that replaced them.
@@ -35,16 +39,47 @@ const RETIRED_MODEL_REPLACEMENTS: Readonly<Record<string, string>> = {
 };
 
 /** Live replacement for a retired model id, or the input when it is still
- *  current.  Exact match only — MiniMax-M3.1-Flash and
- *  MiniMax-M2.7-highspeed must not match the retired stems. */
+ *  current.  The bare id must match exactly — MiniMax-M3.1-Flash and
+ *  MiniMax-M2.7-highspeed must not match the retired stems.  A
+ *  provider-qualified spelling (`minimax-coding-plan/MiniMax-M3`, as a
+ *  discovered catalog spells the models it routes) names the bare id
+ *  after its last `/`, but only under a qualifier that is itself a
+ *  route to these vendors' models (see RETIRED_MODEL_QUALIFIERS): the
+ *  retired model is the same product on those routes, so the match
+ *  runs on that bare id and the replacement keeps the qualifier,
+ *  landing on the same route's live row
+ *  (`minimax-coding-plan/MiniMax-M3.1-Flash`).  Any other qualifier is
+ *  a different route whose trailing segment merely shares the text,
+ *  and its ids are left alone. */
 export function rewriteRetiredModelId(model: string): string {
-  return RETIRED_MODEL_REPLACEMENTS[model] ?? model;
+  const bare = retiredBareId(model);
+  if (bare === null) return model;
+  return model.slice(0, model.length - bare.length) + RETIRED_MODEL_REPLACEMENTS[bare]!;
 }
 
 /** True when the model id is one the product has already retired from
- *  every catalog that used to advertise it. */
+ *  every catalog that used to advertise it — bare, or provider-qualified
+ *  under a known route qualifier with a retired bare id after the last
+ *  `/`. */
 export function isRetiredModelId(model: string): boolean {
-  return Object.prototype.hasOwnProperty.call(RETIRED_MODEL_REPLACEMENTS, model);
+  return retiredBareId(model) !== null;
+}
+
+/** Provider qualifiers under which a qualified spelling names one of the
+ *  retired models themselves: OpenCode's MiniMax Coding Plan route
+ *  (`minimax-coding-plan/MiniMax-M3`) and the DSH engine's provider
+ *  spelling (`minimax/MiniMax-M3.1-Flash`). */
+const RETIRED_MODEL_QUALIFIERS: ReadonlySet<string> = new Set(["minimax", "minimax-coding-plan"]);
+
+/** The retired bare id a model id names, or null when it names none:
+ *  the id itself, or — under a known route qualifier — the segment
+ *  after its last `/`. */
+function retiredBareId(model: string): string | null {
+  const slash = model.lastIndexOf("/");
+  const bare = model.slice(slash + 1);
+  if (!Object.prototype.hasOwnProperty.call(RETIRED_MODEL_REPLACEMENTS, bare)) return null;
+  if (slash !== -1 && !RETIRED_MODEL_QUALIFIERS.has(model.slice(0, slash))) return null;
+  return bare;
 }
 
 /** Rewrite primary + nested fallbacks.  Effort and instanceId stay put —
