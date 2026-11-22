@@ -77,13 +77,14 @@
 // The capture ceilings.  The producer refuses rather than filling a disk:  a
 // store above the file-count ceiling is refused before a byte is copied, and
 // a store above the byte ceiling is refused before the capture directory exists
-// as well, so a refusal leaves nothing behind.  The copy measures the bytes
+// as well, so a refusal leaves nothing behind.  The copy measures the bytes
 // it actually wrote too, because a store that grows while it is being copied
-// slips past an estimate taken before the copy began.  Both ceilings are
-// raised by the operator on the command line, because the store this producer
-// was written for holds more files and more bytes than the values the
-// producer used to ship, and a producer that cannot capture the owner's own
-// store is not evidence about the owner's own store.
+// slips past an estimate taken before the copy began.  The ordinary defaults
+// are sized for an ordinary store:  200,000 files and 8 GiB.  The owner's
+// measured store is larger than that, so capturing it is an explicit act:  the
+// operator names the ceiling on the command line, up to an absolute ceiling of
+// 500,000 files and 32 GiB, and a request above that absolute ceiling is
+// refused with both numbers named rather than being clamped.
 import { createHash } from "node:crypto";
 import {
   chmodSync, closeSync, copyFileSync, existsSync, mkdirSync,
@@ -110,27 +111,52 @@ export const CHECK_NAMES = {
 };
 
 /**
- * The default capture ceiling on bytes: 32 GiB.
+ * The default capture ceiling on bytes: 8 GiB.
  *
  * The ceiling exists so the producer refuses rather than filling a disk, and
- * the default is chosen above the owner's real store so that the plain
- * command can capture it. The measured store is about 13 GB, and the capture
- * that succeeded on 2026-11-22 was 286,257 files and 12,200,859,045 bytes,
- * so 32 GiB leaves room for the store to keep growing and still refuses
- * anything that is not this store.
+ * this default is deliberately sized for an ordinary store rather than for the
+ * largest store this producer might meet.  The owner's measured store is
+ * larger than that:  the capture that succeeded on 2026-11-22 was 286,257
+ * files and 12,200,859,045 bytes, so the plain command refuses that store, and
+ * the refusal is the intended behaviour rather than a fault.  Capturing a
+ * store of that size is an explicit act:  the operator names the ceiling on
+ * the command line, up to the absolute ceiling of 32 GiB, which still covers
+ * the measured store.
  */
-export const DEFAULT_MAX_BYTES = 32 * 1024 * 1024 * 1024;
+export const DEFAULT_MAX_BYTES = 8 * 1024 * 1024 * 1024;
 
 /**
- * The default capture ceiling on file count: 500,000 files.
+ * The default capture ceiling on file count: 200,000 files.
  *
- * The same store holds 286,388 files, which the previous 200,000 default
- * could not capture at all, so the default is chosen above the measured
- * store with room to grow. An explicit ceiling is still honoured: an
- * operator who names one lower than the store is refused, and the refusal
- * names the ceiling and the measured size.
+ * The same store holds 286,388 files, so the ordinary default does not cover
+ * it either and the plain command refuses it before it writes anything.  An
+ * operator who names --max-files raises the ceiling up to the absolute
+ * ceiling of 500,000 files, which does cover the measured store, and a
+ * request above that absolute ceiling is refused with both numbers named
+ * rather than being clamped or silently replaced.
  */
-export const DEFAULT_MAX_FILES = 500_000;
+export const DEFAULT_MAX_FILES = 200_000;
+
+/**
+ * The absolute ceiling on bytes an operator may name: 32 GiB.
+ *
+ * This is the bound on the opt-in and not the default.  It exists so that a
+ * raised ceiling stays a ceiling somebody chose:  a request above this number
+ * is refused, naming both the request and this number, and nothing is
+ * clamped and nothing is silently replaced.  The measured store is
+ * 12,200,859,045 bytes, so this bound covers it with room to grow.
+ */
+export const ABSOLUTE_MAX_BYTES = 32 * 1024 * 1024 * 1024;
+
+/**
+ * The absolute ceiling on file count an operator may name: 500,000 files.
+ *
+ * The measured store holds 286,388 files and the capture that succeeded was
+ * 286,257 files, so this bound covers the measured store with room to grow,
+ * and it is the largest file ceiling this producer accepts on the command
+ * line.
+ */
+export const ABSOLUTE_MAX_FILES = 500_000;
 
 /**
  * The largest file the evidence bundle will accept.  The bundle's reader
@@ -1381,7 +1407,7 @@ function flagValue(args, flag) {
 /**
  * The raw value a ceiling flag carries, or null when the flag was not given.
  *
- * The flag may be written `--max-files 500000` or `--max-files=500000`. A
+ * The flag may be written `--max-files 250000` or `--max-files=250000`. 
  * flag that is present but carries no value at all comes back as the empty
  * string rather than as null, because a ceiling the operator named and did
  * not fill in is a refusal and not a default.
@@ -1400,14 +1426,19 @@ function ceilingArg(args, flag) {
 /**
  * A capture ceiling named on the command line, as a positive whole number.
  *
- * The value has to be a positive whole number: zero, a negative number, a
+ * The value has to be a positive whole number:  zero, a negative number, a
  * fraction or a value that is not a number at all is a usage refusal rather
  * than a silent fall back to the default, because a ceiling the operator did
- * not choose is a ceiling the operator did not set. An absent flag comes
+ * not choose is a ceiling the operator did not set.  An absent flag comes
  * back as undefined, which is how the caller tells "not named" from "named
  * and wrong".
+ *
+ * When an absolute ceiling is given, a request above it is refused as well,
+ * and the refusal names the value that was asked for and the ceiling that
+ * bounds it.  The request is not clamped and not replaced by the ceiling:  a
+ * ceiling the operator did not get is a ceiling the operator did not choose.
  */
-export function parseCeilingFlag(args, flag) {
+export function parseCeilingFlag(args, flag, absoluteCeiling) {
   const raw = ceilingArg(args, flag);
   if (raw === null) return undefined;
   if (!/^\d+$/.test(raw)) {
@@ -1417,7 +1448,25 @@ export function parseCeilingFlag(args, flag) {
   if (!Number.isSafeInteger(value) || value < 1) {
     throw new Error(`${flag} <count> must be a positive whole number`);
   }
+  if (absoluteCeiling !== undefined && value > absoluteCeiling) {
+    throw new Error(`${flag} ${value} is above the absolute ceiling of ${absoluteCeiling}`);
+  }
   return value;
+}
+
+/**
+ * Where the pair of ceilings in force came from.
+ *
+ * "default" is the plain command, "explicit" is an operator who named both
+ * ceilings, and "mixed" is an operator who named one of them and left the
+ * other at its default.  The output says which, because a capture under an
+ * ordinary default and a capture under an opt-in are different claims and a
+ * reader of the JSON has to be able to tell them apart.
+ */
+export function ceilingSource(namedMaxFiles, namedMaxBytes) {
+  if (namedMaxFiles === undefined && namedMaxBytes === undefined) return "default";
+  if (namedMaxFiles !== undefined && namedMaxBytes !== undefined) return "explicit";
+  return "mixed";
 }
 
 let isEntry = false;
@@ -1438,11 +1487,16 @@ if (isEntry) {
       const storeRoot = flagValue(args, "--store") ?? resolveStoreRoot();
       const outDir = flagValue(args, "--out");
       if (!outDir) throw new Error("--out <capture-directory> is required");
-      // The ceilings are the operator's to raise. A value that is not a
-      // positive whole number is refused here, where the reason can be said,
-      // rather than being silently replaced by the default.
-      const maxFiles = parseCeilingFlag(args, "--max-files") ?? DEFAULT_MAX_FILES;
-      const maxBytes = parseCeilingFlag(args, "--max-bytes") ?? DEFAULT_MAX_BYTES;
+      // The ceilings are the operator's to raise, up to the absolute
+      // ceiling and no further.  A value that is not a positive whole
+      // number, and a value above the absolute ceiling, are both refused
+      // here, where the reason can be said, rather than being silently
+      // replaced by the default or clamped down to the ceiling.
+      const namedMaxFiles = parseCeilingFlag(args, "--max-files", ABSOLUTE_MAX_FILES);
+      const namedMaxBytes = parseCeilingFlag(args, "--max-bytes", ABSOLUTE_MAX_BYTES);
+      const maxFiles = namedMaxFiles ?? DEFAULT_MAX_FILES;
+      const maxBytes = namedMaxBytes ?? DEFAULT_MAX_BYTES;
+      const source = ceilingSource(namedMaxFiles, namedMaxBytes);
       const { manifest } = await archiveStore({ storeRoot, outDir, maxFiles, maxBytes });
       console.log(JSON.stringify({
         archived: true,
@@ -1453,6 +1507,7 @@ if (isEntry) {
         readOnlyProved: manifest.readOnlyProved,
         maxFiles,
         maxBytes,
+        ceilingSource: source,
       }));
     } else if (command === "restore") {
       const archiveDir = flagValue(args, "--archive");
@@ -1493,7 +1548,7 @@ if (isEntry) {
       });
       console.log(JSON.stringify({ emitted: Object.keys(emitted) }));
     } else {
-      console.error("usage: node scripts/archive-node-store.mjs archive --store <root> --out <dir> [--max-files <count>] [--max-bytes <bytes>]");
+      console.error(`usage: node scripts/archive-node-store.mjs archive --store <root> --out <dir> [--max-files <count, at most ${ABSOLUTE_MAX_FILES}>] [--max-bytes <bytes, at most ${ABSOLUTE_MAX_BYTES}>]`);
       console.error("       node scripts/archive-node-store.mjs restore --archive <dir> --into <scratch-root>");
       console.error("       node scripts/archive-node-store.mjs receipt --capture <dir> --request <request.json> --provenance-record <file> --provenance-source <https-url> --provenance-by <who> [--parity-report <file>]");
       process.exitCode = 2;
