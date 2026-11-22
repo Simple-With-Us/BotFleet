@@ -125,14 +125,42 @@ function digestsEqualHex(left, right) {
  * stored as digests only. The clock is injected (`nowMs`) so tests run on
  * a fake clock and production passes `Date.now()`.
  */
+/**
+ * Minimum token length the bridge accepts. Established QR tokens are 52
+ * characters (`omb_pair_` plus 32 random bytes); the code path stays the
+ * human fallback at six digits with its own attempt budget and TTL. A
+ * shorter token is refused rather than trusted at any entropy.
+ */
+export const MIN_BRIDGE_TOKEN_LENGTH = 16;
+
+/** Request ids that may key a replay, mirroring `devices.ts`. */
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]{16,128}$/;
+
+/**
+ * A request id the bridge will replay for, or null when the caller sent
+ * none or a malformed one. Malformed ids are treated as absent (older
+ * clients keep exactly-once behaviour) rather than hashed into a
+ * recoverable bearer the Mac sidecar would treat as exactly-once.
+ */
+export function replayableRequestId(value) {
+  const text = String(value ?? '');
+  return REQUEST_ID_PATTERN.test(text) ? text : null;
+}
+
 export function openBridgePairingWindow({ code, token, ttlSeconds, maxAttempts, nowMs }) {
   const cleanCode = String(code ?? '');
   const cleanToken = String(token ?? '');
   const ttl = Number(ttlSeconds);
   const attempts = Math.floor(Number(maxAttempts));
   const now = Number(nowMs);
-  if (!/^\d{6}$/.test(cleanCode) || !cleanToken || !(ttl > 0) || !(now >= 0) || !Number.isFinite(attempts) || attempts < 1) {
-    throw new Error('openBridgePairingWindow requires a 6-digit code, a token, a positive TTL, a clock, and a positive attempt budget');
+  if (!/^\d{6}$/.test(cleanCode)) {
+    throw new Error('openBridgePairingWindow requires a 6-digit code');
+  }
+  if (cleanToken.length < MIN_BRIDGE_TOKEN_LENGTH) {
+    throw new Error('openBridgePairingWindow requires a high-entropy token');
+  }
+  if (!Number.isFinite(ttl) || !(ttl > 0) || !Number.isFinite(now) || !(now >= 0) || !Number.isFinite(attempts) || attempts < 1) {
+    throw new Error('openBridgePairingWindow requires a positive finite TTL, a finite clock, and a positive attempt budget');
   }
   return {
     codeDigest: sha256Hex(cleanCode),
@@ -177,7 +205,8 @@ export function redeemBridgePairingWindow({ window, presented, requestId, paired
   const current = normalizeWindow(window);
   const now = Number(nowMs);
   const presentedDigest = sha256Hex(String(presented ?? ''));
-  const requestDigest = requestId === undefined || requestId === null ? '' : sha256Hex(String(requestId));
+  const validRequestId = replayableRequestId(requestId);
+  const requestDigest = validRequestId === null ? '' : sha256Hex(validRequestId);
 
   if (!(now >= 0) || !Number.isFinite(current.expiresAtMs) || now >= current.expiresAtMs) {
     return { ok: false, reason: 'window expired', window: { ...current, spent: true, replay: null } };
@@ -187,6 +216,7 @@ export function redeemBridgePairingWindow({ window, presented, requestId, paired
     const paired = Array.isArray(pairedDeviceIds) ? pairedDeviceIds : [];
     if (
       replay &&
+      validRequestId !== null &&
       requestDigest !== '' &&
       replay.requestDigest === requestDigest &&
       replay.expiresAtMs > now &&
@@ -218,16 +248,20 @@ export function redeemBridgePairingWindow({ window, presented, requestId, paired
 export function recordBridgePairingReplay({ window, requestId, credentialDigest, deviceId, nowMs }) {
   const current = normalizeWindow(window);
   const now = Number(nowMs);
-  if (!(now >= 0) || requestId === undefined || requestId === null || String(requestId) === '') {
-    throw new Error('recordBridgePairingReplay requires a request id and a clock');
+  const validRequestId = replayableRequestId(requestId);
+  if (!(now >= 0) || validRequestId === null) {
+    throw new Error('recordBridgePairingReplay requires a shaped request id and a clock');
   }
   if (!/^[0-9a-f]{64}$/.test(credentialDigest ?? '') || String(deviceId ?? '') === '') {
     throw new Error('recordBridgePairingReplay requires a credential digest and a device id');
   }
+  if (credentialDigest !== current.codeDigest && credentialDigest !== current.tokenDigest) {
+    throw new Error('recordBridgePairingReplay requires a digest this window minted');
+  }
   return {
     ...current,
     replay: {
-      requestDigest: sha256Hex(String(requestId)),
+      requestDigest: sha256Hex(validRequestId),
       credentialDigest,
       deviceId: String(deviceId),
       expiresAtMs: current.expiresAtMs,
@@ -268,6 +302,13 @@ export function pushSenderForDevice({ serverOwnsPairing, macOwnsPairing } = {}) 
 }
 
 /** Relevance scores by notification kind, mirroring the native provider. */
+const CATEGORY_FOR_KIND = {
+  approval: 'BOTFLEET_APPROVAL',
+  question: 'BOTFLEET_QUESTION',
+};
+
+const BLOCKING_KINDS = new Set(['approval', 'question']);
+
 const RELEVANCE_SCORES = {
   approval: 1.0,
   question: 0.9,
@@ -281,13 +322,14 @@ const RELEVANCE_SCORES = {
  * device sees one shape whichever side sends. Shape only: nothing here
  * sends anything.
  */
-export function buildBridgeAlertPayload({ title, body, threadId, kind, timeSensitive } = {}) {
+export function buildBridgeAlertPayload({ title, body, threadId, kind } = {}) {
+  const kindName = String(kind ?? 'message');
   const aps = {
     alert: { title: String(title ?? ''), body: String(body ?? '') },
     sound: 'default',
-    category: String(kind ?? 'message'),
-    'interruption-level': timeSensitive ? 'time-sensitive' : 'active',
-    'relevance-score': Object.hasOwn(RELEVANCE_SCORES, kind) ? RELEVANCE_SCORES[kind] : 0.3,
+    category: Object.hasOwn(CATEGORY_FOR_KIND, kindName) ? CATEGORY_FOR_KIND[kindName] : 'BOTFLEET_UPDATE',
+    'interruption-level': BLOCKING_KINDS.has(kindName) ? 'time-sensitive' : 'active',
+    'relevance-score': Object.hasOwn(RELEVANCE_SCORES, kindName) ? RELEVANCE_SCORES[kindName] : 0.3,
     'mutable-content': 1,
     'content-available': 1,
   };

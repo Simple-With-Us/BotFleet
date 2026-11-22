@@ -18,7 +18,7 @@ import {
 } from "./companion-bridge.mjs";
 
 const NOW = 1_700_000_000_000;
-const PROOF = "bridge-proof-1";
+const PROOF = "bridge-proof-token-0001";
 
 function openWindow(overrides = {}) {
   return openBridgePairingWindow({ code: "123456", token: PROOF, ttlSeconds: 300, maxAttempts: 3, nowMs: NOW, ...overrides });
@@ -34,7 +34,7 @@ function spentWithReplay(overrides = {}) {
   const first = redeem(window, PROOF);
   assert.equal(first.ok, true);
   const recorded = recordBridgePairingReplay({
-    window: first.window, requestId: "req-1", credentialDigest: first.credentialDigest, deviceId: "d-9", nowMs: NOW,
+    window: first.window, requestId: "pair-request-00000001", credentialDigest: first.credentialDigest, deviceId: "d-9", nowMs: NOW,
   });
   return { window: recorded, credentialDigest: first.credentialDigest };
 }
@@ -156,15 +156,29 @@ test("a wrong credential costs one attempt and the budget locks", () => {
   assert.equal(locked.ok, false);
 });
 
+test("weak tokens and non-finite clocks are refused loudly, not defaulted", () => {
+  for (const overrides of [{ token: "short" }, { token: "" }, { ttlSeconds: Infinity }, { nowMs: NaN }]) {
+    assert.throws(() => openWindow(overrides), /requires/);
+  }
+});
+
+test("replay needs a shaped request id and a digest the window minted", () => {
+  const { window, credentialDigest } = spentWithReplay();
+  const malformed = redeem(window, PROOF, { requestId: "!!!", pairedDeviceIds: ["d-9"] });
+  assert.equal(malformed.ok, false);
+  assert.throws(() => recordBridgePairingReplay({ window, requestId: "!!!", credentialDigest, deviceId: "d-9", nowMs: NOW }), /shaped request id/);
+  assert.throws(() => recordBridgePairingReplay({ window, requestId: "pair-request-00000002", credentialDigest: sha256Hex("other"), deviceId: "d-9", nowMs: NOW }), /digest this window minted/);
+});
+
 test("bad window inputs are refused loudly, not defaulted", () => {
-  for (const overrides of [{ code: "12345" }, { token: "" }, { ttlSeconds: 0 }, { nowMs: -1 }, { maxAttempts: 0 }]) {
-    assert.throws(() => openWindow(overrides), /requires a 6-digit code/);
+  for (const overrides of [{ code: "12345" }, { ttlSeconds: 0 }, { nowMs: -1 }, { maxAttempts: 0 }]) {
+    assert.throws(() => openWindow(overrides), /requires/);
   }
 });
 
 test("the same phone request replays its prior result until expiry", () => {
   const { window, credentialDigest } = spentWithReplay();
-  const replayed = redeem(window, PROOF, { requestId: "req-1", pairedDeviceIds: ["d-9"] });
+  const replayed = redeem(window, PROOF, { requestId: "pair-request-00000001", pairedDeviceIds: ["d-9"] });
   assert.equal(replayed.ok, true);
   assert.equal(replayed.replayed, true);
   assert.equal(replayed.deviceId, "d-9");
@@ -173,13 +187,13 @@ test("the same phone request replays its prior result until expiry", () => {
 
 test("replay needs the same request, the same credential, a paired device, and time left", () => {
   const { window } = spentWithReplay();
-  const wrongRequest = redeem(window, PROOF, { requestId: "req-2", pairedDeviceIds: ["d-9"] });
+  const wrongRequest = redeem(window, PROOF, { requestId: "pair-request-00000002", pairedDeviceIds: ["d-9"] });
   assert.equal(wrongRequest.ok, false);
-  const wrongCredential = redeem(window, "123456", { requestId: "req-1", pairedDeviceIds: ["d-9"] });
+  const wrongCredential = redeem(window, "123456", { requestId: "pair-request-00000001", pairedDeviceIds: ["d-9"] });
   assert.equal(wrongCredential.ok, false);
-  const revoked = redeem(window, PROOF, { requestId: "req-1", pairedDeviceIds: [] });
+  const revoked = redeem(window, PROOF, { requestId: "pair-request-00000001", pairedDeviceIds: [] });
   assert.equal(revoked.ok, false);
-  const expired = redeem(window, PROOF, { requestId: "req-1", pairedDeviceIds: ["d-9"], nowMs: NOW + 300_001 });
+  const expired = redeem(window, PROOF, { requestId: "pair-request-00000001", pairedDeviceIds: ["d-9"], nowMs: NOW + 300_001 });
   assert.equal(expired.ok, false);
   assert.equal(expired.reason, "window expired");
   const noRequestId = redeem(window, PROOF, { pairedDeviceIds: ["d-9"] });
@@ -190,8 +204,8 @@ test("replay needs the same request, the same credential, a paired device, and t
 test("recording a replay needs a request id, a digest, and a device", () => {
   const window = openWindow();
   assert.throws(() => recordBridgePairingReplay({ window, credentialDigest: sha256Hex(PROOF), deviceId: "d-1", nowMs: NOW }), /request id/);
-  assert.throws(() => recordBridgePairingReplay({ window, requestId: "r", credentialDigest: "nope", deviceId: "d-1", nowMs: NOW }), /credential digest/);
-  assert.throws(() => recordBridgePairingReplay({ window, requestId: "r", credentialDigest: sha256Hex(PROOF), deviceId: "", nowMs: NOW }), /device id/);
+  assert.throws(() => recordBridgePairingReplay({ window, requestId: "pair-request-00000002", credentialDigest: "nope", deviceId: "d-1", nowMs: NOW }), /credential digest/);
+  assert.throws(() => recordBridgePairingReplay({ window, requestId: "pair-request-00000002", credentialDigest: sha256Hex(PROOF), deviceId: "", nowMs: NOW }), /device id/);
 });
 
 test("device credentials match digests only, under a concrete id", () => {
@@ -216,15 +230,20 @@ test("one device never has two senders", () => {
 });
 
 test("the alert payload mirrors the native shape", () => {
-  const payload = buildBridgeAlertPayload({ title: "Approval needed", body: "Deploy?", threadId: "t-1", kind: "approval", timeSensitive: true });
+  const payload = buildBridgeAlertPayload({ title: "Approval needed", body: "Deploy?", threadId: "t-1", kind: "approval" });
   assert.equal(payload.aps.alert.title, "Approval needed");
-  assert.equal(payload.aps.category, "approval");
+  assert.equal(payload.aps.category, "BOTFLEET_APPROVAL");
   assert.equal(payload.aps["interruption-level"], "time-sensitive");
   assert.equal(payload.aps["relevance-score"], 1.0);
   assert.equal(payload.aps["thread-id"], "t-1");
   assert.equal(payload.aps["mutable-content"], 1);
   const quiet = buildBridgeAlertPayload({ title: "Hi", body: "Done", kind: "done" });
+  assert.equal(quiet.aps.category, "BOTFLEET_UPDATE");
   assert.equal(quiet.aps["interruption-level"], "active");
+  const question = buildBridgeAlertPayload({ title: "Q", body: "Pick one.", kind: "question" });
+  assert.equal(question.aps.category, "BOTFLEET_QUESTION");
+  assert.equal(question.aps["interruption-level"], "time-sensitive");
+  assert.equal(question.aps["relevance-score"], 0.9);
   assert.ok(!("thread-id" in quiet.aps));
 });
 
