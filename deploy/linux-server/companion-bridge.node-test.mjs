@@ -381,6 +381,18 @@ test("a credential nested inside a caller object is dropped", () => {
   }
 });
 
+test("a metadata key whose value is absent stays absent and spends no kept slot", () => {
+  // An absent value is not a key of the window, and it does not take one of
+  // the eight kept slots either, so eight real values still fit beside it.
+  const window = { ...openWindow(), empty: undefined, a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8 };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.ok(!("empty" in decision.window), "an absent value is not a key of the window");
+  for (const key of ["a", "b", "c", "d", "e", "f", "g", "h"]) {
+    assert.ok(key in decision.window, `${key} survives beside the absent value`);
+  }
+});
+
 test("a value with a custom toJSON cannot smuggle a credential past the check", () => {
   // The value is checked as the JSON the caller's own toJSON writes, so a
   // toJSON that hides a cleartext credential is checked as a benign string.

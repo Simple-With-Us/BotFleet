@@ -514,9 +514,11 @@ function normalizeWindow(window) {
       continue;
     }
     if (isCredentialFieldValue(parsed, { codeDigest: source.codeDigest, tokenDigest: source.tokenDigest })) continue;
-    // A value the caller left absent stays absent: the parsed form of an
-    // undefined value is null, and a null is a value the caller never wrote.
-    extra[key] = value === undefined ? undefined : parsed;
+    // A value the caller left absent stays absent: the key is skipped rather
+    // than kept with an undefined value, so it is not a key of the window
+    // and it does not spend one of the kept slots.
+    if (value === undefined) continue;
+    extra[key] = parsed;
     kept += 1;
   }
   return {
