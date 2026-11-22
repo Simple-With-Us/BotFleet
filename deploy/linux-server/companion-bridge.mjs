@@ -126,12 +126,15 @@ function digestsEqualHex(left, right) {
  * a fake clock and production passes `Date.now()`.
  */
 /**
- * Minimum token length the bridge accepts. Established QR tokens are 52
- * characters (`omb_pair_` plus 32 random bytes); the code path stays the
- * human fallback at six digits with its own attempt budget and TTL. A
- * shorter token is refused rather than trusted at any entropy.
+ * The only token shape the bridge mints and accepts: `omb_pair_` plus 43
+ * base64url characters (52 total), mirroring `devices.ts` and the native
+ * parser, which rejects anything else as a bad credential before the
+ * bridge would. A bridge-minted non-conforming token could never be
+ * redeemed on the Mac side, so accepting one here would only ever produce
+ * a confusing failure there. The code path stays the human fallback at six
+ * digits with its own attempt budget and TTL.
  */
-export const MIN_BRIDGE_TOKEN_LENGTH = 16;
+export const OMB_PAIR_TOKEN = /^omb_pair_[A-Za-z0-9_-]{43}$/;
 
 /** Request ids that may key a replay, mirroring `devices.ts`. */
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]{16,128}$/;
@@ -156,8 +159,8 @@ export function openBridgePairingWindow({ code, token, ttlSeconds, maxAttempts, 
   if (!/^\d{6}$/.test(cleanCode)) {
     throw new Error('openBridgePairingWindow requires a 6-digit code');
   }
-  if (cleanToken.length < MIN_BRIDGE_TOKEN_LENGTH) {
-    throw new Error('openBridgePairingWindow requires a high-entropy token');
+  if (!OMB_PAIR_TOKEN.test(cleanToken)) {
+    throw new Error('openBridgePairingWindow requires an omb_pair_ token');
   }
   if (!Number.isFinite(ttl) || !(ttl > 0) || !Number.isFinite(now) || !(now >= 0) || !Number.isFinite(attempts) || attempts < 1) {
     throw new Error('openBridgePairingWindow requires a positive finite TTL, a finite clock, and a positive attempt budget');
@@ -177,16 +180,35 @@ export function openBridgePairingWindow({ code, token, ttlSeconds, maxAttempts, 
  * Anything missing or non-finite fails closed: a corrupt window spends
  * rather than guessing forever.
  */
+/**
+ * Normalize one stored window, preserving unknown caller fields. Callers
+ * may attach their own metadata to the object they persist; dropping it
+ * on read would silently lose it the first time the bridge touched the
+ * window. Only own enumerable string keys travel, never __proto__,
+ * constructor or prototype, and anything that is not a plain object
+ * fails closed to an empty shell that cannot verify.
+ */
 function normalizeWindow(window) {
-  const expires = Number(window?.expiresAtMs);
-  const attempts = Number(window?.attemptsLeft);
+  let source = window ?? {};
+  if (Array.isArray(source)) source = {};
+  const proto = Object.getPrototypeOf(source);
+  if (proto !== Object.prototype && proto !== null) source = {};
+  const expires = Number(source.expiresAtMs);
+  const attempts = Number(source.attemptsLeft);
+  const extra = {};
+  for (const key of Object.keys(source)) {
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+    if (key === 'codeDigest' || key === 'tokenDigest' || key === 'expiresAtMs' || key === 'attemptsLeft' || key === 'spent' || key === 'replay') continue;
+    extra[key] = source[key];
+  }
   return {
-    codeDigest: String(window?.codeDigest ?? ''),
-    tokenDigest: String(window?.tokenDigest ?? ''),
+    ...extra,
+    codeDigest: String(source.codeDigest ?? ''),
+    tokenDigest: String(source.tokenDigest ?? ''),
     expiresAtMs: Number.isFinite(expires) ? expires : NaN,
     attemptsLeft: Number.isFinite(attempts) ? Math.floor(attempts) : 0,
-    spent: window?.spent === true,
-    replay: window?.replay ?? null,
+    spent: source.spent === true,
+    replay: source.replay ?? null,
   };
 }
 
@@ -201,7 +223,16 @@ function normalizeWindow(window) {
  * replay for a revoked device is refused, because revocation must not
  * leave a recoverable bearer behind.
  */
-export function redeemBridgePairingWindow({ window, presented, requestId, pairedDeviceIds, nowMs }) {
+/**
+ * Redeem one credential and, when the caller supplies the minted device
+ * id, record the replay atomically in the same step that spends the
+ * window. There is no separate record call, so no caller can persist the
+ * spend without the replay and lock the phone out after a lost response.
+ * Without `replayDeviceId` the window still spends exactly once; without
+ * a valid request id there is no replay to record (older clients keep
+ * exactly-once behaviour).
+ */
+export function redeemBridgePairingWindow({ window, presented, requestId, replayDeviceId, pairedDeviceIds, nowMs }) {
   const current = normalizeWindow(window);
   const now = Number(nowMs);
   const presentedDigest = sha256Hex(String(presented ?? ''));
@@ -217,8 +248,7 @@ export function redeemBridgePairingWindow({ window, presented, requestId, paired
     if (
       replay &&
       validRequestId !== null &&
-      requestDigest !== '' &&
-      replay.requestDigest === requestDigest &&
+      digestsEqualHex(replay.requestDigest, requestDigest) &&
       replay.expiresAtMs > now &&
       digestsEqualHex(replay.credentialDigest, presentedDigest) &&
       paired.includes(replay.deviceId)
@@ -236,37 +266,19 @@ export function redeemBridgePairingWindow({ window, presented, requestId, paired
     const left = current.attemptsLeft - 1;
     return { ok: false, reason: 'bad credential', window: { ...current, attemptsLeft: left, spent: left <= 0 } };
   }
-  return { ok: true, replayed: false, credentialDigest: presentedDigest, window: { ...current, spent: true } };
-}
-
-/**
- * Record a pairing replay after the server layer mints the device: the
- * same request id plus the same credential redeems the same device until
- * the window's own expiry. Cleared on revoke/expiry by dropping the
- * window, so revocation never leaves a recoverable bearer behind.
- */
-export function recordBridgePairingReplay({ window, requestId, credentialDigest, deviceId, nowMs }) {
-  const current = normalizeWindow(window);
-  const now = Number(nowMs);
-  const validRequestId = replayableRequestId(requestId);
-  if (!(now >= 0) || validRequestId === null) {
-    throw new Error('recordBridgePairingReplay requires a shaped request id and a clock');
-  }
-  if (!/^[0-9a-f]{64}$/.test(credentialDigest ?? '') || String(deviceId ?? '') === '') {
-    throw new Error('recordBridgePairingReplay requires a credential digest and a device id');
-  }
-  if (!digestsEqualHex(credentialDigest, current.codeDigest) && !digestsEqualHex(credentialDigest, current.tokenDigest)) {
-    throw new Error('recordBridgePairingReplay requires a digest this window minted');
-  }
-  return {
-    ...current,
-    replay: {
+  const spent = { ...current, spent: true };
+  // Any value is stringified so the check below is a plain string
+  // comparison; a non-string id simply never matches the paired list.
+  const replayFor = String(replayDeviceId ?? '');
+  if (validRequestId !== null && replayFor !== '') {
+    spent.replay = {
       requestDigest: sha256Hex(validRequestId),
-      credentialDigest,
-      deviceId: String(deviceId),
+      credentialDigest: presentedDigest,
+      deviceId: replayFor,
       expiresAtMs: current.expiresAtMs,
-    },
-  };
+    };
+  }
+  return { ok: true, replayed: false, credentialDigest: presentedDigest, window: spent };
 }
 
 /**

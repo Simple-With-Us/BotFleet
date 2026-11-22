@@ -12,13 +12,12 @@ import {
   buildBridgeAlertPayload,
   openBridgePairingWindow,
   pushSenderForDevice,
-  recordBridgePairingReplay,
   redeemBridgePairingWindow,
   sha256Hex,
 } from "./companion-bridge.mjs";
 
 const NOW = 1_700_000_000_000;
-const PROOF = "bridge-proof-token-0001";
+const PROOF = "omb_pair_" + "a".repeat(43);
 
 function openWindow(overrides = {}) {
   return openBridgePairingWindow({ code: "123456", token: PROOF, ttlSeconds: 300, maxAttempts: 3, nowMs: NOW, ...overrides });
@@ -28,15 +27,14 @@ function redeem(window, presented, extra = {}) {
   return redeemBridgePairingWindow({ window, presented, nowMs: NOW, pairedDeviceIds: [], ...extra });
 }
 
-/** A window the server already spent, with a recorded replay for d-9. */
+/** A window the server already spent, with an atomic replay for d-9. */
 function spentWithReplay(overrides = {}) {
   const window = openWindow(overrides);
-  const first = redeem(window, PROOF);
+  const first = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
   assert.equal(first.ok, true);
-  const recorded = recordBridgePairingReplay({
-    window: first.window, requestId: "pair-request-00000001", credentialDigest: first.credentialDigest, deviceId: "d-9", nowMs: NOW,
-  });
-  return { window: recorded, credentialDigest: first.credentialDigest };
+  assert.ok(first.window.replay, "replay is recorded atomically with the spend");
+  assert.equal(first.window.replay.deviceId, "d-9");
+  return { window: first.window, credentialDigest: first.credentialDigest };
 }
 
 test("every companion route the Phone tab needs is on the bridge", () => {
@@ -157,17 +155,22 @@ test("a wrong credential costs one attempt and the budget locks", () => {
 });
 
 test("weak tokens and non-finite clocks are refused loudly, not defaulted", () => {
-  for (const overrides of [{ token: "short" }, { token: "" }, { ttlSeconds: Infinity }, { nowMs: NaN }]) {
+  for (const overrides of [{ token: "short" }, { token: "" }, { token: "a".repeat(52) }, { token: "omb_pair_" + "a".repeat(42) }, { token: "omb_pair_" + "a".repeat(43) + "b" }, { ttlSeconds: Infinity }, { nowMs: NaN }]) {
     assert.throws(() => openWindow(overrides), /requires/);
   }
+  // The native shape itself opens fine.
+  assert.equal(openWindow().tokenDigest, sha256Hex(PROOF));
 });
 
-test("replay needs a shaped request id and a digest the window minted", () => {
-  const { window, credentialDigest } = spentWithReplay();
+test("replay needs a shaped request id, and a malformed one means no replay", () => {
+  const { window } = spentWithReplay();
   const malformed = redeem(window, PROOF, { requestId: "!!!", pairedDeviceIds: ["d-9"] });
   assert.equal(malformed.ok, false);
-  assert.throws(() => recordBridgePairingReplay({ window, requestId: "!!!", credentialDigest, deviceId: "d-9", nowMs: NOW }), /shaped request id/);
-  assert.throws(() => recordBridgePairingReplay({ window, requestId: "pair-request-00000002", credentialDigest: sha256Hex("other"), deviceId: "d-9", nowMs: NOW }), /digest this window minted/);
+  assert.equal(malformed.reason, "window already spent");
+  // A malformed request id on an unspent window succeeds without recording.
+  const plain = redeem(openWindow(), PROOF, { requestId: "!!!", replayDeviceId: "d-9" });
+  assert.equal(plain.ok, true);
+  assert.equal(plain.window.replay, null);
 });
 
 test("bad window inputs are refused loudly, not defaulted", () => {
@@ -201,11 +204,29 @@ test("replay needs the same request, the same credential, a paired device, and t
   assert.equal(noRequestId.reason, "window already spent");
 });
 
-test("recording a replay needs a request id, a digest, and a device", () => {
-  const window = openWindow();
-  assert.throws(() => recordBridgePairingReplay({ window, credentialDigest: sha256Hex(PROOF), deviceId: "d-1", nowMs: NOW }), /request id/);
-  assert.throws(() => recordBridgePairingReplay({ window, requestId: "pair-request-00000002", credentialDigest: "nope", deviceId: "d-1", nowMs: NOW }), /credential digest/);
-  assert.throws(() => recordBridgePairingReplay({ window, requestId: "pair-request-00000002", credentialDigest: sha256Hex(PROOF), deviceId: "", nowMs: NOW }), /device id/);
+test("a spent window without a recorded replay cannot be resurrected", () => {
+  // Without replayDeviceId there is no replay to record: the window
+  // spends exactly once and a retry is refused instead of half-replaying.
+  const first = redeem(openWindow(), PROOF, { requestId: "pair-request-00000001", pairedDeviceIds: [] });
+  assert.equal(first.ok, true);
+  assert.equal(first.window.replay, null);
+  assert.equal(first.window.spent, true);
+  const retry = redeem(first.window, PROOF, { requestId: "pair-request-00000001", pairedDeviceIds: ["d-9"] });
+  assert.equal(retry.ok, false);
+  assert.equal(retry.reason, "window already spent");
+});
+
+test("caller metadata survives the round trip instead of being dropped", () => {
+  const window = { ...openWindow(), note: "operator-note", customCount: 7 };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.equal(decision.window.note, "operator-note");
+  assert.equal(decision.window.customCount, 7);
+  // Prototype pollution stays out even when the input tries it.
+  const hostile = JSON.parse('{"__proto__":{"polluted":true},"codeDigest":"x"}');
+  const cleaned = redeem({ ...openWindow(), ...hostile }, PROOF, { requestId: "pair-request-00000001" });
+  assert.equal({}.polluted, undefined);
+  assert.equal(cleaned.ok, true);
 });
 
 test("device credentials match digests only, under a concrete id", () => {
