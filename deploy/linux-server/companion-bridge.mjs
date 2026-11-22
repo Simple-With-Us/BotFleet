@@ -189,13 +189,290 @@ const MAX_WINDOW_METADATA_KEYS = 8;
 const MAX_WINDOW_METADATA_CHARS = 1024;
 
 /**
+ * How many top-level keys one window scan looks at, kept and skipped
+ * alike. A legitimate window carries the reserved keys plus at most eight
+ * kept keys, so forty visited keys leaves ample room for the handful of
+ * skipped keys a real window holds, while an attacker-influenced window
+ * cannot buy unbounded work: the scan stops at the cap instead of walking
+ * every key the caller wrote.
+ */
+const MAX_WINDOW_METADATA_VISITED = MAX_WINDOW_METADATA_KEYS * 4 + 8;
+
+/**
+ * The credential vocabulary. A caller field name is read two ways, and both
+ * readings use this vocabulary.
+ *
+ * Read as words, a name is split on camel-case edges, acronym edges, digit
+ * edges and separators, and a name that carries a credential word at one of
+ * those edges drops the field. That is what catches deviceToken, APIToken,
+ * SMSCode, PIN and sms_code.
+ *
+ * Read as one unbroken run, a name that carries a credential word anywhere
+ * drops the field. That is what catches the names written as a single
+ * lowercase run, where there is no edge to split on: pairingtoken, token123
+ * and smscode.
+ *
+ * Two words sit in only one reading. The word "code" is too generic as a
+ * word, because a bare Code suffix would strip a benign statusCode, so it is
+ * read only as an unbroken run and the benign names are rescued by the
+ * allowlist below. The word "pin" is too ambiguous as a raw run, because a
+ * raw match would strip ordinary words such as shipping and mapping, so it
+ * is read at a word edge instead.
+ */
+const CREDENTIAL_FIELD_WORDS = new Set([
+  'token',
+  'secret',
+  'password',
+  'passcode',
+  'passphrase',
+  'credential',
+  'otp',
+  'jwt',
+  'apikey',
+  'pin',
+]);
+
+/**
+ * The credential words that are safe to look for anywhere in a name. The
+ * word "pin" is missing here, because a raw match would strip ordinary
+ * words such as shipping, mapping and coping.
+ */
+const CREDENTIAL_FIELD_SUBSTRINGS = new Set([
+  'token',
+  'secret',
+  'password',
+  'passcode',
+  'passphrase',
+  'credential',
+  'otp',
+  'jwt',
+  'apikey',
+  'code',
+]);
+
+/**
+ * The credential words that are matched only at a word edge, because a raw
+ * match would strip ordinary words that merely contain them.
+ */
+const CREDENTIAL_EDGE_FIELD_WORDS = new Set(['pin']);
+
+/**
+ * The benign field names the credential rule keeps. The trade leans this
+ * way because the module's contract is digests only, never the value: a
+ * benign field that is dropped costs a caller one piece of metadata, while
+ * a credential that survives costs the cleartext itself. The list is exact
+ * and finite on purpose, so a name is either listed here or it is not, and
+ * a prefixed variant such as httpStatusCode is not listed, so it is
+ * dropped. The allowlist rescues a name and never rescues a credential
+ * value: a field on this list still drops when its value is a credential,
+ * because the value check runs on every value the bridge keeps.
+ */
+const BENIGN_FIELD_NAMES = new Set([
+  'statuscode',
+  'exitcode',
+  'errorcode',
+  'httpcode',
+  'postcode',
+  'zipcode',
+  'countrycode',
+  'areacode',
+  'languagecode',
+  'unicode',
+  'codepoint',
+  'encode',
+  'decode',
+  'encoded',
+  'decoded',
+  'barcode',
+]);
+
+/**
+ * Split one field name into its words. A camel-case edge, an acronym edge
+ * and a digit edge each end a word, and so does any non-alphanumeric
+ * character. The acronym edge is what keeps APIToken and SMSCode from
+ * reading as one word.
+ */
+function splitFieldWords(name) {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .replace(/([A-Za-z])([0-9])/g, '$1 $2')
+    .split(/[^A-Za-z0-9]+/)
+    .filter((word) => word !== '');
+}
+
+/**
+ * Whether the name carries an edge-matched credential word: the word sits
+ * at the start of the name, at the end of it, or beside a non-letter. This
+ * is how pinValue and pinvalue drop the field while shipping and mapping
+ * keep their value.
+ */
+function hasEdgeCredentialWord(lowered) {
+  for (const needle of CREDENTIAL_EDGE_FIELD_WORDS) {
+    let at = lowered.indexOf(needle);
+    while (at !== -1) {
+      const before = at === 0 ? '' : lowered.charAt(at - 1);
+      const after = lowered.charAt(at + needle.length);
+      if (before === '' || after === '' || !/[a-z]/.test(before) || !/[a-z]/.test(after)) return true;
+      at = lowered.indexOf(needle, at + 1);
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether one caller field name carries a credential. The benign allowlist
+ * is read first, so a listed name always keeps its value, and the two
+ * readings of the name follow: the credential words at the edges of the
+ * name, and the credential words anywhere in the run. A cleartext value
+ * therefore cannot ride back out of a stored window under any name.
+ *
+ * The allowlist rescues a name and never rescues a credential value, so
+ * this answer is only half of the decision: the value check runs on the
+ * value as well, whatever the name says.
+ */
+function isCredentialFieldName(key) {
+  const name = String(key ?? '');
+  const lowered = name.toLowerCase();
+  if (BENIGN_FIELD_NAMES.has(lowered)) return false;
+  for (const word of splitFieldWords(name)) {
+    if (CREDENTIAL_FIELD_WORDS.has(word.toLowerCase())) return true;
+  }
+  for (const needle of CREDENTIAL_FIELD_SUBSTRINGS) {
+    if (lowered.includes(needle)) return true;
+  }
+  return hasEdgeCredentialWord(lowered);
+}
+
+/**
+ * The credential shapes a caller value can take, and the only shapes this
+ * check knows. They are the shapes the module and its sibling handle: the
+ * pairing token this module mints, the six digit pairing code, an
+ * Infisical service token, an authorization header value, a JSON web
+ * token, and a PEM private key block. A generic length test is not used,
+ * because it would drop a benign value such as a sha256 digest, and the
+ * point of the benign allowlist is to keep benign metadata. None of these
+ * patterns carries the global flag, because a global pattern keeps its
+ * lastIndex between calls.
+ *
+ * The six digit code is the widest net here, and it is deliberately not
+ * scoped to a name: the pairing code this module accepts IS six digits, so
+ * a code that has been renamed into a benign field would otherwise ride
+ * back out in cleartext. A benign six digit value, a numeric count for
+ * instance, is lost instead. That trade is the module's own: a dropped
+ * field costs a caller one piece of metadata, while a surviving
+ * credential costs the cleartext itself.
+ */
+const CREDENTIAL_VALUE_PATTERNS = [
+  // The pairing token this module mints, matched as a SUBSTRING:  a token
+  // written inside a longer note is still that token, and an anchored
+  // match would let it ride back out inside the note.
+  /omb_pair_[A-Za-z0-9_-]{43}/,
+  // The six digit pairing code, matched as a standalone run of six digits.
+  // The digit lookarounds keep a longer number from producing one, so a
+  // count of 20261122 is not read as a code, while a code written inside a
+  // longer note still is.
+  /(?<!\d)\d{6}(?!\d)/,
+  /\bst\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})*/,
+  // The authorization schemes this module family handles, and no more:  a
+  // generic "any word then a long token" pattern dropped benign metadata,
+  // because an ordinary description can end in a twelve character word.
+  /\b(?:Bearer|Basic|Token|ApiKey|HOBAuth|OAuth)\s+[A-Za-z0-9._~+/=-]{12,}/i,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?/,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+];
+
+/**
+ * Whether one caller value carries a credential. A name can be guessed by
+ * whoever persists the window; a value cannot be renamed out of the way, so
+ * this check runs on every value the bridge is about to keep, under any
+ * name at all.
+ *
+ * The caller hands this check the PARSED form of the value it read through
+ * JSON, and that is the form the window keeps as well, so the value that is
+ * checked and the value that is kept are the same value. Reading the
+ * serialized form first is what makes that possible: a value with a custom
+ * toJSON, or a getter that answers twice, would otherwise be checked as one
+ * value and kept as another, and a cleartext credential could hide in the
+ * difference.
+ *
+ * The parsed form is bounded by the length of the serialized text, because
+ * the caller has already refused anything longer than the size gate. The
+ * serialized length is therefore the only bound there is: there is no depth
+ * limit and no node limit, so a credential nested at any depth is still a
+ * leaf in that structure and is still found, while a benign value that is
+ * merely wide or deep is kept, because nothing about it carries a
+ * credential.
+ *
+ * The digests the window itself carries are the exact answer on top of the
+ * shapes: a value whose digest is the stored code digest or the stored
+ * token digest IS that credential, whatever it is written as and whatever
+ * its name is. That reading does not depend on the value looking like a
+ * credential, so a code or token written in a shape this list does not know
+ * is still caught.
+ *
+ * The walk descends into objects and arrays, because a caller value that is
+ * an object is kept as that object and a credential nested inside it would
+ * otherwise ride back out untouched: the shapes are tested against every
+ * string leaf, and a nested key whose NAME carries a credential drops the
+ * whole value, the same rule the top level applies. A value that cannot be
+ * serialized or parsed is dropped, which is the fail-closed direction.
+ */
+function isCredentialFieldValue(value, digests = {}) {
+  const wanted = [digests.codeDigest, digests.tokenDigest]
+    .map((held) => String(held ?? ''))
+    .filter((digest) => digest !== '');
+  const isCredentialText = (text) => {
+    for (const pattern of CREDENTIAL_VALUE_PATTERNS) {
+      if (pattern.test(text)) return true;
+    }
+    for (const digest of wanted) {
+      if (sha256Hex(text) === digest) return true;
+    }
+    return false;
+  };
+  const walk = (current) => {
+    if (current === null || current === undefined) return false;
+    // `Object(current) === current` is true for an object, an array or a
+    // function and false for a primitive, which is the object test this
+    // repo uses in place of a runtime typeof.
+    if (Object(current) !== current) return isCredentialText(String(current));
+    if (Array.isArray(current)) {
+      for (const item of current) {
+        if (walk(item)) return true;
+      }
+      return false;
+    }
+    for (const key of Object.keys(current)) {
+      // A nested key that carries a credential drops the whole value, the
+      // same rule the top level applies to a field name.
+      if (isCredentialFieldName(key)) return true;
+      if (walk(current[key])) return true;
+    }
+    return false;
+  };
+  return walk(value);
+}
+
+/**
  * Normalize one stored window, preserving a bounded set of unknown caller
  * fields. Callers may attach small metadata to the object they persist;
  * dropping it on read would silently lose it the first time the bridge
  * touched the window. Only own enumerable string keys travel, never
  * __proto__, constructor or prototype, at most eight of them, and no
  * single value larger than 1KB once serialized. Anything that is not a
- * plain object fails closed to an empty shell that cannot verify.
+ * plain object fails closed to an empty shell that cannot verify. A field
+ * whose name carries a credential never travels at all, so a cleartext token
+ * or code persisted on a window is dropped on the way out. The benign names
+ * that keep their value are listed in the module, so the rule stays an
+ * explicit finite list rather than a judgement call. That list rescues a
+ * name only: a value that is one of the credential shapes the module
+ * handles, or that is the window's own code or token by digest, is dropped
+ * under any name, allowlisted or not.
+ *
+ * The scan itself is bounded too: at most MAX_WINDOW_METADATA_VISITED
+ * top-level keys are looked at, kept or skipped, so a window carrying
+ * thousands of keys cannot turn one redeem into thousands of value checks.
  */
 function normalizeWindow(window) {
   let source = window ?? {};
@@ -206,18 +483,42 @@ function normalizeWindow(window) {
   const attempts = Number(source.attemptsLeft);
   const extra = {};
   let kept = 0;
+  let visited = 0;
   for (const key of Object.keys(source)) {
+    // Every key the scan looks at counts, kept or skipped, and the cap is
+    // checked before the expensive work below.
+    visited += 1;
+    if (visited > MAX_WINDOW_METADATA_VISITED) break;
     if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
     if (key === 'codeDigest' || key === 'tokenDigest' || key === 'expiresAtMs' || key === 'attemptsLeft' || key === 'spent' || key === 'replay') continue;
+    if (isCredentialFieldName(key)) continue;
     if (kept >= MAX_WINDOW_METADATA_KEYS) break;
-    let size = 0;
+    // The value is read once and serialized once, and the structure that
+    // text describes is what the check reads and what the window keeps, so
+    // the checked value and the kept value can never be two different
+    // values.
+    const value = source[key];
+    let serialized = null;
     try {
-      size = JSON.stringify(source[key] ?? null)?.length ?? 0;
+      serialized = JSON.stringify(value ?? null);
     } catch {
       continue;
     }
+    const size = serialized?.length ?? 0;
     if (!Number.isFinite(size) || size > MAX_WINDOW_METADATA_CHARS) continue;
-    extra[key] = source[key];
+    let parsed = null;
+    try {
+      parsed = JSON.parse(serialized);
+    } catch {
+      // A value that cannot be read back is not a value the window keeps.
+      continue;
+    }
+    if (isCredentialFieldValue(parsed, { codeDigest: source.codeDigest, tokenDigest: source.tokenDigest })) continue;
+    // A value the caller left absent stays absent: the key is skipped rather
+    // than kept with an undefined value, so it is not a key of the window
+    // and it does not spend one of the kept slots.
+    if (value === undefined) continue;
+    extra[key] = parsed;
     kept += 1;
   }
   return {
@@ -240,7 +541,9 @@ function normalizeWindow(window) {
  * window is refused. Callers without a request id keep exactly-once
  * behaviour. `pairedDeviceIds` is the registry's current membership: a
  * replay for a revoked device is refused, because revocation must not
- * leave a recoverable bearer behind.
+ * leave a recoverable bearer behind. A successful redeem reports the same
+ * fields on both paths. Those fields are the device the caller named, the
+ * digest of the accepted credential, and whether the answer was replayed.
  */
 /**
  * Redeem one credential and, when the caller supplies the minted device
@@ -272,7 +575,7 @@ export function redeemBridgePairingWindow({ window, presented, requestId, replay
       digestsEqualHex(replay.credentialDigest, presentedDigest) &&
       paired.includes(replay.deviceId)
     ) {
-      return { ok: true, replayed: true, deviceId: replay.deviceId, window: current };
+      return { ok: true, replayed: true, deviceId: replay.deviceId, credentialDigest: replay.credentialDigest, window: current };
     }
     return { ok: false, reason: 'window already spent', window: current };
   }
@@ -297,7 +600,7 @@ export function redeemBridgePairingWindow({ window, presented, requestId, replay
       expiresAtMs: current.expiresAtMs,
     };
   }
-  return { ok: true, replayed: false, credentialDigest: presentedDigest, window: spent };
+  return { ok: true, replayed: false, deviceId: replayFor, credentialDigest: presentedDigest, window: spent };
 }
 
 /**
