@@ -338,11 +338,20 @@ function isCredentialFieldName(key) {
  * The credential shapes a caller value can take, and the only shapes this
  * check knows. They are the shapes the module and its sibling handle: the
  * pairing token this module mints, the six digit pairing code, an
- * Infisical service token, and an authorization header value. A generic
- * length test is not used, because it would drop a benign value such as a
- * sha256 digest, and the point of the benign allowlist is to keep benign
- * metadata. None of these patterns carries the global flag, because a
- * global pattern keeps its lastIndex between calls.
+ * Infisical service token, an authorization header value, a JSON web
+ * token, and a PEM private key block. A generic length test is not used,
+ * because it would drop a benign value such as a sha256 digest, and the
+ * point of the benign allowlist is to keep benign metadata. None of these
+ * patterns carries the global flag, because a global pattern keeps its
+ * lastIndex between calls.
+ *
+ * The six digit code is the widest net here, and it is deliberately not
+ * scoped to a name: the pairing code this module accepts IS six digits, so
+ * a code that has been renamed into a benign field would otherwise ride
+ * back out in cleartext. A benign six digit value, a numeric count for
+ * instance, is lost instead. That trade is the module's own: a dropped
+ * field costs a caller one piece of metadata, while a surviving
+ * credential costs the cleartext itself.
  */
 const CREDENTIAL_VALUE_PATTERNS = [
   OMB_PAIR_TOKEN,
@@ -350,6 +359,8 @@ const CREDENTIAL_VALUE_PATTERNS = [
   /\bst\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})*/,
   /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/i,
   /^[A-Za-z][A-Za-z0-9-]{2,}\s+[A-Za-z0-9._~+/=-]{12,}$/,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?/,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
 ];
 
 /**
@@ -357,11 +368,22 @@ const CREDENTIAL_VALUE_PATTERNS = [
  * whoever persists the window; a value cannot be renamed out of the way, so
  * this check runs on every value the bridge is about to keep, under any
  * name at all.
+ *
+ * The digests the window itself carries are the exact answer on top of the
+ * shapes: a value whose digest is the stored code digest or the stored
+ * token digest IS that credential, whatever it is written as and whatever
+ * its name is. That reading does not depend on the value looking like a
+ * credential, so a code or token written in a shape this list does not know
+ * is still caught.
  */
-function isCredentialFieldValue(value) {
+function isCredentialFieldValue(value, digests = {}) {
   const text = String(value ?? '');
   for (const pattern of CREDENTIAL_VALUE_PATTERNS) {
     if (pattern.test(text)) return true;
+  }
+  for (const held of [digests.codeDigest, digests.tokenDigest]) {
+    const digest = String(held ?? '');
+    if (digest !== '' && sha256Hex(text) === digest) return true;
   }
   return false;
 }
@@ -379,7 +401,8 @@ function isCredentialFieldValue(value) {
  * that keep their value are listed in the module, so the rule stays an
  * explicit finite list rather than a judgement call. That list rescues a
  * name only: a value that is one of the credential shapes the module
- * handles is dropped under any name, allowlisted or not.
+ * handles, or that is the window's own code or token by digest, is dropped
+ * under any name, allowlisted or not.
  */
 function normalizeWindow(window) {
   let source = window ?? {};
@@ -395,7 +418,7 @@ function normalizeWindow(window) {
     if (key === 'codeDigest' || key === 'tokenDigest' || key === 'expiresAtMs' || key === 'attemptsLeft' || key === 'spent' || key === 'replay') continue;
     if (isCredentialFieldName(key)) continue;
     if (kept >= MAX_WINDOW_METADATA_KEYS) break;
-    if (isCredentialFieldValue(source[key])) continue;
+    if (isCredentialFieldValue(source[key], { codeDigest: source.codeDigest, tokenDigest: source.tokenDigest })) continue;
     let size = 0;
     try {
       size = JSON.stringify(source[key] ?? null)?.length ?? 0;

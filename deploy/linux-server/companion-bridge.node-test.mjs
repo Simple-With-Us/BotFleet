@@ -337,6 +337,30 @@ test("a credential-shaped value under an allowlisted name is dropped", () => {
   }
 });
 
+test("a bare json web token and a pem private key are dropped under any name", () => {
+  // The two shapes the module does not mint itself but a caller can still
+  // persist: a JSON web token and a PEM private key block. Both are read
+  // out of the value, so renaming them into a benign field does not help.
+  const jwt = "eyJ" + "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" + "." + "eyJzdWIiOiIxIn0" + "." + "c2lnbmF0dXJl";
+  const pem = "-----BEGIN " + "PRIVATE KEY" + "-----\nMIIBVgIBADANBg==\n-----END " + "PRIVATE KEY" + "-----\n";
+  const window = { ...openWindow(), statusCode: jwt, encode: pem };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.ok(!("statusCode" in decision.window), "a json web token must not keep a cleartext value");
+  assert.ok(!("encode" in decision.window), "a pem private key must not keep a cleartext value");
+});
+
+test("the window's own credential is dropped under any name by its digest", () => {
+  // The digest reading is exact and does not depend on the value looking
+  // like a credential: a value whose digest is the stored code digest is
+  // that credential, whatever it is written as and whatever it is named.
+  const held = "plain-text-credential";
+  const window = { ...openWindow(), codeDigest: sha256Hex(held), statusCode: held };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.ok(!("statusCode" in decision.window), "the window's own code must not ride back out in cleartext");
+});
+
 test("a benign value under an allowlisted name survives", () => {
   const window = { ...openWindow(), statusCode: 200, postcode: "60601", unicode: "yes", encode: "utf8" };
   const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });

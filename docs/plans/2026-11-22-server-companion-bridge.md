@@ -54,8 +54,11 @@ unbroken run, so a name like APIToken or pairingtoken still drops the
 field, and a finite list of benign names such as statusCode keeps its
 value. That list rescues a name and never rescues a value: a field whose
 value is one of the credential shapes the module handles, the pairing
-token, the pairing code, an Infisical service token or an authorization
-header value, is dropped under any name.  One device never has
+token, the pairing code, an Infisical service token, an authorization
+header value, a JSON web token or a PEM private key block, is dropped
+under any name.  The window's own code and token are caught by their
+digests as well, so a credential written in a shape the list does not
+know is still lost.  One device never has
 two senders: the server sends when it owns the current pairing, decided
 at lookup time rather than raced at send time. Alert payloads mirror the
 native provider's keys and categories so a device sees one shape
@@ -64,15 +67,16 @@ whichever side sends.
 ## What the core proves today
 
 `deploy/linux-server/companion-bridge.mjs` holds the decision core as
-pure helpers; `companion-bridge.node-test.mjs` pins it with 32 tests on
+pure helpers; `companion-bridge.node-test.mjs` pins it with 34 tests on
 a fake clock and a fake registry (32 is the `node --test` total for that
 file) — route allowlist and locality, 404 vs 405, traversal and
 encoded-dot refusal, query byte-preservation, `$`-literal upstream paths,
 single-spend windows, expiry, corrupt-window lockout, attempt budgets,
 digest-only device auth, atomic replay with same-request recovery,
 metadata preservation, credential-named and credential-valued metadata
-exclusion with its benign allowlist, the one-sender rule, and the
-native-mirrored payload shape. Wired into `test:linux-server-install`.
+exclusion with its benign allowlist, the digest reading for the window's
+own credential, the one-sender rule, and the native-mirrored payload
+shape. Wired into `test:linux-server-install`.
 
 ## Packaging follow-ups (separate lane, after review)
 
