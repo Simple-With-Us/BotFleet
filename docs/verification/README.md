@@ -33,6 +33,7 @@ Verification uses these isolated fixtures:
 - [Saved data faults](saved-data.md) — unreadable bots, rooms, routines and settings files are set aside, never deleted
 - [Bot On/Off switch](bot-off.md) — an Off bot starts nothing new and finishes a running turn
 - [Named tunnel loopback Host](named-tunnel-loopback-host.md) — proves the Access tunnel reaches the harness with loopback Host and documents the mutation gate (BF-2129)
+- [Optional secret store fixture](optional-secret-store-fixture.md) — the fake-credential fixture and readback for the optional secret store: primary selection, independent read and write references, and mode isolation (BF-2622)
 
 ### Test Fixtures
 
