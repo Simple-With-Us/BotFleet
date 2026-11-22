@@ -119,6 +119,10 @@ SHUTDOWN_MARKER="${BOTFLEET_SHUTDOWN_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/st
 STARTUP_DISABLED_MARKER="${BOTFLEET_STARTUP_DISABLED_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/startup-disabled.marker}"
 STARTUP_ENABLED_MARKER="${BOTFLEET_STARTUP_ENABLED_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/startup-enabled.marker}"
 STARTUP_SESSION="${BOTFLEET_STARTUP_SESSION:-${OMB_DATA_DIR:-$HOME/.botfleet}/startup-session}"
+# Written by whichever harness owns the data dir (electron/harness-ownership.mjs).
+# That owner may serve on a port other than $PORT -- the desktop app does --
+# so a failed :$PORT health probe does not mean no harness is running (BF-2465).
+HARNESS_OWNER_FILE="${BOTFLEET_HARNESS_OWNER_FILE:-${OMB_DATA_DIR:-$HOME/.botfleet}/harness-owner.json}"
 LAUNCHD_SERVICE_NAME="${XPC_SERVICE_NAME:-}"
 
 boot_session() {
@@ -196,6 +200,28 @@ EOF
 
 health() {
   /usr/bin/curl -sf -m 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1
+}
+
+# Prints the pid named by harness-owner.json, or fails when there is no
+# readable record.  An unreadable or malformed record falls through to the
+# normal start, where the server's own ownership check refuses it by name;
+# guessing here would only hide that refusal.
+live_harness_owner_pid() {
+  [ -f "$HARNESS_OWNER_FILE" ] || return 1
+  "$NODE" --input-type=module -e '
+import fs from "node:fs";
+let fd;
+try {
+  fd = fs.openSync(process.argv[1], fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  const stat = fs.fstatSync(fd);
+  if (!stat.isFile() || stat.size > 4096) process.exit(1);
+  const value = JSON.parse(fs.readFileSync(fd, "utf8"));
+  if (value === null || typeof value !== "object" || Array.isArray(value) ||
+      !Number.isInteger(value.pid) || value.pid <= 0) process.exit(1);
+  process.stdout.write(String(value.pid));
+} catch { process.exitCode = 1; }
+finally { if (fd !== undefined) fs.closeSync(fd); }
+' -- "$HARNESS_OWNER_FILE" 2>/dev/null
 }
 
 log() {
@@ -457,6 +483,18 @@ fi
 
 if health; then
   log ":${PORT} already healthy after self-heal; not starting a second harness"
+  reset_fail_ledger
+  exit 0
+fi
+
+# BF-2465: the data dir may be owned by a live harness serving on another
+# port (the desktop app on 18799 while this job probes 8799).  Exec'ing node
+# anyway throws the ownership error uncaught, and because the ledger reset
+# below runs before exec, the storm stop never engages: 3,892 identical
+# crashes in 7 hours, one launchd relaunch every few seconds.  A live owner
+# is the same quiet state as a healthy port, so leave it alone the same way.
+if OWNER_PID="$(live_harness_owner_pid)" && [ -n "$OWNER_PID" ] && kill -0 "$OWNER_PID" 2>/dev/null; then
+  log "harness-owner.json names live pid ${OWNER_PID}; another harness owns the data dir; not starting a second harness"
   reset_fail_ledger
   exit 0
 fi
