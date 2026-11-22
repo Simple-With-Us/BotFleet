@@ -287,6 +287,18 @@ struct CompanionSyncContractsTests {
 
         let originWire = String(decoding: NativeCompanionServer.serializeHTTPResponse(checks[2]), as: UTF8.self)
         #expect(originWire.hasPrefix("HTTP/1.1 403 Forbidden\r\n"))
+
+        let noContentWire = String(
+            decoding: NativeCompanionServer.serializeHTTPResponse(CompanionHTTPResponse(statusCode: 204, body: Data())),
+            as: UTF8.self
+        )
+        #expect(noContentWire.hasPrefix("HTTP/1.1 204 No Content\r\n"))
+
+        let unknownWire = String(
+            decoding: NativeCompanionServer.serializeHTTPResponse(CompanionHTTPResponse(statusCode: 599, body: Data())),
+            as: UTF8.self
+        )
+        #expect(unknownWire.hasPrefix("HTTP/1.1 599 Unknown\r\n"))
         #endif
     }
 
@@ -303,6 +315,16 @@ struct CompanionSyncContractsTests {
         #expect(closed.endpoints.map(\.kind) == [.hosted, .tailnet])
         #expect(closed.endpoints.map(\.priority) == [0, 100])
         #expect(closed.hosts == ["ada-mac.tail0000.ts.net"])
+
+        let sanitized = CompanionEndpointAdvertisement.build(
+            serverName: "Ada's Mac",
+            port: 8810,
+            tailnetHost: "evil@ada-mac.tail0000.ts.net",
+            lanHosts: ["bad:9000", "ctrl\u{0001}host", "192.168.1.25"],
+            allowCleartextLAN: true
+        )
+        #expect(sanitized.endpoints.map(\.url) == ["http://192.168.1.25:8810"])
+        #expect(sanitized.hosts == ["192.168.1.25"])
 
         let opened = CompanionEndpointAdvertisement.build(
             serverName: "Ada's Mac",
@@ -519,6 +541,26 @@ struct CompanionSyncContractsTests {
         } else {
             Issue.record("Expected hello with resumed: false after eviction")
         }
+
+        // 8. Reconnecting at the exact 256-frame replay boundary preserves hello plus all 256 replayed frames.
+        let (fullReplayStream, _) = await server.subscribeSSEWithIdentifier(sinceSeq: 5)
+        var fullReplayIterator = fullReplayStream.makeAsyncIterator()
+        var fullReplayCollected: [StreamFrame] = []
+        for _ in 0..<(NativeCompanionServer.sseReplayBufferCapacity + 1) {
+            guard let chunk = await fullReplayIterator.next() else { break }
+            fullReplayCollected.append(contentsOf: try parseSSEFrames(from: chunk))
+        }
+        #expect(fullReplayCollected.count == NativeCompanionServer.sseReplayBufferCapacity + 1)
+        if case let .hello(_, fullResumed) = fullReplayCollected.first?.frame {
+            #expect(fullResumed == true)
+        } else {
+            Issue.record("Expected hello frame to stay un-evicted before 256 replayed frames")
+        }
+        if case let .message(_, firstReplayedMsg) = fullReplayCollected.dropFirst().first?.frame {
+            #expect(firstReplayedMsg.id == "msg-6")
+        } else {
+            Issue.record("Expected first replayed message msg-6")
+        }
     }
 
     // MARK: - Pillar 4: Push Notifications & Live Activity Tokens
@@ -546,10 +588,34 @@ struct CompanionSyncContractsTests {
         try await client.registerPushToken(alertToken)
         try await client.registerLiveActivityToken(liveToken, kind: .pushToStart)
 
+        let maxPaddedHex = "  \(String(repeating: "ab", count: 256)) \n"
+        let paddedResp = await server.handleRequest(CompanionHTTPRequest(
+            method: "POST",
+            path: "/api/companion/push-token",
+            headers: ["Authorization": "Bearer \(paired.response.token)"],
+            jsonString: "{\"token\":\"\(maxPaddedHex.replacingOccurrences(of: "\n", with: "\\n"))\"}"
+        ))
+        #expect(paddedResp.statusCode == 200)
+
+        let overLimitResp = await server.handleRequest(CompanionHTTPRequest(
+            method: "POST",
+            path: "/api/companion/push-token",
+            headers: ["Authorization": "Bearer \(paired.response.token)"],
+            jsonString: "{\"token\":\"\(String(repeating: "ef", count: 257))\"}"
+        ))
+        #expect(overLimitResp.statusCode == 400)
+        #expect(overLimitResp.bodyString.contains("token_too_long"))
+
+        try await client.registerPushToken(alertToken)
+
         let updateError = await #expect(throws: APIError.self) {
             try await client.registerLiveActivityToken(liveToken, kind: .update)
         }
-        #expect(updateError?.statusCode == 400)
+        if case let .status(code, _) = updateError {
+            #expect(code == 400)
+        } else {
+            Issue.record("Expected APIError.status(400), got \(String(describing: updateError))")
+        }
 
         let badField = await server.handleRequest(CompanionHTTPRequest(
             method: "POST",

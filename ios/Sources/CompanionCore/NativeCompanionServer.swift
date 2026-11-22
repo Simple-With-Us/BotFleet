@@ -217,7 +217,8 @@ public struct CompanionEndpointAdvertisement: Sendable, Equatable {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               trimmed.utf8.count <= 253,
-              !trimmed.contains(where: { $0.isWhitespace || "/?#".contains($0) }) else {
+              !trimmed.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F }),
+              !trimmed.contains(where: { $0.isWhitespace || "/?#:@".contains($0) }) else {
             return nil
         }
         return trimmed
@@ -1158,23 +1159,28 @@ public actor NativeCompanionServer {
         return Int(seqPart) != nil
     }
 
-    private func parseSinceCursor(_ request: CompanionHTTPRequest) -> Result<Int?, CompanionHTTPResponse> {
+    private enum ParsedSSECursor: Sendable {
+        case valid(Int?)
+        case invalid(CompanionHTTPResponse)
+    }
+
+    private func parseSinceCursor(_ request: CompanionHTTPRequest) -> ParsedSSECursor {
         let rawCursor = request.queryItems["since"] ?? request.headerValue(for: "Last-Event-ID")
         guard let rawCursor, !rawCursor.isEmpty else {
-            return .success(nil)
+            return .valid(nil)
         }
         guard Self.isValidSSECursor(rawCursor) else {
-            return .failure(.error(400, "invalid_cursor"))
+            return .invalid(.error(400, "invalid_cursor"))
         }
         guard let colon = rawCursor.firstIndex(of: ":") else {
-            return .failure(.error(400, "invalid_cursor"))
+            return .invalid(.error(400, "invalid_cursor"))
         }
         let streamPart = String(rawCursor[..<colon])
         let seqPart = String(rawCursor[rawCursor.index(after: colon)...])
         guard streamPart == streamId, let seq = Int(seqPart) else {
-            return .success(nil)
+            return .valid(nil)
         }
-        return .success(seq)
+        return .valid(seq)
     }
 
     private func makeSSEHandshake(sinceSeq: Int?) -> (helloFrame: String, replayedFrames: [String]) {
@@ -1218,7 +1224,10 @@ public actor NativeCompanionServer {
     func subscribeSSEWithIdentifier(deviceId: String? = nil, sinceSeq: Int? = nil) -> (stream: AsyncStream<String>, id: UUID) {
         let id = UUID()
         let handshake = makeSSEHandshake(sinceSeq: sinceSeq)
-        let stream = AsyncStream<String>(bufferingPolicy: .bufferingNewest(Self.sseBufferCapacity)) { continuation in
+        let streamCapacity = handshake.replayedFrames.isEmpty
+            ? Self.sseBufferCapacity
+            : Self.sseBufferCapacity + handshake.replayedFrames.count + 1
+        let stream = AsyncStream<String>(bufferingPolicy: .bufferingNewest(streamCapacity)) { continuation in
             sseContinuationById[id] = SSESubscriber(deviceId: deviceId, continuation: continuation)
             continuation.yield(handshake.helloFrame)
             for replayed in handshake.replayedFrames {
@@ -1289,9 +1298,9 @@ public actor NativeCompanionServer {
             ))
         }
         switch parseSinceCursor(request) {
-        case .success(let sinceSeq):
+        case .valid(let sinceSeq):
             return .authorized(deviceId: device.id, sinceSeq: sinceSeq)
-        case .failure(let response):
+        case .invalid(let response):
             return .rejected(response)
         }
     }
@@ -1377,9 +1386,9 @@ public actor NativeCompanionServer {
 
         case ("GET", "/api/events"):
             switch parseSinceCursor(request) {
-            case .failure(let errorResponse):
+            case .invalid(let errorResponse):
                 return errorResponse
-            case .success(let sinceSeq):
+            case .valid(let sinceSeq):
                 let handshake = makeSSEHandshake(sinceSeq: sinceSeq)
                 let frames = ([handshake.helloFrame] + handshake.replayedFrames).joined()
                 var headers = Self.privateResponseHeaders
@@ -1675,19 +1684,16 @@ public actor NativeCompanionServer {
             }
         }
         guard let token = json["token"] as? String,
-              !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return .error(400, "token must be a non-empty string")
-        }
-        guard token.utf8.count <= CompanionFieldLimits.pushToken else {
-            return .error(400, "token_too_long")
-        }
-        guard CompanionDeviceRegistry.normalizedPushToken(token) != nil else {
+              let normalizedToken = CompanionDeviceRegistry.normalizedPushToken(token) else {
             return .error(400, "that push token is not usable")
+        }
+        guard normalizedToken.utf8.count <= CompanionFieldLimits.pushToken else {
+            return .error(400, "token_too_long")
         }
         let before = deviceRegistry
         let updated = isLiveActivity
-            ? deviceRegistry.setLiveActivityToken(id: deviceId, token: token)
-            : deviceRegistry.setPushToken(id: deviceId, token: token)
+            ? deviceRegistry.setLiveActivityToken(id: deviceId, token: normalizedToken)
+            : deviceRegistry.setPushToken(id: deviceId, token: normalizedToken)
         guard updated else {
             return .error(400, "that push token is not usable")
         }
@@ -2532,18 +2538,25 @@ public actor NativeCompanionServer {
         switch statusCode {
         case 200: return "OK"
         case 201: return "Created"
+        case 202: return "Accepted"
+        case 204: return "No Content"
+        case 301: return "Moved Permanently"
+        case 302: return "Found"
+        case 304: return "Not Modified"
         case 400: return "Bad Request"
         case 401: return "Unauthorized"
         case 403: return "Forbidden"
         case 404: return "Not Found"
         case 409: return "Conflict"
+        case 410: return "Gone"
         case 413: return "Payload Too Large"
         case 415: return "Unsupported Media Type"
+        case 418: return "I'm a Teapot"
         case 429: return "Too Many Requests"
         case 500: return "Internal Server Error"
         case 501: return "Not Implemented"
         case 503: return "Service Unavailable"
-        default: return "OK"
+        default: return "Unknown"
         }
     }
 
