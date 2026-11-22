@@ -204,6 +204,26 @@ test("replay needs the same request, the same credential, a paired device, and t
   assert.equal(noRequestId.reason, "window already spent");
 });
 
+test("a fresh redeem and its replay report the same fields", () => {
+  // The caller reads one result shape on both paths, so a fresh redeem
+  // reports the named device instead of leaving it undefined.
+  const fresh = redeem(openWindow(), PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(fresh.ok, true);
+  assert.equal(fresh.replayed, false);
+  assert.equal(fresh.deviceId, "d-9");
+  assert.equal(fresh.credentialDigest, sha256Hex(PROOF));
+  const replayed = redeem(fresh.window, PROOF, { requestId: "pair-request-00000001", pairedDeviceIds: ["d-9"] });
+  assert.equal(replayed.ok, true);
+  assert.equal(replayed.replayed, true);
+  assert.equal(replayed.deviceId, "d-9");
+  assert.equal(replayed.credentialDigest, sha256Hex(PROOF));
+  assert.deepEqual(Object.keys(replayed).sort(), Object.keys(fresh).sort());
+  // A redeem that named no device reports an empty device id, not a missing one.
+  const unnamed = redeem(openWindow(), PROOF);
+  assert.equal(unnamed.ok, true);
+  assert.equal(unnamed.deviceId, "");
+});
+
 test("caller metadata is bounded: at most eight small keys survive", () => {
   const crowded = { ...openWindow() };
   for (let i = 0; i < 12; i += 1) crowded[`tag-${i}`] = `v${i}`;
@@ -238,6 +258,31 @@ test("caller metadata survives the round trip instead of being dropped", () => {
   const cleaned = redeem({ ...openWindow(), ...hostile }, PROOF, { requestId: "pair-request-00000001" });
   assert.equal({}.polluted, undefined);
   assert.equal(cleaned.ok, true);
+});
+
+test("a cleartext credential in a stored window never survives a redeem", () => {
+  const window = { ...openWindow(), token: PROOF, code: "123456", credential: "cleartext-secret", credentialDigest: "not-a-real-digest" };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.ok(!("token" in decision.window), "no cleartext token comes back out");
+  assert.ok(!("code" in decision.window), "no cleartext code comes back out");
+  assert.ok(!("credential" in decision.window), "no cleartext credential comes back out");
+  assert.ok(!("credentialDigest" in decision.window), "no credential digest comes back out");
+  // The stored cleartext is never the credential that redeems the window.
+  const other = { ...openWindow(), token: "omb_pair_" + "b".repeat(43) };
+  const refused = redeem(other, "omb_pair_" + "b".repeat(43));
+  assert.equal(refused.ok, false);
+  assert.equal(refused.reason, "bad credential");
+});
+
+test("a credential-shaped caller field name is dropped too", () => {
+  const window = { ...openWindow(), pairingToken: "cleartext", smsCode: "654321", postcode: "60601", note: "kept" };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.ok(!("pairingToken" in decision.window), "a credential word in the name drops the field");
+  assert.ok(!("smsCode" in decision.window), "a credential word in the name drops the field");
+  assert.equal(decision.window.postcode, "60601", "an innocent name keeps its value");
+  assert.equal(decision.window.note, "kept");
 });
 
 test("device credentials match digests only, under a concrete id", () => {

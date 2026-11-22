@@ -39,12 +39,17 @@ registry entries are skipped, never trusted. Pairing windows open with a
 native parser accepts) and spend exactly once; a redeem that names the
 minted device id records the replay atomically in the same call, so no
 caller can persist the spend without the replay and lock the phone out
-after a lost response. A retried request with the same id and credential
+after a lost response.  A successful redeem reports the same fields on
+the fresh and the replayed path: the device the caller named, the digest
+of the accepted credential, and whether the answer was replayed.
+A retried request with the same id and credential
 replays the prior result until expiry; anything else on a spent window
 is refused, and revocation clears the bearer by dropping the window.
 Wrong credentials cost one attempt and the budget locks; corrupt windows
 fail closed instead of guessing. Callers may attach their own metadata
-to the window object and it survives the round trip. One device never has
+to the window object and it survives the round trip, except a field whose
+name carries a credential, which the bridge drops so no cleartext value
+ever comes back out.  One device never has
 two senders: the server sends when it owns the current pairing, decided
 at lookup time rather than raced at send time. Alert payloads mirror the
 native provider's keys and categories so a device sees one shape
@@ -53,13 +58,15 @@ whichever side sends.
 ## What the core proves today
 
 `deploy/linux-server/companion-bridge.mjs` holds the decision core as
-pure helpers; `companion-bridge.node-test.mjs` pins it with 21 tests on
-a fake clock and a fake registry — route allowlist and locality, 404 vs
-405, traversal and encoded-dot refusal, query byte-preservation,
-`$`-literal upstream paths, single-spend windows, expiry, corrupt-window
-lockout, attempt budgets, digest-only device auth, atomic replay with
-same-request recovery, metadata preservation, the one-sender rule, and
-the native-mirrored payload shape. Wired into `test:linux-server-install`.
+pure helpers; `companion-bridge.node-test.mjs` pins it with 25 tests on
+a fake clock and a fake registry (25 is the `node --test` total for that
+file) — route allowlist and locality, 404 vs 405, traversal and
+encoded-dot refusal, query byte-preservation, `$`-literal upstream paths,
+single-spend windows, expiry, corrupt-window lockout, attempt budgets,
+digest-only device auth, atomic replay with same-request recovery,
+metadata preservation, credential-named metadata exclusion, the
+one-sender rule, and the native-mirrored payload shape. Wired into
+`test:linux-server-install`.
 
 ## Packaging follow-ups (separate lane, after review)
 

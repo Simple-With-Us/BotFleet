@@ -189,13 +189,61 @@ const MAX_WINDOW_METADATA_KEYS = 8;
 const MAX_WINDOW_METADATA_CHARS = 1024;
 
 /**
+ * The names that carry a credential value rather than a digest. A window
+ * that persists one of these in cleartext must not hand it back on a redeem,
+ * because the bridge keeps digests only, never the value.
+ */
+const CREDENTIAL_FIELD_NAMES = new Set([
+  'token',
+  'code',
+  'credential',
+  'credentialDigest',
+]);
+
+/**
+ * The words that mark a caller field name as credential-bearing. The exact
+ * names above cannot hold the digest-only invariant on their own, because a
+ * caller may name a credential field anything; these words catch the usual
+ * forms, and they are matched whole so an innocent name like "postcode"
+ * keeps its value.
+ */
+const CREDENTIAL_FIELD_WORDS = new Set([
+  'token',
+  'code',
+  'credential',
+  'secret',
+  'passcode',
+  'passphrase',
+  'password',
+  'otp',
+  'pin',
+]);
+
+/**
+ * Whether one caller field name carries a credential. The module's own
+ * credential names are listed outright, and any name whose words include a
+ * credential word is refused as well, so a cleartext value cannot ride back
+ * out of a stored window under a different name.
+ */
+function isCredentialFieldName(key) {
+  if (CREDENTIAL_FIELD_NAMES.has(key)) return true;
+  const words = key
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .split(/[^A-Za-z0-9]+/)
+    .filter((word) => word !== '');
+  return words.some((word) => CREDENTIAL_FIELD_WORDS.has(word.toLowerCase()));
+}
+
+/**
  * Normalize one stored window, preserving a bounded set of unknown caller
  * fields. Callers may attach small metadata to the object they persist;
  * dropping it on read would silently lose it the first time the bridge
  * touched the window. Only own enumerable string keys travel, never
  * __proto__, constructor or prototype, at most eight of them, and no
  * single value larger than 1KB once serialized. Anything that is not a
- * plain object fails closed to an empty shell that cannot verify.
+ * plain object fails closed to an empty shell that cannot verify. A field
+ * whose name carries a credential never travels at all, so a cleartext token
+ * or code persisted on a window is dropped on the way out.
  */
 function normalizeWindow(window) {
   let source = window ?? {};
@@ -209,6 +257,7 @@ function normalizeWindow(window) {
   for (const key of Object.keys(source)) {
     if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
     if (key === 'codeDigest' || key === 'tokenDigest' || key === 'expiresAtMs' || key === 'attemptsLeft' || key === 'spent' || key === 'replay') continue;
+    if (isCredentialFieldName(key)) continue;
     if (kept >= MAX_WINDOW_METADATA_KEYS) break;
     let size = 0;
     try {
@@ -240,7 +289,9 @@ function normalizeWindow(window) {
  * window is refused. Callers without a request id keep exactly-once
  * behaviour. `pairedDeviceIds` is the registry's current membership: a
  * replay for a revoked device is refused, because revocation must not
- * leave a recoverable bearer behind.
+ * leave a recoverable bearer behind. A successful redeem reports the same
+ * fields on both paths. Those fields are the device the caller named, the
+ * digest of the accepted credential, and whether the answer was replayed.
  */
 /**
  * Redeem one credential and, when the caller supplies the minted device
@@ -272,7 +323,7 @@ export function redeemBridgePairingWindow({ window, presented, requestId, replay
       digestsEqualHex(replay.credentialDigest, presentedDigest) &&
       paired.includes(replay.deviceId)
     ) {
-      return { ok: true, replayed: true, deviceId: replay.deviceId, window: current };
+      return { ok: true, replayed: true, deviceId: replay.deviceId, credentialDigest: replay.credentialDigest, window: current };
     }
     return { ok: false, reason: 'window already spent', window: current };
   }
@@ -297,7 +348,7 @@ export function redeemBridgePairingWindow({ window, presented, requestId, replay
       expiresAtMs: current.expiresAtMs,
     };
   }
-  return { ok: true, replayed: false, credentialDigest: presentedDigest, window: spent };
+  return { ok: true, replayed: false, deviceId: replayFor, credentialDigest: presentedDigest, window: spent };
 }
 
 /**
