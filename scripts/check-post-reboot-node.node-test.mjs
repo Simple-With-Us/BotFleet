@@ -433,7 +433,7 @@ test("check-post-reboot-node.mjs CLI responds with JSON on --json", () => {
   }
 });
 
-test("resolveBoardCli resolves BOARD_CLI or board", () => {
+test("resolveBoardCli resolves an explicit BOARD_CLI", () => {
   const orig = process.env.BOARD_CLI;
   try {
     process.env.BOARD_CLI = "my-board-cli";
@@ -444,7 +444,7 @@ test("resolveBoardCli resolves BOARD_CLI or board", () => {
   }
 });
 
-test("resolveBoardCli throws fail-closed error when board binary is unavailable", () => {
+test("resolveBoardCli throws fail-closed error when the current Linear CLI is unavailable", () => {
   const origCli = process.env.BOARD_CLI;
   const origHome = process.env.HOME;
   const origPath = process.env.PATH;
@@ -454,7 +454,7 @@ test("resolveBoardCli throws fail-closed error when board binary is unavailable"
     process.env.PATH = "/tmp/nonexistent-empty-bin-dir";
     assert.throws(
       () => resolveBoardCli(),
-      /Linear CLI 'board' not found on PATH or at ~\/\.local\/bin\/board/,
+      /Linear CLI 'simple-board' not found on PATH or at ~\/\.local\/bin\/simple-board/,
     );
   } finally {
     if (origCli !== undefined) process.env.BOARD_CLI = origCli;

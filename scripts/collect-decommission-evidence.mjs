@@ -1,7 +1,7 @@
 // Prepare an offline packet from explicitly named captures.
 // Host readers are injection-only; this module supplies no subprocess,
 // network, credential, scheduler, installation or retirement adapters.
-import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { redactSecretsInText } from "../shared/redact.ts";
@@ -10,6 +10,23 @@ import {
   EvidenceRefSchema, MAX_EVIDENCE_BUNDLE_BYTES, MAX_EVIDENCE_FILE_BYTES,
   MAX_EVIDENCE_FILES, parseEvidenceReceipt, readEvidenceRef, receiptReferences, REQUIRED_RECEIPTS,
 } from "./decommission-evidence-bundle.mjs";
+
+/* oxlint-disable eslint/no-irregular-whitespace -- Owner-required NBSP sentence gaps occur only in prose comments in this script. */
+
+/**
+ * A refusal the operator can act on.  The generic capture refusal says
+ * a capture may be invalid; this one names the path that stopped the run.
+ */
+export class EvidenceRefusal extends Error {}
+
+/**
+ * The refusal reason for an error, in the words of what actually happened.  
+ * Every other failure keeps the generic capture complaint.
+ */
+export function evidenceRefusalReason(error) {
+  if (error instanceof EvidenceRefusal) return error.message;
+  return "invalid, unredacted, mismatched, missing or unsafe capture";
+}
 
 /** Captures must be redacted before their hashes and receipts are issued. */
 export async function collectEvidenceBundle(request, { readCapturedFile, readers = {} }) {
@@ -70,6 +87,14 @@ if (isEntry) {
       const packet = await collectEvidenceBundle(request, { readCapturedFile: reader.read });
       if (args[1]) {
         const output = resolve(args[1]);
+        // An existing output path is refused rather than reused: the packet
+        // is a private snapshot, so writing into a directory that already
+        // holds one would leave a stale capture beside the new one.
+        if (existsSync(output)) {
+          throw new EvidenceRefusal(
+            `the output path already exists and this run will not reuse it: ${output}`,
+          );
+        }
         mkdirSync(output, { mode: 0o700 });
         for (const [path, bytes] of packet.files) {
           const target = join(output, path);
@@ -79,8 +104,8 @@ if (isEntry) {
         writeFileSync(join(output, "bundle.json"), `${JSON.stringify(packet.bundle, null, 2)}\n`, { flag: "wx", mode: 0o600 });
       }
       console.log(JSON.stringify({ prepared: true, written: Boolean(args[1]), missing: packet.missing, validation: "not-performed", ownerAcceptance: packet.bundle.receipts["owner-acceptance"] ? "captured-external-assertion" : "missing" }));
-    } catch {
-      console.error("Evidence collection refused: invalid, unredacted, mismatched, missing or unsafe capture");
+    } catch (error) {
+      console.error(`Evidence collection refused: ${evidenceRefusalReason(error)}`);
       process.exitCode = 2;
     }
   }

@@ -8,7 +8,7 @@
 // So the refresh is one command, and the two halves that can be derived
 // instead of asserted are derived:
 //
-//   - issue states come from Linear through the board CLI, and a failed query
+//   - issue states come from Linear through the simple-board CLI, and a failed query
 //     exits non-zero rather than writing a partial file, so a refresh that did
 //     not happen can never read as one that did;
 //   - `inventory-clean` comes from running the audit against the committed
@@ -26,7 +26,7 @@
 //   node scripts/decommission-gate-state.mjs --board-json <nodes.json> --out out.json
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import {
@@ -41,18 +41,23 @@ import {
   trackedFiles,
 } from "./audit-node-decommission.mjs";
 
+/* oxlint-disable eslint/no-irregular-whitespace -- Owner-required NBSP sentence gaps occur only in prose comments in this script. */
+
 const LINEAR_PAGE_SIZE = 250;
 // Four pages (a thousand issues) bound the refresh; the loop below almost
 // always stops after the first page, because it quits as soon as every
 // required issue has been seen.
 const LINEAR_MAX_PAGES = 4;
+// The owner's copy rule: a real U+00A0 plus a normal space between the
+// sentences of anything a human reads.
+const SENTENCE_GAP = "  ";
 
 const linearPageQuery = (after) =>
   `query { issues(filter: { team: { key: { eq: "BF" } } }, first: ${LINEAR_PAGE_SIZE}${after ? `, after: ${JSON.stringify(after)}` : ""}) { nodes { identifier state { name } } pageInfo { hasNextPage endCursor } } }`;
 
 /**
  * Accept every shape the refresh can hand us: a bare nodes array (a fixture,
- * or a jq-extracted file), the raw `board api query --json` envelope, or the
+ * or a jq-extracted file), the raw `api query --json` envelope, or the
  * same envelope without its `data` wrapper.  Anything else is refused rather
  * than guessed at.
  */
@@ -65,31 +70,151 @@ export function unwrapNodes(raw) {
 }
 
 /**
- * Resolve the CLI binary to query Linear. Prefers explicit BOARD_CLI env,
- * prefers verified board at ~/.local/bin/board, and guards against legacy
- * mac-collab binary shadows when resolving from PATH.
+ * The current Linear-backed CLI.  The legacy `board` binary, its
+ * `board-legacy` alias and the mac-collab backend behind them are retired
+ * write routes (AGENTS.md), so a refresh must never resolve one of them.  
+ * `simple-board` serves the `api query` surface this script already sends:
+ * a GraphQL document, `--max-chars` and `--json`.
  */
-export function resolveBoardCli() {
-  if (process.env.BOARD_CLI) return process.env.BOARD_CLI;
-  const verifiedDefault = join(process.env.HOME ?? "", ".local", "bin", "board");
-  if (existsSync(verifiedDefault)) {
-    return verifiedDefault;
-  }
-  try {
-    const whichOut = execFileSync("which", ["board"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-    if (whichOut) {
-      const real = realpathSync(whichOut);
-      if (!real.includes("mac-collab")) {
-        return whichOut;
-      }
-    }
-  } catch {
-    // fall through to fail-closed throw
-  }
-  throw new Error("Linear CLI 'board' not found on PATH or at ~/.local/bin/board. Set BOARD_CLI or install verified board at ~/.local/bin/board.");
+export const CURRENT_LINEAR_CLI = "simple-board";
+
+/** The retired CLI names a refresh must never resolve. */
+export const RETIRED_LINEAR_CLI_NAMES = ["board", "board-legacy"];
+
+/**
+ * The retired mac-collab backend, whose binaries are retired write routes
+ * too (AGENTS.md).  The marker is compared case-folded: a
+ * case-insensitive volume resolves the directory under any spelling.
+ */
+export const RETIRED_BACKEND_MARKER = "mac-collab";
+
+/**
+ * A path that names a retired CLI is not a Linear route.  The basename is
+ * folded to lowercase before the comparison: on a case-insensitive volume
+ * `BOARD` and `Board` resolve to the same retired binary, and an exact-case
+ * comparison would let them through.
+ */
+export function isRetiredLinearCli(path) {
+  const name = basename(path).toLowerCase();
+  return RETIRED_LINEAR_CLI_NAMES.some((retired) => {
+    const retiredName = retired.toLowerCase();
+    return name === retiredName || name.startsWith(`${retiredName}-`);
+  });
 }
 
-/** One Linear page through the board CLI.  Throws rather than returning []. */
+/**
+ * A path inside the retired mac-collab backend is not a Linear route.  The
+ * marker is compared as a WHOLE PATH SEGMENT, case-folded, so a
+ * directory whose NAME merely contains the marker (a home directory
+ * called mac-collab-user, for instance) is not the retired backend,
+ * while the retired backend directory itself always is.  Both
+ * separators count, so a Windows-style path matches too.
+ */
+export function isRetiredBackendPath(path) {
+  const segments = String(path ?? "").toLowerCase().split(/[\\/]+/);
+  return segments.includes(RETIRED_BACKEND_MARKER);
+}
+
+/**
+ * The real path behind a CLI path, or the literal path when it does not
+ * exist.  A retired binary reached through a symlink or under a
+ * renamed copy has to fail the same gate, so the refusal looks at the
+ * resolved path as well as the literal one.
+ */
+export function resolveRealCliPath(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    // The path does not exist, so the basename check still applies to it.
+    return path;
+  }
+}
+
+/**
+ * The CLI on PATH, or null when it is missing or a retired mac-collab shadow.
+ */
+function linearCliOnPath(name) {
+  try {
+    const whichOut = execFileSync("which", [name], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (!whichOut) return null;
+    const resolved = resolveRealCliPath(whichOut);
+    if (isRetiredBackendPath(resolved)) return null;
+    // A `simple-board` that resolves to a retired binary is that binary
+    // under another name, so it fails the same gate.
+    if (isRetiredLinearCli(resolved)) return null;
+    // The VALIDATED path is the one that is returned.  Handing back the
+    // literal `which` output would leave a gap between the check and the
+    // use:  a symlink swapped after this gate, or a `which` that answers
+    // with a symlink, would send the exec somewhere the gate never saw.
+    return resolved;
+  } catch {
+    // The CLI is not on PATH, so the refresh fails closed below.
+    return null;
+  }
+}
+
+/**
+ * Resolve the CLI binary to query Linear.  Prefers explicit BOARD_CLI,
+ * prefers the verified simple-board under ~/.local/bin, and refuses the
+ * retired `board` binary outright: it is a retired write route, so a refresh
+ * must never resolve it.
+ */
+export function resolveBoardCli() {
+  const override = process.env.BOARD_CLI;
+  if (override) {
+    // The override is resolved before it is judged: a symlink or a renamed
+    // copy of a retired binary must not reach the gate under an innocent
+    // name, and the retired backend is refused by its own path as well.
+    const resolved = resolveRealCliPath(override);
+    if (isRetiredLinearCli(override)) {
+      throw new Error(
+        `BOARD_CLI names the retired Linear CLI '${override}'.${SENTENCE_GAP}Set BOARD_CLI to ${CURRENT_LINEAR_CLI}, the current Linear-backed CLI.`,
+      );
+    }
+    if (isRetiredLinearCli(resolved)) {
+      throw new Error(
+        `BOARD_CLI resolves to the retired Linear CLI '${resolved}'.${SENTENCE_GAP}Set BOARD_CLI to ${CURRENT_LINEAR_CLI}, the current Linear-backed CLI.`,
+      );
+    }
+    if (isRetiredBackendPath(override) || isRetiredBackendPath(resolved)) {
+      throw new Error(
+        `BOARD_CLI names a retired Linear CLI in the mac-collab backend '${override}'.${SENTENCE_GAP}Set BOARD_CLI to ${CURRENT_LINEAR_CLI}, the current Linear-backed CLI.`,
+      );
+    }
+    // The VALIDATED path is the one that is returned, so the exec runs
+    // exactly the target the gate judged and not the literal spelling of it.
+    return resolved;
+  }
+  const verifiedDefault = join(process.env.HOME ?? "", ".local", "bin", CURRENT_LINEAR_CLI);
+  if (existsSync(verifiedDefault)) {
+    // The default branch carries the same gate as the override and the PATH
+    // branch.  A verified default that is a symlink to, or a copy of, the
+    // retired binary, or that sits in the retired backend, is that retired
+    // write route under an innocent name, so it is refused here too.
+    const resolvedDefault = resolveRealCliPath(verifiedDefault);
+    if (isRetiredLinearCli(verifiedDefault) || isRetiredLinearCli(resolvedDefault)) {
+      throw new Error(
+        `Default CLI '${verifiedDefault}' resolves to the retired Linear CLI '${resolvedDefault}'.${SENTENCE_GAP}Set BOARD_CLI to ${CURRENT_LINEAR_CLI}, the current Linear-backed CLI.`,
+      );
+    }
+    if (isRetiredBackendPath(verifiedDefault) || isRetiredBackendPath(resolvedDefault)) {
+      throw new Error(
+        `Default CLI '${verifiedDefault}' sits in the retired mac-collab backend '${resolvedDefault}'.${SENTENCE_GAP}Set BOARD_CLI to ${CURRENT_LINEAR_CLI}, the current Linear-backed CLI.`,
+      );
+    }
+    return resolvedDefault;
+  }
+  const onPath = linearCliOnPath(CURRENT_LINEAR_CLI);
+  if (onPath) return onPath;
+  throw new Error(
+    `Linear CLI '${CURRENT_LINEAR_CLI}' not found on PATH or at ~/.local/bin/${CURRENT_LINEAR_CLI}.${SENTENCE_GAP}Set BOARD_CLI or install ${CURRENT_LINEAR_CLI} at ~/.local/bin/${CURRENT_LINEAR_CLI}.`,
+  );
+}
+
+/** One Linear page through the Linear CLI.  Throws rather than returning []. */
 export function fetchLinearPage(after) {
   const cli = resolveBoardCli();
   const out = execFileSync(
@@ -127,11 +252,11 @@ export function collectLinearNodes(fetchPage) {
   return nodes;
 }
 
-/** Read Linear nodes through the board CLI.  Throws rather than returning []. */
+/** Read Linear nodes through the Linear CLI.  Throws rather than returning []. */
 export function linearNodes() {
   const nodes = collectLinearNodes(fetchLinearPage);
   if (nodes.length === 0) {
-    throw new Error("board api query returned no issues; refusing to write a state file");
+    throw new Error("simple-board api query returned no issues; refusing to write a state file");
   }
   return nodes;
 }

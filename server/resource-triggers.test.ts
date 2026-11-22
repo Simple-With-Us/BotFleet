@@ -9,6 +9,7 @@ import {
   crossed,
   ResourceTriggerManager,
   sampleHost,
+  sampleHostAsync,
   valueFor,
   webhookDispatchHoldReason,
   webhookDispatchHot,
@@ -117,6 +118,16 @@ describe("sampleHost", () => {
     expect(s.ramUsedPct).toBeGreaterThan(0);
     expect(s.ramUsedPct).toBeLessThanOrEqual(100);
   });
+
+  it("sampleHostAsync reports the same shape without sync probes (BF-2468)", async () => {
+    const s = await sampleHostAsync();
+    expect(s.diskFreeGb).toBeGreaterThan(0);
+    expect(s.diskUsedPct).toBeGreaterThanOrEqual(0);
+    expect(s.diskUsedPct).toBeLessThanOrEqual(100);
+    expect(s.ramUsedPct).toBeGreaterThan(0);
+    expect(s.ramUsedPct).toBeLessThanOrEqual(100);
+    expect(s.load1m).toBeGreaterThanOrEqual(0);
+  });
 });
 
 describe("ResourceTriggerManager", () => {
@@ -144,7 +155,7 @@ describe("ResourceTriggerManager", () => {
     return { manager, queued, admission };
   }
 
-  it("preserves a trigger breach while scheduler admission is fenced", () => {
+  it("preserves a trigger breach while scheduler admission is fenced", async () => {
     const now = { t: 1_000 };
     const host = { current: sample({ diskFreeGb: 40 }) };
     const { manager, queued, admission } = make(now, host, { open: false });
@@ -158,15 +169,15 @@ describe("ResourceTriggerManager", () => {
       cooldownMinutes: 45,
       sustainSamples: 1,
     });
-    expect(manager.tick()).toHaveLength(0);
+    expect(await manager.tick()).toHaveLength(0);
     expect(queued).toHaveLength(0);
 
     admission.open = true;
-    expect(manager.tick()).toHaveLength(1);
+    expect(await manager.tick()).toHaveLength(1);
     expect(queued).toEqual([trigger.id]);
   });
 
-  it("fires once then respects cooldown", () => {
+  it("fires once then respects cooldown", async () => {
     const now = { t: 1_000 };
     const host = { current: sample({ diskFreeGb: 40 }) };
     const { manager, queued } = make(now, host);
@@ -180,17 +191,17 @@ describe("ResourceTriggerManager", () => {
       cooldownMinutes: 45,
       sustainSamples: 1,
     });
-    expect(manager.tick()).toHaveLength(1);
+    expect(await manager.tick()).toHaveLength(1);
     expect(queued).toEqual([trigger.id]);
-    expect(manager.tick()).toHaveLength(0);
+    expect(await manager.tick()).toHaveLength(0);
     now.t += 44 * 60_000;
-    expect(manager.tick()).toHaveLength(0);
+    expect(await manager.tick()).toHaveLength(0);
     now.t += 2 * 60_000;
-    expect(manager.tick()).toHaveLength(1);
+    expect(await manager.tick()).toHaveLength(1);
     expect(queued).toEqual([trigger.id, trigger.id]);
   });
 
-  it("requires a sustained breach before firing", () => {
+  it("requires a sustained breach before firing", async () => {
     // A `du` sweep or a build can take 1m load from 12 to 120 and back inside a single
     // 30s sample.  Waking a bot for that spike is noise, so N consecutive samples must
     // breach before the trigger fires.
@@ -206,13 +217,13 @@ describe("ResourceTriggerManager", () => {
       threshold: 16,
       sustainSamples: 3,
     });
-    expect(manager.tick()).toHaveLength(0);
-    expect(manager.tick()).toHaveLength(0);
-    expect(manager.tick()).toHaveLength(1);
+    expect(await manager.tick()).toHaveLength(0);
+    expect(await manager.tick()).toHaveLength(0);
+    expect(await manager.tick()).toHaveLength(1);
     expect(queued).toHaveLength(1);
   });
 
-  it("resets the streak when pressure clears", () => {
+  it("resets the streak when pressure clears", async () => {
     const now = { t: 1_000 };
     const host = { current: sample({ load1m: 40 }) };
     const { manager, queued } = make(now, host);
@@ -225,18 +236,18 @@ describe("ResourceTriggerManager", () => {
       threshold: 16,
       sustainSamples: 3,
     });
-    expect(manager.tick()).toHaveLength(0);
-    expect(manager.tick()).toHaveLength(0);
+    expect(await manager.tick()).toHaveLength(0);
+    expect(await manager.tick()).toHaveLength(0);
     host.current = sample({ load1m: 2 }); // recovered -- streak must restart
-    expect(manager.tick()).toHaveLength(0);
+    expect(await manager.tick()).toHaveLength(0);
     host.current = sample({ load1m: 40 });
-    expect(manager.tick()).toHaveLength(0);
-    expect(manager.tick()).toHaveLength(0);
-    expect(manager.tick()).toHaveLength(1);
+    expect(await manager.tick()).toHaveLength(0);
+    expect(await manager.tick()).toHaveLength(0);
+    expect(await manager.tick()).toHaveLength(1);
     expect(queued).toHaveLength(1);
   });
 
-  it("does not fire a paused trigger", () => {
+  it("does not fire a paused trigger", async () => {
     const now = { t: 1_000 };
     const host = { current: sample({ load1m: 40 }) };
     const { manager, queued } = make(now, host);
@@ -249,7 +260,36 @@ describe("ResourceTriggerManager", () => {
       threshold: 16,
       enabled: false,
     });
-    expect(manager.tick()).toHaveLength(0);
+    expect(await manager.tick()).toHaveLength(0);
     expect(queued).toEqual([]);
+  });
+
+  it("awaits an async sample instead of blocking on sync probes (BF-2468)", async () => {
+    const now = { t: 1_000 };
+    const dir = mkdtempSync(join(tmpdir(), "bf-resource-"));
+    dirs.push(dir);
+    const queued: string[] = [];
+    const manager = new ResourceTriggerManager({
+      file: join(dir, "resource-triggers.json"),
+      now: () => now.t,
+      sample: async () => sample({ diskFreeGb: 40 }),
+      botState: () => "ready",
+      enqueue: (input) => {
+        queued.push(input.triggerId);
+        return { id: "run-1" };
+      },
+      pendingRuns: () => 0,
+    });
+    const trigger = manager.create({
+      name: "Disk low",
+      prompt: "Clean the disk",
+      botId: "housekeeper",
+      metric: "disk_free_gb",
+      cmp: "below",
+      threshold: 80,
+      sustainSamples: 1,
+    });
+    expect(await manager.tick()).toHaveLength(1);
+    expect(queued).toEqual([trigger.id]);
   });
 });

@@ -119,6 +119,10 @@ SHUTDOWN_MARKER="${BOTFLEET_SHUTDOWN_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/st
 STARTUP_DISABLED_MARKER="${BOTFLEET_STARTUP_DISABLED_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/startup-disabled.marker}"
 STARTUP_ENABLED_MARKER="${BOTFLEET_STARTUP_ENABLED_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/startup-enabled.marker}"
 STARTUP_SESSION="${BOTFLEET_STARTUP_SESSION:-${OMB_DATA_DIR:-$HOME/.botfleet}/startup-session}"
+# Written by whichever harness owns the data dir (electron/harness-ownership.mjs).
+# That owner may serve on a port other than $PORT -- the desktop app does --
+# so a failed :$PORT health probe does not mean no harness is running (BF-2465).
+HARNESS_OWNER_FILE="${BOTFLEET_HARNESS_OWNER_FILE:-${OMB_DATA_DIR:-$HOME/.botfleet}/harness-owner.json}"
 LAUNCHD_SERVICE_NAME="${XPC_SERVICE_NAME:-}"
 
 boot_session() {
@@ -196,6 +200,54 @@ EOF
 
 health() {
   /usr/bin/curl -sf -m 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1
+}
+
+# Prints "<pid> <record mtime, epoch seconds>" from harness-owner.json, or
+# fails when there is no readable record.  Both values come from the one
+# O_NOFOLLOW descriptor (fstat beside the read), so a replace or symlink
+# swap between two path lookups can never mix generations.  The record is
+# validated with the same shape rules as readRecord in
+# electron/harness-ownership.mjs (version, port, nonce), so a truncated or
+# foreign file never suppresses startup.  An unreadable or malformed record
+# falls through to the normal start, where the server's own ownership check
+# refuses it by name; guessing here would only hide that.
+live_harness_owner_record() {
+  [ -f "$HARNESS_OWNER_FILE" ] || return 1
+  "$NODE" --input-type=module -e '
+import fs from "node:fs";
+let fd;
+try {
+  fd = fs.openSync(process.argv[1], fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  const stat = fs.fstatSync(fd);
+  if (!stat.isFile() || stat.size > 4096) process.exit(1);
+  const value = JSON.parse(fs.readFileSync(fd, "utf8"));
+  if (value === null || typeof value !== "object" || Array.isArray(value) ||
+      value.version !== 1 || !Number.isInteger(value.pid) || value.pid <= 0 ||
+      !Number.isInteger(value.port) || value.port < 1 || value.port > 65535 ||
+      typeof value.nonce !== "string" || !/^[a-f0-9]{64}$/.test(value.nonce)) process.exit(1);
+  process.stdout.write(value.pid + " " + Math.floor(stat.mtimeMs / 1000));
+} catch { process.exitCode = 1; }
+finally { if (fd !== undefined) fs.closeSync(fd); }
+' -- "$HARNESS_OWNER_FILE" 2>/dev/null
+}
+
+# True when the owner record predates this boot.  kill -0 alone cannot tell
+# the record's owner from an unrelated process that recycled its pid after a
+# reboot; the record file's mtime can, because the owner writes it while
+# acquiring.  A record older than kern.boottime names a dead boot's harness
+# whatever lives at that pid now.  Unreadable clocks answer "not stale" so a
+# probe failure never starts a second harness beside a live owner.
+harness_owner_predates_boot() {
+  local mtime="$1" boot
+  boot="$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null | /usr/bin/sed -n 's/^{ sec = \([0-9]*\).*/\1/p')"
+  # Linux has no kern.boottime; /proc/stat carries the same epoch as btime.
+  # Production is macOS-only, but the launcher tests also run on Linux CI.
+  if [ -z "$boot" ] && [ -r /proc/stat ]; then
+    boot="$(/usr/bin/awk '/^btime/ { print $2 }' /proc/stat 2>/dev/null)"
+  fi
+  case "$mtime" in '' | *[!0-9]*) return 1 ;; esac
+  case "$boot" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$mtime" -lt "$boot" ]
 }
 
 log() {
@@ -457,6 +509,21 @@ fi
 
 if health; then
   log ":${PORT} already healthy after self-heal; not starting a second harness"
+  reset_fail_ledger
+  exit 0
+fi
+
+# BF-2465: the data dir may be owned by a live harness serving on another
+# port (the desktop app on 18799 while this job probes 8799).  Exec'ing node
+# anyway throws the ownership error uncaught, and because the ledger reset
+# below runs before exec, the storm stop never engages: 3,892 identical
+# crashes in 7 hours, one launchd relaunch every few seconds.  A live owner
+# is the same quiet state as a healthy port, so leave it alone the same way.
+OWNER_RECORD="$(live_harness_owner_record)" || OWNER_RECORD=""
+OWNER_PID="${OWNER_RECORD%% *}"
+OWNER_MTIME="${OWNER_RECORD##* }"
+if [ -n "$OWNER_PID" ] && [ "$OWNER_PID" != "$OWNER_RECORD" ] && kill -0 "$OWNER_PID" 2>/dev/null && ! harness_owner_predates_boot "$OWNER_MTIME"; then
+  log "harness-owner.json names live pid ${OWNER_PID}; another harness owns the data dir; not starting a second harness"
   reset_fail_ledger
   exit 0
 fi

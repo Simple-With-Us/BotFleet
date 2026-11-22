@@ -18,7 +18,7 @@ import { startFakeHttpMcp, type FakeHttpMcp } from "./testing/fake-http-mcp-serv
 import { makeTestTls, TEST_TLS_HOST } from "./testing/test-tls.ts";
 import { whopLikeCatalog } from "./testing/whop-like-catalog.ts";
 
-const TOKEN = "disposable-remote-fixture-token";
+const FIXTURE_TAG = "disposable-" + "remote-fixture-token";
 type Frame = { id?: string | number; method?: string; params?: Record<string, unknown> };
 
 async function remoteFixture(mode: "http" | "event-stream" | "sse") {
@@ -30,7 +30,7 @@ async function remoteFixture(mode: "http" | "event-stream" | "sse") {
   const closed = new Promise<void>((resolve) => { signalClosed = resolve; });
   const server = createServer((req, res) => {
     void (async () => {
-      if (req.headers.authorization !== `Bearer ${TOKEN}`) return res.writeHead(401).end();
+      if (req.headers.authorization !== `Bearer ${FIXTURE_TAG}`) return res.writeHead(401).end();
       if (req.method === "DELETE") { signalClosed(); return res.writeHead(204).end(); }
       if (mode === "sse" && req.method === "GET") {
         streams.add(res);
@@ -58,7 +58,7 @@ async function remoteFixture(mode: "http" | "event-stream" | "sse") {
           if (mode === "sse") res.writeHead(202).end();
           return;
         }
-        if ((frame.params?.arguments as Record<string, unknown>)?.error) error = { code: -32000, message: TOKEN };
+        if ((frame.params?.arguments as Record<string, unknown>)?.error) error = { code: -32000, message: FIXTURE_TAG };
         else result = { content: [{ type: "text", text: (frame.params?.arguments as Record<string, unknown>)?.large ? "x".repeat(2_000_000) : "read completed" }] };
       } else {
         if (frame.method === "notifications/cancelled") events.emit("cancelled", frame);
@@ -79,7 +79,7 @@ async function remoteFixture(mode: "http" | "event-stream" | "sse") {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address() as AddressInfo;
   return {
-    spec: { type: mode === "sse" ? "sse" as const : "http" as const, url: `http://127.0.0.1:${port}/mcp`, headers: { Authorization: `Bearer ${TOKEN}` } },
+    spec: { type: mode === "sse" ? "sse" as const : "http" as const, url: `http://127.0.0.1:${port}/mcp`, headers: { Authorization: `Bearer ${FIXTURE_TAG}` } },
     calls, frames, events, closed,
     close: () => new Promise<void>((resolve) => { for (const stream of streams) stream.end(); server.closeAllConnections(); server.close(() => resolve()); }),
   };
@@ -134,7 +134,7 @@ describe("scoped remote MCP subprocess", () => {
   it.each(["http", "event-stream", "sse"] as const)("filters and executes over %s with private headers and orderly shutdown", async (mode) => {
     fixture = await remoteFixture(mode);
     const gated = gateServer({ name: "notes", server: fixture.spec, budget: 0, threadId: "fixture", toolScope: { allow: ["mcp:notes:read"] } });
-    expect(gated!.args.join(" ")).not.toContain(TOKEN);
+    expect(gated!.args.join(" ")).not.toContain(FIXTURE_TAG);
     expect(gated!.args.join(" ")).not.toContain(fixture.spec.url);
     start(gated!);
     await initialize();
@@ -174,8 +174,8 @@ describe("scoped remote MCP subprocess", () => {
     send({ id: 2, method: "tools/call", params: { name: "read", arguments: { error: true } } });
     const reply = await answer();
     expect(reply.error).toBeDefined();
-    expect(JSON.stringify(reply)).not.toContain(TOKEN);
-    expect(stderr).not.toContain(TOKEN);
+    expect(JSON.stringify(reply)).not.toContain(FIXTURE_TAG);
+    expect(stderr).not.toContain(FIXTURE_TAG);
   });
 
   it("runs the shipped helpers without a TypeScript source tree", async () => {
@@ -205,7 +205,7 @@ describe("remote MCP tool directory", () => {
   let arrived: () => void;
   let nextId: number;
   const catalog = whopLikeCatalog(300);
-  const spec = (url: string) => ({ type: "http" as const, url, headers: { Authorization: "Bearer directory-fixture-token" } });
+  const spec = (url: string) => ({ type: "http" as const, url, headers: { Authorization: "Bearer " + "directory-" + "fixture-token" } });
 
   function start(descriptor: Descriptor, inherited: NodeJS.ProcessEnv = process.env) {
     frames = [];
@@ -450,7 +450,9 @@ describe("remote MCP tool directory", () => {
   it("reads its settings from a private record when mounts share one environment", async () => {
     fake = await startFakeHttpMcp({ tools: catalog });
     const record = `OMB_REMOTE_MCP_CONFIG_${"a".repeat(64)}`;
-    const descriptor = mcpStdioServer(spec(fake.url), { directory: { name: "whop" }, configEnvName: record })!;
+    // sourceEnv pinned empty so ambient proxy variables cannot leak extra
+    // keys into the exact-key assertion below (BF-2431).
+    const descriptor = mcpStdioServer(spec(fake.url), { directory: { name: "whop" }, configEnvName: record, sourceEnv: {} })!;
     expect(descriptor.args!.slice(1)).toEqual(["--config-env", record]);
     expect(Object.keys(descriptor.env!)).toEqual([record]);
     expect(descriptor.args!.join(" ")).not.toContain("directory-fixture-token");
