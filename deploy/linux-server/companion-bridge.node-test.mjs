@@ -204,6 +204,17 @@ test("replay needs the same request, the same credential, a paired device, and t
   assert.equal(noRequestId.reason, "window already spent");
 });
 
+test("caller metadata is bounded: at most eight small keys survive", () => {
+  const crowded = { ...openWindow() };
+  for (let i = 0; i < 12; i += 1) crowded[`tag-${i}`] = `v${i}`;
+  crowded.big = "x".repeat(2000);
+  const decision = redeem(crowded, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  const kept = Object.keys(decision.window).filter((k) => k.startsWith("tag-"));
+  assert.equal(kept.length, 8);
+  assert.equal(decision.window.big, undefined);
+});
+
 test("a spent window without a recorded replay cannot be resurrected", () => {
   // Without replayDeviceId there is no replay to record: the window
   // spends exactly once and a retry is refused instead of half-replaying.

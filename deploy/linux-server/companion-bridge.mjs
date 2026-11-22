@@ -181,12 +181,21 @@ export function openBridgePairingWindow({ code, token, ttlSeconds, maxAttempts, 
  * rather than guessing forever.
  */
 /**
- * Normalize one stored window, preserving unknown caller fields. Callers
- * may attach their own metadata to the object they persist; dropping it
- * on read would silently lose it the first time the bridge touched the
- * window. Only own enumerable string keys travel, never __proto__,
- * constructor or prototype, and anything that is not a plain object
- * fails closed to an empty shell that cannot verify.
+ * The most caller metadata a window may carry through. Unbounded copies
+ * turn every redeem — including rejected ones — into O(N) copy work over
+ * caller-controlled keys, so anything past eight small keys is dropped.
+ */
+const MAX_WINDOW_METADATA_KEYS = 8;
+const MAX_WINDOW_METADATA_CHARS = 1024;
+
+/**
+ * Normalize one stored window, preserving a bounded set of unknown caller
+ * fields. Callers may attach small metadata to the object they persist;
+ * dropping it on read would silently lose it the first time the bridge
+ * touched the window. Only own enumerable string keys travel, never
+ * __proto__, constructor or prototype, at most eight of them, and no
+ * single value larger than 1KB once serialized. Anything that is not a
+ * plain object fails closed to an empty shell that cannot verify.
  */
 function normalizeWindow(window) {
   let source = window ?? {};
@@ -196,10 +205,20 @@ function normalizeWindow(window) {
   const expires = Number(source.expiresAtMs);
   const attempts = Number(source.attemptsLeft);
   const extra = {};
+  let kept = 0;
   for (const key of Object.keys(source)) {
     if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
     if (key === 'codeDigest' || key === 'tokenDigest' || key === 'expiresAtMs' || key === 'attemptsLeft' || key === 'spent' || key === 'replay') continue;
+    if (kept >= MAX_WINDOW_METADATA_KEYS) break;
+    let size = 0;
+    try {
+      size = JSON.stringify(source[key] ?? null)?.length ?? 0;
+    } catch {
+      continue;
+    }
+    if (!Number.isFinite(size) || size > MAX_WINDOW_METADATA_CHARS) continue;
     extra[key] = source[key];
+    kept += 1;
   }
   return {
     ...extra,
