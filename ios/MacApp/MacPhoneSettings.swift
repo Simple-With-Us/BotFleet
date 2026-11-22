@@ -189,12 +189,23 @@ struct MacPhoneSettings: View {
         if let inviteURL {
             let key = inviteURL.absoluteString
             if renderedQRKey != key {
+                // Drop the old code at once: the new window's invite must
+                // never show the previous window's QR while it renders.
+                renderedQR = nil
                 let image = await Task.detached(priority: .userInitiated) {
                     Self.makeQRImage(from: key)
                 }.value
-                if self.inviteURL?.absoluteString == key {
+                guard self.inviteURL?.absoluteString == key else { return }
+                if let image {
+                    // The key is set only on success, so a failed render
+                    // stays retryable: Refresh re-renders instead of
+                    // serving the cached failure forever.
                     renderedQRKey = key
                     renderedQR = image
+                } else {
+                    renderedQRKey = nil
+                    renderedQR = nil
+                    errorMessage = "Could not draw the pairing code. Tap Refresh to try again."
                 }
             }
         } else {
