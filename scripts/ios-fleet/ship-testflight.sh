@@ -620,8 +620,10 @@ asc_credential_available() {
   [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]] && return 0
   [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_P8:-}" ]] && return 0
   # The scoped reader is the last source:  it is there when the helper and
-  # the reader are both installed, and its read still has to succeed.
-  [[ -n "${FLEET_INFISICAL_READER:-}" ]] && return 0
+  # the reader are both installed, and its read still has to succeed.  A seam
+  # that points at a missing or unreadable file is not a source, so the five
+  # callers skip instead of asking a reader that cannot answer.
+  [[ -n "${FLEET_INFISICAL_READER:-}" && -f "${FLEET_INFISICAL_READER}" && -r "${FLEET_INFISICAL_READER}" ]] && return 0
   [[ -f "$HOME/apps/infisical-scoped/infisical-scoped.py" ]] && return 0
   return 1
 }
