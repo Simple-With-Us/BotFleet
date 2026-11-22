@@ -2118,6 +2118,9 @@ export class ZulipHub {
       const ids = new Set(batch.map((item) => item.id));
       session.markHandled(ids);
       unit.items = unit.items.filter((item) => !ids.has(item.id));
+      // A partially retired unit is a new episode for whatever remains: a
+      // later stop refusal for those items tells the log again (BF-2454).
+      if (unit.items.length) delete unit.stopLogged;
       if (!unit.items.length) state.pending = state.pending.filter((candidate) => candidate !== unit);
       session.indexPending();
       return unit.items.length;
