@@ -74,13 +74,16 @@
 // A root account writes through a read-only bit, so this script refuses to
 // run as root rather than report a read-only archive it did not have.
 //
-// The capture ceilings. The producer refuses rather than filling a disk: a
+// The capture ceilings.  The producer refuses rather than filling a disk:  a
 // store above the file-count ceiling is refused before a byte is copied, and
-// a store above the byte ceiling is refused while it is copied. Both
-// ceilings are raised by the operator on the command line, because the store
-// this producer was written for holds more files and more bytes than the
-// values the producer used to ship, and a producer that cannot capture the
-// owner's own store is not evidence about the owner's own store.
+// a store above the byte ceiling is refused before the capture directory exists
+// as well, so a refusal leaves nothing behind.  The copy measures the bytes
+// it actually wrote too, because a store that grows while it is being copied
+// slips past an estimate taken before the copy began.  Both ceilings are
+// raised by the operator on the command line, because the store this producer
+// was written for holds more files and more bytes than the values the
+// producer used to ship, and a producer that cannot capture the owner's own
+// store is not evidence about the owner's own store.
 import { createHash } from "node:crypto";
 import {
   chmodSync, closeSync, copyFileSync, existsSync, mkdirSync,
@@ -298,6 +301,50 @@ export function listStoreFiles(root) {
   files.sort();
   skipped.sort((a, b) => a.path.localeCompare(b.path));
   return { files, skipped };
+}
+
+/**
+ * Whether a WAL or shared-memory sibling is superseded by the snapshot of the
+ * database it sits beside.
+ *
+ * The capture leaves such a sibling out, because the snapshot of the database
+ * replaces it, and a size estimate that counted it would overstate what the
+ * capture copies.  The database is recognized by its own magic, which is the
+ * same test the capture uses, so the estimate and the copy agree.
+ */
+function supersedesSnapshotSibling(storeRelative, knownFiles, source) {
+  const withoutSuffix = storeRelative.replace(/-(wal|shm)$/, "");
+  if (withoutSuffix === storeRelative) return false;
+  if (!knownFiles.has(withoutSuffix)) return false;
+  return readHeader(join(source, withoutSuffix), SQLITE_MAGIC.length).equals(SQLITE_MAGIC);
+}
+
+/**
+ * The bytes a capture of this store would copy, measured before anything is
+ * written.
+ *
+ * The byte ceiling has to be refused BEFORE the capture starts, because a
+ * refusal that arrives half way through leaves a half-copied tree behind, and
+ * a half-copied tree is not evidence of anything.  So the sizes are taken
+ * from the listing and added up before the capture directory exists.
+ *
+ * The number is an estimate rather than a promise.  A redacted text file is
+ * not exactly the size of its source, and a database snapshot is not the size
+ * of the live database, so the copy measures the bytes it actually wrote and
+ * refuses there as well.  The estimate catches the ordinary case before any
+ * output exists;  the in-copy check catches a store that grew underneath it.
+ */
+export function estimateCaptureBytes(source, files) {
+  const knownFiles = new Set(files);
+  let bytes = 0;
+  let counted = 0;
+  for (const storeRelative of files) {
+    if (exclusionReason(storeRelative)) continue;
+    if (supersedesSnapshotSibling(storeRelative, knownFiles, source)) continue;
+    bytes += statSync(join(source, storeRelative)).size;
+    counted += 1;
+  }
+  return { bytes, files: counted };
 }
 
 /** A directory that may hold evidence: 0700, owned by this account. */
@@ -670,101 +717,148 @@ export async function archiveStore({ storeRoot, outDir, maxBytes = DEFAULT_MAX_B
   const { files, skipped } = listStoreFiles(source);
   if (files.length > maxFiles) throw new Error(`store holds ${files.length} files, above the ${maxFiles} ceiling`);
 
-  mkdirSync(target, { mode: 0o700 });
-  const tree = join(target, "tree");
-  mkdirSync(tree, { mode: 0o700 });
+  // The byte ceiling is refused before the capture directory exists, so a
+  // refusal leaves nothing behind at all.  The copy measures the bytes it
+  // actually wrote as well, because a store that grows while it is being
+  // copied slips past an estimate taken before the copy began.
+  const estimate = estimateCaptureBytes(source, files);
+  if (estimate.bytes > maxBytes) throw new Error(`store holds ${estimate.bytes} bytes, above the ${maxBytes} byte ceiling`);
 
-  const manifestFiles = [];
-  const excluded = skipped.map((entry) => ({ ...entry, bytes: 0 }));
-  const snapshotOf = new Set();
-  let totalBytes = 0;
-  for (const storeRelative of files) {
-    if (exclusionReason(storeRelative)) {
-      const stat = statSync(join(source, storeRelative));
-      excluded.push({ path: storeRelative, reason: exclusionReason(storeRelative), bytes: stat.size });
-      continue;
-    }
-    // A WAL or shared-memory sibling of a database that was snapshotted is
-    // superseded by the snapshot, and copying it would restore a journal
-    // that belongs to a different snapshot.
-    const withoutSuffix = storeRelative.replace(/-(wal|shm)$/, "");
-    if (withoutSuffix !== storeRelative && snapshotOf.has(withoutSuffix)) {
-      excluded.push({ path: storeRelative, reason: "superseded-by-snapshot", bytes: 0 });
-      continue;
-    }
-    const destination = join(tree, ...storeRelative.split("/"));
-    mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
-    const row = await captureFile(join(source, storeRelative), destination, storeRelative, { readOnly: true });
-    if (row.excluded) {
-      rmQuietly(destination);
-      excluded.push({ path: row.path, reason: row.reason, bytes: row.bytes });
-      continue;
-    }
-    if (row.kind === "sqlite-snapshot") snapshotOf.add(storeRelative);
-    totalBytes += row.bytes;
-    if (totalBytes > maxBytes) throw new Error(`archive reached ${totalBytes} bytes, above the ${maxBytes} byte ceiling`);
-    manifestFiles.push(row);
-  }
-  excluded.sort((a, b) => a.path.localeCompare(b.path));
+  try {
+    mkdirSync(target, { mode: 0o700 });
+    const tree = join(target, "tree");
+    mkdirSync(tree, { mode: 0o700 });
 
-  // Make the tree read-only from the deepest directory upwards, so the
-  // directories are sealed after their contents are in place.
-  const directories = [];
-  const collectDirectories = (directory) => {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      if (entry.isDirectory()) {
-        const child = join(directory, entry.name);
-        collectDirectories(child);
-        directories.push(child);
+    const manifestFiles = [];
+    const excluded = skipped.map((entry) => ({ ...entry, bytes: 0 }));
+    const snapshotOf = new Set();
+    let totalBytes = 0;
+    for (const storeRelative of files) {
+      if (exclusionReason(storeRelative)) {
+        const stat = statSync(join(source, storeRelative));
+        excluded.push({ path: storeRelative, reason: exclusionReason(storeRelative), bytes: stat.size });
+        continue;
       }
+      // A WAL or shared-memory sibling of a database that was snapshotted is
+      // superseded by the snapshot, and copying it would restore a journal
+      // that belongs to a different snapshot.
+      const withoutSuffix = storeRelative.replace(/-(wal|shm)$/, "");
+      if (withoutSuffix !== storeRelative && snapshotOf.has(withoutSuffix)) {
+        excluded.push({ path: storeRelative, reason: "superseded-by-snapshot", bytes: 0 });
+        continue;
+      }
+      const destination = join(tree, ...storeRelative.split("/"));
+      mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+      const row = await captureFile(join(source, storeRelative), destination, storeRelative, { readOnly: true });
+      if (row.excluded) {
+        rmQuietly(destination);
+        excluded.push({ path: row.path, reason: row.reason, bytes: row.bytes });
+        continue;
+      }
+      if (row.kind === "sqlite-snapshot") snapshotOf.add(storeRelative);
+      totalBytes += row.bytes;
+      if (totalBytes > maxBytes) throw new Error(`archive reached ${totalBytes} bytes, above the ${maxBytes} byte ceiling`);
+      manifestFiles.push(row);
+    }
+    excluded.sort((a, b) => a.path.localeCompare(b.path));
+
+    // Make the tree read-only from the deepest directory upwards, so the
+    // directories are sealed after their contents are in place.
+    const directories = [];
+    const collectDirectories = (directory) => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          const child = join(directory, entry.name);
+          collectDirectories(child);
+          directories.push(child);
+        }
+      }
+    };
+    collectDirectories(tree);
+    directories.push(tree);
+    for (const directory of directories) chmodSync(directory, ARCHIVE_DIR_MODE);
+
+    const probe = manifestFiles.length ? proveReadOnly(join(tree, ...manifestFiles[0].path.split("/"))) : { ok: false, reason: "empty-archive" };
+
+    const redactionFailures = manifestFiles.reduce((sum, row) => sum + (row.redactionFailures ?? 0), 0);
+    const redactionFailedFiles = manifestFiles.filter((row) => (row.redactionFailures ?? 0) > 0).length;
+    const manifest = {
+      marker: ARCHIVE_MARKER,
+      version: ARCHIVE_VERSION,
+      capturedAt,
+      source,
+      readOnlyProved: probe.ok,
+      totals: { files: manifestFiles.length, bytes: totalBytes, excluded: excluded.length, redactionFailures },
+      files: manifestFiles,
+      excluded,
+    };
+    const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    if (redactSecretsInText(manifestBytes.toString("utf8")) !== manifestBytes.toString("utf8")) {
+      throw new Error("refusing to write a manifest that carries a credential shape");
+    }
+    writeFileSync(join(target, "manifest.json"), manifestBytes, { mode: 0o600 });
+    // The report is what travels in the packet.  The manifest itself names
+    // every file, and a store with eighteen thousand files produces a manifest
+    // far larger than the bundle will carry, so the report summarizes the
+    // archive and binds the manifest by hash.
+    const report = {
+      marker: "botfleet-node-store-archive-report",
+      version: ARCHIVE_VERSION,
+      capturedAt,
+      source,
+      readOnlyProved: manifest.readOnlyProved,
+      totals: manifest.totals,
+      manifestSha256: sha256(manifestBytes),
+      manifestBytes: manifestBytes.length,
+      excluded: manifest.excluded.slice(0, MAX_REPORT_ROWS),
+      excludedCount: manifest.excluded.length,
+      excludedTruncated: manifest.excluded.length > MAX_REPORT_ROWS,
+      credentialMatches: manifest.files.reduce((sum, row) => sum + (row.credentialMatches ?? 0), 0),
+      redactionFailures,
+      redactionFailedFiles,
+      scope: "The archive is a private copy of the owner's own store, and it holds what the store holds.  The text in it is redacted;  a database snapshot is copied whole and the credential shapes it holds are counted here.  A file the redactor could not parse is counted as a redaction failure here rather than kept quietly, and the capture does not certify itself clean while that count is above zero.  This report travels in the packet;  the archive itself does not.",
+    };
+    writeBoundedReport(join(target, "archive-report.json"), report);
+    return { manifest, report, outDir: target };
+  } catch (error) {
+    // A refusal leaves nothing behind:  no capture directory, no partial tree,
+    // no manifest, no report.
+    removeCaptureDirectory(target);
+    throw error;
+  }
+}
+
+/**
+ * Remove a capture directory that a refusal left behind.
+ *
+ * A refusal must leave nothing:  no capture directory, no partial tree, no
+ * manifest, no report.  The tree's directories are sealed read-only before
+ * the manifest is written, so they are unlocked first, because a read-only
+ * directory cannot have its contents removed by the account that owns it.
+ */
+function removeCaptureDirectory(target) {
+  const unlock = (directory) => {
+    let entries;
+    try {
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) unlock(join(directory, entry.name));
+    }
+    try {
+      chmodSync(directory, 0o700);
+    } catch {
+      /* the directory is already gone */
     }
   };
-  collectDirectories(tree);
-  directories.push(tree);
-  for (const directory of directories) chmodSync(directory, ARCHIVE_DIR_MODE);
-
-  const probe = manifestFiles.length ? proveReadOnly(join(tree, ...manifestFiles[0].path.split("/"))) : { ok: false, reason: "empty-archive" };
-
-  const redactionFailures = manifestFiles.reduce((sum, row) => sum + (row.redactionFailures ?? 0), 0);
-  const redactionFailedFiles = manifestFiles.filter((row) => (row.redactionFailures ?? 0) > 0).length;
-  const manifest = {
-    marker: ARCHIVE_MARKER,
-    version: ARCHIVE_VERSION,
-    capturedAt,
-    source,
-    readOnlyProved: probe.ok,
-    totals: { files: manifestFiles.length, bytes: totalBytes, excluded: excluded.length, redactionFailures },
-    files: manifestFiles,
-    excluded,
-  };
-  const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-  if (redactSecretsInText(manifestBytes.toString("utf8")) !== manifestBytes.toString("utf8")) {
-    throw new Error("refusing to write a manifest that carries a credential shape");
+  unlock(target);
+  try {
+    rmSync(target, { recursive: true, force: true });
+  } catch {
+    /* the directory is already gone */
   }
-  writeFileSync(join(target, "manifest.json"), manifestBytes, { mode: 0o600 });
-  // The report is what travels in the packet.  The manifest itself names
-  // every file, and a store with eighteen thousand files produces a manifest
-  // far larger than the bundle will carry, so the report summarizes the
-  // archive and binds the manifest by hash.
-  const report = {
-    marker: "botfleet-node-store-archive-report",
-    version: ARCHIVE_VERSION,
-    capturedAt,
-    source,
-    readOnlyProved: manifest.readOnlyProved,
-    totals: manifest.totals,
-    manifestSha256: sha256(manifestBytes),
-    manifestBytes: manifestBytes.length,
-    excluded: manifest.excluded.slice(0, MAX_REPORT_ROWS),
-    excludedCount: manifest.excluded.length,
-    excludedTruncated: manifest.excluded.length > MAX_REPORT_ROWS,
-    credentialMatches: manifest.files.reduce((sum, row) => sum + (row.credentialMatches ?? 0), 0),
-    redactionFailures,
-    redactionFailedFiles,
-    scope: "The archive is a private copy of the owner's own store, and it holds what the store holds.  The text in it is redacted;  a database snapshot is copied whole and the credential shapes it holds are counted here.  A file the redactor could not parse is counted as a redaction failure here rather than kept quietly, and the capture does not certify itself clean while that count is above zero.  This report travels in the packet;  the archive itself does not.",
-  };
-  writeBoundedReport(join(target, "archive-report.json"), report);
-  return { manifest, report, outDir: target };
 }
 
 /** Remove a path, ignoring the failure that matters when it is already gone. */
