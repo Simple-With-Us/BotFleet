@@ -140,7 +140,11 @@ function linearCliOnPath(name) {
     // A `simple-board` that resolves to a retired binary is that binary
     // under another name, so it fails the same gate.
     if (isRetiredLinearCli(resolved)) return null;
-    return whichOut;
+    // The VALIDATED path is the one that is returned.  Handing back the
+    // literal `which` output would leave a gap between the check and the
+    // use:  a symlink swapped after this gate, or a `which` that answers
+    // with a symlink, would send the exec somewhere the gate never saw.
+    return resolved;
   } catch {
     // The CLI is not on PATH, so the refresh fails closed below.
     return null;
@@ -175,10 +179,29 @@ export function resolveBoardCli() {
         `BOARD_CLI names a retired Linear CLI in the mac-collab backend '${override}'.${SENTENCE_GAP}Set BOARD_CLI to ${CURRENT_LINEAR_CLI}, the current Linear-backed CLI.`,
       );
     }
-    return override;
+    // The VALIDATED path is the one that is returned, so the exec runs
+    // exactly the target the gate judged and not the literal spelling of it.
+    return resolved;
   }
   const verifiedDefault = join(process.env.HOME ?? "", ".local", "bin", CURRENT_LINEAR_CLI);
-  if (existsSync(verifiedDefault)) return verifiedDefault;
+  if (existsSync(verifiedDefault)) {
+    // The default branch carries the same gate as the override and the PATH
+    // branch.  A verified default that is a symlink to, or a copy of, the
+    // retired binary, or that sits in the retired backend, is that retired
+    // write route under an innocent name, so it is refused here too.
+    const resolvedDefault = resolveRealCliPath(verifiedDefault);
+    if (isRetiredLinearCli(verifiedDefault) || isRetiredLinearCli(resolvedDefault)) {
+      throw new Error(
+        `Default CLI '${verifiedDefault}' resolves to the retired Linear CLI '${resolvedDefault}'.${SENTENCE_GAP}Set BOARD_CLI to ${CURRENT_LINEAR_CLI}, the current Linear-backed CLI.`,
+      );
+    }
+    if (isRetiredBackendPath(verifiedDefault) || isRetiredBackendPath(resolvedDefault)) {
+      throw new Error(
+        `Default CLI '${verifiedDefault}' sits in the retired mac-collab backend '${resolvedDefault}'.${SENTENCE_GAP}Set BOARD_CLI to ${CURRENT_LINEAR_CLI}, the current Linear-backed CLI.`,
+      );
+    }
+    return resolvedDefault;
+  }
   const onPath = linearCliOnPath(CURRENT_LINEAR_CLI);
   if (onPath) return onPath;
   throw new Error(

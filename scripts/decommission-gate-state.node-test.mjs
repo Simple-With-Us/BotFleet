@@ -197,9 +197,62 @@ test("a BOARD_CLI symlink to the current CLI is still accepted", () => {
     const link = join(root, "simple-board");
     symlinkSync(join(root, "current-cli"), link);
     const resolved = withEnv({ BOARD_CLI: link }, resolveBoardCli);
-    assert.equal(resolved, link, "a symlink to the current CLI must still resolve");
+    // The VALIDATED path comes back, not the literal spelling of it:  the
+    // exec has to run exactly the target the gate judged.
+    assert.equal(resolved, join(root, "current-cli"), "a symlink to the current CLI must still resolve");
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the verified default that resolves to a retired CLI is refused", () => {
+  // The default branch under ~/.local/bin carries the same gate as the
+  // override and the PATH branch.  A verified default that is a symlink to
+  // the retired binary is that retired write route under an innocent name.
+  const root = mkdtempSync(join(tmpdir(), "bf-linear-default-"));
+  try {
+    writeFakeCli(join(root, "board"));
+    const binDir = join(root, ".local", "bin");
+    mkdirSync(binDir, { recursive: true });
+    symlinkSync(join(root, "board"), join(binDir, "simple-board"));
+    assert.throws(
+      () => withEnv({ BOARD_CLI: undefined, HOME: root }, resolveBoardCli),
+      /retired Linear CLI/,
+      "a verified default that resolves to the retired binary must be refused",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the PATH branch returns the validated path, not the literal one", () => {
+  // The gate judges the RESOLVED path, so that is the path the caller gets
+  // back:  a literal that the gate never judged would leave a gap between
+  // the check and the exec.
+  const bin = fakeBin([]);
+  const home = fakeHome([]);
+  try {
+    // The CLI on PATH is a symlink, so `which` answers with the symlink and
+    // the gate judges the target behind it.
+    writeFakeCli(join(bin, "current-cli"));
+    symlinkSync(join(bin, "current-cli"), join(bin, "simple-board"));
+    const resolved = withEnv(
+      { BOARD_CLI: undefined, HOME: home, PATH: bin },
+      resolveBoardCli,
+    );
+    assert.equal(
+      resolved,
+      join(bin, "current-cli"),
+      "the PATH branch must return the path the gate validated",
+    );
+    assert.notEqual(
+      resolved,
+      join(bin, "simple-board"),
+      "the PATH branch must not return the unchecked literal path",
+    );
+  } finally {
+    rmSync(bin, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
