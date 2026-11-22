@@ -170,6 +170,25 @@ struct InfisicalSettingsFixtureTests {
         let encoded = String(decoding: try JSONEncoder().encode(coordinator.draft), as: UTF8.self)
         #expect(!encoded.contains("fixture-raw-credential-never-stored"))
     }
+
+    @Test("A host the fixture never registered fails fast instead of waiting out the request timeout")
+    func unregisteredHostFailsFast() async throws {
+        let server = FixtureSettingsServer()
+        let endpoint = try FixtureSettingsEndpoint(server: server)
+        let url = try #require(URL(string: "https://unregistered.fixture.test/api/infisical/status"))
+
+        // The protocol answers an unregistered host with a failure of its
+        // own, so the request ends at once and never reaches the session
+        // timeout.
+        do {
+            _ = try await endpoint.session.data(from: url)
+            Issue.record("The unregistered host answered instead of failing")
+        } catch let error as URLError {
+            #expect(error.code == .cannotFindHost)
+        } catch {
+            Issue.record("The unregistered host failed with an unexpected error: \(error)")
+        }
+    }
 }
 
 /// The coordinator under test, wired to the real settings client so the wire
@@ -255,11 +274,20 @@ private final class FixtureSettingsProtocol: URLProtocol, @unchecked Sendable {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        guard let url = request.url else { return }
+        // Every early return below reports the failure to the URLSession
+        // client, so a mis-registered host fails fast instead of leaving the
+        // request hanging until the session timeout.
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
         Self.lock.lock()
         let server = Self.servers[url.host ?? ""]
         Self.lock.unlock()
-        guard let server else { return }
+        guard let server else {
+            client?.urlProtocol(self, didFailWithError: URLError(.cannotFindHost))
+            return
+        }
 
         var payload: [String: Any] = [:]
         if request.httpMethod == "PUT" {
@@ -275,8 +303,14 @@ private final class FixtureSettingsProtocol: URLProtocol, @unchecked Sendable {
         } else {
             payload = ["infisical": server.status()]
         }
-        guard let data = try? JSONSerialization.data(withJSONObject: payload),
-              let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil) else { return }
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.cannotDecodeContentData))
+            return
+        }
+        guard let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: data)
         client?.urlProtocolDidFinishLoading(self)
