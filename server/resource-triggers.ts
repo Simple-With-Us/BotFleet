@@ -1,7 +1,8 @@
 import { normalizeRunOn, type RoutineRunOn } from "../shared/run-on.ts";
 import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
 import { existsSync, mkdirSync, readFileSync, statfsSync } from "node:fs";
 import { cpus, freemem, loadavg, totalmem } from "node:os";
 import { dirname, join } from "node:path";
@@ -192,19 +193,33 @@ function parseSwap(text: string): { usedPct: number; usedGb: number; totalGb: nu
  * from it pins near 99% and carries no signal.  Real pressure is wired + active + what
  * the compressor is holding.
  */
+function parseVmStatRamUsedPct(out: string): number | null {
+  const pageSize = Number(out.match(/page size of (\d+) bytes/)?.[1] ?? 4096);
+  const pages = (label: string): number => {
+    const m = out.match(new RegExp(`${label}:\\s+(\\d+)`));
+    return m ? Number(m[1]) : 0;
+  };
+  const used =
+    (pages("Pages wired down") + pages("Pages active") + pages("Pages occupied by compressor")) * pageSize;
+  const total = totalmem();
+  if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(used) || used <= 0) return null;
+  return Math.min(100, (used / total) * 100);
+}
+
 function darwinRamUsedPct(): number | null {
   try {
-    const out = execFileSync("vm_stat", [], { encoding: "utf8", timeout: 3000 });
-    const pageSize = Number(out.match(/page size of (\d+) bytes/)?.[1] ?? 4096);
-    const pages = (label: string): number => {
-      const m = out.match(new RegExp(`${label}:\\s+(\\d+)`));
-      return m ? Number(m[1]) : 0;
-    };
-    const used =
-      (pages("Pages wired down") + pages("Pages active") + pages("Pages occupied by compressor")) * pageSize;
-    const total = totalmem();
-    if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(used) || used <= 0) return null;
-    return Math.min(100, (used / total) * 100);
+    return parseVmStatRamUsedPct(execFileSync("vm_stat", [], { encoding: "utf8", timeout: 3000 }));
+  } catch {
+    return null;
+  }
+}
+
+const execFileAsync = promisify(execFile);
+
+async function darwinRamUsedPctAsync(): Promise<number | null> {
+  try {
+    const { stdout } = await execFileAsync("vm_stat", [], { encoding: "utf8", timeout: 3000 });
+    return parseVmStatRamUsedPct(stdout);
   } catch {
     return null;
   }
@@ -338,6 +353,81 @@ export function sampleHost(now = Date.now()): HostSample {
   };
 }
 
+/**
+ * The same sample as sampleHost without blocking the event loop (BF-2468).
+ *
+ * The synchronous probes (vm_stat, df, sysctl) can each wait out their full
+ * timeout on a saturated host -- up to ~11s of frozen event loop every 30s
+ * tick, stalling every turn and API call behind a monitoring read.  Here the
+ * three probes run as async child processes in parallel; parsing and
+ * fallbacks are identical to sampleHost, which stays for callers that
+ * genuinely need a value synchronously.
+ */
+export async function sampleHostAsync(now = Date.now()): Promise<HostSample> {
+  const total = totalmem();
+  const free = freemem();
+  const ramFallback = total > 0 ? ((total - free) / total) * 100 : 0;
+
+  const ramPromise: Promise<number> =
+    process.platform === "darwin"
+      ? darwinRamUsedPctAsync().then((pct) => pct ?? ramFallback)
+      : Promise.resolve(ramFallback);
+
+  const diskPromise: Promise<{ freeGb: number; usedPct: number }> = (async () => {
+    if (process.platform === "win32") {
+      try {
+        const stats = statfsSync(process.cwd().slice(0, 3));
+        const totalBytes = stats.blocks * stats.bsize;
+        const freeBytes = stats.bavail * stats.bsize;
+        if (totalBytes > 0) return { freeGb: freeBytes / (1024 * 1024 * 1024), usedPct: ((totalBytes - freeBytes) / totalBytes) * 100 };
+      } catch {
+        /* keep zeros */
+      }
+      return { freeGb: 0, usedPct: 0 };
+    }
+    // Same APFS data-volume reasoning as sampleHost: `/` alone reports the
+    // sealed system snapshot's Capacity%, which can never fire a trigger.
+    const diskTargets = process.platform === "darwin" ? ["/System/Volumes/Data", "/"] : ["/"];
+    for (const target of diskTargets) {
+      try {
+        const { stdout } = await execFileAsync("df", ["-k", target], { encoding: "utf8", timeout: 5000 });
+        const parsed = parseDfK(stdout);
+        if (parsed) return parsed;
+      } catch {
+        /* try the next target */
+      }
+    }
+    try {
+      const stats = statfsSync("/");
+      const totalBytes = stats.blocks * stats.bsize;
+      const freeBytes = stats.bavail * stats.bsize;
+      if (totalBytes > 0) return { freeGb: freeBytes / (1024 * 1024 * 1024), usedPct: ((totalBytes - freeBytes) / totalBytes) * 100 };
+    } catch {
+      /* keep zeros */
+    }
+    return { freeGb: 0, usedPct: 0 };
+  })();
+
+  const swapPromise: Promise<{ usedPct: number; usedGb: number; totalGb: number } | null> =
+    process.platform === "darwin"
+      ? execFileAsync("sysctl", ["-n", "vm.swapusage"], { encoding: "utf8", timeout: 3000 })
+          .then(({ stdout }) => parseSwap(stdout))
+          .catch(() => null)
+      : Promise.resolve(null);
+
+  const [ramUsedPct, disk, swap] = await Promise.all([ramPromise, diskPromise, swapPromise]);
+  return {
+    at: now,
+    diskFreeGb: Math.round(disk.freeGb * 100) / 100,
+    diskUsedPct: Math.round(disk.usedPct * 10) / 10,
+    ramUsedPct: Math.round(ramUsedPct * 10) / 10,
+    swapUsedPct: swap == null ? null : Math.round(swap.usedPct * 10) / 10,
+    swapUsedGb: swap == null ? null : Math.round(swap.usedGb * 100) / 100,
+    swapTotalGb: swap == null ? null : Math.round(swap.totalGb * 100) / 100,
+    load1m: Math.round(loadavg()[0] * 100) / 100,
+  };
+}
+
 function eventPrompt(trigger: ResourceTrigger, sample: HostSample, value: number, deliveryId: string): string {
   const nproc = Math.max(1, cpus().length);
   return [
@@ -355,7 +445,7 @@ function eventPrompt(trigger: ResourceTrigger, sample: HostSample, value: number
 export interface ResourceTriggerManagerOptions {
   file?: string;
   now?: () => number;
-  sample?: () => HostSample;
+  sample?: () => HostSample | Promise<HostSample>;
   emit?: (event: ResourceTriggerManagerEvent) => void;
   botState: (botId: string) => BotDispatchState;
   /** Synchronous admission fence used during an update boundary. */
@@ -389,7 +479,7 @@ export class ResourceTriggerManager {
   private triggers: ResourceTrigger[] = [];
   private readonly file: string;
   private readonly now: () => number;
-  private readonly sampleFn: () => HostSample;
+  private readonly sampleFn: () => HostSample | Promise<HostSample>;
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
   private lastSamplePersistAt = 0;
@@ -401,7 +491,7 @@ export class ResourceTriggerManager {
     this.options = options;
     this.file = options.file ?? join(DATA_DIR, "resource-triggers.json");
     this.now = options.now ?? Date.now;
-    this.sampleFn = options.sample ?? (() => sampleHost(this.now()));
+    this.sampleFn = options.sample ?? (() => sampleHostAsync(this.now()));
     mkdirSync(dirname(this.file), { recursive: true });
     if (existsSync(this.file)) {
       try {
@@ -523,13 +613,13 @@ export class ResourceTriggerManager {
     this.timer = null;
   }
 
-  tick(): ResourceTriggerFire[] {
+  async tick(): Promise<ResourceTriggerFire[]> {
     if (this.options.admit?.() === false) return [];
     if (this.ticking) return [];
     this.ticking = true;
     const fired: ResourceTriggerFire[] = [];
     try {
-      const sample = this.sampleFn();
+      const sample = await this.sampleFn();
       const now = this.now();
       let changed = false;
       for (const trigger of this.triggers) {
