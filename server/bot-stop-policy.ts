@@ -87,11 +87,19 @@ export function botAutomationsPausedMessage(): string {
  * purpose" — only the first is worth retrying or reporting as a failure.
  * A bot switched Off is the same kind of decision, so it counts here too.
  */
-export function isBotStoppedError(error: unknown): boolean {
+/** Which refusal this was, for callers whose recovery differs between a
+ *  stop and an Off switch (a stop lifts by running a turn; Off lifts by a
+ *  settings patch alone, which settles nothing). */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a caught dispatch failure is the untrusted input this boundary parses
+export function botStopErrorCode(error: unknown): "bot_stopped" | typeof BOT_OFF_CODE | undefined {
   const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
   // The error's own message already says which: an Off refusal tells the person
   // to turn the bot on, a stop tells them to start it again.
-  return code === "bot_stopped" || code === BOT_OFF_CODE;
+  return code === "bot_stopped" || code === BOT_OFF_CODE ? code : undefined;
+}
+
+export function isBotStoppedError(error: unknown): boolean {
+  return botStopErrorCode(error) !== undefined;
 }
 
 /** The error `startTurn` throws for an Off bot: 409 like a stop, with a
