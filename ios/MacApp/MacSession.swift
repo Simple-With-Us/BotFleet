@@ -1101,6 +1101,12 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         await nativeListenerBackend.currentAdvertisement()
     }
 
+    /// Loads the whole Phone tab snapshot through the same loader the
+    /// contract tests exercise, so the tested path is the shipped path.
+    public func loadPhoneSnapshot() async -> PhoneSettingsSnapshot {
+        await PhoneSettingsSnapshotLoader(backend: nativeListenerBackend).load()
+    }
+
     private func applyExitPolicy(for event: CompanionListenerExitEvent) async {
         let persist = policyStore.readPersistOnExit() ?? lifecycleSettings.persistOnExit
         // The native listener reads the setting the same way the harness
