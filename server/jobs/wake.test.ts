@@ -207,6 +207,39 @@ describe("job wakes", () => {
     expect(delivered).toEqual(["job_a"]);
   });
 
+  it("calls off an already-armed retry when a stopped refusal parks settle-only (BF-2454)", async () => {
+    const delivered: string[] = [];
+    let stopped = false;
+    const t = setup({
+      startWake: async (_botId, _threadId, _prompt, jobIds) => {
+        if (stopped) throw Object.assign(new Error("This bot is stopped."), { status: 409, code: "bot_stopped" });
+        delivered.push(...jobIds);
+      },
+    });
+    // A busy park arms the 30-second retry timer first.
+    t.state.busy.add("bot-a");
+    t.finish(job("job_a"));
+    await t.fireTimers();
+    const retry = t.timers.find((timer) => timer.ms === 30_000 && !timer.cleared)!;
+    expect(retry).toBeDefined();
+    // A second completion fires while that timer is still armed, and this
+    // dispatch meets the stop instead: the armed poll is called off.  Fire
+    // only the 5-second merge timer, as real time would reach it first.
+    t.state.busy.delete("bot-a");
+    stopped = true;
+    t.finish(job("job_b"));
+    const merge = t.timers.find((timer) => !timer.cleared && timer.ms === 5_000)!;
+    merge.fn();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(delivered).toEqual([]);
+    expect(retry.cleared).toBe(true);
+    expect(t.timers.filter((timer) => !timer.cleared && timer.ms === 30_000)).toHaveLength(0);
+    stopped = false;
+    t.coordinator.botSettled("bot-a");
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(delivered).toEqual(["job_a", "job_b"]);
+  });
+
   it("keeps retrying an off bot's wake on the timer, logging the hold once (BF-2454)", async () => {
     const lines: string[] = [];
     const delivered: string[] = [];
