@@ -104,10 +104,15 @@ export function isRetiredLinearCli(path) {
 
 /**
  * A path inside the retired mac-collab backend is not a Linear route.  The
- * comparison is case-folded for the same reason the CLI name is.
+ * marker is compared as a WHOLE PATH SEGMENT, case-folded, so a
+ * directory whose NAME merely contains the marker (a home directory
+ * called mac-collab-user, for instance) is not the retired backend,
+ * while the retired backend directory itself always is.  Both
+ * separators count, so a Windows-style path matches too.
  */
 export function isRetiredBackendPath(path) {
-  return path.toLowerCase().includes(RETIRED_BACKEND_MARKER);
+  const segments = String(path ?? "").toLowerCase().split(/[\\/]+/);
+  return segments.includes(RETIRED_BACKEND_MARKER);
 }
 
 /**

@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -11,7 +12,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { isRetiredLinearCli, resolveBoardCli } from "./decommission-gate-state.mjs";
+import {
+  isRetiredBackendPath,
+  isRetiredLinearCli,
+  resolveBoardCli,
+} from "./decommission-gate-state.mjs";
 
 /* oxlint-disable eslint/no-irregular-whitespace -- Owner-required NBSP sentence gaps occur only in prose comments in this test file. */
 
@@ -68,6 +73,18 @@ function withEnv(env, run) {
       else process.env[key] = value;
     }
   }
+}
+
+/** A private HOME whose own directory name can be chosen. */
+function fakeHomeNamed(name, names) {
+  const parent = mkdtempSync(join(tmpdir(), "bf-linear-home-"));
+  const home = join(parent, name);
+  mkdirSync(home, { recursive: true });
+  if (names.length > 0) {
+    mkdirSync(join(home, ".local", "bin"), { recursive: true });
+    for (const cli of names) writeFakeCli(join(home, ".local", "bin", cli));
+  }
+  return { parent, home };
 }
 
 test("the refresh resolves simple-board and never the retired board binary", () => {
@@ -268,4 +285,91 @@ test("the fail-closed message names the current CLI", () => {
     rmSync(bin, { recursive: true, force: true });
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+test("a HOME whose name merely contains the retired marker is not the retired backend", () => {
+  // The retired-backend marker is matched as a whole path segment, so a
+  // home directory called mac-collab-user is a user's home and not the
+  // retired backend.  The verified CLI there has to resolve.
+  const { parent, home } = fakeHomeNamed("mac-collab-user", ["simple-board"]);
+  try {
+    const resolved = withEnv(
+      { BOARD_CLI: undefined, HOME: home, PATH: "/usr/bin:/bin" },
+      resolveBoardCli,
+    );
+    assert.equal(
+      resolved,
+      realpathSync(join(home, ".local", "bin", "simple-board")),
+      "a HOME whose name merely contains the retired marker must not lose the verified CLI",
+    );
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("a HOME inside the retired backend directory is still refused", () => {
+  // The retired backend directory itself is still the retired backend, so
+  // the verified CLI inside it is refused.
+  const { parent, home } = fakeHomeNamed("mac-collab", ["simple-board"]);
+  try {
+    assert.throws(
+      () =>
+        withEnv({ BOARD_CLI: undefined, HOME: home, PATH: "/usr/bin:/bin" }, resolveBoardCli),
+      /retired mac-collab backend/,
+      "the retired backend directory itself must still be refused",
+    );
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("BOARD_CLI inside a directory named mac-collab is refused", () => {
+  const parent = mkdtempSync(join(tmpdir(), "bf-linear-override-"));
+  try {
+    const retiredBin = join(parent, "mac-collab", "bin");
+    mkdirSync(retiredBin, { recursive: true });
+    const cli = join(retiredBin, "simple-board");
+    writeFakeCli(cli);
+    assert.throws(
+      () => withEnv({ BOARD_CLI: cli }, resolveBoardCli),
+      /mac-collab backend/,
+      "a BOARD_CLI inside the retired backend directory must be refused",
+    );
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("the retired backend segment matches whatever the case", () => {
+  // A case-insensitive volume resolves the retired backend under any
+  // spelling, so the segment comparison is case-folded.
+  const { parent, home } = fakeHomeNamed("MAC-COLLAB", ["simple-board"]);
+  try {
+    assert.throws(
+      () =>
+        withEnv({ BOARD_CLI: undefined, HOME: home, PATH: "/usr/bin:/bin" }, resolveBoardCli),
+      /retired mac-collab backend/,
+      "the retired backend segment must match whatever the case",
+    );
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("the retired backend marker matches a whole path segment only", () => {
+  assert.equal(
+    isRetiredBackendPath("/Users/jay/apps/mac-collab/bin/board"),
+    true,
+    "the retired backend directory is the retired backend",
+  );
+  assert.equal(
+    isRetiredBackendPath("/home/mac-collab-user/.local/bin/simple-board"),
+    false,
+    "a directory whose name merely contains the marker is not the retired backend",
+  );
+  assert.equal(
+    isRetiredBackendPath("C:\\apps\\mac-collab\\bin\\board"),
+    true,
+    "a Windows-style path counts too",
+  );
 });
