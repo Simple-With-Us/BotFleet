@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { resolveStaticFile } from "./static-files.ts";
+import { resolveStaticFile, staticCacheControl, staticFileHeaders } from "./static-files.ts";
 
 const base = mkdtempSync(join(tmpdir(), "omb-static-"));
 const root = join(base, "ui");
@@ -49,5 +49,16 @@ describe("resolveStaticFile", () => {
     }
     expect(resolveStaticFile(root, "/assets/leak.txt")).toBeNull();
     expect(resolveStaticFile(root, "/assets/alias.js")).toBe(real(join(root, "assets", "app.js")));
+  });
+});
+
+describe("staticCacheControl (BF-2468)", () => {
+  it("caches hashed assets immutably and revalidates everything else", () => {
+    expect(staticCacheControl("/assets/app-abc123.js")).toBe("public, max-age=31536000, immutable");
+    expect(staticCacheControl("assets/app-abc123.js")).toBe("public, max-age=31536000, immutable");
+    expect(staticCacheControl("/index.html")).toBe("no-cache");
+    expect(staticCacheControl("/")).toBe("no-cache");
+    expect(staticCacheControl("/favicon.ico")).toBe("no-cache");
+    expect(staticFileHeaders("/assets/app-abc123.js")).toEqual({ "Cache-Control": "public, max-age=31536000, immutable" });
   });
 });
