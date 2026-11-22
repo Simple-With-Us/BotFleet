@@ -319,5 +319,35 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
         guard let server else { return }
         await server.stopListening()
     }
+
+    public func openPairingWindow() async -> NativePairingWindow? {
+        guard let server else { return nil }
+        return await server.openPairingWindow()
+    }
+
+    public func closePairingWindow() async {
+        guard let server else { return }
+        await server.closePairingWindow()
+    }
+
+    public func activePairingWindow() async -> NativePairingWindow? {
+        guard let server else { return nil }
+        return await server.activePairingWindow()
+    }
+
+    public func pairedDevices() async -> [PairedDevice] {
+        guard let server else { return [] }
+        return await server.pairedDevices()
+    }
+
+    public func revokeDevice(id: String) async -> Bool {
+        guard let server else { return false }
+        return await server.revokeDevice(id: id)
+    }
+
+    public func setEndpointAdvertisement(_ advertisement: CompanionEndpointAdvertisement) async {
+        guard let server else { return }
+        await server.setEndpointAdvertisement(advertisement)
+    }
 }
 #endif

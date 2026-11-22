@@ -219,26 +219,39 @@ function isJsonString(value: JsonValue | undefined): value is string {
   return Object.prototype.toString.call(value) === "[object String]";
 }
 
-/** The body `{ "token": "<hex>" }` and nothing else.
+/** The body `{ "token": "<hex>" }` (optionally with `{ "kind": "push-to-start" }`)
+ * and nothing else.
+ *
+ * `CompanionClient.registerLiveActivityToken` sends `"kind": "push-to-start"`
+ * on the wire (`LiveActivityTokenKind.pushToStart`), while older callers may
+ * omit `kind`.  `"update"` tokens are still refused because `devices.ts`
+ * stores one push-to-start credential per device.
  *
  * This route is terminated by the sidecar rather than forwarded, so its body
  * never reaches the harness — but it is still a body off the network, and
  * `String(body.token)` would quietly turn a number, an array or an object
  * into the string "42" / "…" and hand it to the registry to reject.  Naming
- * the one field and its type keeps the 400 honest about what arrived.
+ * the allowed fields and their types keeps the 400 honest about what arrived.
  *
  * Whole-request rejection, like the profile and organize routes: a device
  * that sends something else has a bug or an intent, and neither should be
  * answered with a token. */
 export function companionLiveActivityTokenDenial(body: JsonObject): Denial | null {
   const fields = Object.keys(body);
-  const unsupported = fields.find((field) => field !== "token");
+  const unsupported = fields.find((field) => field !== "token" && field !== "kind");
   if (unsupported) {
     return { status: 400, error: `${unsupported} is not part of a Live Activity token registration` };
   }
   const token = body.token;
   if (token === undefined) return { status: 400, error: "a Live Activity token is required" };
   if (!isJsonString(token)) return { status: 400, error: "token must be a string" };
+  if (Object.hasOwn(body, "kind")) {
+    const kind = body.kind;
+    if (!isJsonString(kind)) return { status: 400, error: "kind must be a string" };
+    if (kind !== "push-to-start") {
+      return { status: 400, error: "only push-to-start Live Activity tokens are supported" };
+    }
+  }
   return null;
 }
 

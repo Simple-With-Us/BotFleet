@@ -61,12 +61,41 @@ describe("rewriteRetiredModelId", () => {
 });
 
 describe("isRetiredModelId", () => {
-  it("flags only exact retired spellings", () => {
+  it("flags retired spellings, bare or provider-qualified, and not live ones", () => {
     expect(isRetiredModelId("MiniMax-M3")).toBe(true);
     expect(isRetiredModelId("MiniMax-M3.1-Flash-Preview")).toBe(true);
     expect(isRetiredModelId("MiniMax-M3.1-Flash")).toBe(false);
     expect(isRetiredModelId("MiniMax-M3.1-Flash-1M")).toBe(false);
     expect(isRetiredModelId("MiniMax-M3.1-Flash-thinking")).toBe(false);
+  });
+});
+
+describe("provider-qualified spellings", () => {
+  it("rewrites a provider-qualified retired id and keeps the qualifier", () => {
+    // A discovered catalog spells the models it routes with the provider
+    // prefix (`minimax-coding-plan/MiniMax-M3` in the OpenCode catalog).
+    // The retired model is the same product on that route, so the
+    // rewrite lands on the route's own live row rather than stranding
+    // the qualified spelling outside the map.
+    expect(rewriteRetiredModelId("minimax-coding-plan/MiniMax-M3")).toBe("minimax-coding-plan/MiniMax-M3.1-Flash");
+    expect(isRetiredModelId("minimax-coding-plan/MiniMax-M3")).toBe(true);
+  });
+
+  it("leaves a provider-qualified live id alone", () => {
+    expect(rewriteRetiredModelId("minimax-coding-plan/MiniMax-M3.1-Flash")).toBe("minimax-coding-plan/MiniMax-M3.1-Flash");
+    expect(isRetiredModelId("minimax-coding-plan/MiniMax-M3.1-Flash")).toBe(false);
+  });
+
+  it("rewrites the DSH engine's provider spelling of a retired id", () => {
+    expect(rewriteRetiredModelId("minimax/MiniMax-M3")).toBe("minimax/MiniMax-M3.1-Flash");
+    expect(isRetiredModelId("minimax/MiniMax-M3")).toBe(true);
+  });
+
+  it("leaves a spelling under an unrelated qualifier alone", () => {
+    // A different route whose trailing segment merely shares the text is
+    // not the retired model: its ids are neither rewritten nor dropped.
+    expect(rewriteRetiredModelId("some-other-route/MiniMax-M3")).toBe("some-other-route/MiniMax-M3");
+    expect(isRetiredModelId("some-other-route/MiniMax-M3")).toBe(false);
   });
 });
 

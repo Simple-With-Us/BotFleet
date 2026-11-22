@@ -1304,6 +1304,9 @@ public struct StoreImporter: Sendable {
         if routinesSnapshot.runs.count != targetRoutineRunCount {
             mismatches.append("routine_run count \(routinesSnapshot.runs.count) != \(targetRoutineRunCount)")
         }
+        if routinesSnapshot.requestReceipts.count != targetRoutineRequestReceiptCount {
+            mismatches.append("routine_request_receipt count \(routinesSnapshot.requestReceipts.count) != \(targetRoutineRequestReceiptCount)")
+        }
         if webhooksSnapshot.webhooks.count != targetWebhookCount {
             mismatches.append("webhook count \(webhooksSnapshot.webhooks.count) != \(targetWebhookCount)")
         }

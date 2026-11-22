@@ -1297,6 +1297,8 @@ describe("APNs token registration", () => {
         ["a null token", { token: null }],
         ["a missing token", {}],
         ["an extra field", { token: hex, environment: "production" }],
+        ["an unsupported update kind", { token: hex, kind: "update" }],
+        ["a non-string kind", { token: hex, kind: 42 }],
       ] as const) {
         const rejected = await fetch(`http://127.0.0.1:${port}/api/companion/live-activity-token`, {
           method: "POST",
@@ -1324,7 +1326,7 @@ describe("APNs token registration", () => {
           authorization: `Bearer ${TOKEN}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify({ token: hex }),
+        body: JSON.stringify({ token: hex, kind: "push-to-start" }),
       });
       expect(ok.status).toBe(200);
       expect(await ok.json()).toEqual({ ok: true });

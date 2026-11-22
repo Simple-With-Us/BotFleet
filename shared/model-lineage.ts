@@ -13,10 +13,14 @@
 //     newest member offered by the instance's catalog is shown, plus a
 //     floating "Latest <Class>" choice.
 //   - A saved selection may be REWRITTEN to a newer member of its class.  It
-//     is never ALIASED: recorded usage, per-model stats, and every message
+//     is never ALIASED for the record: recorded usage and every message
 //     row keep the real slug that ran (docs/rollouts/2026-09-18-latest-model-ids.md,
-//     server/drivers/model-discovery.ts).  Nothing here maps one id onto
-//     another for attribution.
+//     server/drivers/model-discovery.ts).
+//   - PERFORMANCE stats are the one exception (owner ruling, 2026-11-21):
+//     latency, pricing, and performance figures carry over by lineage
+//     class through this table — a class's performance stats attribute
+//     to the member its family names as carrier (performanceStatsCarrier),
+//     never to a map kept anywhere else.
 //   - Automatic moves go forward only when the newer member's blended list
 //     price is within 25% of the saved one.  When either price is unknown,
 //     a subscription CLI engine moves on the class match alone (the plan,
@@ -67,6 +71,9 @@ interface Family {
   /** Retired ids: the value is the successor class, or null when nothing
    *  replaces it (a write that introduces one is refused). */
   retired?: Readonly<Record<string, string | null>>;
+  /** Performance-stats carrier per class key: the member a class's
+   *  performance stats attribute to.  See performanceStatsCarrier. */
+  statsCarriers?: Readonly<Record<string, string>>;
 }
 
 function num(value: string | undefined): number | undefined {
@@ -239,6 +246,58 @@ const GROK: Family = {
     "grok-4.5": "grok",
     "grok-4.6": "grok",
     "grok-3-mini": null,
+  },
+};
+
+// ── Gemini ────────────────────────────────────────────────────────────────
+// Registered for performance-stats carryover (owner ruling, 2026-11-21):
+// the Flash class's current member is Gemini 4 Hydrogen and the Pro
+// class's is Gemini 4 Neon, so performance stats recorded under any
+// member of a class attribute to that member (performanceStatsCarrier).
+// Gemini 4 Argon is not a BotFleet model option at all (owner
+// correction, 2026-11-21) and Carbon is outside the scheme: both are
+// deliberately unclassified, so their stats stay their own.  The Gemini
+// driver kinds are deliberately absent from DRIVER_LINEAGE below —
+// selection, picker, and latest resolution for them do not change.
+const GEMINI_FLASH = /^gemini-(\d+)(?:\.(\d+))?-flash(?:-(?:lite|low|medium|high|xhigh))?$/;
+const GEMINI_PRO = /^gemini-(\d+)(?:\.(\d+))?-pro(?:-(?:preview|low|medium|high|xhigh))?$/;
+const GEMINI_HYDROGEN = /^gemini-4-hydrogen(?:-(?:low|medium|high|xhigh))?$/;
+const GEMINI_NEON = /^gemini-4-neon(?:-(?:low|medium|high|xhigh))?$/;
+
+const GEMINI: Family = {
+  id: "gemini",
+  classes: [
+    { key: "flash", label: "Flash" },
+    { key: "pro", label: "Pro" },
+  ],
+  classify(id) {
+    if (GEMINI_HYDROGEN.test(id)) return { classKey: "flash", rank: rankOf(4) };
+    const flash = GEMINI_FLASH.exec(id);
+    if (flash) return { classKey: "flash", rank: rankOf(num(flash[1]), num(flash[2])) };
+    if (GEMINI_NEON.test(id)) return { classKey: "pro", rank: rankOf(4) };
+    const pro = GEMINI_PRO.exec(id);
+    if (pro) return { classKey: "pro", rank: rankOf(num(pro[1]), num(pro[2])) };
+    return null;
+  },
+  label(_id, c) {
+    return c.classKey === "flash"
+      ? `Gemini ${versionText(c.rank)} Flash`
+      : `Gemini ${versionText(c.rank)} Pro`;
+  },
+  // Google API list prices per million tokens.  Flash: 2.5 Flash
+  // $0.30/$2.50, 3.8 Flash $0.75/$3.75, 4 Hydrogen $1.50/$7.50.  Pro:
+  // 2.5 Pro and 3.1 Pro $1.25/$10, 4 Neon $3/$15.
+  prices: {
+    "flash@2.5": { input: 0.3, output: 2.5 },
+    "flash@3.8": { input: 0.75, output: 3.75 },
+    "flash@4": { input: 1.5, output: 7.5 },
+    "pro@2.5": { input: 1.25, output: 10 },
+    "pro@3.1": { input: 1.25, output: 10 },
+    "pro@4": { input: 3, output: 15 },
+  },
+  statsCarriers: {
+    flash: "gemini-4-hydrogen",
+    pro: "gemini-4-neon",
   },
 };
 
@@ -496,6 +555,27 @@ export function anyLineageLabel(id: string): string | undefined {
     if (classified) return family.label(id, classified);
   }
   return undefined;
+}
+
+/** Families whose classes carry performance stats to a named member.
+ *  One place: a family joins by naming its carriers, nowhere else. */
+const STATS_CARRIER_FAMILIES: readonly Family[] = [GEMINI];
+
+/** The id a model's PERFORMANCE stats (latency, pricing, performance)
+ *  attribute to.  Owner ruling, 2026-11-21: performance stats carry over
+ *  by lineage class — a class's performance stats land on the member
+ *  its family names as carrier (Gemini Flash -> gemini-4-hydrogen,
+ *  Gemini Pro -> gemini-4-neon).  Recorded usage and message rows are
+ *  NOT aliased: they keep the real slug that ran, exactly as before.
+ *  An id no carrier-bearing family classifies — Gemini 4 Argon and
+ *  Carbon, and every non-Gemini id — attributes to itself. */
+export function performanceStatsCarrier(id: string): string {
+  if (!id || id.includes("::")) return id;
+  for (const family of STATS_CARRIER_FAMILIES) {
+    const classified = family.classify(id);
+    if (classified) return family.statsCarriers?.[classified.classKey] ?? id;
+  }
+  return id;
 }
 
 // ── reconcile ────────────────────────────────────────────────────────────

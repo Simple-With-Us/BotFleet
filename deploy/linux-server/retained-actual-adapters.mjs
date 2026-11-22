@@ -186,9 +186,21 @@ export function createActualLinuxAdapters({ root, node, pnpm }) {
   if (!pnpmPath.startsWith(`${join(fixtureRoot, 'private-toolchain')}/`)) {
     throw new Error('Retained fixture pnpm must be copied into its private toolchain');
   }
-  if (execFileSync(nodePath, ['--version'], { encoding: 'utf8' }).trim() !== 'v24.18.0' ||
-      execFileSync(nodePath, [pnpmPath, '--version'], { encoding: 'utf8' }).trim() !== '12.16.1') {
-    throw new Error('Retained fixture toolchain versions differ from both receipts');
+  // Both runtime versions are captured once, exactly as the binaries report them, and the
+  // receipts' pins are compared with the v prefix normalized away (a receipt captured by
+  // common.sh writes the bare number; node --version prints the v prefix).
+  const nodeVersionRaw = execFileSync(nodePath, ['--version'], { encoding: 'utf8' }).trim();
+  if (!/^v\d+\.\d+\.\d+$/.test(nodeVersionRaw)) {
+    throw new Error('Retained fixture node runtime reports no semantic version');
+  }
+  const nodeVersion = nodeVersionRaw.replace(/^v/, '');
+  // The shim is corepack: it resolves the pnpm version from the CURRENT directory's
+  // packageManager pin, so the version it reports depends on where it runs.  The creation gate
+  // only proves it reports SOME semantic version here; the exact per-slot binding happens in
+  // installDependencies, where the shim runs inside the slot's own source tree.
+  const probePnpmVersion = () => execFileSync(nodePath, [pnpmPath, '--version'], { encoding: 'utf8' }).trim();
+  if (!/^\d+\.\d+\.\d+$/.test(probePnpmVersion())) {
+    throw new Error('Retained fixture pnpm reports no semantic version');
   }
   const home = join(fixtureRoot, 'private-home');
   const data = join(fixtureRoot, 'private-data');
@@ -240,8 +252,19 @@ export function createActualLinuxAdapters({ root, node, pnpm }) {
 
   return {
     installDependencies: async (context) => {
-      if (context.toolchain.nodeVersion !== '24.18.0' || context.toolchain.packageManager !== 'pnpm@12.16.1') {
-        throw new Error('Retained fixture receipt toolchain mismatch');
+      // Exact per-slot binding: the receipt's nodeVersion (bare, as common.sh captured it) must
+      // equal the runtime's normalized version, and the receipt's packageManager pin must be the
+      // pnpm@<exact version> the shim actually reports — a shape-only check would let a receipt
+      // from a different toolchain pass against the wrong binary.
+      // The shim runs with cwd = the slot's source tree (run() spawns it there), so asking it
+      // here — inside installDependencies, before spawning — resolves the slot's own pin.
+      // The probe runs with the SAME private env the spawned install uses, so it observes the
+      // isolated environment (COREPACK_ENABLE_NETWORK=0 et al.) rather than the ambient one and
+      // can neither reach the network nor resolve against a different cache.
+      const slotPnpmVersion = execFileSync(nodePath, [pnpmPath, '--version'], { encoding: 'utf8', cwd: context.exportRoot, env }).trim();
+      if (context.toolchain.nodeVersion !== nodeVersion ||
+          context.toolchain.packageManager !== `pnpm@${slotPnpmVersion}`) {
+        throw new Error(`Retained fixture receipt toolchain mismatch (node ${nodeVersion}, pnpm ${slotPnpmVersion}, receipt ${context.toolchain.nodeVersion}/${context.toolchain.packageManager})`);
       }
       return run(context, 'install', nodePath, [
         pnpmPath, 'install', '--offline', '--frozen-lockfile', '--ignore-scripts', '--package-import-method=copy',

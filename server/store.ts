@@ -47,7 +47,7 @@ import {
 } from "../shared/model-lineage.ts";
 import { mergeTaskStats, type TurnStatsSample } from "./turn-stats.ts";
 import { customModelSkip } from "./model-lineage.ts";
-import { rewriteModelSelection } from "./retired-model-ids.ts";
+import { isRetiredModelId, rewriteModelSelection, rewriteRetiredModelId } from "./retired-model-ids.ts";
 import { automationRolloverSeedText } from "./automation-rollover.ts";
 import type { ToolPolicy } from "./tool-policy.ts";
 
@@ -524,6 +524,57 @@ function mergeInstanceUsage(
     out.byModel = prev.byModel;
   }
   return out;
+}
+
+/** Sum two banked per-model usage rows into one.  Totals add; cost stays
+ *  null only while both sides are unpriced — null, or absent on a row
+ *  written before the field existed (a row that never priced does not
+ *  zero one that did); the last-turn markers (lastInput, contextWindow)
+ *  keep the surviving row's values, falling back to the folded row's. */
+function sumBankedModelUsage(into: TaskUsage, from: TaskUsage): TaskUsage {
+  const intoCost = into.costUsd ?? null;
+  const fromCost = from.costUsd ?? null;
+  const out: TaskUsage = {
+    input: into.input + from.input,
+    output: into.output + from.output,
+    costUsd: intoCost === null && fromCost === null ? null : (intoCost ?? 0) + (fromCost ?? 0),
+    turns: into.turns + from.turns,
+  };
+  if (into.cachedInput !== undefined || from.cachedInput !== undefined) {
+    out.cachedInput = (into.cachedInput ?? 0) + (from.cachedInput ?? 0);
+  }
+  if (into.lastInput !== undefined || from.lastInput !== undefined) {
+    out.lastInput = into.lastInput ?? from.lastInput;
+  }
+  if (into.contextWindow !== undefined || from.contextWindow !== undefined) {
+    out.contextWindow = into.contextWindow ?? from.contextWindow;
+  }
+  return out;
+}
+
+/** Fold every retired id's banked row in a per-model breakdown onto its
+ *  live successor (retired-model-ids.ts), merging with the successor's
+ *  own row when one exists.  A row the caller's guard claims — an
+ *  instance's own custom catalog row that reuses the retired spelling —
+ *  is left alone, mirroring the selection rewrite's custom skip.
+ *  Returns whether anything moved. */
+function foldRetiredModelUsage(
+  byModel: Record<string, TaskUsage> | undefined,
+  skip?: (model: string) => boolean,
+): boolean {
+  if (!byModel) return false;
+  let changed = false;
+  for (const model of Object.keys(byModel)) {
+    if (!isRetiredModelId(model)) continue;
+    if (skip?.(model)) continue;
+    const row = byModel[model]!;
+    delete byModel[model];
+    const successor = rewriteRetiredModelId(model);
+    const existing = byModel[successor];
+    byModel[successor] = existing ? sumBankedModelUsage(existing, row) : row;
+    changed = true;
+  }
+  return changed;
 }
 
 /** Everything the BOT authored is scrubbed of content-shaped secrets before
@@ -2856,9 +2907,17 @@ export class Store {
    * every task's modelSelection and activeModelSelection: retired ids onto
    * the newest member of their successor class, "Latest <Class>" entries
    * onto the newest member the instance offers, and pinned older members
-   * forward when the price band allows.  Only saved SELECTIONS move.
-   * Message rows, usage buckets, and per-model stats keep the slug that
-   * actually ran — the owner's no-aliasing rule.
+   * forward when the price band allows.  Saved SELECTIONS move, and the
+   * per-model usage stats fold too: a row banked under a retired id
+   * (retired-model-ids.ts) merges onto its live successor in the same
+   * pass, so a model the product retired never presents as in use —
+   * MiniMax-M3's banked lifetime row kept reading as current use months
+   * after the last M3 turn ran (owner ruling, 2026-11-21).  Message
+   * rows keep the slug that actually ran, and a superseded-but-not-
+   * retired id keeps its stats row: only the retired map folds.  A row
+   * an instance's own custom catalog still offers under the retired
+   * spelling is the operator's own model and keeps its row, exactly as
+   * its selection does.
    *
    * `ownerDirective` also applies the one-time owner-directed flags (every
    * Sonnet and every Luna becomes Latest), gated on a marker file so a
@@ -2976,8 +3035,27 @@ export class Store {
       if (wanted && !wanted.has(bot.id)) continue;
       if (opts.skipBusy && bot.busy) continue;
       visited.add(bot.id);
-      const before = JSON.stringify([bot.modelSelection, bot.activeModelSelection, bot.tasks]);
+      const before = JSON.stringify([bot.modelSelection, bot.activeModelSelection, bot.tasks, bot.roomUsageByInstance]);
       const notices: string[] = [];
+      // Per-model usage stats fold retired ids onto their live successor
+      // in the same pass (see the doc comment above): rows banked before
+      // a retirement merge forward instead of presenting the retired
+      // model as in use.  The fold honors the selection path's guard: a
+      // row an instance's own custom catalog still offers under the
+      // retired spelling is the operator's own model and keeps its row,
+      // exactly as its selection does.
+      for (const task of bot.tasks ?? []) {
+        for (const [bucketKey, bucket] of Object.entries(task.usageByInstance ?? {})) {
+          // A forked bucket key is `instanceId~engineId`; the lineage
+          // context is keyed by the instance id alone.
+          const instanceId = bucketKey.split("~")[0]!;
+          foldRetiredModelUsage(bucket.byModel, (model) => skipRetired({ instanceId, model }));
+        }
+      }
+      for (const [bucketKey, bucket] of Object.entries(bot.roomUsageByInstance ?? {})) {
+        const instanceId = bucketKey.split("~")[0]!;
+        foldRetiredModelUsage(bucket.byModel, (model) => skipRetired({ instanceId, model }));
+      }
       if (bot.modelSelection?.instanceId) {
         const saved = bot.modelSelection;
         const next = pass(saved, { botId: bot.id, scope: "bot" });
@@ -3009,7 +3087,7 @@ export class Store {
           task.activeModelSelection = pass(task.activeModelSelection).selection;
         }
       }
-      if (JSON.stringify([bot.modelSelection, bot.activeModelSelection, bot.tasks]) === before) continue;
+      if (JSON.stringify([bot.modelSelection, bot.activeModelSelection, bot.tasks, bot.roomUsageByInstance]) === before) continue;
       dirty = true;
       const notice = notices.length ? notices.join(" · ") : null;
       if (notice) {

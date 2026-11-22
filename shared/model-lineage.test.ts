@@ -9,6 +9,7 @@ import {
   lineageStatus,
   modelPrice,
   newestInClass,
+  performanceStatsCarrier,
   presentCatalog,
   pricesWithinBand,
   reconcileChain,
@@ -449,5 +450,30 @@ describe("lineageStatus", () => {
       successor: { model: "gpt-5.6-luna", latest: "luna" },
     });
     expect(lineageStatus("codex", "gpt-6-luna", codex, false)).toEqual({ kind: "ok" });
+  });
+});
+
+describe("performanceStatsCarrier", () => {
+  it("carries Flash-class performance stats to Gemini 4 Hydrogen", () => {
+    expect(performanceStatsCarrier("gemini-2.5-flash")).toBe("gemini-4-hydrogen");
+    expect(performanceStatsCarrier("gemini-3.8-flash")).toBe("gemini-4-hydrogen");
+    expect(performanceStatsCarrier("gemini-3.8-flash-high")).toBe("gemini-4-hydrogen");
+    expect(performanceStatsCarrier("gemini-4-hydrogen")).toBe("gemini-4-hydrogen");
+    expect(performanceStatsCarrier("gemini-4-hydrogen-low")).toBe("gemini-4-hydrogen");
+  });
+
+  it("carries Pro-class performance stats to Gemini 4 Neon, with no Argon stop", () => {
+    expect(performanceStatsCarrier("gemini-2.5-pro")).toBe("gemini-4-neon");
+    expect(performanceStatsCarrier("gemini-3.1-pro-high")).toBe("gemini-4-neon");
+    expect(performanceStatsCarrier("gemini-3.1-pro-low")).toBe("gemini-4-neon");
+    expect(performanceStatsCarrier("gemini-4-neon")).toBe("gemini-4-neon");
+  });
+
+  it("leaves unclassed and non-Gemini ids on themselves", () => {
+    expect(performanceStatsCarrier("gemini-4-argon")).toBe("gemini-4-argon");
+    expect(performanceStatsCarrier("gemini-4-argon-high")).toBe("gemini-4-argon-high");
+    expect(performanceStatsCarrier("gemini-4-carbon")).toBe("gemini-4-carbon");
+    expect(performanceStatsCarrier("claude-sonnet-5-5")).toBe("claude-sonnet-5-5");
+    expect(performanceStatsCarrier("grok-4.7")).toBe("grok-4.7");
   });
 });

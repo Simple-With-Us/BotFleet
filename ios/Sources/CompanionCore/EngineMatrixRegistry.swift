@@ -367,7 +367,7 @@ public enum EngineMatrixRegistry {
             baseArguments: ["--experimental-acp"],
             wireProtocol: .acpJSONRPC,
             authRequirement: .cliManagedLogin(cliBinary: "gemini"),
-            defaultModel: "gemini-2.5-pro"
+            defaultModel: "gemini-4-hydrogen"
         ),
         .geminiApi: EngineDriverDescriptor(
             id: .geminiApi,
@@ -377,7 +377,7 @@ public enum EngineMatrixRegistry {
             baseArguments: [],
             wireProtocol: .httpsSSE,
             authRequirement: .infisicalSecret(key: "GEMINI_API_KEY", provider: .gemini),
-            defaultModel: "gemini-2.5-pro"
+            defaultModel: "gemini-4-hydrogen"
         ),
         .dsh: EngineDriverDescriptor(
             id: .dsh,

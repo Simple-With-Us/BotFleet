@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { decodeInjectId, hostApiKey, localHost, mergeLocalInject } from "../local-inject.ts";
+import { isRetiredModelId } from "../../retired-model-ids.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 import { humanizeOpenCodeModelProbeProblem } from "../../../shared/opencode-model-probe.ts";
 import {
@@ -65,7 +66,7 @@ async function firstLiveModel(
     const stdout = await runOpenCodeModels(cli, env, false);
     for (const line of stdout.split(/\r?\n/u)) {
       const candidate = line.trim();
-      if (validModelSlug(candidate) && !DEPRECATED_OPENCODE_MODEL_SLUGS.has(candidate)) return candidate;
+      if (validModelSlug(candidate) && !DEPRECATED_OPENCODE_MODEL_SLUGS.has(candidate) && !isRetiredModelId(candidate)) return candidate;
     }
   } catch {
     // An unreadable catalog is not an error here: the caller falls back to
@@ -156,7 +157,12 @@ export function parseOpenCodeModelsOutput(stdout: string): ModelCatalog | null {
         // A header-only/older CLI remains useful; fall back to the model id.
       }
     }
-    if (record.status === "deprecated" || DEPRECATED_OPENCODE_MODEL_SLUGS.has(slug)) return;
+    // A retired id (retired-model-ids.ts) is dropped the same way: a
+    // provider's live list keeps serving a model after the product
+    // retired it — the MiniMax Coding Plan still lists MiniMax-M3 — and
+    // an unfiltered row would keep that model selectable here even
+    // though every other engine's catalog excludes it.
+    if (record.status === "deprecated" || DEPRECATED_OPENCODE_MODEL_SLUGS.has(slug) || isRetiredModelId(slug)) return;
     const name = typeof record.name === "string" && record.name.trim()
       ? record.name.trim()
       : labelForModel(model);
