@@ -258,7 +258,10 @@ export function createActualLinuxAdapters({ root, node, pnpm }) {
       // from a different toolchain pass against the wrong binary.
       // The shim runs with cwd = the slot's source tree (run() spawns it there), so asking it
       // here — inside installDependencies, before spawning — resolves the slot's own pin.
-      const slotPnpmVersion = execFileSync(nodePath, [pnpmPath, '--version'], { encoding: 'utf8', cwd: context.exportRoot }).trim();
+      // The probe runs with the SAME private env the spawned install uses, so it observes the
+      // isolated environment (COREPACK_ENABLE_NETWORK=0 et al.) rather than the ambient one and
+      // can neither reach the network nor resolve against a different cache.
+      const slotPnpmVersion = execFileSync(nodePath, [pnpmPath, '--version'], { encoding: 'utf8', cwd: context.exportRoot, env }).trim();
       if (context.toolchain.nodeVersion !== nodeVersion ||
           context.toolchain.packageManager !== `pnpm@${slotPnpmVersion}`) {
         throw new Error(`Retained fixture receipt toolchain mismatch (node ${nodeVersion}, pnpm ${slotPnpmVersion}, receipt ${context.toolchain.nodeVersion}/${context.toolchain.packageManager})`);
