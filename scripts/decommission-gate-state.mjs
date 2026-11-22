@@ -81,12 +81,48 @@ export const CURRENT_LINEAR_CLI = "simple-board";
 /** The retired CLI names a refresh must never resolve. */
 export const RETIRED_LINEAR_CLI_NAMES = ["board", "board-legacy"];
 
-/** A path that names a retired CLI is not a Linear route. */
+/**
+ * The retired mac-collab backend, whose binaries are retired write routes
+ * too (AGENTS.md).  The marker is compared case-folded: a
+ * case-insensitive volume resolves the directory under any spelling.
+ */
+export const RETIRED_BACKEND_MARKER = "mac-collab";
+
+/**
+ * A path that names a retired CLI is not a Linear route.  The basename is
+ * folded to lowercase before the comparison: on a case-insensitive volume
+ * `BOARD` and `Board` resolve to the same retired binary, and an exact-case
+ * comparison would let them through.
+ */
 export function isRetiredLinearCli(path) {
-  const name = basename(path);
-  return RETIRED_LINEAR_CLI_NAMES.some(
-    (retired) => name === retired || name.startsWith(`${retired}-`),
-  );
+  const name = basename(path).toLowerCase();
+  return RETIRED_LINEAR_CLI_NAMES.some((retired) => {
+    const retiredName = retired.toLowerCase();
+    return name === retiredName || name.startsWith(`${retiredName}-`);
+  });
+}
+
+/**
+ * A path inside the retired mac-collab backend is not a Linear route.  The
+ * comparison is case-folded for the same reason the CLI name is.
+ */
+export function isRetiredBackendPath(path) {
+  return path.toLowerCase().includes(RETIRED_BACKEND_MARKER);
+}
+
+/**
+ * The real path behind a CLI path, or the literal path when it does not
+ * exist.  A retired binary reached through a symlink or under a
+ * renamed copy has to fail the same gate, so the refusal looks at the
+ * resolved path as well as the literal one.
+ */
+export function resolveRealCliPath(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    // The path does not exist, so the basename check still applies to it.
+    return path;
+  }
 }
 
 /**
@@ -99,7 +135,11 @@ function linearCliOnPath(name) {
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
     if (!whichOut) return null;
-    if (realpathSync(whichOut).includes("mac-collab")) return null;
+    const resolved = resolveRealCliPath(whichOut);
+    if (isRetiredBackendPath(resolved)) return null;
+    // A `simple-board` that resolves to a retired binary is that binary
+    // under another name, so it fails the same gate.
+    if (isRetiredLinearCli(resolved)) return null;
     return whichOut;
   } catch {
     // The CLI is not on PATH, so the refresh fails closed below.
@@ -116,9 +156,23 @@ function linearCliOnPath(name) {
 export function resolveBoardCli() {
   const override = process.env.BOARD_CLI;
   if (override) {
+    // The override is resolved before it is judged: a symlink or a renamed
+    // copy of a retired binary must not reach the gate under an innocent
+    // name, and the retired backend is refused by its own path as well.
+    const resolved = resolveRealCliPath(override);
     if (isRetiredLinearCli(override)) {
       throw new Error(
         `BOARD_CLI names the retired Linear CLI '${override}'.${SENTENCE_GAP}Set BOARD_CLI to ${CURRENT_LINEAR_CLI}, the current Linear-backed CLI.`,
+      );
+    }
+    if (isRetiredLinearCli(resolved)) {
+      throw new Error(
+        `BOARD_CLI resolves to the retired Linear CLI '${resolved}'.${SENTENCE_GAP}Set BOARD_CLI to ${CURRENT_LINEAR_CLI}, the current Linear-backed CLI.`,
+      );
+    }
+    if (isRetiredBackendPath(override) || isRetiredBackendPath(resolved)) {
+      throw new Error(
+        `BOARD_CLI names a retired Linear CLI in the mac-collab backend '${override}'.${SENTENCE_GAP}Set BOARD_CLI to ${CURRENT_LINEAR_CLI}, the current Linear-backed CLI.`,
       );
     }
     return override;

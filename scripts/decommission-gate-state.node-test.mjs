@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { resolveBoardCli } from "./decommission-gate-state.mjs";
+import { isRetiredLinearCli, resolveBoardCli } from "./decommission-gate-state.mjs";
 
 /* oxlint-disable eslint/no-irregular-whitespace -- Owner-required NBSP sentence gaps occur only in prose comments in this test file. */
 
@@ -133,6 +133,73 @@ test("BOARD_CLI may not point at the retired board binary", () => {
       /retired Linear CLI/,
       `BOARD_CLI=${retired} must be refused`,
     );
+  }
+});
+
+test("the retired CLI check folds the basename case", () => {
+  for (const retired of [
+    "/usr/local/bin/board",
+    "/usr/local/bin/BOARD",
+    "/usr/local/bin/Board",
+    "/usr/local/bin/BOARD-LEGACY",
+    "/usr/local/bin/Board-legacy",
+  ]) {
+    assert.equal(
+      isRetiredLinearCli(retired),
+      true,
+      `${retired} names a retired CLI, whatever the case`,
+    );
+  }
+  assert.equal(
+    isRetiredLinearCli("/usr/local/bin/simple-board"),
+    false,
+    "the current CLI is not a retired CLI",
+  );
+});
+
+test("BOARD_CLI may not name a retired CLI in a different case", () => {
+  for (const retired of [
+    "/usr/local/bin/BOARD",
+    "/usr/local/bin/Board",
+    "/usr/local/bin/BOARD-LEGACY",
+    "/usr/local/bin/Board-legacy",
+  ]) {
+    assert.throws(
+      () => withEnv({ BOARD_CLI: retired }, resolveBoardCli),
+      /retired Linear CLI/,
+      `BOARD_CLI=${retired} must be refused`,
+    );
+  }
+});
+
+test("a BOARD_CLI symlink to a retired board binary is refused", () => {
+  const root = mkdtempSync(join(tmpdir(), "bf-linear-symlink-"));
+  try {
+    // A stand-in for the retired binary, never executed: the resolver only
+    // resolves paths, it never runs them.
+    writeFakeCli(join(root, "board"));
+    const link = join(root, "linear-cli");
+    symlinkSync(join(root, "board"), link);
+    assert.throws(
+      () => withEnv({ BOARD_CLI: link }, resolveBoardCli),
+      /retired Linear CLI/,
+      "a symlink to the retired board binary must be refused",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a BOARD_CLI symlink to the current CLI is still accepted", () => {
+  const root = mkdtempSync(join(tmpdir(), "bf-linear-symlink-"));
+  try {
+    writeFakeCli(join(root, "current-cli"));
+    const link = join(root, "simple-board");
+    symlinkSync(join(root, "current-cli"), link);
+    const resolved = withEnv({ BOARD_CLI: link }, resolveBoardCli);
+    assert.equal(resolved, link, "a symlink to the current CLI must still resolve");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
