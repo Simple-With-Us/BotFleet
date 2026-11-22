@@ -96,12 +96,12 @@
 # fleet runners).
 #
 # Secrets (never printed):
-#   ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8  (env first; else Infisical via
-#   `fleet-secrets get`: /asc ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8, written to a
-#   0600 temp file and deleted on exit).  A path in ASC_KEY_PATH is NOT a
+#   ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8  (env first; else Infisical via the
+#   shared scoped reader: /asc ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8, written
+#   to a 0600 temp file and deleted on exit).  A path in ASC_KEY_PATH is NOT a
 #   credential source:  it is ignored wherever it appears.
 #   or Xcode-signed-in session for destination=upload export
-#   SENTRY_AUTH_TOKEN  (dSYM + Size Analysis upload; env or `fleet-secrets get`)
+#   SENTRY_AUTH_TOKEN  (dSYM + Size Analysis upload; env or the scoped reader)
 #   SENTRY_DSN         (injected into xcodebuild so Cocoa plist $(SENTRY_DSN) is set)
 #
 # Sentry after a successful archive (2026-09-01):
@@ -128,8 +128,26 @@ FLEET_DIR="$(cd "$(dirname "$0")" && pwd)"
 APPS_JSON="${FLEET_DIR}/apps.json"
 TEAM_ID="CC8UTF7ATG"
 # AFC-359: App Store Connect credentials come from the environment (CI sets them) or
-# Infisical Fleet-OPS via fleet-secrets.  Nothing is read from the old secrets folder.
-FLEET_SECRETS_BIN="${FLEET_SECRETS:-${HOME}/.local/bin/fleet-secrets}"
+# Infisical Fleet-OPS via the shared scoped reader.  Nothing is read from the old
+# secrets folder.
+#
+# The helper resolves the reader, names the consumer's own service-token
+# account and fails closed when there is no reader or no grant.  A helper that
+# is not there refuses the read rather than stopping the ship.
+FLEET_INFISICAL_HELPER="${FLEET_DIR}/../lib/fleet-infisical-read.sh"
+if [ -f "$FLEET_INFISICAL_HELPER" ]; then
+  . "$FLEET_INFISICAL_HELPER"
+else
+  fleet_secret_get() {
+    echo "the scoped reader helper is not installed at ${FLEET_INFISICAL_HELPER}" >&2
+    return 4
+  }
+fi
+# The App Store Connect credential's own read-only service token, and the
+# folder its names live in.
+ASC_SECRET_ACCOUNT="${FLEET_INFISICAL_ASC_ACCOUNT:-fleet-tools-mm-asc-ro}"
+# The Sentry token lives in its own folder, with its own account.
+SENTRY_SECRET_ACCOUNT="${FLEET_INFISICAL_SENTRY_ACCOUNT:-}"
 ASC_TMP_DIR=""
 # "staging" means a credential was resolved and the staging path was refused.
 # Anything else, including empty, means no credential was resolved.  The upload
@@ -212,11 +230,11 @@ resolve_project() {
 }
 
 # fs_get NAME FOLDER -> value on stdout (never logged); non-zero when absent.
+# The read names the consumer's own account, and a refused read is an absent
+# name here:  the caller decides what a missing credential means.
 fs_get() {
-  local v bin="$FLEET_SECRETS_BIN"
-  [[ -x "$bin" ]] || bin="$(command -v fleet-secrets 2>/dev/null || true)"
-  [[ -n "$bin" && -x "$bin" ]] || return 1
-  v="$("$bin" get "$1" --path "$2" 2>/dev/null </dev/null)" || return 1
+  local v
+  v="$(fleet_secret_get "$1" "$2" "$ASC_SECRET_ACCOUNT" 2>/dev/null </dev/null)" || return 1
   [[ -n "$v" ]] || return 1
   printf '%s' "$v"
 }
@@ -378,8 +396,8 @@ asc_resolve_diagnostic_credential() {
 #
 # WHY THE KEY IS HANDED OVER IN THE ENVIRONMENT (AFC-459, Kody rule 42 on the
 # CodeCaps PR #271 review):  the private key is a secret, and the approved
-# secret sources are the process environment, a captured `fleet-secrets get
-# NAME` and bootstrap-only Keychain credentials.  A caller-supplied file is not
+# secret sources are the process environment, a captured scoped-reader read
+# and bootstrap-only Keychain credentials.  A caller-supplied file is not
 # one of them, so the node client never reads a key file.  This shell layer
 # owns the credential for altool and Xcode, so it hands the key to the client
 # in the environment, which is where the client looks for it.
@@ -387,7 +405,7 @@ asc_resolve_diagnostic_credential() {
 # THE CREDENTIAL IS RESOLVED FROM THREE PLACES:
 #   1. CI: the APPLE_API_* names the ship workflow exports from Infisical
 #   2. ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 already in the environment
-#   3. Mac: Infisical Fleet-OPS through fleet-secrets, /asc ASC_KEY_ID,
+#   3. Mac: Infisical Fleet-OPS through the scoped reader, /asc ASC_KEY_ID,
 #      ASC_ISSUER_ID and ASC_KEY_P8.
 # A disk credential is not a source at all:  a named ASC_KEY_PATH is ignored,
 # so a stale or foreign path in an operator's shell can never sign the upload
@@ -500,9 +518,9 @@ load_secrets() {
     fi
   fi
 
-  # 3. The Mac: Infisical Fleet-OPS through fleet-secrets.  Nothing is read
-  #    from the old secrets folder (AFC-359) and nothing is read from a named
-  #    path (AFC-459).
+  # 3. The Mac: Infisical Fleet-OPS through the scoped reader.  Nothing is
+  #    read from the old secrets folder (AFC-359) and nothing is read from a
+  #    named path (AFC-459).
   if [[ -z "$key_pem" ]]; then
     asc_kid="$(fs_get ASC_KEY_ID /asc 2>/dev/null || true)"
     [[ -n "$kid" ]] || kid="$asc_kid"
@@ -601,8 +619,10 @@ asc_client() {
 asc_credential_available() {
   [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]] && return 0
   [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_P8:-}" ]] && return 0
-  [[ -x "$FLEET_SECRETS_BIN" ]] && return 0
-  command -v fleet-secrets >/dev/null 2>&1 && return 0
+  # The scoped reader is the last source:  it is there when the helper and
+  # the reader are both installed, and its read still has to succeed.
+  [[ -n "${FLEET_INFISICAL_READER:-}" ]] && return 0
+  [[ -f "$HOME/apps/infisical-scoped/infisical-scoped.py" ]] && return 0
   return 1
 }
 
@@ -623,19 +643,17 @@ sentry_project_for_app() {
   esac
 }
 
-# Pull SENTRY_AUTH_TOKEN from the environment, else from `fleet-secrets get`
-# when that helper is installed (Mac).  Extract into a var, never echo.
+# Pull SENTRY_AUTH_TOKEN from the environment, else from the shared scoped
+# reader (Mac).  Extract into a var, never echo.
 load_sentry_auth() {
   if [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
     return 0
   fi
-  if command -v fleet-secrets &>/dev/null; then
-    local token
-    token="$(fleet-secrets get SENTRY_AUTH_TOKEN 2>/dev/null | tr -d '\r')" || token=""
-    if [[ -n "$token" ]]; then
-      SENTRY_AUTH_TOKEN="$token"
-      export SENTRY_AUTH_TOKEN
-    fi
+  local token
+  token="$(fleet_secret_get SENTRY_AUTH_TOKEN "/botfleet-sentry" "$SENTRY_SECRET_ACCOUNT" 2>/dev/null | tr -d '\r')" || token=""
+  if [[ -n "$token" ]]; then
+    SENTRY_AUTH_TOKEN="$token"
+    export SENTRY_AUTH_TOKEN
   fi
 }
 
@@ -1655,7 +1673,7 @@ sys.exit(0 if a>b else 1)' "$FIXED_MARKETING" "$_rel"; then
       _rejected_key="$(key_label "$ASC_DIAG_KEY_ID")"
       _rejected_issuer="$(key_issuer_label "$ASC_DIAG_ISSUER_ID")"
       die "App Store Connect rejected the API key (HTTP 401/403) while reading the next marketing version (key id ${_rejected_key}, issuer id ${_rejected_issuer}).
-  Fix the key (ASC_* in env or Infisical /asc; fleet-secrets doctor) and re-run.
+  Fix the key (ASC_* in env or Infisical /asc; the scoped reader's doctor) and re-run.
   --allow-unverified-seq does not cover a rejected credential:  the upload would fail with it too."
     fi
     set -e
@@ -1667,7 +1685,7 @@ sys.exit(0 if a>b else 1)' "$FIXED_MARKETING" "$_rel"; then
   record of which patches that train already holds:  guessing would ship a
   version that already exists (or skip one that does not).
   Fix one of these, then re-run:
-    1) restore ASC access: check ASC_* in env or Infisical /asc (fleet-secrets doctor) and that 'node' is on PATH, then
+    1) restore ASC access: check ASC_* in env or Infisical /asc (the scoped reader's doctor) and that 'node' is on PATH, then
        run: node ${FLEET_DIR}/asc-api.mjs latest-marketing-patch ${BUNDLE_ID} ${MARKETING_PREFIX} ${ASC_PLATFORM}
      2) or pin the version explicitly:  --version <X.Y.Z>
         --version is honoured exactly, so the marketing version no longer needs
@@ -1731,7 +1749,7 @@ sys.exit(0 if a>b else 1)' "$FIXED_MARKETING" "$_rel"; then
       _rejected_key="$(key_label "$ASC_DIAG_KEY_ID")"
       _rejected_issuer="$(key_issuer_label "$ASC_DIAG_ISSUER_ID")"
       die "App Store Connect rejected the API key (HTTP 401/403) while reading the build floor (key id ${_rejected_key}, issuer id ${_rejected_issuer}).
-  Fix the key (ASC_* in env or Infisical /asc; fleet-secrets doctor) and re-run.
+  Fix the key (ASC_* in env or Infisical /asc; the scoped reader's doctor) and re-run.
   --allow-unverified-seq does not cover a rejected credential:  the upload would fail with it too."
     fi
     set -e
@@ -1743,7 +1761,7 @@ sys.exit(0 if a>b else 1)' "$FIXED_MARKETING" "$_rel"; then
   builds, and App Store Connect is the only record of them:  a build number
   that is not greater is rejected as a duplicate.
   Fix one of these, then re-run:
-    1) restore ASC access: check ASC_* in env or Infisical /asc (fleet-secrets doctor) and that 'node' is on PATH, then
+    1) restore ASC access: check ASC_* in env or Infisical /asc (the scoped reader's doctor) and that 'node' is on PATH, then
        run: node ${FLEET_DIR}/asc-api.mjs build-floor ${BUNDLE_ID} ${MARKETING} ${ASC_PLATFORM}
      2) or pass the build number explicitly:  --build <N>
         --build is honoured exactly:  CFBundleVersion becomes N.  It must be

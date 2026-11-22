@@ -5,7 +5,7 @@
 # `pnpm package:mac:local` (or any other package:* script) starts.
 #
 # Resolution order per name: already-exported environment variable ->
-# `fleet-secrets get NAME --path /botfleet-sentry` (Infisical Fleet-OPS prod;
+# the shared scoped reader (Infisical Fleet-OPS prod, /botfleet-sentry;
 # AFC-359: the retired secrets folder is never read) -> the `infisical` CLI (only if
 # it is on PATH and already logged in -- this script never runs `infisical
 # login`).  A value found for SENTRY_DSN but not VITE_SENTRY_DSN is copied
@@ -39,11 +39,26 @@ if [[ $# -eq 0 ]]; then
   exit 2
 fi
 
-FLEET_SECRETS="${FLEET_SECRETS_BIN:-$HOME/.local/bin/fleet-secrets}"
+# The shared scoped reader helper.  It resolves the reader, names the
+# consumer's own account and fails closed when there is no reader or no
+# grant.  A helper that is not there refuses the read rather than stopping
+# the run.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FLEET_INFISICAL_HELPER="$ROOT/scripts/lib/fleet-infisical-read.sh"
+if [ -f "$FLEET_INFISICAL_HELPER" ]; then
+  . "$FLEET_INFISICAL_HELPER"
+else
+  fleet_secret_get() {
+    echo "the scoped reader helper is not installed at ${FLEET_INFISICAL_HELPER}" >&2
+    return 4
+  }
+fi
 SENTRY_FOLDER="/botfleet-sentry"
+# The Sentry DSN's own read-only service token.
+SENTRY_SECRET_ACCOUNT="${FLEET_INFISICAL_SENTRY_ACCOUNT:-}"
 
-# Reads $1 from (in order) the current environment, fleet-secrets, then the
-# infisical CLI.  Prints the resolved value on stdout; prints nothing (and
+# Reads $1 from (in order) the current environment, the scoped reader, then
+# the infisical CLI.  Prints the resolved value on stdout; prints nothing (and
 # nothing else, ever) when unresolved.  Callers capture this with
 # command substitution, so no other output may reach stdout here.
 resolve_secret() {
@@ -54,8 +69,8 @@ resolve_secret() {
   local name="$1"
   local val="${!name:-}"
 
-  if [[ -z "$val" && -x "$FLEET_SECRETS" ]]; then
-    val="$("$FLEET_SECRETS" get "$name" --path "$SENTRY_FOLDER" </dev/null 2>/dev/null || true)"
+  if [[ -z "$val" ]]; then
+    val="$(fleet_secret_get "$name" "$SENTRY_FOLDER" "$SENTRY_SECRET_ACCOUNT" </dev/null 2>/dev/null || true)"
   fi
 
   if [[ -z "$val" ]] && command -v infisical >/dev/null 2>&1; then
@@ -84,7 +99,7 @@ if [[ -z "$SENTRY_DSN" ]]; then
 fi
 
 if [[ -z "$SENTRY_DSN" ]]; then
-  echo "[with-sentry-dsn] no SENTRY_DSN found (checked env, fleet-secrets $SENTRY_FOLDER, the infisical CLI); packaging with Sentry inert" >&2
+  echo "[with-sentry-dsn] no SENTRY_DSN found (checked env, the scoped reader $SENTRY_FOLDER, the infisical CLI); packaging with Sentry inert" >&2
 fi
 
 export SENTRY_DSN VITE_SENTRY_DSN

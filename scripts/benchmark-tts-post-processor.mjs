@@ -12,27 +12,27 @@
  *   node scripts/benchmark-tts-post-processor.mjs --minimax   # Only test MiniMax models
  */
 
-import { execFileSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
 
-// 1. Keys come from the environment first, then from `fleet-secrets get NAME`
+import { readFleetSecret } from "./lib/fleet-infisical-read.mjs";
+
+// 1. Keys come from the environment first, then from the shared scoped reader
 //    (Mac, Infisical Fleet-OPS).  The value is captured and never printed; a
-//    missing helper or an absent key just means "not set".
-function fleetSecret(name) {
-  try {
-    return execFileSync("fleet-secrets", ["get", name], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 20_000,
-    }).trim();
-  } catch {
-    return "";
-  }
+//    missing reader or an absent key just means "not set".
+//
+//    The account is the consumer's own read-only service token, and a grant
+//    covers exactly one folder.
+const API_KEYS_FOLDER = "/global-api-keys";
+const API_KEYS_ACCOUNT = process.env.FLEET_INFISICAL_GLOBAL_API_KEYS_ACCOUNT || "";
+
+function scopedSecret(name) {
+  const got = readFleetSecret(name, API_KEYS_FOLDER, API_KEYS_ACCOUNT);
+  return got.code === 0 && got.value !== null ? got.value.trim() : "";
 }
 
 function secret(...names) {
   for (const name of names) {
-    const value = process.env[name] || fleetSecret(name);
+    const value = process.env[name] || scopedSecret(name);
     if (value) return value;
   }
   return undefined;

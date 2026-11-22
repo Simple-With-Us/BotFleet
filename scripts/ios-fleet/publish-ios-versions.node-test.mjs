@@ -478,19 +478,20 @@ test("the no-op check compares the base as read, even when --out-json is the sam
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("a bare gh login is not a credential; fleet-secrets GH_PAT is, or the run fails", () => {
+test("a bare gh login is not a credential; the scoped reader GH_PAT is, or the run fails", () => {
   const { dir, base } = fixture("afc-ios-versions-pat-", FLEET);
   const stub = mkdtempSync(join(tmpdir(), "afc-ios-stub-"));
-  writeFileSync(join(stub, "fleet-secrets"), "#!/usr/bin/env bash\nexit 1\n");
-  chmodSync(join(stub, "fleet-secrets"), 0o755);
+  // The reader is a Python program:  the helper runs it with `python3 -I`.
+  const reader = join(stub, "infisical-scoped.py");
+  writeFileSync(reader, "import sys\nsys.exit(4)\n");
   writeFileSync(join(stub, "gh"), "#!/usr/bin/env bash\nexit 0\n");
   chmodSync(join(stub, "gh"), 0o755);
   const res = run(
     ["--bundle-id", "com.socratictrade.ios", "--version", "1.0.69", "--base-json", base, "--skip-local-write"],
-    { PATH: `${stub}:${process.env.PATH}`, GH_TOKEN: "", GITHUB_TOKEN: "" },
+    { PATH: `${stub}:${process.env.PATH}`, FLEET_INFISICAL_READER: reader, GH_TOKEN: "", GITHUB_TOKEN: "" },
   );
   assert.notEqual(res.status, 0);
-  assert.match(res.stderr, /fleet-secrets could not return GH_PAT/);
+  assert.match(res.stderr, /scoped reader could not return GH_PAT/);
   rmSync(dir, { recursive: true, force: true });
   rmSync(stub, { recursive: true, force: true });
 });

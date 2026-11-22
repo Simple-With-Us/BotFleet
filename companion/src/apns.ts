@@ -3,15 +3,13 @@
 // leaves this process; tests inject sendImpl.
 import { connect as http2Connect, constants as http2Constants, type ClientHttp2Session, type ClientHttp2Stream } from "node:http2";
 import { createHash, createPrivateKey, sign as cryptoSign } from "node:crypto";
-import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
 
 import { isFiniteJsonNumber, isJsonObject, isJsonString, type JsonObject, type JsonValue } from "./json.ts";
 import { DATA_DIR, writeFileAtomic } from "./state.ts";
 import { loadScopedApnsMaterial, resetScopedApnsCache, type ApnsScopedBinding } from "./apns-scoped-binding.ts";
+import { APNS_READ_OK, readApnsScopedSecret } from "./apns-scoped-read.ts";
 
 export type { ApnsScopedBinding };
 
@@ -44,14 +42,9 @@ function pinnedKeyId(): string | undefined {
   return process.env.APNS_KEY_ID?.trim() || undefined;
 }
 
-/** The `fleet-secrets` binary.  `FLEET_SECRETS_BIN` is the test seam. */
-function fleetSecretsBin(): string {
-  return process.env.FLEET_SECRETS_BIN?.trim() || join(homedir(), ".local", "bin", "fleet-secrets");
-}
-
 /** How long a key read from Infisical is trusted before it is read again.
- * The sidecar re-checks the key every few minutes; one `fleet-secrets` call
- * per window is enough to notice a rotation without a process per tick. */
+ * The sidecar re-checks the key every few minutes; one scoped read per window
+ * is enough to notice a rotation without a process per tick. */
 export const APNS_VAULT_CACHE_MS = 4 * 60 * 1000;
 /** A failed read is retried sooner: a Mac that was still booting should not
  *  keep pushes off for a whole window.  The window is measured from the moment
@@ -59,13 +52,13 @@ export const APNS_VAULT_CACHE_MS = 4 * 60 * 1000;
  *  its own failure entry and trigger an immediate second blocking read. */
 export const APNS_VAULT_RETRY_MS = 30_000;
 
-/** The slowest `fleet-secrets` read measured on the fleet Mac (2026-10-19):
+/** The slowest vault read measured on the fleet Mac (2026-10-19):
  *  3.6-5.3 s warm, 16.6 s with a cold cache.  The ceiling below is derived
  *  from this number rather than picked by feel, so re-measuring retunes the
  *  guard instead of leaving a magic constant behind. */
 export const APNS_VAULT_READ_BUDGET_MS = 16_600;
 
-/** How long one `fleet-secrets` read may take before it counts as failed.
+/** How long one scoped read may take before it counts as failed.
  *
  * The read is an Infisical round-trip, not a local file read.  A ceiling below
  * the vault's own latency does not slow the sidecar down — it removes the
@@ -127,9 +120,30 @@ export function resetApnsKeyCache(): void {
   resetScopedApnsCache();
 }
 
-const execFileAsync = promisify(execFile);
+/** The folder the APNs names live in.  The Fleet-OPS root names are
+ * references into `/apns`, so the literals live there. */
+function apnsSecretFolder(): string {
+  return process.env.APNS_INFISICAL_FOLDER?.trim() || "/apns";
+}
 
-/** One `fleet-secrets` read, off the event loop.
+/** The companion's own read-only service token account.  No account for the
+ * APNs key exists yet, so the read is refused until one is issued and named
+ * here.  The read never falls back to another route. */
+function apnsSecretAccount(): string {
+  return process.env.APNS_INFISICAL_ACCOUNT?.trim() || "";
+}
+
+/** Why the last read did not produce a key.  It names what is missing, so
+ * the operator sees the grant that has to exist rather than a bare "no key". */
+let vaultReadReason = "";
+
+/** What to tell the operator about a read that did not answer.  The reason
+ * names the missing piece and never a value. */
+export function apnsKeyReadReason(): string {
+  return vaultReadReason;
+}
+
+/** One scoped read of the APNs material, off the event loop.
  *
  * The read is an Infisical round-trip:  3.6-5.3 s warm, 16.6 s cold on the
  * fleet Mac, and the ceiling above allows up to 49.8 s for a slower vault.
@@ -139,28 +153,34 @@ const execFileAsync = promisify(execFile);
  * The read is async and the caller awaits it, and the same `timeout` still
  * bounds it:  the child is killed at the ceiling, and a killed read is still
  * a failed read, which is what turns APNs pushes off. */
-async function fleetSecretsGet(name: string): Promise<string | null> {
-  try {
-    const { stdout } = await execFileAsync(fleetSecretsBin(), ["get", name], {
-      encoding: "utf8",
-      timeout: vaultReadTimeoutMs(),
-    });
-    return stdout.replace(/\n$/, "");
-  } catch {
-    return null;
+async function scopedVaultGet(name: string): Promise<string | null> {
+  const got = await readApnsScopedSecret(name, apnsSecretFolder(), apnsSecretAccount(), vaultReadTimeoutMs());
+  if (got.code === APNS_READ_OK) {
+    vaultReadReason = "";
+    return got.value;
   }
+  if (got.reason === "no-account") {
+    vaultReadReason = "no scoped Infisical account is configured for the APNs read (APNS_INFISICAL_ACCOUNT)";
+  } else if (got.reason === "reader-missing") {
+    vaultReadReason = "the scoped Infisical reader is not installed";
+  } else if (got.reason === "absent") {
+    vaultReadReason = "the APNs name is absent from the vault";
+  } else {
+    vaultReadReason = "the scoped Infisical read was refused";
+  }
+  return null;
 }
 
 /** The key id Infisical names for the shared key, or null when the read
  * fails or does not look like an Apple key id. */
 async function sharedKeyId(): Promise<string | null> {
-  const id = (await fleetSecretsGet(SHARED_APNS_KEY_ID_NAME))?.trim();
+  const id = (await scopedVaultGet(SHARED_APNS_KEY_ID_NAME))?.trim();
   return id && /^[A-Z0-9]{10}$/.test(id) ? id : null;
 }
 
 /** The read itself, away from the cache check. */
 async function readVaultFromVault(pin: string, retryMs: number, generation: number): Promise<VaultKey> {
-  const p8 = await fleetSecretsGet(apnsVaultName(pin || undefined));
+  const p8 = await scopedVaultGet(apnsVaultName(pin || undefined));
   // The entry is stamped when the read FINISHED, not when it started.  A read
   // that runs longer than the retry window would otherwise leave an
   // already-expired entry behind, and the very next caller — `refreshConfig`
@@ -244,7 +264,10 @@ async function resolveP8(binding?: ApnsScopedBinding): Promise<{ p8: string; ori
       return null;
     }
   }
-  // A caller-supplied scoped binding replaces the fleet-secrets read. Without one, the path below is unchanged.
+  // A caller-supplied scoped binding replaces the vault read.  Without one,
+  // the path below reads through the shared scoped reader, and there is no
+  // other route:  a bad binding never falls through to it, and a missing
+  // grant never becomes a guess.
   if (binding) {
     const got = await loadScopedApnsMaterial(binding, {
       pin: pinned ?? "",
@@ -2594,7 +2617,8 @@ export function watchHarnessNotifications(options: {
     if (discovered) resumeIdleQueues();
     if (!discovered && !warnedMissing) {
       warnedMissing = true;
-      console.warn("companion: APNs key missing; closed-app phone wake is off until it appears");
+      const reason = vaultReadReason ? ` (${vaultReadReason})` : "";
+      console.warn(`companion: APNs key missing${reason}; closed-app phone wake is off until it appears`);
     }
     return discovered;
   };

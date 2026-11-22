@@ -19,13 +19,14 @@
 #   --print-for PLAT    Print a paste-ready MCP config snippet for PLAT
 #                       (none|json|claude-code|cursor|antigravity|grok|codex)
 #   --check-only        Verify the session already stored (--out file when given, otherwise
-#                       `fleet-secrets get COMPOSIO_SESSION_ID --path /composio-session-id`); do not mint
+#                       the scoped reader's COMPOSIO_SESSION_ID read in
+#                       /composio-session-id); do not mint
 #   --no-persist        Don't write to --out (use for one-off inspection)
 #   -h, --help          This help
 #
 # API key resolution order:
 #   1. $COMPOSIO_API_KEY env
-#   2. `fleet-secrets get COMPOSIO_API_KEY` (Mac, when the helper is installed)
+#   2. the shared scoped reader (Mac, when the reader is installed)
 
 set -euo pipefail
 
@@ -33,7 +34,25 @@ USER_ID="jay-fleet"
 OUT=""
 SESSION_FOLDER="/composio-session-id"
 SESSION_KEY="COMPOSIO_SESSION_ID"
-FLEET_SECRETS="${FLEET_SECRETS_BIN:-fleet-secrets}"
+
+# The shared scoped reader helper.  It resolves the reader, names the
+# consumer's own account and fails closed when there is no reader or no
+# grant:  the value reaches stdout and nothing else does.  A helper that is
+# not there refuses the read rather than stopping the script.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FLEET_INFISICAL_HELPER="$ROOT/scripts/lib/fleet-infisical-read.sh"
+if [ -f "$FLEET_INFISICAL_HELPER" ]; then
+  . "$FLEET_INFISICAL_HELPER"
+else
+  fleet_secret_get() {
+    echo "the scoped reader helper is not installed at ${FLEET_INFISICAL_HELPER}" >&2
+    return 4
+  }
+fi
+# The Composio credential's own read-only service token.  A grant covers
+# exactly one folder, so the session and the API key each name their own.
+COMPOSIO_SECRET_ACCOUNT="${FLEET_INFISICAL_COMPOSIO_ACCOUNT:-}"
+COMPOSIO_SESSION_ACCOUNT="${FLEET_INFISICAL_COMPOSIO_SESSION_ACCOUNT:-}"
 PRINT_FOR="none"
 CHECK_ONLY=0
 PERSIST=1
@@ -56,14 +75,10 @@ resolve_api_key() {
   if [[ -n "${COMPOSIO_API_KEY:-}" ]]; then
     printf "%s" "$COMPOSIO_API_KEY"; return 0
   fi
-  if ! command -v "$FLEET_SECRETS" &>/dev/null; then
-    echo "COMPOSIO_API_KEY not set and fleet-secrets is not installed" >&2
-    return 1
-  fi
   local key
-  key="$("$FLEET_SECRETS" get COMPOSIO_API_KEY 2>/dev/null)" || key=""
+  key="$(fleet_secret_get COMPOSIO_API_KEY "/" "$COMPOSIO_SECRET_ACCOUNT" 2>/dev/null)" || key=""
   if [[ -z "$key" ]]; then
-    echo "COMPOSIO_API_KEY not set and fleet-secrets get returned nothing" >&2
+    echo "COMPOSIO_API_KEY not set and the scoped reader returned nothing" >&2
     return 1
   fi
   printf "%s" "$key"
@@ -219,7 +234,7 @@ main() {
       fi
       stored="$(cat "$OUT")"
     else
-      stored="$("$FLEET_SECRETS" get "$SESSION_KEY" --path "$SESSION_FOLDER" 2>/dev/null)" || stored=""
+      stored="$(fleet_secret_get "$SESSION_KEY" "$SESSION_FOLDER" "$COMPOSIO_SESSION_ACCOUNT" 2>/dev/null)" || stored=""
       if [[ -z "$stored" ]]; then
         echo "check-only: no stored session (Infisical ${SESSION_FOLDER} ${SESSION_KEY} is missing or unreadable)" >&2
         exit 1

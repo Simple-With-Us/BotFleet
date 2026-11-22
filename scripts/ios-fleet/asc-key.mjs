@@ -2,7 +2,7 @@
 // for the Apple tools, and how the client takes it.
 //
 // The private key is a secret, and the approved secret sources are the
-// process environment, a captured `fleet-secrets get NAME` and bootstrap-only
+// process environment, a captured scoped-reader read and bootstrap-only
 // Keychain credentials.  A path on disk is not one of them, so the node client
 // never reads a key file.  This module is the part of that handoff the shell
 // layer needs:  it validates a PEM and it stages the key for the Apple tools
@@ -18,7 +18,7 @@
 //     parent directory is not owner-only, so a credential can never land in a
 //     shared or durable place;
 //   - never read back as a credential:  the credential comes from the
-//     environment or from fleet-secrets, and the staged file is a
+//     environment or from the scoped reader, and the staged file is a
 //     materialisation for the Apple tools, nothing more.
 //
 // A key on stdout is a key in a log, in a CI transcript and in whatever
@@ -255,8 +255,8 @@ export function writePrivateKeyFile(keyPath, value) {
 // wholesale copy hands every credential on the operator's machine to the
 // child, including the ones that have nothing to do with App Store Connect.
 // These are the variables the client reads (see resolveCredential in
-// asc-api.mjs), plus PATH and HOME, which it needs to find fleet-secrets and
-// to reach the bootstrap Keychain.
+// asc-api.mjs), plus PATH and HOME, which it needs to find the scoped reader
+// and to reach the bootstrap Keychain.
 export const CLIENT_ENV_ALLOWLIST = [
   "PATH",
   "HOME",
@@ -270,8 +270,8 @@ export const CLIENT_ENV_ALLOWLIST = [
   "APPLE_API_KEY_ID",
   "APPLE_API_ISSUER_ID",
   "APPLE_API_KEY_P8_BASE64",
-  "FLEET_SECRETS_BIN",
-  "FLEET_SECRETS"
+  "FLEET_INFISICAL_READER",
+  "FLEET_INFISICAL_ASC_ACCOUNT"
 ];
 
 // Builds the environment a child of the key handoff runs with.

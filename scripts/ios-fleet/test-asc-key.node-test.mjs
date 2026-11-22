@@ -2,7 +2,7 @@
 // for the Apple tools, and how the client takes it.
 //
 // The private key is a secret, and the approved secret sources are the process
-// environment, a captured `fleet-secrets get NAME` and bootstrap-only Keychain
+// environment, a captured scoped-reader read and bootstrap-only Keychain
 // credentials.  A caller-supplied file is not one of them, so the node client
 // never reads a key file:  the shell layer that owns the credential writes a
 // short-lived mode-600 copy and hands the key over in the environment.  These

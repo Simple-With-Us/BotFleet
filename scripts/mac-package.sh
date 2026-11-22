@@ -16,7 +16,7 @@
 #
 # Signing material is never read from this repo and never printed.  The Apple
 # notarization credentials are resolved in the fleet's approved order: the
-# environment first, then Infisical through `fleet-secrets get`, and only then
+# environment first, then Infisical through the scoped reader, and only then
 # this machine's own notarytool keychain profile, which is a bootstrap
 # identity rather than a shared secret store:
 #   APPLE_API_KEY_P8   App Store Connect API private key (PEM)
@@ -26,7 +26,7 @@
 #   SPARKLE_EDDSA_KEY  sign_update private key file; required with
 #                       sign_update on PATH for distributable packaging
 #   SENTRY_DSN         native Sentry DSN (BF-2541); environment first, then
-#                       Infisical through `fleet-secrets get`, never printed.
+#                       Infisical through the scoped reader, never printed.
 #                       Empty is fine: the package ships with Sentry inert,
 #                       exactly like the release workflow.
 #
@@ -43,6 +43,29 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/release-native"
+
+# The shared scoped reader helper.  It resolves the reader, names the
+# consumer's own account and fails closed when there is no reader or no
+# grant:  the value reaches stdout and nothing else does.  A helper that is
+# not there refuses the read rather than stopping the packaging run.
+FLEET_INFISICAL_HELPER="$ROOT/scripts/lib/fleet-infisical-read.sh"
+if [ -f "$FLEET_INFISICAL_HELPER" ]; then
+  . "$FLEET_INFISICAL_HELPER"
+else
+  fleet_secret_get() {
+    echo "the scoped reader helper is not installed at ${FLEET_INFISICAL_HELPER}" >&2
+    return 4
+  }
+fi
+
+# Where the notarization credentials live, and which account reads them.
+# The account is the consumer's own read-only service token; a grant covers
+# exactly one folder, so it is named here rather than guessed at runtime.
+NOTARY_SECRET_FOLDER="/botfleet-server"
+NOTARY_SECRET_ACCOUNT="${FLEET_INFISICAL_BOTFLEET_SERVER_SECRET_ACCOUNT:-}"
+# The Sentry DSN lives in its own folder, with its own account.
+SENTRY_SECRET_FOLDER="/botfleet-sentry"
+SENTRY_SECRET_ACCOUNT="${FLEET_INFISICAL_SENTRY_ACCOUNT:-}"
 SKIP_NOTARIZE=0
 # The native assets live on their own release tag, exactly as the workflow
 # does: release.yml owns the v<version> release, verifies that its asset set
@@ -82,14 +105,14 @@ trap cleanup EXIT
 # environment wins; Infisical is the next source; the keychain profile below
 # is the machine-identity bootstrap and the last resort.  Nothing is printed.
 resolve_notary_credentials() {
-  if [ -z "${APPLE_API_KEY_P8:-}" ] && command -v fleet-secrets >/dev/null 2>&1; then
-    APPLE_API_KEY_P8="$(fleet-secrets get APPLE_API_KEY_P8 2>/dev/null || true)"
+  if [ -z "${APPLE_API_KEY_P8:-}" ]; then
+    APPLE_API_KEY_P8="$(fleet_secret_get APPLE_API_KEY_P8 "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
   fi
-  if [ -z "${APPLE_API_KEY_ID:-}" ] && command -v fleet-secrets >/dev/null 2>&1; then
-    APPLE_API_KEY_ID="$(fleet-secrets get APPLE_API_KEY_ID 2>/dev/null || true)"
+  if [ -z "${APPLE_API_KEY_ID:-}" ]; then
+    APPLE_API_KEY_ID="$(fleet_secret_get APPLE_API_KEY_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
   fi
-  if [ -z "${APPLE_API_ISSUER_ID:-}" ] && command -v fleet-secrets >/dev/null 2>&1; then
-    APPLE_API_ISSUER_ID="$(fleet-secrets get APPLE_API_ISSUER_ID 2>/dev/null || true)"
+  if [ -z "${APPLE_API_ISSUER_ID:-}" ]; then
+    APPLE_API_ISSUER_ID="$(fleet_secret_get APPLE_API_ISSUER_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
   fi
 }
 
@@ -139,8 +162,8 @@ fi
 # Native Sentry (BF-2541): same stamping as native-mac-release.yml.  The DSN
 # resolves environment-first, then Infisical, and is never printed; an empty
 # DSN packages with Sentry inert rather than failing the build.
-if [ -z "${SENTRY_DSN:-}" ] && command -v fleet-secrets >/dev/null 2>&1; then
-  SENTRY_DSN="$(fleet-secrets get SENTRY_DSN 2>/dev/null || true)"
+if [ -z "${SENTRY_DSN:-}" ]; then
+  SENTRY_DSN="$(fleet_secret_get SENTRY_DSN "$SENTRY_SECRET_FOLDER" "$SENTRY_SECRET_ACCOUNT" 2>/dev/null || true)"
 fi
 SENTRY_DSN="${SENTRY_DSN:-}"
 SOURCE_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"

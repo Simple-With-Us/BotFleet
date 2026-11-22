@@ -313,11 +313,12 @@ test("the root is resolved physically so a pointer is not mistaken for a path", 
 // --- Infisical machine identity ----------------------------------------------
 //
 // launchd does not inherit a desktop session, so the only identity the harness
-// can recover after a restart is the pair `fleet-secrets get` returns.  These
-// tests use a private HOME with a fake $HOME/.local/bin/fleet-secrets (backed by
-// a plain NAME=value file inside the fixture) and a node stub that records only fixture-prefixed
-// values (anything else is reported as "other") so a real secret can never
-// land in the assertion output.
+// can recover after a restart is the pair the scoped reader returns.  These
+// tests use a private HOME with a fake reader at
+// $HOME/apps/infisical-scoped/infisical-scoped.py (backed by a plain
+// NAME=value file inside the fixture) and a node stub that records only
+// fixture-prefixed values (anything else is reported as "other") so a real
+// secret can never land in the assertion output.
 
 function writeIdentityNode(dir) {
   const recorder = join(dir, "record-env.mjs");
@@ -365,7 +366,7 @@ function identityFixture() {
   mkdirSync(join(serverRoot, "node_modules", "yaml"), { recursive: true });
   writeFileSync(join(serverRoot, "server", "index.ts"), "// fake entry\n");
   const home = join(dir, "home");
-  mkdirSync(join(home, ".local", "bin"), { recursive: true });
+  mkdirSync(join(home, "apps", "infisical-scoped"), { recursive: true });
   const dataDir = join(home, ".botfleet");
   mkdirSync(dataDir);
   writeFileSync(join(dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "remote" }));
@@ -375,7 +376,7 @@ function identityFixture() {
     home,
     dataDir,
     keys: join(dir, "fake-store"),
-    bin: join(home, ".local", "bin", "fleet-secrets"),
+    reader: join(home, "apps", "infisical-scoped", "infisical-scoped.py"),
     report: join(dir, "env-report"),
     node: writeIdentityNode(dir),
     ledger: join(dir, "ledger"),
@@ -383,20 +384,31 @@ function identityFixture() {
   };
 }
 
-// Installs a fake `fleet-secrets` whose `get NAME` prints the value of the first
+// Installs a fake reader whose `get NAME` prints the value of the first
 // NAME=value line in the fixture store (no quote stripping, like the real one)
 // and exits 3 when the name is absent.
+//
+// The fake is a Python program because the helper runs a reader with
+// `python3 -I`:  a shell script cannot stand in for one.
 //
 // The placeholder values in that store stay short on purpose: the relay's
 // secret scan refuses a file whose fixture values are credential-shaped, and
 // these strings are placeholders that never stand for a real credential.
 function writeKeys(fixture, body) {
   writeFileSync(fixture.keys, body.endsWith("\n") ? body : `${body}\n`, { mode: 0o600 });
-  installFakeFleetSecrets(fixture, [
-    "#!/bin/sh",
-    '[ "$1" = get ] || exit 2',
-    `line="$(grep -m1 "^$2=" ${JSON.stringify(fixture.keys)})" || exit 3`,
-    'printf "%s" "${line#*=}"',
+  installFakeReader(fixture, [
+    'if not args or args[0] != "get":',
+    "    sys.exit(2)",
+    "name = args[1]",
+    "try:",
+    `    with open(${JSON.stringify(fixture.keys)}) as fh:`,
+    "        for line in fh:",
+    '            if line.startswith(name + "="):',
+    '                sys.stdout.write(line.split("=", 1)[1].rstrip("\\n"))',
+    "                sys.exit(0)",
+    "except OSError:",
+    "    pass",
+    "sys.exit(3)",
   ].join("\n"));
 }
 
@@ -412,9 +424,19 @@ function fakeSecurity(fixture, status) {
   return binary;
 }
 
-function installFakeFleetSecrets(fixture, script) {
-  writeFileSync(fixture.bin, `${script}\n`);
-  chmodSync(fixture.bin, 0o755);
+// Installs a fake reader:  a Python program the helper runs with `python3 -I`.
+// The body is Python, and it is the only thing the fake needs beyond the
+// argument list it was given.
+function installFakeReader(fixture, body) {
+  const source = ["import os, sys", "args = sys.argv[1:]", body].join("\n");
+  writeFileSync(fixture.reader, `${source}\n`);
+  chmodSync(fixture.reader, 0o755);
+}
+
+// A fake reader that records that it was reached and then refuses.  A test
+// that installs this one proves the launcher never called it.
+function installCalledReader(fixture, marker) {
+  installFakeReader(fixture, [`open(${JSON.stringify(marker)}, "w").close()`, "sys.exit(4)"].join("\n"));
 }
 
 function runIdentity(fixture, extraEnv = {}, { dataDir = fixture.dataDir } = {}) {
@@ -460,12 +482,12 @@ function identityReport(fixture, result) {
   );
 }
 
-test("local startup bypasses the Infisical helper", () => {
+test("local startup bypasses the Infisical reader", () => {
   const fixture = identityFixture();
   const called = join(fixture.dir, "helper-called");
   try {
     writeFileSync(join(fixture.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
-    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    installCalledReader(fixture, called);
     const got = identityReport(fixture, runIdentity(fixture));
     assert.equal(existsSync(called), false);
     assert.equal(got.INFISICAL_TOKEN, "unset");
@@ -497,7 +519,7 @@ test("a helper binary with no enrollment and no choice starts this Mac and reads
   const called = join(fixture.dir, "helper-called");
   try {
     rmSync(join(fixture.dataDir, "startup-enrollment.json"));
-    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    installCalledReader(fixture, called);
     const result = runIdentity(fixture);
     assert.equal(result.status, 0);
     assert.match(result.stdout, /without Infisical bootstrap/);
@@ -515,7 +537,7 @@ test("a saved remote enrollment answers remote and reads the helper", () => {
   const called = join(fixture.dir, "helper-called");
   try {
     writeFileSync(join(fixture.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "remote" }));
-    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    installCalledReader(fixture, called);
     const result = runIdentity(fixture);
     assert.equal(result.status, 0);
     assert.match(result.stdout, /with the Infisical bootstrap/);
@@ -530,7 +552,7 @@ test("an explicit operator opt-in answers remote and reads the helper", () => {
   const called = join(fixture.dir, "helper-called");
   try {
     rmSync(join(fixture.dataDir, "startup-enrollment.json"));
-    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    installCalledReader(fixture, called);
     const result = runIdentity(fixture, { BOTFLEET_STARTUP_ENROLLMENT: "remote" });
     assert.equal(result.status, 0);
     assert.match(result.stdout, /with the Infisical bootstrap/);
@@ -546,7 +568,7 @@ test("the operator opt-in marker file answers remote and reads the helper", () =
   try {
     rmSync(join(fixture.dataDir, "startup-enrollment.json"));
     writeFileSync(join(fixture.dataDir, "startup-infisical.opt-in"), "");
-    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    installCalledReader(fixture, called);
     const result = runIdentity(fixture);
     assert.equal(result.status, 0);
     assert.match(result.stdout, /with the Infisical bootstrap/);
@@ -563,7 +585,7 @@ test("a Mac holding the Keychain enrollment keeps remote startup", () => {
   const called = join(fixture.dir, "helper-called");
   try {
     rmSync(join(fixture.dataDir, "startup-enrollment.json"));
-    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    installCalledReader(fixture, called);
     const result = runIdentity(fixture, { BOTFLEET_SECURITY_BIN: fakeSecurity(fixture, 0) });
     assert.equal(result.status, 0);
     assert.match(result.stdout, /with the Infisical bootstrap/);
@@ -582,7 +604,7 @@ test("a Keychain that cannot be read fails closed to local", () => {
   const called = join(fixture.dir, "helper-called");
   try {
     rmSync(join(fixture.dataDir, "startup-enrollment.json"));
-    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    installCalledReader(fixture, called);
     const result = runIdentity(fixture, { BOTFLEET_SECURITY_BIN: fakeSecurity(fixture, 1) });
     assert.equal(result.status, 0);
     assert.match(result.stdout, /without Infisical bootstrap/);
@@ -598,7 +620,7 @@ test("a host already holding an Infisical identity keeps remote startup without 
     const called = join(fixture.dir, "helper-called");
     try {
       rmSync(join(fixture.dataDir, "startup-enrollment.json"));
-      installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+      installCalledReader(fixture, called);
       const result = runIdentity(fixture, env);
       assert.equal(result.status, 0);
       assert.doesNotMatch(result.stdout, /startup setup is required/);
@@ -616,7 +638,7 @@ test("an explicit local choice wins over every legacy identity source", () => {
   const called = join(local.dir, "helper-called");
   try {
     writeFileSync(join(local.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
-    installFakeFleetSecrets(local, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    installCalledReader(local, called);
     const result = runIdentity(local, { INFISICAL_TOKEN: "st.legacy", BOTFLEET_SECURITY_BIN: fakeSecurity(local, 0) });
     assert.match(result.stdout, /without Infisical bootstrap/);
     assert.equal(existsSync(called), false);
@@ -633,7 +655,7 @@ test("an explicit operator opt-in overrides a saved local choice", () => {
   const called = join(fixture.dir, "helper-called");
   try {
     writeFileSync(join(fixture.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
-    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    installCalledReader(fixture, called);
     const result = runIdentity(fixture, { BOTFLEET_STARTUP_ENROLLMENT: "remote" });
     assert.equal(result.status, 0);
     assert.match(result.stdout, /with the Infisical bootstrap/);
@@ -648,7 +670,7 @@ test("an explicit local operator choice overrides a saved remote choice", () => 
   const called = join(fixture.dir, "helper-called");
   try {
     writeFileSync(join(fixture.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "remote" }));
-    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    installCalledReader(fixture, called);
     const result = runIdentity(fixture, { BOTFLEET_STARTUP_ENROLLMENT: "local" });
     assert.equal(result.status, 0);
     assert.match(result.stdout, /without Infisical bootstrap/);
@@ -664,7 +686,7 @@ test("the operator opt-in marker file overrides a saved local choice", () => {
   try {
     writeFileSync(join(fixture.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
     writeFileSync(join(fixture.dataDir, "startup-infisical.opt-in"), "");
-    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    installCalledReader(fixture, called);
     const result = runIdentity(fixture);
     assert.equal(result.status, 0);
     assert.match(result.stdout, /with the Infisical bootstrap/);
@@ -707,7 +729,7 @@ test("an explicit local operator choice wins over the Keychain enrollment", () =
   const called = join(local.dir, "helper-called");
   try {
     rmSync(join(local.dataDir, "startup-enrollment.json"));
-    installFakeFleetSecrets(local, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    installCalledReader(local, called);
     const result = runIdentity(local, { BOTFLEET_STARTUP_ENROLLMENT: "local", BOTFLEET_SECURITY_BIN: fakeSecurity(local, 0) });
     assert.match(result.stdout, /without Infisical bootstrap/);
     assert.equal(existsSync(called), false);
@@ -731,7 +753,7 @@ test("invalid startup preferences fail closed before helper access", () => {
   const fixture = identityFixture();
   const called = join(fixture.dir, "helper-called");
   try {
-    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    installCalledReader(fixture, called);
     for (const body of ["{", "x".repeat(1025), "null", JSON.stringify({ version: 2, mode: "remote" }),
       JSON.stringify({ version: 1, mode: "remote", extra: true })]) {
       writeFileSync(join(fixture.dataDir, "startup-enrollment.json"), body);
@@ -891,7 +913,7 @@ test("a store with no identity does not export empty strings", () => {
   }
 });
 
-test("a half pair from fleet-secrets is not exported", () => {
+test("a half pair from the scoped reader is not exported", () => {
   const fixture = identityFixture();
   try {
     writeKeys(fixture, "INFISICAL_CLIENT_ID=fixture-only-id\n");
@@ -903,7 +925,7 @@ test("a half pair from fleet-secrets is not exported", () => {
   }
 });
 
-test("an identity already in the environment is not replaced by fleet-secrets", () => {
+test("an identity already in the environment is not replaced by the scoped reader", () => {
   const fixture = identityFixture();
   try {
     writeKeys(
@@ -921,7 +943,7 @@ test("an identity already in the environment is not replaced by fleet-secrets", 
   }
 });
 
-test("a missing fleet-secrets still forwards an identity the environment already holds", () => {
+test("a missing reader still forwards an identity the environment already holds", () => {
   const fixture = identityFixture();
   try {
     const got = identityReport(fixture, runIdentity(fixture, {
@@ -935,10 +957,10 @@ test("a missing fleet-secrets still forwards an identity the environment already
   }
 });
 
-test("a failing fleet-secrets does not stop the harness", () => {
+test("a failing reader does not stop the harness", () => {
   const fixture = identityFixture();
   try {
-    installFakeFleetSecrets(fixture, "#!/bin/sh\nexit 4");
+    installFakeReader(fixture, "sys.exit(4)");
     const got = identityReport(fixture, runIdentity(fixture));
     assert.equal(got.INFISICAL_CLIENT_ID, "unset");
     assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");

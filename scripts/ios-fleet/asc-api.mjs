@@ -10,9 +10,9 @@
  *      base64, so it is decoded into a 0600 temp file and removed on exit)
  *   2. ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 in the environment (the form
  *      the shell layer hands the key over in)
- *   3. Infisical Fleet-OPS through `fleet-secrets` (the Mac): /asc holds
- *      ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8 (the PEM), kept in memory
- *      only (AFC-359: the retired secrets folder is never read)
+ *   3. Infisical Fleet-OPS through the shared scoped reader (the Mac): /asc
+ *      holds ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8 (the PEM), kept in
+ *      memory only (AFC-359: the retired secrets folder is never read)
  *
  * ASC_KEY_PATH IS NOT A CREDENTIAL SOURCE (AFC-459, Kody rule 42 on the
  * CodeCaps PR #271 review):  a path on disk is not an approved secret
@@ -40,10 +40,11 @@
 import { readFileSync, writeFileSync, mkdtempSync, rmSync, chmodSync, realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash, createSign } from "node:crypto";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { readFleetSecret } from "../lib/fleet-infisical-read.mjs";
 import { normalizePrivateKey } from "./asc-key.mjs";
 import { nextSharedBuild } from "./shared-build.mjs";
 import {
@@ -54,19 +55,18 @@ import {
   parsePatch
 } from "./version-plan.mjs";
 
-// Reads one value from Infisical Fleet-OPS through fleet-secrets.  Returns ""
-// when absent or unreadable;  never prints the value or the tool's stderr.
-// FLEET_SECRETS_BIN is the test seam.
-function fleetSecretsGet(name, folder) {
-  const bin = process.env.FLEET_SECRETS_BIN || join(homedir(), ".local", "bin", "fleet-secrets");
-  try {
-    return execFileSync(bin, ["get", name, "--path", folder], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).replace(/\n$/, "");
-  } catch {
-    return "";
-  }
+// The App Store Connect credential's own read-only service token, and the
+// folder its names live in.  A grant covers exactly one folder, so both are
+// named here rather than guessed at runtime.
+const ASC_SECRET_FOLDER = "/asc";
+const ASC_SECRET_ACCOUNT = process.env.FLEET_INFISICAL_ASC_ACCOUNT || "fleet-tools-mm-asc-ro";
+
+// Reads one value from Infisical Fleet-OPS through the shared scoped reader.
+// Returns "" when absent or unreadable;  never prints the value or the
+// reader's stderr.  FLEET_INFISICAL_READER is the test seam.
+function scopedRead(name, folder, account) {
+  const got = readFleetSecret(name, folder, account);
+  return got.code === 0 && got.value !== null ? got.value : "";
 }
 
 function base64url(input) {
@@ -78,7 +78,7 @@ function base64url(input) {
 // ---------------------------------------------------------------------------
 // WHY THERE ARE SEVERAL SOURCES (fixed 2026-10-02):
 // .github/workflows/ios-ship.yml runs on a GitHub-hosted macos-latest runner,
-// which has no Infisical machine identity or fleet-secrets.  The credential reaches that
+// which has no Infisical machine identity or scoped reader.  The credential reaches that
 // runner as THREE ENVIRONMENT VARIABLES -- APPLE_API_KEY_ID,
 // APPLE_API_ISSUER_ID and APPLE_API_KEY_P8_BASE64 -- exported into $GITHUB_ENV
 // by .github/actions/infisical-secrets.  Reading only the file meant the key
@@ -169,7 +169,7 @@ function resolveCredential() {
   }
 
   // 2) The same secret as a plain environment variable.  This is the form
-  //    fleet-secrets hands out, and the form the shell layer uses when it
+  //    the scoped reader hands out, and the form the shell layer uses when it
   //    hands a staged key to this client.
   if (envKeyId && envIssuer && envKeyPem) {
     const pem = normalizePrivateKey(envKeyPem);
@@ -186,18 +186,20 @@ function resolveCredential() {
   //    writes a staged key and exports it as ASC_KEY_P8.  Step 4 reads
   //    Infisical directly, so a local operator needs nothing exported at all.
 
-  // 4) The Mac: Infisical Fleet-OPS through fleet-secrets, in memory only.
-  //    A hosted runner has no fleet-secrets, so this finds nothing there and
-  //    falls through to the "tried" message.
-  const ascKid = fleetSecretsGet("ASC_KEY_ID", "/asc");
+  // 4) The Mac: Infisical Fleet-OPS through the shared scoped reader, in
+  //    memory only.  A hosted runner has no reader, so this finds nothing
+  //    there and falls through to the "tried" message.
+  const ascKid = scopedRead("ASC_KEY_ID", ASC_SECRET_FOLDER, ASC_SECRET_ACCOUNT);
   const kid = envKeyId || ascKid;
-  const iss = envIssuer || fleetSecretsGet("ASC_ISSUER_ID", "/asc");
+  const iss = envIssuer || scopedRead("ASC_ISSUER_ID", ASC_SECRET_FOLDER, ASC_SECRET_ACCOUNT);
   if (kid && iss) {
     // /asc holds one key.  An environment key id that differs from it has no
     // Infisical copy, so it falls through to the "tried" message.
-    const pem = kid === ascKid ? normalizePrivateKey(fleetSecretsGet("ASC_KEY_P8", "/asc")) : null;
+    const pem = kid === ascKid
+      ? normalizePrivateKey(scopedRead("ASC_KEY_P8", ASC_SECRET_FOLDER, ASC_SECRET_ACCOUNT))
+      : null;
     if (pem) {
-      return { keyId: kid.trim(), issuerId: iss.trim(), privateKeyPem: pem, source: "Infisical (fleet-secrets)" };
+      return { keyId: kid.trim(), issuerId: iss.trim(), privateKeyPem: pem, source: "Infisical (scoped reader)" };
     }
   }
 
@@ -933,7 +935,7 @@ async function main() {
       "asc-auth: no App Store Connect credential found. Tried, in order:\n" +
       "  1) APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_P8_BASE64 in the environment\n" +
       "  2) ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 in the environment\n" +
-      "  3) Infisical /asc (fleet-secrets)\n" +
+      "  3) Infisical /asc (scoped reader)\n" +
       "  A path in ASC_KEY_PATH is not a credential source:  the shell layer that owns the\n" +
       "  credential hands the key over in ASC_KEY_P8." +
       (RESOLUTION_NOTES.length

@@ -133,7 +133,8 @@ describe("scoped APNs binding", () => {
     delete process.env.APNS_KEY_ID;
     delete process.env.APNS_VAULT_READ_TIMEOUT_MS;
     delete process.env.APNS_VAULT_RETRY_MS;
-    process.env.FLEET_SECRETS_BIN = "/nonexistent/fleet-bin";
+    process.env.FLEET_INFISICAL_READER = "/nonexistent/reader.py";
+    process.env.APNS_INFISICAL_ACCOUNT = "fixture-apns-ro";
     dir = mkdtempSync(join(tmpdir(), "apns-scoped-"));
     resetApnsKeyCache();
   });
@@ -365,12 +366,13 @@ describe("scoped APNs binding", () => {
     expect(calls).toBe(0);
   });
 
-  it("fails closed on a bad binding and does not fall through to fleet-secrets", async () => {
+  it("fails closed on a bad binding and does not fall through to the scoped reader", async () => {
     const marker = join(dir, "called");
-    const bin = join(dir, "fleet-secrets");
-    writeFileSync(bin, `#!/bin/sh\necho called > '${marker}'\nexit 3\n`);
+    // The reader is a Python program:  the companion runs it with `python3 -I`.
+    const bin = join(dir, "infisical-scoped.py");
+    writeFileSync(bin, `import sys\nopen(${JSON.stringify(marker)}, "w").write("called")\nsys.exit(3)\n`);
     chmodSync(bin, 0o755);
-    process.env.FLEET_SECRETS_BIN = bin;
+    process.env.FLEET_INFISICAL_READER = bin;
     let secrets = 0;
     const fetchImpl: ApnsScopedFetch = async (url) => {
       if (new URL(url).pathname.includes("/secrets/")) secrets += 1;
@@ -384,10 +386,14 @@ describe("scoped APNs binding", () => {
 
   it.skipIf(process.platform === "win32")("does not call fetch when the scoped binding is omitted", async () => {
     const marker = join(dir, "called");
-    const bin = join(dir, "fleet-secrets");
-    writeFileSync(bin, `#!/bin/sh\necho called > '${marker}'\ncat <<'PEM'\n${P8}PEM\n`);
+    // The reader is a Python program:  the companion runs it with `python3 -I`.
+    const bin = join(dir, "infisical-scoped.py");
+    writeFileSync(
+      bin,
+      `import sys\nopen(${JSON.stringify(marker)}, "w").write("called")\nsys.stdout.write(${JSON.stringify(P8)})\n`,
+    );
     chmodSync(bin, 0o755);
-    process.env.FLEET_SECRETS_BIN = bin;
+    process.env.FLEET_INFISICAL_READER = bin;
     const original = globalThis.fetch;
     let network = 0;
     const replacement: typeof fetch = async () => {

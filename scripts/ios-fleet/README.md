@@ -42,7 +42,7 @@ Hosted signing comes from existing repo Actions secrets
 checks the p8 and imports the Distribution identity (the ship step decodes
 the APPLE_API_* names into a private temp file).  On Jay's Mac the ASC key
 comes from Infisical Fleet-OPS `/asc` (`ASC_KEY_ID`, `ASC_ISSUER_ID`,
-`ASC_KEY_P8`) through `fleet-secrets`.  Do not mint a new App Store Connect key.  CI invokes the
+`ASC_KEY_P8`) through the shared scoped reader.  Do not mint a new App Store Connect key.  CI invokes the
 wrapper with no extra flags.
 
 The `.xcodeproj` is gitignored; hosted ships must run `xcodegen generate`

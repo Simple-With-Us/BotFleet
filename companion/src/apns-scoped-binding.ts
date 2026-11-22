@@ -1,6 +1,6 @@
 // Opt-in APNs key read through a caller-supplied read-only service token.
 // The default companion path does not call this module. Nothing here reads
-// the environment, fleet-secrets, or a shared machine identity.
+// the environment, the scoped reader, or a shared machine identity.
 import { createHash } from "node:crypto";
 
 import { isJsonBoolean, isJsonObject, isJsonString, type JsonObject, type JsonValue } from "./json.ts";
