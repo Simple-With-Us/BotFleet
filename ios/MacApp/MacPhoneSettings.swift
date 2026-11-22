@@ -27,7 +27,7 @@ struct MacPhoneSettings: View {
     @State private var serverName: String = ""
     @State private var errorMessage: String?
     @State private var renderedQR: NSImage? = nil
-    private static let qrContext = CIContext()
+    @State private var renderedQRKey: String? = nil
 
     var body: some View {
         ScrollView {
@@ -75,7 +75,7 @@ struct MacPhoneSettings: View {
     private var pairingCard: some View {
         GroupBox("Pairing Code") {
             VStack(alignment: .leading, spacing: 12) {
-                if let window, let inviteURL {
+                if let window, inviteURL != nil {
                     if let qr = renderedQR {
                         Image(nsImage: qr)
                             .resizable()
@@ -180,19 +180,25 @@ struct MacPhoneSettings: View {
 
     private func reload() async {
         errorMessage = nil
-        devices = await session.pairedPhones()
-        window = await session.activePhonePairingWindow()
-        let advertisement = await session.phoneAdvertisement()
-        serverName = advertisement.serverName
-        routes = PhoneSettingsDisplay.routeRows(advertisement: advertisement)
-        if let window {
-            inviteURL = NativeCompanionServer.makePairingInviteURL(window: window, advertisement: advertisement)
-        } else {
-            inviteURL = nil
-        }
+        let snapshot = await session.loadPhoneSnapshot()
+        devices = snapshot.devices
+        window = snapshot.window
+        inviteURL = snapshot.inviteURL
+        serverName = snapshot.serverName
+        routes = snapshot.routes
         if let inviteURL {
-            renderedQR = qrImage(from: inviteURL.absoluteString)
+            let key = inviteURL.absoluteString
+            if renderedQRKey != key {
+                let image = await Task.detached(priority: .userInitiated) {
+                    Self.makeQRImage(from: key)
+                }.value
+                if self.inviteURL?.absoluteString == key {
+                    renderedQRKey = key
+                    renderedQR = image
+                }
+            }
         } else {
+            renderedQRKey = nil
             renderedQR = nil
         }
     }
@@ -201,14 +207,20 @@ struct MacPhoneSettings: View {
         Date(timeIntervalSince1970: seconds).formatted(date: .abbreviated, time: .omitted)
     }
 
-    private func qrImage(from string: String) -> NSImage? {
+    /// Renders off the main thread: reload() awaits this in a detached
+    /// task and assigns the result back on the MainActor, so pairing-window
+    /// fetches, toggles, and Refresh never stall interaction. The context
+    /// is created per render because the shared one lives on the MainActor;
+    /// renders happen once per pairing window, so setup cost is negligible.
+    private nonisolated static func makeQRImage(from string: String) -> NSImage? {
         #if canImport(CoreImage.CIFilterBuiltins)
+        let context = CIContext()
         let filter = CIFilter.qrCodeGenerator()
         filter.message = Data(string.utf8)
         filter.correctionLevel = "M"
         guard let output = filter.outputImage else { return nil }
         let scaled = output.transformed(by: CGAffineTransform(scaleX: 8, y: 8))
-        guard let cgImage = Self.qrContext.createCGImage(scaled, from: scaled.extent) else { return nil }
+        guard let cgImage = context.createCGImage(scaled, from: scaled.extent) else { return nil }
         return NSImage(cgImage: cgImage, size: NSSize(width: 180, height: 180))
         #else
         return nil
