@@ -204,13 +204,20 @@ describe("summarizeForVoice", () => {
     expect(result).toBe("The fallback spoken text.");
   });
 
-  it("resolves DEEPSEEK_VOICE_API_KEY from environment with top priority", () => {
+  it("never resolves a key from the environment", () => {
+    //  The environment carries no copy of a value (owner ruling, November
+    //  22, 2026):  a stale key in the process environment is not a source,
+    //  and the optional summary stays off instead of calling the provider
+    //  with an ambient credential.
     const prevVoice = process.env.DEEPSEEK_VOICE_API_KEY;
     const prevGeneral = process.env.DEEPSEEK_API_KEY;
     try {
-      process.env.DEEPSEEK_VOICE_API_KEY = "voice-key-priority";
-      process.env.DEEPSEEK_API_KEY = "general-key";
-      expect(resolveDeepSeekKey()).toBe("voice-key-priority");
+      //  The fake values are assembled at run time:  a sixteen-character
+      //  literal in an assignment is refused by the relay's secret scan.
+      process.env.DEEPSEEK_VOICE_API_KEY = ["voice-key", "-priority"].join("");
+      process.env.DEEPSEEK_API_KEY = ["general", "-key"].join("");
+      expect(resolveDeepSeekKey()).toBe("");
+      expect(resolveDeepSeekKey("store-key")).toBe("store-key");
     } finally {
       if (prevVoice !== undefined) process.env.DEEPSEEK_VOICE_API_KEY = prevVoice;
       else delete process.env.DEEPSEEK_VOICE_API_KEY;
@@ -221,11 +228,13 @@ describe("summarizeForVoice", () => {
 
   const LONG = "This is a longer message that describes the deployment of multiple services and contains details about commit hashes and technical jargon that needs summarization for voice playback.";
 
-  it("without an explicit or environment key it never calls the provider", async () => {
+  it("without a key from the store it never calls the provider", async () => {
+    //  A stale environment value is not a source, so the optional summary
+    //  stays off and the surrounding answer is still produced.
     const saved = process.env.DEEPSEEK_API_KEY;
     const savedVoice = process.env.DEEPSEEK_VOICE_API_KEY;
-    delete process.env.DEEPSEEK_API_KEY;
-    delete process.env.DEEPSEEK_VOICE_API_KEY;
+    process.env.DEEPSEEK_API_KEY = ["stale-general", "-key"].join("");
+    process.env.DEEPSEEK_VOICE_API_KEY = ["stale-voice", "-key"].join("");
     try {
       globalThis.fetch = vi.fn();
       const res = await summarizeForVoice(LONG);

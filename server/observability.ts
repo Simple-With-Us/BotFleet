@@ -19,7 +19,6 @@ import {
   isSentryActive,
   MALFORMED_DSN_MESSAGE,
   SENTRY_DELIVERY_NOT_READY_MESSAGE,
-  sentryDsnFromEnv,
   sentryRuntimeState,
   type SentryRuntimeInput,
   type SentrySource,
@@ -91,21 +90,20 @@ class ObservabilityManager {
     return secretSource("observability.sentryDsn") === "infisical";
   }
 
-  /** The secret store, then env, then config, then nothing.  Env wins over
-   * the config file so a CI runner or the LaunchAgent can pin a DSN; Settings
-   * then shows "Environment" as the source and disables the field rather than
-   * pretending it is editable.  The store outranks both for the one name it
-   * can hold, because a rotated value there is the whole point of putting it
-   * there. */
+  /** The store, then the app's own settings, then nothing.
+   *
+   * The environment is not a source (owner ruling, November 22, 2026):  a
+   * DSN the process inherited is never read, and the store outranks the
+   * file for the one name it can hold, because a rotated value there is the
+   * whole point of putting it there. */
   private resolve(): SentryRuntimeInput {
     const settings = this.settings();
-    const envDsn = sentryDsnFromEnv();
     const fromVault = this.dsnFromVault();
-    const dsn = fromVault ? settings.dsn : (envDsn ?? settings.dsn);
-    // The SDK only ever sees the three original sources; a vault DSN travels
-    // as "config" because that is where `loadConfig()` put it.  `getStatus()`
-    // is where the operator-facing fourth answer is told apart.
-    const source: SentrySource = fromVault ? "config" : envDsn ? "env" : settings.dsn ? "config" : "none";
+    const dsn = settings.dsn;
+    // The SDK only ever sees the config; a vault DSN travels as "config"
+    // because that is where `loadConfig()` put it.  `getStatus()` is where
+    // the operator-facing fourth answer is told apart.
+    const source: SentrySource = fromVault ? "config" : settings.dsn ? "config" : "none";
     return {
       dsn: dsn ?? null,
       enabled: settings.enabled,

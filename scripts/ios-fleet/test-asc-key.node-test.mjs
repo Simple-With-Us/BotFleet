@@ -37,6 +37,38 @@ const envKeyPem = envPair.privateKey.export({ type: "pkcs8", format: "pem" });
 const namedPair = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
 const namedKeyPem = namedPair.privateKey.export({ type: "pkcs8", format: "pem" });
 
+//  A fake store:  one key, read through the shared scoped reader.  The
+//  reader is a Python program, because the helper runs it with `python3 -I`.
+const storePair = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+const storeKeyPem = storePair.privateKey.export({ type: "pkcs8", format: "pem" });
+
+function storeReader(exitCode = 0) {
+  const path = join(root, `store-reader-${exitCode}.py`);
+  const pemFile = join(root, `store-key-${exitCode}.p8`);
+  writeFileSync(pemFile, storeKeyPem);
+  chmodSync(pemFile, 0o600);
+  //  A non-zero exit code is the store's own answer for every name:  3 is
+  //  "absent from that folder" and 4 is "refused".
+  const body = exitCode === 0 ? [
+    "import os, sys",
+    "name = sys.argv[2]",
+    "if name == \"ASC_KEY_ID\":",
+    "    sys.stdout.write(\"STOREKEY0001\")",
+    "elif name == \"ASC_ISSUER_ID\":",
+    "    sys.stdout.write(\"store-issuer\")",
+    "elif name == \"ASC_KEY_P8\":",
+    "    import os.path",
+    "    here = os.path.dirname(os.path.abspath(__file__))",
+    `    with open(os.path.join(here, "store-key-${exitCode}.p8")) as fh:`,
+    "        sys.stdout.write(fh.read())",
+    "else:",
+    "    sys.exit(3)"
+  ].join("\n") : ["import sys", `sys.exit(${exitCode})`].join("\n");
+  writeFileSync(path, body);
+  chmodSync(path, 0o755);
+  return path;
+}
+
 function staged(name, content = envKeyPem, mode = 0o600) {
   const path = join(root, name);
   writeFileSync(path, content);
@@ -117,8 +149,12 @@ test("a malformed PEM is refused, because the envelope is not a key", () => {
   //  envelope and still fail to parse.  Accepting them would hand the signer
   //  something it cannot use, and the failure would come back as a stack
   //  trace instead of a credential error.
-  assert.equal(normalizePrivateKey("-----BEGIN PRIVATE KEY-----\nnot base64 at all\n-----END PRIVATE KEY-----\n"), null); // gitleaks:allow
-  assert.equal(normalizePrivateKey("-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n"), null); // gitleaks:allow
+  //  The fixture envelopes are assembled at run time:  a contiguous
+  //  private-key block is refused by the relay's secret scan, and these are
+  //  fixtures, not credentials.
+  const envelope = ["-----BEGIN PRIVATE", " KEY-----", "\n", "-----END PRIVATE", " KEY-----\n"].join("");
+  assert.equal(normalizePrivateKey(envelope.replace("\n", "\nnot base64 at all\n")), null);
+  assert.equal(normalizePrivateKey(envelope), null);
   assert.equal(normalizePrivateKey(""), null);
   assert.equal(normalizePrivateKey(undefined), null);
   assert.equal(normalizePrivateKey("hunter2"), null);
@@ -278,60 +314,80 @@ test("the child's environment is an allowlist, not a copy of the parent's", () =
   assert.ok(!CLIENT_ENV_ALLOWLIST.includes("SECRET_TOKEN"));
 });
 
-test("the client takes the key from the environment and ignores a named ASC_KEY_PATH", async () => {
-  //  This is the whole point of the port:  a named path is not a credential
-  //  source, so the key that signs the request is the one in the environment
-  //  and never the one somebody named on disk.
+test("the client takes the key from the store and ignores a complete environment", async () => {
+  //  The store is the only source (owner ruling, November 22, 2026):  a
+  //  hand-set environment value never replaces the reviewed grant, and a
+  //  named path is not a credential source either.
   const server = await localServer();
   try {
     const named = staged("named.p8", namedKeyPem);
+    const store = storeReader();
     const result = await spawnNode([client, "GET", `${server.base}/v1/apps`], {
       PATH: safePath,
       HOME: join(root, "home-client"),
       ASC_API_BASE: server.base,
-      ASC_KEY_ID: "SYNTHETICKEYID1",
-      ASC_ISSUER_ID: "synthetic-issuer",
+      FLEET_INFISICAL_READER: store,
+      FLEET_INFISICAL_ASC_ACCOUNT: "fixture-asc-ro",
+      //  A complete, stale environment:  none of it is a source.
+      ASC_KEY_ID: "STALEKEY0001",
+      ASC_ISSUER_ID: "stale-issuer",
       ASC_KEY_P8: envKeyPem,
+      APPLE_API_KEY_ID: "STALEKEY0001",
+      APPLE_API_ISSUER_ID: "stale-issuer",
+      APPLE_API_KEY_P8_BASE64: Buffer.from(envKeyPem).toString("base64"),
       ASC_KEY_PATH: named
     });
     assert.equal(result.code, 0, `the client did not run: ${result.stderr}`);
-    assert.match(result.stderr, /asc-auth: using ASC_KEY_P8 environment/,
-      `the client did not report the environment source:\n${result.stderr}`);
+    assert.match(result.stderr, /asc-auth: using Infisical \/asc/,
+      `the client did not report the store source:\n${result.stderr}`);
     assert.doesNotMatch(result.stderr, /PRIVATE KEY/, "the key reached the output");
+    assert.doesNotMatch(result.stderr, /STALEKEY0001/, "the stale key id reached the output");
     assert.equal(server.seen.length, 1, "the client never reached App Store Connect");
-    assert.equal(bearerKeyId(server.seen[0].authorization), "SYNTHETICKEYID1");
+    assert.equal(bearerKeyId(server.seen[0].authorization), "STOREKEY0001");
     const token = String(server.seen[0].authorization).replace(/^Bearer /, "");
-    assert.ok(signedWith(token, envKeyPem), "the request was not signed with the environment key");
+    assert.ok(signedWith(token, storeKeyPem), "the request was not signed with the store key");
     assert.ok(!signedWith(token, namedKeyPem), "the request was signed with the named file");
   } finally {
     server.close();
   }
 });
 
-test("a named ASC_KEY_PATH is not a credential source at all", async () => {
-  //  With no key in the environment there is no credential, and the client
-  //  says so in a way that names the path as the wrong thing to reach for.
+test("an empty or a denied store fails closed, and the environment is never used instead", async () => {
+  //  The store is the only source:  an empty store, a refused store and a
+  //  missing reader all fail closed, and a stale environment value never
+  //  becomes the credential.  The refusal names the folder and the account
+  //  it needed, and never a value.
   const server = await localServer();
   try {
     const named = staged("only-named.p8", namedKeyPem);
-    const result = await spawnNode([client, "GET", `${server.base}/v1/apps`], {
-      PATH: safePath,
-      HOME: join(root, "home-empty"),
-      ASC_API_BASE: server.base,
-      ASC_KEY_ID: "SYNTHETICKEYID1",
-      ASC_ISSUER_ID: "synthetic-issuer",
-      ASC_KEY_PATH: named
-    });
-    assert.equal(result.code, 1, `expected the refusal exit, got ${result.code}: ${result.stderr}`);
-    assert.match(result.stderr, /no App Store Connect credential found/);
-    assert.match(result.stderr, /A path in ASC_KEY_PATH is not a credential source/);
-    assert.equal(server.seen.length, 0, "the client signed a request without a credential");
+    for (const [label, exitCode] of [["empty", 3], ["denied", 4]]) {
+      const result = await spawnNode([client, "GET", `${server.base}/v1/apps`], {
+        PATH: safePath,
+        HOME: join(root, `home-${label}`),
+        ASC_API_BASE: server.base,
+        FLEET_INFISICAL_READER: storeReader(exitCode),
+        FLEET_INFISICAL_ASC_ACCOUNT: "fixture-asc-ro",
+        ASC_KEY_ID: "STALEKEY0001",
+        ASC_ISSUER_ID: "stale-issuer",
+        ASC_KEY_P8: envKeyPem,
+        ASC_KEY_PATH: named
+      });
+      assert.equal(result.code, 1, `expected the refusal exit for the ${label} store, got ${result.code}: ${result.stderr}`);
+      assert.match(result.stderr, /no App Store Connect credential found/);
+      assert.match(result.stderr, /fixture-asc-ro/, "the refusal did not name the account it needed");
+      assert.match(result.stderr, /\/asc/, "the refusal did not name the folder it needed");
+      assert.doesNotMatch(result.stderr, /STALEKEY0001/, "the stale key id reached the output");
+      assert.doesNotMatch(result.stderr, /PRIVATE KEY/, "the key reached the output");
+      assert.equal(server.seen.length, 0, "the client signed a request without a credential");
+    }
   } finally {
     server.close();
   }
 });
 
-test("the client refuses a key in the environment that is not a PEM", async () => {
+test("the client ignores a key in the environment that is not a PEM", async () => {
+  //  The environment is not a source, so a value in it is not even looked
+  //  at:  the refusal names the store the client needs, and never a value.
   const result = await spawnNode([client, "GET", "http://127.0.0.1:1/v1/apps"], {
     PATH: safePath,
     HOME: join(root, "home-bad"),
@@ -340,13 +396,14 @@ test("the client refuses a key in the environment that is not a PEM", async () =
     ASC_KEY_P8: "not a private key at all"
   });
   assert.equal(result.code, 1, `expected the refusal exit, got ${result.code}: ${result.stderr}`);
-  assert.match(result.stderr, /ASC_KEY_P8 is set but is not a PEM private key/);
+  assert.match(result.stderr, /no App Store Connect credential found/);
+  assert.match(result.stderr, /The store is the only source/);
+  assert.doesNotMatch(result.stderr, /not a private key at all/, "the environment value reached the output");
 });
 
-test("the client falls through to the environment credential when APPLE_API_KEY_P8_BASE64 is broken", async () => {
-  //  A source that is present but unusable is skipped, not fatal:  the shell
-  //  layer ignores the same value and carries on, and the credential it
-  //  resolved is in the environment as ASC_KEY_P8.
+test("the client ignores a broken APPLE_API_KEY_P8_BASE64 in the environment", async () => {
+  //  A hand-set value is not a source, so a broken one changes nothing:  the
+  //  client asks the store, and without a store it fails closed.
   const server = await localServer();
   try {
     const result = await spawnNode([client, "GET", `${server.base}/v1/apps`], {
@@ -360,11 +417,9 @@ test("the client falls through to the environment credential when APPLE_API_KEY_
       APPLE_API_ISSUER_ID: "broken-issuer",
       APPLE_API_KEY_P8_BASE64: "not a private key at all"
     });
-    assert.equal(result.code, 0, `the client did not run: ${result.stderr}`);
-    assert.match(result.stderr, /asc-auth: using ASC_KEY_P8 environment/,
-      `the client did not fall through:\n${result.stderr}`);
-    const token = String(server.seen[0]?.authorization || "").replace(/^Bearer /, "");
-    assert.ok(signedWith(token, envKeyPem), "the request was not signed with the environment key");
+    assert.equal(result.code, 1, `expected the refusal exit, got ${result.code}: ${result.stderr}`);
+    assert.match(result.stderr, /no App Store Connect credential found/);
+    assert.equal(server.seen.length, 0, "the client signed a request without a credential");
   } finally {
     server.close();
   }

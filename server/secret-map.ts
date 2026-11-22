@@ -8,6 +8,15 @@
 // table and one layer above all of them: for a name the vault holds, the vault
 // wins; underneath, the existing env-versus-file ordering is untouched.
 //
+// The owner's ruling of November 22, 2026 is the rule here:  every secret
+// resolves from the store, and the environment carries no copy of a value --
+// not as a first source and not as a second one.  So when a store is
+// configured, the store owns every name in the table below:  its answer is
+// the value, and a name it does not hold is absent, with the environment
+// copy and the file copy both out of the way.  When no store is configured
+// there is no store to own the name, and the app's own configuration still
+// applies.
+//
 // Three rules keep that layer safe:
 //   1. Only a name in this table is ever applied.  A vault row called `PATH`,
 //      `NODE_ENV` or `INFISICAL_CLIENT_SECRET` cannot reach this process.
@@ -375,6 +384,17 @@ export const SECRET_FIELDS: readonly SecretFieldSpec[] = [
   },
 ] as const;
 
+/** The environment names this table manages.
+ *
+ * The config overlay asks for these:  once a store is configured, a value
+ * the environment carries for one of them is not a source, because the
+ * store owns the name (owner ruling, November 22, 2026). */
+export function mappedEnvNames(): ReadonlySet<string> {
+  const names = new Set<string>();
+  for (const spec of SECRET_FIELDS) for (const name of spec.env) names.add(name);
+  return names;
+}
+
 /** Every Infisical name this process will accept, built once from the table.
  * Knob names ride along: the snapshot is the one listing for both layers,
  * and `knob-map.ts` resolves its own rows off it. */
@@ -586,9 +606,22 @@ export function resolveSecretFields(
   snap: ReadonlyMap<string, string> | null,
 ): SecretProvenance[] {
   const rows: SecretProvenance[] = [];
+  // The store is the only source for a name it manages (owner ruling,
+  // November 22, 2026:  every secret resolves from Infisical, and the
+  // environment carries no copy of a value).  When a store is configured,
+  // an environment copy is neither a first source nor a second one:  the
+  // store's answer is the value for a name it holds, and a name it does
+  // not hold keeps the app's own configuration -- the file, which is the
+  // app's own store and never a copy of a vault value.  A host with no
+  // store configured has no store to own the name, so the environment
+  // still applies there.
+  const storeOwns = snap !== null;
   for (const spec of SECRET_FIELDS) {
+    //  The file value is the app's own store, and the config overlay above
+    //  no longer copies an environment value into it once a store is
+    //  configured, so what is here came from the file.
     const local = readField(cfg, spec) ?? "";
-    const fromEnv = envValueFor(spec, env);
+    const fromEnv = storeOwns ? undefined : envValueFor(spec, env);
     const vaultValue = snap?.get(spec.infisicalName);
 
     let source: SecretSource;

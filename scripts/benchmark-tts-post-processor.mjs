@@ -17,13 +17,11 @@ import { performance } from "node:perf_hooks";
 import { readFleetSecret } from "./lib/fleet-infisical-read.mjs";
 
 // 1. Keys come from the shared scoped reader (Mac, Infisical Fleet-OPS).  The
-//    order is this repository's own contract, the one INFISICAL.md states:
-//    the vault wins over the environment and over a file.  The store is read
-//    first and its answer is the key, and the value it returned is exported
-//    for this process afterwards.  A value the environment already carries is
-//    the second source and is used only when the store has nothing, which is
-//    what an operator's own shell is.  A missing reader, an absent name or a
-//    missing grant just means "not set".
+//    store is the only source (owner ruling, November 22, 2026:  every
+//    secret resolves from the store, and the environment carries no copy of
+//    a value).  A missing reader, an absent name or a missing grant just
+//    means "not set":  the benchmark reports the model as unavailable
+//    instead of falling back to an ambient value.
 //
 //    The account is the consumer's own read-only service token, and a grant
 //    covers exactly one folder.  It is read at call time, not at import, so a
@@ -37,13 +35,12 @@ function scopedSecret(name) {
 }
 
 /**
- * One key, resolved from the store first and from the environment second.
+ * One key, resolved from the store only.
  *
  * The names are the store's own names for the key, and `envName` is the name
  * the client below reads.  The value the store answered is exported under
- * that name, so the environment carries what the store said; a value the
- * environment already held is left alone and used only when the store has
- * nothing.
+ * that name for this process, because the client below reads it from there;
+ * a value the environment already held is never used.
  *
  * @param {string} envName the name the client reads
  * @param {...string} names the store's names for the key, in order
@@ -57,8 +54,10 @@ function secret(envName, ...names) {
       return value;
     }
   }
-  const carried = process.env[envName];
-  return carried ? carried : undefined;
+  // A value the environment already carries is not a source:  it is cleared
+  // so the client below cannot pick it up, and the key is simply not set.
+  delete process.env[envName];
+  return undefined;
 }
 
 const MINIMAX_API_KEY = secret("MINIMAX_API_KEY", "MINIMAX_API_KEY");

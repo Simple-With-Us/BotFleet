@@ -403,25 +403,28 @@ test("scheduled-ship-gate skips empty last-ship on schedule", () => {
 // runner holding a perfectly good APPLE_API_* credential in the environment
 // still could not authenticate -- and ship-testflight.sh piped asc-api.mjs's
 // stderr to /dev/null, so the reason never reached the run log.
-test("asc-api.mjs resolves its credential from all three sources", () => {
+test("asc-api.mjs resolves its credential from the store only", () => {
   const asc = read("scripts/ios-fleet/asc-api.mjs");
-  assert.match(asc, /function resolveCredential\(\)/);
-  // Source 1: the APPLE_API_* names ios-ship.yml exports from Infisical.
-  // Source 2: ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 in the environment.
-  // Source 3: Infisical through the shared scoped reader (AFC-359).
-  assert.match(asc, /APPLE_API_KEY_P8_BASE64/);
-  assert.match(asc, /process\.env\.ASC_KEY_ID/);
-  assert.match(asc, /process\.env\.ASC_KEY_P8/);
-  assert.match(asc, /scopedRead\("ASC_KEY_ID", ASC_SECRET_FOLDER, ASC_SECRET_ACCOUNT\)/);
-  assert.doesNotMatch(asc, /homedir\(\), "\.secrets"/);
-  // The base64 p8 is materialized privately and unlinked on exit.
-  assert.match(asc, /Buffer\.from\(cleaned, "base64"\)/);
-  assert.match(asc, /mkdtempSync\(join\(tmpdir\(\), "asc-key-"\)\)/);
-  assert.match(asc, /mode: 0o600/);
-  assert.match(asc, /process\.on\("exit", cleanupTempKeys\)/);
+  assert.match(asc, /function resolveCredential/);
+  // The store is the only source (owner ruling, November 22, 2026):  the
+  // environment carries no copy of a value, so none of these names is read.
+  assert.doesNotMatch(asc, /process[.]env[.]ASC_KEY_ID/);
+  assert.doesNotMatch(asc, /process[.]env[.]ASC_KEY_P8/);
+  assert.doesNotMatch(asc, /process[.]env[.]APPLE_API_KEY_ID/);
+  assert.doesNotMatch(asc, /process[.]env[.]APPLE_API_KEY_P8_BASE64/);
+  // The store is read through the shared scoped reader, with the folder and
+  // the consumer's own account (AFC-359).
+  assert.match(asc, /scopedRead[(]"ASC_KEY_ID", folder, account[)]/);
+  assert.match(asc, /scopedRead[(]"ASC_ISSUER_ID", folder, account[)]/);
+  assert.match(asc, /scopedRead[(]"ASC_KEY_P8", folder, account[)]/);
+  assert.doesNotMatch(asc, /homedir[(][)], "[.]secrets"/);
+  // The material may be a PEM or the base64 of one, and both are parsed
+  // before they are accepted.
+  assert.match(asc, /Buffer[.]from[(]cleaned, "base64"[)]/);
+  assert.match(asc, /normalizePrivateKey/);
   // Never print a value -- only the source and the key-id LENGTH.
-  assert.match(asc, /key id length \$\{cred\.keyId\.length\}/);
-  assert.doesNotMatch(asc, /console\.(log|error)\([^)]*privateKeyPem/);
+  assert.match(asc, /key id length/);
+  assert.doesNotMatch(asc, /console[.](log|error)[(][^)]*privateKeyPem/);
 });
 
 test("asc-api.mjs never reads a named path as a credential source", () => {
@@ -432,7 +435,7 @@ test("asc-api.mjs never reads a named path as a credential source", () => {
   assert.doesNotMatch(asc, /process\.env\.ASC_KEY_PATH/);
   assert.doesNotMatch(asc, /fromFile\(/);
   // The message names the path as the wrong thing to reach for.
-  assert.match(asc, /A path in ASC_KEY_PATH is not a credential source/);
+  assert.match(asc, /ASC_KEY_PATH is not/);
   // Every environment PEM is parsed before it is accepted, so a truncated key
   // is a credential error rather than a signer stack trace.
   assert.match(asc, /normalizePrivateKey/);
@@ -450,9 +453,13 @@ test("asc-api.mjs says what it tried instead of failing on a missing file", () =
     });
     assert.equal(none.status, 1);
     assert.match(none.stderr, /no App Store Connect credential found/);
-    assert.match(none.stderr, /APPLE_API_KEY_P8_BASE64/);
+    // The refusal names the store it needed, and the names it looks for.
+    assert.match(none.stderr, /The store is the only source/);
+    assert.match(none.stderr, /[/]asc/);
+    assert.match(none.stderr, /ASC_KEY_ID or APPLE_API_KEY_ID/);
 
-    // APPLE_API_* present but undecodable: proves the env IS read, and says so.
+    // A complete environment is not a source:  the client still refuses, and
+    // the refusal names the store rather than the environment.
     const bad = spawnSync(process.execPath, [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "latest-build-seq", "app.botfleet.ios", "1.0"], {
       encoding: "utf8",
       env: {
@@ -463,7 +470,8 @@ test("asc-api.mjs says what it tried instead of failing on a missing file", () =
       },
     });
     assert.equal(bad.status, 1);
-    assert.match(bad.stderr, /APPLE_API_KEY_P8_BASE64 is set but did not decode to a PEM private key/);
+    assert.match(bad.stderr, /no App Store Connect credential found/);
+    assert.doesNotMatch(bad.stderr, /bm90LWEtcGVt/, "the environment value reached the output");
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
