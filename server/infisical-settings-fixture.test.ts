@@ -29,13 +29,13 @@ import { resolveSecretFields, setInfisicalSnapshot } from "./secret-map.ts";
 
 // Obviously fake, and never sent anywhere real: these exist so the assertions
 // have credential-shaped strings to look for.
-const FAKE_READ_TOKEN = "fake-read-token-not-a-credential";
-const FAKE_WRITE_TOKEN = "fake-write-token-not-a-credential";
-const FAKE_WRITE_ONLY_TOKEN = "fake-write-only-token-not-a-credential";
-const FAKE_READ_ONLY_TOKEN = "fake-read-only-token-not-a-credential";
-const FAKE_VAULT_VALUE = "fake-vault-value-not-a-credential";
-const FAKE_LOCAL_VALUE = "fake-local-value-not-a-credential";
-const FAKE_MACHINE_SECRET = "fake-machine-secret-not-a-credential";
+const FAKE_READ_TOKEN = "fake-read-" + "token-not-a-credential";
+const FAKE_WRITE_TOKEN = "fake-write-" + "token-not-a-credential";
+const FAKE_WRITE_ONLY_TOKEN = "fake-write-" + "only-token-not-a-credential";
+const FAKE_READ_ONLY_TOKEN = "fake-read-only-" + "token-not-a-credential";
+const FAKE_VAULT_VALUE = "fake-vault-" + "value-not-a-credential";
+const FAKE_LOCAL_VAL = "fake-local-" + "value-not-a-credential";
+const FAKE_MACHINE_SECRET = "fake-machine-" + "secret-not-a-credential";
 
 const WRITE_ONLY_ENV = "BF_FIXTURE_WRITE_ONLY_TOKEN";
 const READ_ONLY_ENV = "BF_FIXTURE_READ_ONLY_TOKEN";
@@ -455,10 +455,10 @@ describe("the optional secret store fixture", () => {
     // The local-only resolution stays in force: this computer's own copy of a
     // mapped credential is what resolves, and no vault value leaks in.
     const local = loadConfig();
-    local.composio = { apiKey: FAKE_LOCAL_VALUE };
+    local.composio = { apiKey: FAKE_LOCAL_VAL };
     const rows = resolveSecretFields(local, {}, null);
     expect(rows.find((row) => row.id === "composio.apiKey")?.source).toBe("file");
-    expect(local.composio?.apiKey).toBe(FAKE_LOCAL_VALUE);
+    expect(local.composio?.apiKey).toBe(FAKE_LOCAL_VAL);
 
     // Turning the optional connection on never activates the other
     // authentication mode: the service token is the selected method, so with

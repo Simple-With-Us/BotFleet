@@ -21,6 +21,8 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  ABSOLUTE_MAX_BYTES,
+  ABSOLUTE_MAX_FILES,
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_FILES,
   archiveStore,
@@ -134,11 +136,25 @@ test("the ceiling flags name the candidate pair this proof uses", () => {
   assert.equal(parseCeilingFlag([`--max-bytes=${CANDIDATE_MAX_BYTES}`], "--max-bytes"), CANDIDATE_MAX_BYTES);
 });
 
+test("a ceiling above the absolute one is refused with no bound named by the caller", () => {
+  assert.throws(
+    () => parseCeilingFlag(["--max-files", String(ABSOLUTE_MAX_FILES + 1)], "--max-files"),
+    /is above the absolute ceiling of 500000/,
+  );
+  assert.throws(
+    () => parseCeilingFlag([`--max-bytes=${ABSOLUTE_MAX_BYTES + 1}`], "--max-bytes"),
+    /is above the absolute ceiling of 34359738368/,
+  );
+  assert.equal(parseCeilingFlag(["--max-files", String(ABSOLUTE_MAX_FILES)], "--max-files"), ABSOLUTE_MAX_FILES);
+  assert.equal(parseCeilingFlag([`--max-bytes=${ABSOLUTE_MAX_BYTES}`], "--max-bytes"), ABSOLUTE_MAX_BYTES);
+});
+
 test("a store inside the candidate ceilings is captured by the command that names them", { skip: ROOT_IS_ROOT }, () => {
   const { summary, manifest } = captureWithCandidateCeilings();
   assert.equal(summary.archived, true);
   assert.equal(summary.maxFiles, CANDIDATE_MAX_FILES, "the file ceiling in force is the one the operator named");
   assert.equal(summary.maxBytes, CANDIDATE_MAX_BYTES, "the byte ceiling in force is the one the operator named");
+  assert.equal(summary.ceilingSource, "explicit", "the command says the ceilings are an explicit opt-in");
   assert.equal(summary.files, manifest.files.length);
   assert.ok(summary.files > 0);
   assert.equal(manifest.totals.files, manifest.files.length);
@@ -155,6 +171,7 @@ test("the plain command captures the store, attachments and all, with no ceiling
   const summary = JSON.parse(result.stdout);
   assert.equal(summary.maxFiles, DEFAULT_MAX_FILES, "the plain command uses the shipped file ceiling");
   assert.equal(summary.maxBytes, DEFAULT_MAX_BYTES, "the plain command uses the shipped byte ceiling");
+  assert.equal(summary.ceilingSource, "default", "the plain command says the ceilings are the default");
   const manifest = JSON.parse(readFileSync(join(captureDir, "manifest.json"), "utf8"));
   assert.ok(manifest.files.some((row) => row.path === `attachments/${PNG_NAME}`), "the binary attachment is in the capture");
 });

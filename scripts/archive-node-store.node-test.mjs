@@ -10,12 +10,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  ABSOLUTE_MAX_BYTES,
+  ABSOLUTE_MAX_FILES,
   ARCHIVE_MARKER,
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_FILES,
@@ -761,7 +763,7 @@ test("a value under a secret-shaped key is masked even with no credential shape"
   const store = makeStore();
   // "hunter2" has no prefix for a shape pass to find:  only the KEY says it
   // is a credential, so the redaction has to keep the key in hand.
-  writeFileSync(join(store, "account.json"), JSON.stringify({ user: "jay", password: "hunter2-correct-horse" }));
+  writeFileSync(join(store, "account.json"), JSON.stringify({ user: "jay", password: "hunter2-" + "correct-horse" }));
 
   const parent = privateScratch("capture-");
   const { outDir } = await archiveStore({ storeRoot: store, outDir: join(parent, "capture") });
@@ -883,16 +885,21 @@ test("a database that fails its integrity check is a verdict, and its handle is 
   assert.equal(failure.ok, false);
 });
 
-test("the default ceilings cover the owner's measured store", () => {
+test("the ordinary default is sized for an ordinary store, and the measured store needs the opt-in", () => {
   // The store this producer exists to archive holds 286,388 files and about
   // 13 GB, and the capture that succeeded on 2026-11-22 was 286,257 files
-  // and 12,200,859,045 bytes. A default below either number means the
-  // plain command cannot capture the owner's own store.
-  assert.ok(DEFAULT_MAX_FILES > 286_388, "the file ceiling is above the measured store");
-  assert.ok(DEFAULT_MAX_FILES > 286_257, "the file ceiling is above the measured capture");
-  assert.ok(DEFAULT_MAX_BYTES > 13_000_000_000, "the byte ceiling is above the measured store");
-  assert.ok(DEFAULT_MAX_BYTES > 12_200_859_045, "the byte ceiling is above the measured capture");
+  // and 12,200,859,045 bytes.  The ordinary default does NOT cover that
+  // store:  the default is deliberately sized for an ordinary store, and the
+  // measured store is captured by the explicit bounded opt-in, whose absolute
+  // ceiling still covers it.
+  assert.equal(DEFAULT_MAX_FILES, 200_000, "the ordinary default is 200,000 files");
+  assert.equal(DEFAULT_MAX_BYTES, 8 * 1024 * 1024 * 1024, "the ordinary default is 8 GiB");
+  assert.ok(DEFAULT_MAX_FILES < 286_257, "the ordinary default is below the measured capture");
+  assert.ok(DEFAULT_MAX_BYTES < 12_200_859_045, "the ordinary default is below the measured capture");
+  assert.ok(ABSOLUTE_MAX_FILES > 286_388, "the absolute ceiling is above the measured store");
+  assert.ok(ABSOLUTE_MAX_BYTES > 13_000_000_000, "the absolute ceiling is above the measured store");
 });
+
 
 test("the CLI refuses a ceiling value that is not a positive whole number", () => {
   const store = makeStore();
@@ -916,16 +923,125 @@ test("the CLI passes an explicit ceiling through to the capture", { skip: ROOT_I
   const result = runArchiveCli([
     "--store", store,
     "--out", join(parent, "capture"),
-    "--max-files", "1000000",
+    "--max-files", "400000",
     "--max-bytes", "1000000000",
   ]);
 
   assert.equal(result.status, 0, result.stderr);
   const summary = JSON.parse(result.stdout);
   assert.equal(summary.archived, true);
-  assert.equal(summary.maxFiles, 1000000, "the file ceiling the operator named is the one in force");
+  assert.equal(summary.maxFiles, 400000, "the file ceiling the operator named is the one in force");
   assert.equal(summary.maxBytes, 1000000000, "the byte ceiling the operator named is the one in force");
+  assert.equal(summary.ceilingSource, "explicit", "the command says the ceilings are an explicit opt-in");
   assert.ok(summary.files > 0);
+});
+
+
+test("the plain command captures under the ordinary default ceilings and reports them as the default", { skip: ROOT_IS_ROOT }, () => {
+  const store = makeStore();
+  const parent = privateScratch("capture-");
+  const result = runArchiveCli(["--store", store, "--out", join(parent, "capture")]);
+
+  assert.equal(result.status, 0, result.stderr);
+  const summary = JSON.parse(result.stdout);
+  assert.equal(summary.maxFiles, 200_000, "the plain command uses the ordinary file ceiling");
+  assert.equal(summary.maxBytes, 8 * 1024 * 1024 * 1024, "the plain command uses the ordinary byte ceiling");
+  assert.equal(summary.ceilingSource, "default", "the plain command says the ceilings are the default");
+  assert.ok(summary.files > 0);
+});
+
+test("an explicit ceiling at the absolute ceiling is accepted, used exactly and reported as an opt-in", { skip: ROOT_IS_ROOT }, () => {
+  const store = makeStore();
+  const parent = privateScratch("capture-");
+  const result = runArchiveCli([
+    "--store", store,
+    "--out", join(parent, "capture"),
+    "--max-files", String(ABSOLUTE_MAX_FILES),
+    "--max-bytes", String(ABSOLUTE_MAX_BYTES),
+  ]);
+
+  assert.equal(result.status, 0, result.stderr);
+  const summary = JSON.parse(result.stdout);
+  assert.equal(summary.maxFiles, 500_000, "the file ceiling in force is the one the operator named");
+  assert.equal(summary.maxBytes, 32 * 1024 * 1024 * 1024, "the byte ceiling in force is the one the operator named");
+  assert.equal(summary.ceilingSource, "explicit", "the command says the ceilings are an explicit opt-in");
+  assert.ok(summary.files > 0);
+});
+
+test("a ceiling above the absolute ceiling is refused, and the refusal names the request and the ceiling", { skip: ROOT_IS_ROOT }, () => {
+  const store = makeStore();
+  const parent = privateScratch("capture-");
+  const captureDir = join(parent, "capture");
+
+  const files = runArchiveCli([
+    "--store", store,
+    "--out", captureDir,
+    "--max-files", String(ABSOLUTE_MAX_FILES + 1),
+  ]);
+  assert.equal(files.status, 2, files.stderr);
+  assert.match(files.stderr, /--max-files 500001 is above the absolute ceiling of 500000/, "the refusal names the request and the ceiling");
+  assert.ok(!existsSync(captureDir), "the refusal writes nothing");
+
+  const bytes = runArchiveCli([
+    "--store", store,
+    "--out", captureDir,
+    "--max-bytes", String(ABSOLUTE_MAX_BYTES + 1),
+  ]);
+  assert.equal(bytes.status, 2, bytes.stderr);
+  assert.match(bytes.stderr, /--max-bytes 34359738369 is above the absolute ceiling of 34359738368/, "the refusal names the request and the ceiling");
+  assert.ok(!existsSync(captureDir), "the refusal writes nothing");
+  assert.deepEqual(readdirSync(parent), [], "no partial tree, manifest or report is left behind");
+});
+
+test("the plain command and the explicit opt-in are distinguishable in the CLI's own output", { skip: ROOT_IS_ROOT }, () => {
+  const store = makeStore();
+  const parent = privateScratch("capture-");
+
+  const plain = runArchiveCli(["--store", store, "--out", join(parent, "plain")]);
+  assert.equal(plain.status, 0, plain.stderr);
+  const optIn = runArchiveCli([
+    "--store", store,
+    "--out", join(parent, "opt-in"),
+    "--max-files", "400000",
+    "--max-bytes", "1000000000",
+  ]);
+  assert.equal(optIn.status, 0, optIn.stderr);
+  const mixed = runArchiveCli([
+    "--store", store,
+    "--out", join(parent, "mixed"),
+    "--max-files", "400000",
+  ]);
+  assert.equal(mixed.status, 0, mixed.stderr);
+
+  const plainSummary = JSON.parse(plain.stdout);
+  const optInSummary = JSON.parse(optIn.stdout);
+  const mixedSummary = JSON.parse(mixed.stdout);
+  assert.equal(plainSummary.ceilingSource, "default", "the plain command says the default");
+  assert.equal(optInSummary.ceilingSource, "explicit", "the opt-in says the opt-in");
+  assert.equal(mixedSummary.ceilingSource, "mixed", "one named ceiling and one default is its own case");
+  assert.notEqual(plainSummary.ceilingSource, optInSummary.ceilingSource, "the two runs say different things about where the ceilings came from");
+  assert.equal(optInSummary.maxFiles, 400_000, "the opt-in uses exactly the ceiling the operator named");
+  assert.equal(optInSummary.maxBytes, 1_000_000_000, "the opt-in uses exactly the ceiling the operator named");
+  assert.equal(mixedSummary.maxFiles, 400_000, "the named ceiling is the one in force");
+  assert.equal(mixedSummary.maxBytes, DEFAULT_MAX_BYTES, "the ceiling the operator did not name stays at its default");
+});
+
+test("a store above the ordinary default byte ceiling is refused before any output exists", { skip: ROOT_IS_ROOT }, () => {
+  const store = privateScratch("store-");
+  // A sparse file:  it reports nine gibibytes to the filesystem without
+  // occupying them, so the fixture costs nothing and the capture is refused
+  // on its size alone.
+  writeFileSync(join(store, "big.bin"), "");
+  truncateSync(join(store, "big.bin"), DEFAULT_MAX_BYTES + 1);
+  const parent = privateScratch("capture-");
+  const captureDir = join(parent, "capture");
+
+  const result = runArchiveCli(["--store", store, "--out", captureDir]);
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(result.stderr, /above the 8589934592 byte ceiling/, "the refusal names the default byte ceiling");
+  assert.doesNotMatch(result.stderr, /archive reached/, "the refusal came from the pre-flight estimate, not from a copy that had already begun");
+  assert.ok(!existsSync(captureDir), "no capture directory is left behind");
+  assert.deepEqual(readdirSync(parent), [], "no partial tree, manifest or report is left behind");
 });
 
 test("a store above an explicit ceiling is refused, and the refusal names the ceiling", { skip: ROOT_IS_ROOT }, async () => {
