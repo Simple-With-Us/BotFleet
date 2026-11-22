@@ -189,49 +189,143 @@ const MAX_WINDOW_METADATA_KEYS = 8;
 const MAX_WINDOW_METADATA_CHARS = 1024;
 
 /**
- * The names that carry a credential value rather than a digest. A window
- * that persists one of these in cleartext must not hand it back on a redeem,
- * because the bridge keeps digests only, never the value.
- */
-const CREDENTIAL_FIELD_NAMES = new Set([
-  'token',
-  'code',
-  'credential',
-  'credentialDigest',
-]);
-
-/**
- * The words that mark a caller field name as credential-bearing. The exact
- * names above cannot hold the digest-only invariant on their own, because a
- * caller may name a credential field anything; these words catch the usual
- * forms, and they are matched whole so an innocent name like "postcode"
- * keeps its value.
+ * The credential vocabulary. A caller field name is read two ways, and both
+ * readings use this vocabulary.
+ *
+ * Read as words, a name is split on camel-case edges, acronym edges, digit
+ * edges and separators, and a name that carries a credential word at one of
+ * those edges drops the field. That is what catches deviceToken, APIToken,
+ * SMSCode, PIN and sms_code.
+ *
+ * Read as one unbroken run, a name that carries a credential word anywhere
+ * drops the field. That is what catches the names written as a single
+ * lowercase run, where there is no edge to split on: pairingtoken, token123
+ * and smscode.
+ *
+ * Two words sit in only one reading. The word "code" is too generic as a
+ * word, because a bare Code suffix would strip a benign statusCode, so it is
+ * read only as an unbroken run and the benign names are rescued by the
+ * allowlist below. The word "pin" is too ambiguous as a raw run, because a
+ * raw match would strip ordinary words such as shipping and mapping, so it
+ * is read at a word edge instead.
  */
 const CREDENTIAL_FIELD_WORDS = new Set([
   'token',
-  'code',
-  'credential',
   'secret',
+  'password',
   'passcode',
   'passphrase',
-  'password',
+  'credential',
   'otp',
+  'jwt',
+  'apikey',
   'pin',
 ]);
 
 /**
- * Whether one caller field name carries a credential. The module's own
- * credential names are listed outright, and any name whose words include a
- * credential word is refused as well, so a cleartext value cannot ride back
- * out of a stored window under a different name.
+ * The credential words that are safe to look for anywhere in a name. The
+ * word "pin" is missing here, because a raw match would strip ordinary
+ * words such as shipping, mapping and coping.
  */
-function isCredentialFieldName(key) {
-  if (CREDENTIAL_FIELD_NAMES.has(key)) return true;
-  const words = key
+const CREDENTIAL_FIELD_SUBSTRINGS = new Set([
+  'token',
+  'secret',
+  'password',
+  'passcode',
+  'passphrase',
+  'credential',
+  'otp',
+  'jwt',
+  'apikey',
+  'code',
+]);
+
+/**
+ * The credential words that are matched only at a word edge, because a raw
+ * match would strip ordinary words that merely contain them.
+ */
+const CREDENTIAL_EDGE_FIELD_WORDS = new Set(['pin']);
+
+/**
+ * The benign field names the credential rule keeps. The trade leans this
+ * way because the module's contract is digests only, never the value: a
+ * benign field that is dropped costs a caller one piece of metadata, while
+ * a credential that survives costs the cleartext itself. The list is exact
+ * and finite on purpose, so a name is either listed here or it is not, and
+ * a prefixed variant such as httpStatusCode is not listed, so it is
+ * dropped.
+ */
+const BENIGN_FIELD_NAMES = new Set([
+  'statuscode',
+  'exitcode',
+  'errorcode',
+  'httpcode',
+  'postcode',
+  'zipcode',
+  'countrycode',
+  'areacode',
+  'languagecode',
+  'unicode',
+  'codepoint',
+  'encode',
+  'decode',
+  'encoded',
+  'decoded',
+  'barcode',
+]);
+
+/**
+ * Split one field name into its words. A camel-case edge, an acronym edge
+ * and a digit edge each end a word, and so does any non-alphanumeric
+ * character. The acronym edge is what keeps APIToken and SMSCode from
+ * reading as one word.
+ */
+function splitFieldWords(name) {
+  return name
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .replace(/([A-Za-z])([0-9])/g, '$1 $2')
     .split(/[^A-Za-z0-9]+/)
     .filter((word) => word !== '');
-  return words.some((word) => CREDENTIAL_FIELD_WORDS.has(word.toLowerCase()));
+}
+
+/**
+ * Whether the name carries an edge-matched credential word: the word sits
+ * at the start of the name, at the end of it, or beside a non-letter. This
+ * is how pinValue and pinvalue drop the field while shipping and mapping
+ * keep their value.
+ */
+function hasEdgeCredentialWord(lowered) {
+  for (const needle of CREDENTIAL_EDGE_FIELD_WORDS) {
+    let at = lowered.indexOf(needle);
+    while (at !== -1) {
+      const before = at === 0 ? '' : lowered.charAt(at - 1);
+      const after = lowered.charAt(at + needle.length);
+      if (before === '' || after === '' || !/[a-z]/.test(before) || !/[a-z]/.test(after)) return true;
+      at = lowered.indexOf(needle, at + 1);
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether one caller field name carries a credential. The benign allowlist
+ * is read first, so a listed name always keeps its value, and the two
+ * readings of the name follow: the credential words at the edges of the
+ * name, and the credential words anywhere in the run. A cleartext value
+ * therefore cannot ride back out of a stored window under any name.
+ */
+function isCredentialFieldName(key) {
+  const name = String(key ?? '');
+  const lowered = name.toLowerCase();
+  if (BENIGN_FIELD_NAMES.has(lowered)) return false;
+  for (const word of splitFieldWords(name)) {
+    if (CREDENTIAL_FIELD_WORDS.has(word.toLowerCase())) return true;
+  }
+  for (const needle of CREDENTIAL_FIELD_SUBSTRINGS) {
+    if (lowered.includes(needle)) return true;
+  }
+  return hasEdgeCredentialWord(lowered);
 }
 
 /**
@@ -243,7 +337,9 @@ function isCredentialFieldName(key) {
  * single value larger than 1KB once serialized. Anything that is not a
  * plain object fails closed to an empty shell that cannot verify. A field
  * whose name carries a credential never travels at all, so a cleartext token
- * or code persisted on a window is dropped on the way out.
+ * or code persisted on a window is dropped on the way out. The benign names
+ * that keep their value are listed in the module, so the rule stays an
+ * explicit finite list rather than a judgement call.
  */
 function normalizeWindow(window) {
   let source = window ?? {};

@@ -285,6 +285,41 @@ test("a credential-shaped caller field name is dropped too", () => {
   assert.equal(decision.window.note, "kept");
 });
 
+test("an acronym-prefixed credential name does not survive a redeem", () => {
+  // An acronym prefix used to hide the credential word from the splitter.
+  const window = { ...openWindow(), APIToken: "cleartext", SMSCode: "654321", JWTToken: "cleartext", TOKENValue: "cleartext" };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  for (const key of ["APIToken", "SMSCode", "JWTToken", "TOKENValue"]) {
+    assert.ok(!(key in decision.window), `${key} must not survive a redeem`);
+  }
+});
+
+test("a concatenated credential name does not survive a redeem", () => {
+  // One unbroken lowercase run leaves no word edge to split on, so the name
+  // is read as a whole run instead.
+  const window = { ...openWindow(), pairingtoken: "cleartext", authtoken: "cleartext", token123: "cleartext", smscode: "654321" };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  for (const key of ["pairingtoken", "authtoken", "token123", "smscode"]) {
+    assert.ok(!(key in decision.window), `${key} must not survive a redeem`);
+  }
+});
+
+test("a benign Code-suffixed field survives the round trip", () => {
+  // The generic code word no longer strips a benign field on its own: the
+  // benign names are listed explicitly, and every other name is dropped.
+  const window = { ...openWindow(), statusCode: "ok", exitCode: "0", postcode: "60601", unicode: "yes", encode: "utf8", decode: "utf8" };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.equal(decision.window.statusCode, "ok");
+  assert.equal(decision.window.exitCode, "0");
+  assert.equal(decision.window.postcode, "60601");
+  assert.equal(decision.window.unicode, "yes");
+  assert.equal(decision.window.encode, "utf8");
+  assert.equal(decision.window.decode, "utf8");
+});
+
 test("device credentials match digests only, under a concrete id", () => {
   const devices = [
     { id: "d-1", tokenDigest: sha256Hex(PROOF) },
