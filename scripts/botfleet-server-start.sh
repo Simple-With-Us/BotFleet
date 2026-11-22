@@ -202,13 +202,16 @@ health() {
   /usr/bin/curl -sf -m 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1
 }
 
-# Prints the pid named by harness-owner.json, or fails when there is no
-# readable record.  The record is validated with the same shape rules as
-# readRecord in electron/harness-ownership.mjs (version, port, nonce), so a
-# truncated or foreign file never suppresses startup.  An unreadable or
-# malformed record falls through to the normal start, where the server's own
-# ownership check refuses it by name; guessing here would only hide that.
-live_harness_owner_pid() {
+# Prints "<pid> <record mtime, epoch seconds>" from harness-owner.json, or
+# fails when there is no readable record.  Both values come from the one
+# O_NOFOLLOW descriptor (fstat beside the read), so a replace or symlink
+# swap between two path lookups can never mix generations.  The record is
+# validated with the same shape rules as readRecord in
+# electron/harness-ownership.mjs (version, port, nonce), so a truncated or
+# foreign file never suppresses startup.  An unreadable or malformed record
+# falls through to the normal start, where the server's own ownership check
+# refuses it by name; guessing here would only hide that.
+live_harness_owner_record() {
   [ -f "$HARNESS_OWNER_FILE" ] || return 1
   "$NODE" --input-type=module -e '
 import fs from "node:fs";
@@ -222,7 +225,7 @@ try {
       value.version !== 1 || !Number.isInteger(value.pid) || value.pid <= 0 ||
       !Number.isInteger(value.port) || value.port < 1 || value.port > 65535 ||
       typeof value.nonce !== "string" || !/^[a-f0-9]{64}$/.test(value.nonce)) process.exit(1);
-  process.stdout.write(String(value.pid));
+  process.stdout.write(value.pid + " " + Math.floor(stat.mtimeMs / 1000));
 } catch { process.exitCode = 1; }
 finally { if (fd !== undefined) fs.closeSync(fd); }
 ' -- "$HARNESS_OWNER_FILE" 2>/dev/null
@@ -235,8 +238,7 @@ finally { if (fd !== undefined) fs.closeSync(fd); }
 # whatever lives at that pid now.  Unreadable clocks answer "not stale" so a
 # probe failure never starts a second harness beside a live owner.
 harness_owner_predates_boot() {
-  local mtime boot
-  mtime="$(/usr/bin/stat -f%m "$HARNESS_OWNER_FILE" 2>/dev/null)" || return 1
+  local mtime="$1" boot
   boot="$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null | /usr/bin/sed -n 's/^{ sec = \([0-9]*\).*/\1/p')"
   case "$mtime" in '' | *[!0-9]*) return 1 ;; esac
   case "$boot" in '' | *[!0-9]*) return 1 ;; esac
@@ -512,7 +514,10 @@ fi
 # below runs before exec, the storm stop never engages: 3,892 identical
 # crashes in 7 hours, one launchd relaunch every few seconds.  A live owner
 # is the same quiet state as a healthy port, so leave it alone the same way.
-if OWNER_PID="$(live_harness_owner_pid)" && [ -n "$OWNER_PID" ] && kill -0 "$OWNER_PID" 2>/dev/null && ! harness_owner_predates_boot; then
+OWNER_RECORD="$(live_harness_owner_record)" || OWNER_RECORD=""
+OWNER_PID="${OWNER_RECORD%% *}"
+OWNER_MTIME="${OWNER_RECORD##* }"
+if [ -n "$OWNER_PID" ] && [ "$OWNER_PID" != "$OWNER_RECORD" ] && kill -0 "$OWNER_PID" 2>/dev/null && ! harness_owner_predates_boot "$OWNER_MTIME"; then
   log "harness-owner.json names live pid ${OWNER_PID}; another harness owns the data dir; not starting a second harness"
   reset_fail_ledger
   exit 0
