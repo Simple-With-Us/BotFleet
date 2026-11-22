@@ -2,7 +2,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { StoreProvider } from "@/state/store";
-import { AppDeck, memberAssignedBots } from "./AppDeck";
+import { AppDeck, folderTagFor, memberAssignedBots } from "./AppDeck";
 
 describe("AppDeck", () => {
   it("renders without crashing in a StoreProvider", () => {
@@ -34,6 +34,20 @@ describe("AppDeck", () => {
     );
 
     expect(html).toContain('aria-label="App Deck Navigation"');
+  });
+});
+
+describe("folderTagFor (BF-2554)", () => {
+  it("suppresses a tag that only repeats the app name", () => {
+    expect(folderTagFor("BotFleet", "/Users/jay/Code/BotFleet")).toBeNull();
+    expect(folderTagFor("botfleet ", "/Users/jay/Code/BotFleet/")).toBeNull();
+  });
+
+  it("keeps a folder tag that adds information", () => {
+    expect(folderTagFor("Compiler", "/Users/jay/Code/BotFleet")).toBe("BotFleet");
+    expect(folderTagFor("Compiler", "C:\\work\\BotFleet")).toBe("BotFleet");
+    expect(folderTagFor("Compiler", null)).toBeNull();
+    expect(folderTagFor("Compiler", "")).toBeNull();
   });
 });
 
