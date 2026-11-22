@@ -255,7 +255,7 @@ export function recordBridgePairingReplay({ window, requestId, credentialDigest,
   if (!/^[0-9a-f]{64}$/.test(credentialDigest ?? '') || String(deviceId ?? '') === '') {
     throw new Error('recordBridgePairingReplay requires a credential digest and a device id');
   }
-  if (credentialDigest !== current.codeDigest && credentialDigest !== current.tokenDigest) {
+  if (!digestsEqualHex(credentialDigest, current.codeDigest) && !digestsEqualHex(credentialDigest, current.tokenDigest)) {
     throw new Error('recordBridgePairingReplay requires a digest this window minted');
   }
   return {
