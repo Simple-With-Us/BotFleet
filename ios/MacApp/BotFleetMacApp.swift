@@ -242,6 +242,8 @@ struct BotFleetMacApp: App {
                             Text(banner)
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
+                        } else if section == .phone {
+                            MacPhoneSettings(session: session)
                         } else {
                             Text(session.capabilities.versionStamp)
                                 .font(.caption)

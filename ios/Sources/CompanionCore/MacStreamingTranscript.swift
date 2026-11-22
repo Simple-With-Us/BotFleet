@@ -549,6 +549,7 @@ public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identif
     case shortcuts
     case lifecycle
     case permissions
+    case phone
 
     public var id: String { rawValue }
 
@@ -563,6 +564,7 @@ public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identif
         case .shortcuts: return "Shortcuts"
         case .lifecycle: return "Lifecycle"
         case .permissions: return "Permissions"
+        case .phone: return "Phone"
         }
     }
 
@@ -577,6 +579,7 @@ public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identif
         case .shortcuts: return "command"
         case .lifecycle: return "bolt.horizontal.circle"
         case .permissions: return "lock.shield"
+        case .phone: return "iphone"
         }
     }
 }

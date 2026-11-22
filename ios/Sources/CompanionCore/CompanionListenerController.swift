@@ -318,6 +318,13 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
     public func stop() async {
         guard let server else { return }
         await server.stopListening()
+        // The server keeps its last advertisement across a socket stop, so
+        // clearing only the backend cache would leave a stop/start cycle
+        // serving stale routes while the tab reports none.  Both sides are
+        // cleared together: a restart serves nothing until fresh routes are
+        // set, and the tab agrees with `GET /api/companion/endpoints`.
+        await server.setEndpointAdvertisement(CompanionEndpointAdvertisement())
+        lastAdvertisement = CompanionEndpointAdvertisement()
     }
 
     public func openPairingWindow() async -> NativePairingWindow? {
@@ -345,9 +352,20 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
         return await server.revokeDevice(id: id)
     }
 
+    /// The last advertisement this backend was asked to serve. Empty until
+    /// something sets one, so the Phone tab honestly reads "no routes
+    /// advertised yet" — and lights up as soon as the bridge slice wires
+    /// real advertisements through here.
+    private var lastAdvertisement = CompanionEndpointAdvertisement()
+
     public func setEndpointAdvertisement(_ advertisement: CompanionEndpointAdvertisement) async {
         guard let server else { return }
         await server.setEndpointAdvertisement(advertisement)
+        lastAdvertisement = advertisement
+    }
+
+    public func currentAdvertisement() -> CompanionEndpointAdvertisement {
+        lastAdvertisement
     }
 }
 #endif
