@@ -19,6 +19,9 @@ import {
 const NOW = 1_700_000_000_000;
 const PROOF = "omb_pair_" + "a".repeat(43);
 
+/** The window fields the bridge owns; every other key is caller metadata. */
+const RESERVED_WINDOW_FIELDS = new Set(["codeDigest", "tokenDigest", "expiresAtMs", "attemptsLeft", "spent", "replay"]);
+
 function openWindow(overrides = {}) {
   return openBridgePairingWindow({ code: "123456", token: PROOF, ttlSeconds: 300, maxAttempts: 3, nowMs: NOW, ...overrides });
 }
@@ -523,4 +526,70 @@ test("route rows name every entry the bridge serves", () => {
   for (const route of BRIDGE_ALLOWED_ROUTES) {
     assert.ok(route.method && route.path && (route.local === true || route.local === false) && route.description);
   }
+});
+
+test("a benign wide value survives the round trip", () => {
+  // A wide but harmless value is still under the size gate, so the value
+  // check reads it through its serialized form and finds nothing that
+  // carries a credential: it comes back whole.
+  const wide = Array.from({ length: 300 }, () => 1);
+  const window = { ...openWindow(), wideNote: wide };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.ok(Array.isArray(decision.window.wideNote), "a benign wide value comes back");
+  assert.equal(decision.window.wideNote.length, 300);
+});
+
+test("a benign deep value survives the round trip", () => {
+  // A value nested eight levels deep is under the size gate too, and the
+  // walk reads the structure its serialized form describes, so a value
+  // that is merely deep is kept.
+  let deep = "bottom-note";
+  for (let level = 0; level < 8; level += 1) deep = { [`level${level}`]: deep };
+  const window = { ...openWindow(), deepNote: deep };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.ok(decision.window.deepNote, "a benign deep value comes back");
+  assert.equal(decision.window.deepNote.level7.level6.level5.level4.level3.level2.level1.level0, "bottom-note");
+});
+
+test("a credential nested deep is still dropped", () => {
+  // The depth bound is gone, so the security direction is proved another
+  // way: a credential at the bottom of a deep object is still found and
+  // the whole value is still dropped.
+  let deep = PROOF;
+  for (let level = 0; level < 8; level += 1) deep = { [`level${level}`]: deep };
+  const window = { ...openWindow(), deepNote: deep };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.ok(!("deepNote" in decision.window), "a credential nested deep must not survive");
+});
+
+test("the window scan stops at the visited cap", () => {
+  // Two hundred skipped keys sit in front of a benign one, so the scan
+  // reaches its visited cap before it ever looks at the benign key: the
+  // key behind the cap does not come back, and the window's own fields do.
+  const window = { ...openWindow() };
+  for (let index = 0; index < 200; index += 1) window[`pairingToken-${index}`] = "cleartext";
+  window.afterCap = "behind-the-cap";
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.ok(!("afterCap" in decision.window), "the scan stops at the visited cap");
+  assert.equal(decision.window.codeDigest, window.codeDigest);
+  assert.equal(decision.window.tokenDigest, window.tokenDigest);
+  assert.equal(decision.window.expiresAtMs, window.expiresAtMs);
+  assert.equal(decision.window.attemptsLeft, window.attemptsLeft);
+  assert.equal(decision.window.spent, true);
+  const kept = Object.keys(decision.window).filter((key) => !RESERVED_WINDOW_FIELDS.has(key));
+  assert.ok(kept.length <= 8, `at most eight kept keys survive, got ${kept.length}`);
+});
+
+test("a benign key before the visited cap still survives", () => {
+  // The cap is not a blanket drop: a benign key in front of the skipped
+  // keys is still kept.
+  const window = { ...openWindow(), beforeCap: "kept-before-the-cap" };
+  for (let index = 0; index < 200; index += 1) window[`pairingToken-${index}`] = "cleartext";
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.equal(decision.window.beforeCap, "kept-before-the-cap");
 });

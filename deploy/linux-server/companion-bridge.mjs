@@ -189,6 +189,16 @@ const MAX_WINDOW_METADATA_KEYS = 8;
 const MAX_WINDOW_METADATA_CHARS = 1024;
 
 /**
+ * How many top-level keys one window scan looks at, kept and skipped
+ * alike. A legitimate window carries the reserved keys plus at most eight
+ * kept keys, so forty visited keys leaves ample room for the handful of
+ * skipped keys a real window holds, while an attacker-influenced window
+ * cannot buy unbounded work: the scan stops at the cap instead of walking
+ * every key the caller wrote.
+ */
+const MAX_WINDOW_METADATA_VISITED = MAX_WINDOW_METADATA_KEYS * 4 + 8;
+
+/**
  * The credential vocabulary. A caller field name is read two ways, and both
  * readings use this vocabulary.
  *
@@ -372,17 +382,20 @@ const CREDENTIAL_VALUE_PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
 ];
 
-/** How deep the value walk goes before a value is dropped as unknown. */
-const MAX_VALUE_WALK_DEPTH = 6;
-
-/** How many nodes the value walk visits before a value is dropped. */
-const MAX_VALUE_WALK_NODES = 256;
-
 /**
  * Whether one caller value carries a credential. A name can be guessed by
  * whoever persists the window; a value cannot be renamed out of the way, so
  * this check runs on every value the bridge is about to keep, under any
  * name at all.
+ *
+ * The value is read through its SERIALIZED form rather than through the
+ * live object. The caller has already refused anything whose serialized
+ * length passes the size gate, so the text handed here is bounded, and the
+ * structure that text describes is bounded with it. The serialized length
+ * is therefore the only bound there is: there is no depth limit and no node
+ * limit, so a credential nested at any depth is still a leaf in that
+ * structure and is still found, while a benign value that is merely wide or
+ * deep is kept, because nothing about it carries a credential.
  *
  * The digests the window itself carries are the exact answer on top of the
  * shapes: a value whose digest is the stored code digest or the stored
@@ -393,13 +406,12 @@ const MAX_VALUE_WALK_NODES = 256;
  *
  * The walk descends into objects and arrays, because a caller value that is
  * an object is kept as that object and a credential nested inside it would
- * otherwise ride back out untouched:  the shapes are tested against every
+ * otherwise ride back out untouched: the shapes are tested against every
  * string leaf, and a nested key whose NAME carries a credential drops the
- * whole value, the same rule the top level applies. The walk is bounded in
- * depth and in the nodes it visits, and it fails closed: a value that
- * reaches either bound is dropped rather than kept.
+ * whole value, the same rule the top level applies. A value that cannot be
+ * serialized or parsed is dropped, which is the fail-closed direction.
  */
-function isCredentialFieldValue(value, digests = {}) {
+function isCredentialFieldValue(serialized, digests = {}) {
   const wanted = [digests.codeDigest, digests.tokenDigest]
     .map((held) => String(held ?? ''))
     .filter((digest) => digest !== '');
@@ -412,11 +424,14 @@ function isCredentialFieldValue(value, digests = {}) {
     }
     return false;
   };
-  let visited = 0;
-  const walk = (current, depth) => {
-    if (depth > MAX_VALUE_WALK_DEPTH) return true;
-    visited += 1;
-    if (visited > MAX_VALUE_WALK_NODES) return true;
+  let parsed;
+  try {
+    parsed = JSON.parse(String(serialized ?? ''));
+  } catch {
+    // A value that cannot be read back is a credential: fail closed.
+    return true;
+  }
+  const walk = (current) => {
     if (current === null || current === undefined) return false;
     // `Object(current) === current` is true for an object, an array or a
     // function and false for a primitive, which is the object test this
@@ -424,7 +439,7 @@ function isCredentialFieldValue(value, digests = {}) {
     if (Object(current) !== current) return isCredentialText(String(current));
     if (Array.isArray(current)) {
       for (const item of current) {
-        if (walk(item, depth + 1)) return true;
+        if (walk(item)) return true;
       }
       return false;
     }
@@ -432,11 +447,11 @@ function isCredentialFieldValue(value, digests = {}) {
       // A nested key that carries a credential drops the whole value, the
       // same rule the top level applies to a field name.
       if (isCredentialFieldName(key)) return true;
-      if (walk(current[key], depth + 1)) return true;
+      if (walk(current[key])) return true;
     }
     return false;
   };
-  return walk(value, 0);
+  return walk(parsed);
 }
 
 /**
@@ -454,6 +469,10 @@ function isCredentialFieldValue(value, digests = {}) {
  * name only: a value that is one of the credential shapes the module
  * handles, or that is the window's own code or token by digest, is dropped
  * under any name, allowlisted or not.
+ *
+ * The scan itself is bounded too: at most MAX_WINDOW_METADATA_VISITED
+ * top-level keys are looked at, kept or skipped, so a window carrying
+ * thousands of keys cannot turn one redeem into thousands of value checks.
  */
 function normalizeWindow(window) {
   let source = window ?? {};
@@ -464,21 +483,27 @@ function normalizeWindow(window) {
   const attempts = Number(source.attemptsLeft);
   const extra = {};
   let kept = 0;
+  let visited = 0;
   for (const key of Object.keys(source)) {
+    // Every key the scan looks at counts, kept or skipped, and the cap is
+    // checked before the expensive work below.
+    visited += 1;
+    if (visited > MAX_WINDOW_METADATA_VISITED) break;
     if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
     if (key === 'codeDigest' || key === 'tokenDigest' || key === 'expiresAtMs' || key === 'attemptsLeft' || key === 'spent' || key === 'replay') continue;
     if (isCredentialFieldName(key)) continue;
     if (kept >= MAX_WINDOW_METADATA_KEYS) break;
-    // The size is measured first, so the value walk below only ever sees a
-    // value whose serialized length is already bounded.
-    let size = 0;
+    // The value is serialized once: the size gate reads that text, and the
+    // value check reads the structure the same text describes.
+    let serialized = null;
     try {
-      size = JSON.stringify(source[key] ?? null)?.length ?? 0;
+      serialized = JSON.stringify(source[key] ?? null);
     } catch {
       continue;
     }
+    const size = serialized?.length ?? 0;
     if (!Number.isFinite(size) || size > MAX_WINDOW_METADATA_CHARS) continue;
-    if (isCredentialFieldValue(source[key], { codeDigest: source.codeDigest, tokenDigest: source.tokenDigest })) continue;
+    if (isCredentialFieldValue(serialized, { codeDigest: source.codeDigest, tokenDigest: source.tokenDigest })) continue;
     extra[key] = source[key];
     kept += 1;
   }
