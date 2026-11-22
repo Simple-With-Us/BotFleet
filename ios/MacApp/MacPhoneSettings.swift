@@ -1,5 +1,11 @@
 import SwiftUI
 import CompanionCore
+#if canImport(AppKit)
+import AppKit
+#endif
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
 #if canImport(CoreImage.CIFilterBuiltins)
 import CoreImage.CIFilterBuiltins
 #endif
@@ -20,6 +26,8 @@ struct MacPhoneSettings: View {
     @State private var routes: [PhoneRouteRow] = []
     @State private var serverName: String = ""
     @State private var errorMessage: String?
+    @State private var qrCache: [String: NSImage] = [:]
+    private static let qrContext = CIContext()
 
     var body: some View {
         ScrollView {
@@ -61,14 +69,14 @@ struct MacPhoneSettings: View {
             }
             .padding(24)
         }
-        .task { await reload() }
+        .task(id: session.companionListenerEnabled) { await reload() }
     }
 
     private var pairingCard: some View {
         GroupBox("Pairing Code") {
             VStack(alignment: .leading, spacing: 12) {
                 if let window, let inviteURL {
-                    if let qr = qrImage(from: inviteURL.absoluteString) {
+                    if let qr = qrImageCached(from: inviteURL) {
                         Image(nsImage: qr)
                             .resizable()
                             .interpolation(.none)
@@ -88,7 +96,10 @@ struct MacPhoneSettings: View {
                 } else {
                     Button("Show Pairing Code") {
                         Task {
-                            await session.openPhonePairingWindow()
+                            errorMessage = nil
+                            if await session.openPhonePairingWindow() == nil {
+                                errorMessage = "Could not open a pairing window. Make sure the listener is on."
+                            }
                             await reload()
                         }
                     }
@@ -118,8 +129,11 @@ struct MacPhoneSettings: View {
                             Spacer()
                             Button("Revoke") {
                                 Task {
-                                    await session.revokePairedPhone(id: device.id)
-                                    await reload()
+                                    if await session.revokePairedPhone(id: device.id) {
+                                        await reload()
+                                    } else {
+                                        errorMessage = "Could not revoke \(device.name). Try again."
+                                    }
                                 }
                             }
                         }
@@ -182,15 +196,22 @@ struct MacPhoneSettings: View {
         Date(timeIntervalSince1970: seconds).formatted(date: .abbreviated, time: .omitted)
     }
 
+    private func qrImageCached(from url: URL) -> NSImage? {
+        let key = url.absoluteString
+        if let cached = qrCache[key] { return cached }
+        guard let image = qrImage(from: key) else { return nil }
+        qrCache[key] = image
+        return image
+    }
+
     private func qrImage(from string: String) -> NSImage? {
         #if canImport(CoreImage.CIFilterBuiltins)
-        let context = CIContext()
         let filter = CIFilter.qrCodeGenerator()
         filter.message = Data(string.utf8)
         filter.correctionLevel = "M"
         guard let output = filter.outputImage else { return nil }
         let scaled = output.transformed(by: CGAffineTransform(scaleX: 8, y: 8))
-        guard let cgImage = context.createCGImage(scaled, from: scaled.extent) else { return nil }
+        guard let cgImage = Self.qrContext.createCGImage(scaled, from: scaled.extent) else { return nil }
         return NSImage(cgImage: cgImage, size: NSSize(width: 180, height: 180))
         #else
         return nil

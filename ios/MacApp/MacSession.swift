@@ -1077,8 +1077,8 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     // Phone tab. They never change bind, power, or credential policy: the
     // toggle stays on `setCompanionListenerEnabled` above.
 
-    public func openPhonePairingWindow() async {
-        _ = await nativeListenerBackend.openPairingWindow()
+    public func openPhonePairingWindow() async -> NativePairingWindow? {
+        await nativeListenerBackend.openPairingWindow()
     }
 
     public func closePhonePairingWindow() async {
