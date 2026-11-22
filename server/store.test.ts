@@ -1180,6 +1180,10 @@ describe("Store task working folder", () => {
     expect(rolled.threadId).not.toBe(first.threadId);
     expect(rolled.automationKey).toBe("webhook:wh_compile");
     expect(store.taskByThread(bot.id, first.threadId)?.automationKey).toBeUndefined();
+    // BF-2556: the retired task is renamed so the list never shows two
+    // threads with the live title; the replacement holds it alone.
+    expect(rolled.title).toBe("Compile gates");
+    expect(store.taskByThread(bot.id, first.threadId)?.title).toMatch(/^Compile gates \(archived \d{4}-\d{2}-\d{2}\)$/);
     expect(store.taskByAutomationKey(bot.id, "webhook:wh_compile")?.threadId).toBe(rolled.threadId);
     // Old history stays put.
     expect(store.messagesFor(first.threadId).some((m) => m.text === "old wake")).toBe(true);
