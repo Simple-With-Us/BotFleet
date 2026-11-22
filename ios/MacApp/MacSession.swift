@@ -110,6 +110,10 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// Owns the listener's start and stop; the backend opens the app's store
     /// only on the first start, so nothing is created while the setting is off.
     public let companionListener: CompanionListenerController
+    /// The concrete listener backend behind `companionListener`, kept so the
+    /// Phone settings tab can open pairing windows and list devices without
+    /// going through the controller's start/stop lifecycle.
+    private let nativeListenerBackend: NativeCompanionListenerBackend
 
     // Native engine composition (sole-writer handoff from AG).  The
     // supervisor is owned here so its supervised-process count is readable
@@ -253,6 +257,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
             advertisement: advertisement
         )
         self.companionListenerEnabled = self.companionListener.isEnabled
+        self.nativeListenerBackend = backend
         self.companionListener.onStateChange = { [weak self] state in
             self?.companionListenerState = state
         }
@@ -1064,6 +1069,42 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         triggerCuaEmergencyStop()
         await drainNativeEnginesForTermination()
         await applyExitPolicy(for: .appTerminating)
+    }
+
+    // MARK: - Phone Settings (BF-2652)
+    //
+    // Thin delegates to the concrete listener backend for the Settings >
+    // Phone tab. They never change bind, power, or credential policy: the
+    // toggle stays on `setCompanionListenerEnabled` above.
+
+    public func openPhonePairingWindow() async -> NativePairingWindow? {
+        await nativeListenerBackend.openPairingWindow()
+    }
+
+    public func closePhonePairingWindow() async {
+        await nativeListenerBackend.closePairingWindow()
+    }
+
+    public func activePhonePairingWindow() async -> NativePairingWindow? {
+        await nativeListenerBackend.activePairingWindow()
+    }
+
+    public func pairedPhones() async -> [PairedDevice] {
+        await nativeListenerBackend.pairedDevices()
+    }
+
+    public func revokePairedPhone(id: String) async -> Bool {
+        await nativeListenerBackend.revokeDevice(id: id)
+    }
+
+    public func phoneAdvertisement() async -> CompanionEndpointAdvertisement {
+        await nativeListenerBackend.currentAdvertisement()
+    }
+
+    /// Loads the whole Phone tab snapshot through the same loader the
+    /// contract tests exercise, so the tested path is the shipped path.
+    public func loadPhoneSnapshot() async -> PhoneSettingsSnapshot {
+        await PhoneSettingsSnapshotLoader(backend: nativeListenerBackend).loadConsistent()
     }
 
     private func applyExitPolicy(for event: CompanionListenerExitEvent) async {
