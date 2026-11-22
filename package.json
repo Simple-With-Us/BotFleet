@@ -106,7 +106,7 @@
     "smoke:native-host-package": "node scripts/native-host-package-smoke.mjs",
     "test:native-release": "node --test scripts/native-appcast.node-test.mjs scripts/native-release-workflow.node-test.mjs scripts/native-update-release-config.node-test.mjs scripts/native-release-signature.node-test.mjs scripts/native-host-artifact.node-test.mjs scripts/native-host-package-smoke.node-test.mjs scripts/decommission-gates.node-test.mjs scripts/placement-evidence.node-test.mjs scripts/placement-rollback-probe.node-test.mjs scripts/mac-release-version.node-test.mjs scripts/check-post-reboot-node.node-test.mjs scripts/check-decommission-tree.node-test.mjs scripts/check-node-ci-jobs.node-test.mjs scripts/check-soak-24h.node-test.mjs scripts/archive-node-store.node-test.mjs scripts/import-parity-report-contract.node-test.mjs scripts/emit-replay-receipt.node-test.mjs",
     "test:electron-release": "node --test scripts/electron-release-version.node-test.mjs",
-    "test:linux-server-install": "node --test deploy/linux-server/dependency-install.node-test.mjs deploy/linux-server/start.node-test.mjs deploy/linux-server/start-token.node-test.mjs deploy/linux-server/retained-source.node-test.mjs deploy/linux-server/retained-actual-adapters.node-test.mjs scripts/emit-linux-retention-receipt.node-test.mjs"
+    "test:linux-server-install": "node --test deploy/linux-server/dependency-install.node-test.mjs deploy/linux-server/start.node-test.mjs deploy/linux-server/start-token.node-test.mjs deploy/linux-server/companion-bridge.node-test.mjs deploy/linux-server/retained-source.node-test.mjs deploy/linux-server/retained-actual-adapters.node-test.mjs scripts/emit-linux-retention-receipt.node-test.mjs"
   },
   "dependencies": {
     "@openfeature/server-sdk": "^1.23.0",
