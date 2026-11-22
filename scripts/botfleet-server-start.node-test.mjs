@@ -176,6 +176,42 @@ test("a genuine success resets the ledger", () => {
   }
 });
 
+test("a live harness owner on another port exits 0 without exec'ing a second harness (BF-2465)", () => {
+  const fixture = makeFixture({ withDependencies: true });
+  try {
+    // The desktop app owns the data dir from another port: the :PORT health
+    // probe fails, but harness-owner.json names this test process, which is
+    // alive for exactly as long as the launcher needs to check.
+    writeFileSync(
+      join(fixture.dataDir, "harness-owner.json"),
+      JSON.stringify({ version: 1, pid: process.pid, port: 18799, nonce: "a".repeat(64) }),
+    );
+    const result = run(fixture, { threshold: 3 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /another harness owns the data dir; not starting a second harness/);
+    // The stub node's final exec would echo its arguments; it never ran.
+    assert.doesNotMatch(result.stdout, /--experimental-strip-types/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a dead harness owner does not block startup (BF-2465)", () => {
+  const fixture = makeFixture({ withDependencies: true });
+  try {
+    const deadPid = spawnSync("/bin/true", [], { encoding: "utf8" }).pid;
+    writeFileSync(
+      join(fixture.dataDir, "harness-owner.json"),
+      JSON.stringify({ version: 1, pid: deadPid, port: 18799, nonce: "a".repeat(64) }),
+    );
+    const result = run(fixture, { threshold: 3 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /--experimental-strip-types/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
 test("a missing checkout is an ordinary preflight failure, not an unhandled crash", () => {
   const fixture = makeFixture();
   rmSync(join(fixture.serverRoot, "server", "index.ts"));
