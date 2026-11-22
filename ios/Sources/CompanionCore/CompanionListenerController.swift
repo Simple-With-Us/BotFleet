@@ -318,6 +318,7 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
     public func stop() async {
         guard let server else { return }
         await server.stopListening()
+        lastAdvertisement = CompanionEndpointAdvertisement()
     }
 
     public func openPairingWindow() async -> NativePairingWindow? {
@@ -352,9 +353,9 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
     private var lastAdvertisement = CompanionEndpointAdvertisement()
 
     public func setEndpointAdvertisement(_ advertisement: CompanionEndpointAdvertisement) async {
-        lastAdvertisement = advertisement
         guard let server else { return }
         await server.setEndpointAdvertisement(advertisement)
+        lastAdvertisement = advertisement
     }
 
     public func currentAdvertisement() -> CompanionEndpointAdvertisement {
