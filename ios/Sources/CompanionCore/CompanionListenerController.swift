@@ -345,9 +345,20 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
         return await server.revokeDevice(id: id)
     }
 
+    /// The last advertisement this backend was asked to serve. Empty until
+    /// something sets one, so the Phone tab honestly reads "no routes
+    /// advertised yet" — and lights up as soon as the bridge slice wires
+    /// real advertisements through here.
+    private var lastAdvertisement = CompanionEndpointAdvertisement()
+
     public func setEndpointAdvertisement(_ advertisement: CompanionEndpointAdvertisement) async {
+        lastAdvertisement = advertisement
         guard let server else { return }
         await server.setEndpointAdvertisement(advertisement)
+    }
+
+    public func currentAdvertisement() -> CompanionEndpointAdvertisement {
+        lastAdvertisement
     }
 }
 #endif
