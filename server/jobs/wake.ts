@@ -30,6 +30,7 @@
 
 import { BOT_OFF_CODE } from "../../shared/bot-power.ts";
 import type { JobSnapshot } from "../../shared/jobs.ts";
+import { botStopErrorCode } from "../bot-stop-policy.ts";
 import type { JobNoticeItem } from "../steer-queue.ts";
 
 export interface JobWakeDeps {
@@ -159,7 +160,14 @@ export class JobWakeCoordinator {
    *  what delivers the wake.  Polling it every 30 s forever only logs. */
   private park(threadId: string, botId: string, retryTimer = true): void {
     this.waiting.set(threadId, botId);
-    if (!retryTimer || this.retries.has(threadId)) return;
+    if (!retryTimer) {
+      // Settle-only means settle-only: a retry timer armed by an earlier
+      // busy park would still poll once more, so call it off.
+      this.retries.get(threadId)?.cancel();
+      this.retries.delete(threadId);
+      return;
+    }
+    if (this.retries.has(threadId)) return;
     const timer = this.setTimer(() => {
       this.retries.delete(threadId);
       const waitingBot = this.waiting.get(threadId);
@@ -246,7 +254,7 @@ export class JobWakeCoordinator {
       // next settle tries again.
       this.used.set(threadId, Math.max(0, (this.used.get(threadId) ?? 1) - 1));
       this.deps.restoreNotices(threadId, items);
-      const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+      const code = botStopErrorCode(error);
       if (code === "bot_stopped") {
         // Stopped on purpose: park for the next settle with no retry timer
         // and one log line per thread (BF-2454), not a 30 s poll forever.
