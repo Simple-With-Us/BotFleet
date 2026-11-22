@@ -70,18 +70,30 @@ test("trusted native assets are cryptographically verified with the canonical pu
 
 /** Run the workflow's assembled-config import loop in real bash against one env
  *  line and print the exported value, so the shipped text — not a copy of it —
- *  is what the regression check exercises. */
+ *  is what the regression check exercises.
+ *
+ *  The fixture is written FIRST and the loop runs exactly once, the way the
+ *  workflow runs it.  A loop that also ran before its fixture existed failed
+ *  its own redirection, and because only the final command's status was
+ *  asserted that failure was swallowed: the check could not tell a working
+ *  import from an import that never happened. */
 function runEnvImport(stepRun, envLine) {
   const importLoop = stepRun.match(/while IFS= read -r config_line; do[\s\S]*?done < "\$RUNNER_TEMP\/assembled-native-update\.env"/);
   assert.ok(importLoop, "the assemble step must import the config with a first-'=' split that keeps padded values");
-  const result = runShell(
-    `${importLoop[0].replaceAll("$RUNNER_TEMP", "/tmp")}\n` +
-    `printf '%s\\n' '${envLine}' > /tmp/assembled-native-update.env\n` +
-    `${importLoop[0].replaceAll("$RUNNER_TEMP", "/tmp")}\n` +
-    `printf '%s' "$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"`,
-  );
-  assert.equal(result.status, 0, result.stderr);
-  return result.stdout;
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-native-env-"));
+  const envPath = join(directory, "assembled-native-update.env");
+  try {
+    const loop = importLoop[0].replaceAll("$RUNNER_TEMP", directory);
+    const result = runShell(
+      `printf '%s\n' '${envLine}' > '${envPath}'\n` +
+      `${loop}\n` +
+      `printf '%s' "$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"`,
+    );
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout;
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 /** One top-level shell function, taken verbatim out of the script. */
