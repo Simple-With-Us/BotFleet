@@ -161,12 +161,13 @@ exit 2
 FAKE
 chmod +x "${FAKE_BIN}/node"
 
-# A stub fleet-secrets that always reports "absent", so ASC credentials stay
-# unset and no test can reach the real Infisical (the script falls back to
-# fleet-secrets on PATH).
-printf '#!/usr/bin/env bash\nexit 3\n' >"${FAKE_BIN}/fleet-secrets"
-chmod +x "${FAKE_BIN}/fleet-secrets"
-export FLEET_SECRETS="${FAKE_BIN}/fleet-secrets"
+# A stub reader that always reports "absent", so ASC credentials stay
+# unset and no test can reach the real Infisical (the helper reads the reader
+# the environment names).  The reader is a Python program, because the helper
+# runs it with `python3 -I`.
+printf 'import sys\nsys.exit(3)\n' >"${FAKE_BIN}/infisical-scoped.py"
+chmod +x "${FAKE_BIN}/infisical-scoped.py"
+export FLEET_INFISICAL_READER="${FAKE_BIN}/infisical-scoped.py"
 
 # A tiny clean git repo so repo_head_sha() has a real, stable SHA.
 git -C "$REPO" init -q 2>/dev/null || git -C "$REPO" init >/dev/null
@@ -231,7 +232,7 @@ run_ship() {
     PATH="${FAKE_BIN}:/usr/bin:/bin:/usr/sbin:/sbin" \
     TMPDIR="${SHIP_TMPDIR:-${WORK}/tmp}" \
     IOS_FLEET_STATE_DIR="$STATE" \
-    FLEET_SECRETS="${FAKE_BIN}/fleet-secrets" \
+    FLEET_INFISICAL_READER="${FAKE_BIN}/infisical-scoped.py" \
     IOS_FLEET_NODE="${FAKE_BIN}/node" \
     ASC_KEY_ID="${TEST_ASC_KEY_ID:-}" \
     ASC_ISSUER_ID="${TEST_ASC_ISSUER_ID:-}" \

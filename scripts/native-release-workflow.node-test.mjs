@@ -414,9 +414,15 @@ test("one key file serves every notarization, and it leaves no copy behind", () 
 // The fleet's approved order: the environment first, then Infisical, and
 // the keychain profile only as this machine's bootstrap identity.
 test("the notarization credentials are resolved in the approved order", () => {
-  assert.match(localScript, /fleet-secrets get APPLE_API_KEY_P8/);
-  assert.match(localScript, /fleet-secrets get APPLE_API_KEY_ID/);
-  assert.match(localScript, /fleet-secrets get APPLE_API_ISSUER_ID/);
+  // The Infisical leg reads through the shared scoped reader, with the
+  // folder the names live in and the consumer's own account.  The retired
+  // command must not come back.
+  assert.match(localScript, /fleet_secret_get APPLE_API_KEY_P8/);
+  assert.match(localScript, /fleet_secret_get APPLE_API_KEY_ID/);
+  assert.match(localScript, /fleet_secret_get APPLE_API_ISSUER_ID/);
+  assert.match(localScript, /fleet-infisical-read\.sh/);
+  assert.match(localScript, /NOTARY_SECRET_FOLDER="\/asc"/);
+  assert.doesNotMatch(localScript, /fleet-secrets/);
   const resolver = localScript.indexOf("resolve_notary_credentials");
   const call = localScript.indexOf("resolve_notary_credentials\n");
   assert.ok(resolver !== -1 && call !== -1, "the resolver must run before notarization");

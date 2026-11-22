@@ -408,11 +408,11 @@ test("asc-api.mjs resolves its credential from all three sources", () => {
   assert.match(asc, /function resolveCredential\(\)/);
   // Source 1: the APPLE_API_* names ios-ship.yml exports from Infisical.
   // Source 2: ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 in the environment.
-  // Source 3: Infisical through fleet-secrets (AFC-359).
+  // Source 3: Infisical through the shared scoped reader (AFC-359).
   assert.match(asc, /APPLE_API_KEY_P8_BASE64/);
   assert.match(asc, /process\.env\.ASC_KEY_ID/);
   assert.match(asc, /process\.env\.ASC_KEY_P8/);
-  assert.match(asc, /fleetSecretsGet\("ASC_KEY_ID", "\/asc"\)/);
+  assert.match(asc, /scopedRead\("ASC_KEY_ID", ASC_SECRET_FOLDER, ASC_SECRET_ACCOUNT\)/);
   assert.doesNotMatch(asc, /homedir\(\), "\.secrets"/);
   // The base64 p8 is materialized privately and unlinked on exit.
   assert.match(asc, /Buffer\.from\(cleaned, "base64"\)/);
@@ -480,14 +480,23 @@ test("asc-api.mjs stays dependency-free: it runs from a bare directory with no n
   assert.deepEqual(specs.filter((spec) => !spec.startsWith("node:") && !spec.startsWith(".")), [], "asc-api.mjs may only import node: builtins");
   const tmp = mkdtempSync(join(tmpdir(), "asc-bare-"));
   try {
-    const copy = join(tmp, "asc-api.mjs");
+    // The copy keeps the checkout's layout, because the client imports the
+    // shared reader helper from ../lib:  a missing sibling is
+    // ERR_MODULE_NOT_FOUND, which is the same failure this test exists to
+    // catch.
+    const client = join(tmp, "ios-fleet");
+    const lib = join(tmp, "lib");
+    mkdirSync(client, { recursive: true });
+    mkdirSync(lib, { recursive: true });
+    const copy = join(client, "asc-api.mjs");
     writeFileSync(copy, src);
     // The client imports asc-key.mjs, version-plan.mjs and shared-build.mjs, so the bare copy
     // needs them too:  a missing sibling is ERR_MODULE_NOT_FOUND, which is
     // the same failure this test exists to catch.
-    writeFileSync(join(tmp, "asc-key.mjs"), read("scripts/ios-fleet/asc-key.mjs"));
-    writeFileSync(join(tmp, "version-plan.mjs"), read("scripts/ios-fleet/version-plan.mjs"));
-    writeFileSync(join(tmp, "shared-build.mjs"), read("scripts/ios-fleet/shared-build.mjs"));
+    writeFileSync(join(client, "asc-key.mjs"), read("scripts/ios-fleet/asc-key.mjs"));
+    writeFileSync(join(client, "version-plan.mjs"), read("scripts/ios-fleet/version-plan.mjs"));
+    writeFileSync(join(client, "shared-build.mjs"), read("scripts/ios-fleet/shared-build.mjs"));
+    writeFileSync(join(lib, "fleet-infisical-read.mjs"), read("scripts/lib/fleet-infisical-read.mjs"));
     const run = spawnSync(process.execPath, [copy, "latest-build-seq", "app.botfleet.ios", "1.0"], {
       encoding: "utf8",
       env: { PATH: process.env.PATH || "", HOME: tmp },

@@ -13,7 +13,7 @@
  * Usage:
  *   node scripts/ios-fleet/fleet-tf-audit.mjs [--config <file>] [--json] [--repo-heads <file>]
  *
- * --config defaults to fleet-tf-audit.apps.json beside this script.  --repo-heads takes a JSON object that maps an app name to the committer date (ISO string) of that repo's main HEAD.  Credentials come from asc-api.mjs (environment or Infisical through fleet-secrets) and are never printed.  Exit 0 means every app passes, 1 means at least one policy violation, and 2 means an auth or network error stopped the audit.
+ * --config defaults to fleet-tf-audit.apps.json beside this script.  --repo-heads takes a JSON object that maps an app name to the committer date (ISO string) of that repo's main HEAD.  Credentials come from asc-api.mjs (environment or Infisical through the shared scoped reader) and are never printed.  Exit 0 means every app passes, 1 means at least one policy violation, and 2 means an auth or network error stopped the audit.
  */
 import { readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";

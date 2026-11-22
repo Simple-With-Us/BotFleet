@@ -475,7 +475,13 @@ reset_fail_ledger
 rotate_log_if_large
 
 # --- the Infisical service tokens ----------------------------------------
-# Recovered through `fleet-secrets get`, and nothing else out of it.
+# Recovered through the scoped reader, and nothing else out of it.
+#
+# The shared reader helper lives in scripts/lib in the checkout.  The
+# installed copy of this wrapper runs from ~/apps, so the helper is looked for
+# next to it as well:  the installed wrapper needs
+# scripts/lib/fleet-infisical-read.sh copied beside it, or
+# FLEET_INFISICAL_READ_HELPER pointing at it.
 #
 # The helper's own approved bootstrap is managed separately from these app
 # credentials.  Its replacement access must be verified before rollout;
@@ -487,14 +493,42 @@ rotate_log_if_large
 # It never provisions or borrows a machine identity.  Explicit product machine
 # identity settings remain the backend's responsibility; inherited values are
 # left untouched and cannot activate that option implicitly.
-# A missing helper or token does not prevent an optional Infisical install
+# A missing reader or token does not prevent an optional Infisical install
 # from starting; writes still require their separate write credential.
+#
+# The account is the harness's own read-only service token, and the folder is
+# the Fleet-OPS root where the harness identity names live.  A grant covers
+# exactly one folder, so a token scoped to the root does not reach a
+# subfolder.
+FLEET_SECRET_FOLDER="/"
+FLEET_SECRET_ACCOUNT="${FLEET_INFISICAL_BOTFLEET_SERVER_ACCOUNT:-botfleet-server-ro}"
+
+# The shared reader helper, and the sourced function it defines.
+FLEET_INFISICAL_HELPER=""
+for _fleet_helper_candidate in \
+  "${FLEET_INFISICAL_READ_HELPER:-}" \
+  "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/lib/fleet-infisical-read.sh" \
+  "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/fleet-infisical-read.sh"
+do
+  if [ -n "$_fleet_helper_candidate" ] && [ -f "$_fleet_helper_candidate" ]; then
+    FLEET_INFISICAL_HELPER="$_fleet_helper_candidate"
+    break
+  fi
+done
+if [ -n "$FLEET_INFISICAL_HELPER" ]; then
+  # shellcheck source=/dev/null
+  . "$FLEET_INFISICAL_HELPER"
+fi
+
 fleet_secret() {
-  local name="$1" bin="$HOME/.local/bin/fleet-secrets"
-  # A missing executable helper leaves optional vault access unconfigured.
-  [ -f "$bin" ] && [ -x "$bin" ] || return 0
-  # The value goes to stdout only; errors are dropped so no fragment is shown.
-  "$bin" get "$name" 2>/dev/null | tr -d '\r' || true
+  local name="$1" value=""
+  # A missing helper leaves optional vault access unconfigured.
+  if [ -n "${FLEET_INFISICAL_HELPER:-}" ]; then
+    # The value goes to stdout only; the reason is dropped so no fragment of a
+    # refused read reaches the launch log.
+    value="$(fleet_secret_get "$name" "$FLEET_SECRET_FOLDER" "$FLEET_SECRET_ACCOUNT" 2>/dev/null || true)"
+  fi
+  printf '%s' "$value"
   return 0
 }
 
@@ -545,7 +579,7 @@ startup_data_dir() {
 #   * The marker file <data dir>/startup-infisical.opt-in, which opts this
 #     Mac in to the Infisical bootstrap.
 #
-# A helper binary's presence is NOT an answer: fleet-secrets is installed on
+# A reader's presence is NOT an answer: the scoped reader is installed on
 # every fleet Mac, so inferring the choice from it answered remote for every
 # Mac, which is the opposite of what the startup choice is for (BF-2636).
 #

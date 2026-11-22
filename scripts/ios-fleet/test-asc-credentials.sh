@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # AFC-459: ship-testflight.sh resolves the App Store Connect credential from
-# the environment first, then from Infisical through fleet-secrets, and never
-# from a path on disk.
+# the environment first, then from Infisical through the shared scoped reader,
+# and never from a path on disk.
 #
 # 2026-10-21 (Kody rule 42 on the CodeCaps PR #271 review): the private key is
 # handed over in the environment, never as a path the node client reads.  The
 # shell layer owns the credential, so this test drives load_secrets with a
-# FAKE fleet-secrets binary and throwaway keys generated here at test time.
+# FAKE reader and throwaway keys generated here at test time.
 # No network, no real secrets, and no committed key.
 set -euo pipefail
 
@@ -33,34 +33,40 @@ gen_pem > "${tmp}/asc.p8"
 gen_pem > "${tmp}/other.p8"
 chmod 600 "${tmp}/asc.p8" "${tmp}/other.p8"
 
-# Fake fleet-secrets: prints synthetic values, records the folders it was asked
+# Fake reader: prints synthetic values, records the folders it was asked
 # for.  BotFleet has one Infisical folder (/asc) and no per-key folder.
-cat > "${tmp}/fleet-secrets" <<'FAKE'
-#!/usr/bin/env bash
-[[ "$1" == get ]] || exit 2
-name="$2"; folder="$4"
-echo "${name} ${folder}" >> "${FAKE_LOG}"
-case "${folder}:${name}" in
-  /asc:ASC_KEY_ID) printf 'ABCDE12345\n' ;;
-  /asc:ASC_ISSUER_ID) printf 'issuer-synthetic\n' ;;
-  /asc:ASC_KEY_P8) cat "${FAKE_ASC_PEM}" ;;
-  *) exit 3 ;;
-esac
+# The reader is a Python program, because the helper runs it with `python3 -I`.
+cat > "${tmp}/infisical-scoped.py" <<'FAKE'
+import os, sys
+args = sys.argv[1:]
+if not args or args[0] != "get":
+    sys.exit(2)
+name = args[1]
+folder = args[args.index("--folder") + 1]
+with open(os.environ["FAKE_LOG"], "a") as fh:
+    fh.write(name + " " + folder + "\n")
+if folder == "/asc" and name == "ASC_KEY_ID":
+    sys.stdout.write("ABCDE12345\n")
+elif folder == "/asc" and name == "ASC_ISSUER_ID":
+    sys.stdout.write("issuer-synthetic\n")
+elif folder == "/asc" and name == "ASC_KEY_P8":
+    with open(os.environ["FAKE_ASC_PEM"]) as fh:
+        sys.stdout.write(fh.read())
+else:
+    sys.exit(3)
 FAKE
-chmod +x "${tmp}/fleet-secrets"
+chmod +x "${tmp}/infisical-scoped.py"
 export FAKE_LOG="${tmp}/fake.log"
 export FAKE_ASC_PEM="${tmp}/asc.p8"
 : > "$FAKE_LOG"
 
-# A vault that is always closed.  fs_get falls back to whatever
-# fleet-secrets is on the PATH when the configured binary is not executable,
-# so a case that wants NO credential points FLEET_SECRETS_BIN at this
-# executable stub and not at a path that does not exist:  a path that does
-# not exist lets the real fleet-secrets answer, and a test has no business
-# reading the owner's vault.
+# A vault that is always closed.  A case that wants NO credential points
+# FLEET_INFISICAL_READER at this stub and not at a path that does not exist:
+# a path that does not exist lets the installed reader answer, and a test has
+# no business reading the owner's vault.
 cat > "${tmp}/no-vault" <<'VAULT'
-#!/usr/bin/env bash
-exit 2
+import sys
+sys.exit(4)
 VAULT
 chmod 700 "${tmp}/no-vault"
 
@@ -107,7 +113,9 @@ funcs="${tmp}/funcs.sh"
   echo 'ASC_TMP_DIR=""'
   echo 'ASC_DIAG_KEY_ID=""'
   echo 'ASC_DIAG_ISSUER_ID=""'
-  echo "FLEET_SECRETS_BIN=\"${tmp}/fleet-secrets\""
+  printf '. "%s"\n' "${here}/../lib/fleet-infisical-read.sh"
+  echo "FLEET_INFISICAL_READER=\"${tmp}/infisical-scoped.py\""
+  echo 'ASC_SECRET_ACCOUNT="fixture-asc-ro"'
   echo "FLEET_DIR=\"${here}\""
   echo "ASC_COMPARE_TOOL=\"${tmp}/compare.cjs\""
   cat <<'FUNCS'
@@ -177,7 +185,7 @@ ASC_KEY_P8="$(<"${tmp}/other.p8")" \
   same_env_as_file "'"$tmp"'/other.p8"
   different_env_from_file "'"$tmp"'/named-key.p8"
 ' || fail "a named key file overrode the environment"
-[[ ! -s "$FAKE_LOG" ]] || fail "fleet-secrets was called although the environment was complete"
+[[ ! -s "$FAKE_LOG" ]] || fail "the scoped reader was called although the environment was complete"
 
 # 2a. A named ASC_KEY_PATH is not a credential source at all:  it is ignored,
 # and the credential comes from Infisical.  A file somebody names can never
@@ -196,7 +204,7 @@ env -u ASC_KEY_P8 -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8
   different_env_from_file "'"$tmp"'/named-file.p8"
   cleanup_asc_tmp
 ' || fail "a named key file was used as the credential"
-grep -q '^ASC_KEY_P8 /asc$' "$FAKE_LOG" || fail "fleet-secrets was not consulted for the credential"
+grep -q '^ASC_KEY_P8 /asc$' "$FAKE_LOG" || fail "the scoped reader was not consulted for the credential"
 
 # 2b. The run says that it ignored the named path, so an operator can see why
 #     the file they named is not the credential in play.
@@ -369,7 +377,7 @@ env -u ASC_KEY_P8 -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8
   same_env_as_file "'"$tmp"'/asc.p8"
   cleanup_asc_tmp
 ' || fail "a named key file that names nothing broke the run"
-grep -q '^ASC_KEY_P8 /asc$' "$FAKE_LOG" || fail "fleet-secrets was not consulted for the credential"
+grep -q '^ASC_KEY_P8 /asc$' "$FAKE_LOG" || fail "the scoped reader was not consulted for the credential"
 
 # 2k. An inherited ASC_KEY_PATH does not survive a failed resolution:  the
 #     path is cleared, so nothing downstream can pick it up and hand xcodebuild
@@ -747,10 +755,10 @@ validate_log="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8
   bash -c '
   set -euo pipefail
   source "'"$funcs"'"
-  # The sourced file points at the fake fleet-secrets.  Point it at nothing
+  # The sourced file points at the fake reader.  Point it at nothing
   # after that, so the rejected ambient value is the only credential there
   # is and no other source can rescue the run.
-  FLEET_SECRETS_BIN="'"${tmp}"'/no-vault"
+  FLEET_INFISICAL_READER="'"${tmp}"'/no-vault"
   load_secrets
   [[ "$AUTH_MODE" == none ]]
   [[ "$ASC_AUTH_FAILURE" == credential ]]
@@ -781,10 +789,10 @@ validator_log="$(env -u ASC_KEY_PATH -u ASC_KEY_P8 \
   PATH="${tmp}/bin-validator:${PATH}" ASC_TEST_PEM="${tmp}/asc.p8" bash -c '
   set -euo pipefail
   source "'"$funcs"'"
-  # The sourced file points at the fake fleet-secrets.  Point it at nothing
+  # The sourced file points at the fake reader.  Point it at nothing
   # after that, so the only credential in the run is the one the ambient
   # ASC_KEY_P8 carries.
-  FLEET_SECRETS_BIN="'"${tmp}"'/no-vault"
+  FLEET_INFISICAL_READER="'"${tmp}"'/no-vault"
   # The credential reaches the run through the environment it belongs in, so
   # no byte of the key is ever an argument of a process.
   ASC_KEY_P8="$(cat "$ASC_TEST_PEM")"
@@ -807,9 +815,9 @@ env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
   -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 bash -c '
   set -euo pipefail
   source "'"$funcs"'"
-  # The sourced file points at the fake fleet-secrets.  Point it at nothing
+  # The sourced file points at the fake reader.  Point it at nothing
   # after that, so this case really has no credential.
-  FLEET_SECRETS_BIN="'"${tmp}"'/no-vault"
+  FLEET_INFISICAL_READER="'"${tmp}"'/no-vault"
   load_secrets
   [[ "$AUTH_MODE" == none ]]
   [[ -z "${ASC_AUTH_FAILURE:-}" ]]
@@ -898,7 +906,7 @@ run_diag() {  # env assignments..., then load_secrets with the refusing validato
     for a in "$@"; do export "$a"; done
     env PATH="${tmp}/bin-val3:${PATH}" bash -c '
     source "'"$funcs"'"
-    FLEET_SECRETS_BIN="'"${tmp}"'/no-vault"
+    FLEET_INFISICAL_READER="'"${tmp}"'/no-vault"
     load_secrets
     echo "class=${ASC_AUTH_FAILURE:-none}"
   ' 2>&1
@@ -940,7 +948,7 @@ run_diag_identity() {  # env assignments..., then the resolver
           ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8 ASC_KEY_PATH
     local a
     for a in "$@"; do export "$a"; done
-    env FLEET_SECRETS_BIN="${tmp}/fleet-secrets" bash -c '
+    env FLEET_INFISICAL_READER="${tmp}/infisical-scoped.py" bash -c '
     source "'"$funcs"'"
     asc_resolve_diagnostic_credential
     printf "id=%s\nissuer=%s\n" "$ASC_DIAG_KEY_ID" "$ASC_DIAG_ISSUER_ID"

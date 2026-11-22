@@ -15,18 +15,21 @@
 # lengths and appcast are all produced after stapling, never before.
 #
 # Signing material is never read from this repo and never printed.  The Apple
-# notarization credentials are resolved in the fleet's approved order: the
-# environment first, then Infisical through `fleet-secrets get`, and only then
-# this machine's own notarytool keychain profile, which is a bootstrap
-# identity rather than a shared secret store:
+# notarization credentials are resolved in the store's order: Infisical
+# through the scoped reader first, the environment second, and only then this
+# machine's own notarytool keychain profile, which is a bootstrap identity
+# rather than a shared secret store.  The store's answer is the credential, so
+# a stale exported value cannot displace it; the environment is the second
+# source and is used only when the store has nothing, which is the value the
+# workflows fetch from the vault themselves with the infisical-secrets action:
 #   APPLE_API_KEY_P8   App Store Connect API private key (PEM)
 #   APPLE_API_KEY_ID   the key's id, and APPLE_API_ISSUER_ID its issuer
 #   NOTARY_PROFILE     notarytool keychain profile (default: AC_PASSWORD)
 #   MAC_SIGN_IDENTITY  Keychain identity (default: Developer ID Application)
 #   SPARKLE_EDDSA_KEY  sign_update private key file; required with
 #                       sign_update on PATH for distributable packaging
-#   SENTRY_DSN         native Sentry DSN (BF-2541); environment first, then
-#                       Infisical through `fleet-secrets get`, never printed.
+#   SENTRY_DSN         native Sentry DSN (BF-2541); the scoped reader first,
+#                       the environment second, never printed.
 #                       Empty is fine: the package ships with Sentry inert,
 #                       exactly like the release workflow.
 #
@@ -43,6 +46,33 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/release-native"
+
+# The shared scoped reader helper.  It resolves the reader, names the
+# consumer's own account and fails closed when there is no reader or no
+# grant:  the value reaches stdout and nothing else does.  A helper that is
+# not there refuses the read rather than stopping the packaging run.
+FLEET_INFISICAL_HELPER="$ROOT/scripts/lib/fleet-infisical-read.sh"
+if [ -f "$FLEET_INFISICAL_HELPER" ]; then
+  . "$FLEET_INFISICAL_HELPER"
+else
+  fleet_secret_get() {
+    echo "the scoped reader helper is not installed at ${FLEET_INFISICAL_HELPER}" >&2
+    return 4
+  }
+fi
+
+# Where the notarization credentials live, and which account reads them.
+# They are the App Store Connect key, so they live in the fleet's App Store
+# Connect folder, and the account is that consumer's own read-only service
+# token:  a grant covers exactly one folder, so it is named here rather than
+# guessed at runtime.
+NOTARY_SECRET_FOLDER="/asc"
+NOTARY_SECRET_ACCOUNT="${FLEET_INFISICAL_ASC_ACCOUNT:-fleet-tools-mm-asc-ro}"
+# The Sentry DSN is a fleet-wide key, so it lives in the global keys folder
+# with its own account.  An account that is not provisioned is a refused read:
+# it never falls back to another consumer's grant.
+SENTRY_SECRET_FOLDER="/global-api-keys"
+SENTRY_SECRET_ACCOUNT="${FLEET_INFISICAL_SENTRY_ACCOUNT:-}"
 SKIP_NOTARIZE=0
 # The native assets live on their own release tag, exactly as the workflow
 # does: release.yml owns the v<version> release, verifies that its asset set
@@ -78,19 +108,30 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Resolve the Apple notarization credentials in the approved order.  The
-# environment wins; Infisical is the next source; the keychain profile below
-# is the machine-identity bootstrap and the last resort.  Nothing is printed.
+# Resolve the Apple notarization credentials.  Nothing is printed.
+#
+# The order is the store's own contract, the one this repository's
+# INFISICAL.md states:  the vault wins over the environment and over a file.
+# The scoped reader is read first and its answer is the credential; a value
+# the environment already carries is the second source and is used only when
+# the store has nothing, which is the transport the workflows use for the
+# value they read from the vault themselves.  The keychain profile below is
+# the machine-identity bootstrap and the last resort.
+#
+# The folder holds the key under the ASC spelling the fleet's own reader uses
+# and under the Apple spelling the workflows use.  Both name the same
+# credential, so both are tried and the first answer wins.
 resolve_notary_credentials() {
-  if [ -z "${APPLE_API_KEY_P8:-}" ] && command -v fleet-secrets >/dev/null 2>&1; then
-    APPLE_API_KEY_P8="$(fleet-secrets get APPLE_API_KEY_P8 2>/dev/null || true)"
-  fi
-  if [ -z "${APPLE_API_KEY_ID:-}" ] && command -v fleet-secrets >/dev/null 2>&1; then
-    APPLE_API_KEY_ID="$(fleet-secrets get APPLE_API_KEY_ID 2>/dev/null || true)"
-  fi
-  if [ -z "${APPLE_API_ISSUER_ID:-}" ] && command -v fleet-secrets >/dev/null 2>&1; then
-    APPLE_API_ISSUER_ID="$(fleet-secrets get APPLE_API_ISSUER_ID 2>/dev/null || true)"
-  fi
+  local value
+  value="$(fleet_secret_get ASC_KEY_P8 "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  [ -n "$value" ] || value="$(fleet_secret_get APPLE_API_KEY_P8 "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  if [ -n "$value" ]; then APPLE_API_KEY_P8="$value"; fi
+  value="$(fleet_secret_get ASC_KEY_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  [ -n "$value" ] || value="$(fleet_secret_get APPLE_API_KEY_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  if [ -n "$value" ]; then APPLE_API_KEY_ID="$value"; fi
+  value="$(fleet_secret_get ASC_ISSUER_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  [ -n "$value" ] || value="$(fleet_secret_get APPLE_API_ISSUER_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  if [ -n "$value" ]; then APPLE_API_ISSUER_ID="$value"; fi
 }
 
 # Open the API key on a file descriptor and unlink it at once, so the key is
@@ -136,16 +177,17 @@ if ! command -v xcodegen >/dev/null; then
 fi
 (cd "$ROOT/ios" && xcodegen generate)
 
-# Native Sentry (BF-2541): same stamping as native-mac-release.yml.  The DSN
-# resolves environment-first, then Infisical, and is never printed; an empty
-# DSN packages with Sentry inert rather than failing the build.
-if [ -z "${SENTRY_DSN:-}" ] && command -v fleet-secrets >/dev/null 2>&1; then
-  SENTRY_DSN="$(fleet-secrets get SENTRY_DSN 2>/dev/null || true)"
-fi
+# Native Sentry (BF-2541): same stamping as native-mac-release.yml.  The
+# store is read first and its answer is the DSN; a value the environment
+# already carries is kept only when the store has none.  The DSN is never
+# printed, and an empty DSN packages with Sentry inert rather than failing
+# the build.
+SENTRY_DSN_VALUE="$(fleet_secret_get SENTRY_DSN "$SENTRY_SECRET_FOLDER" "$SENTRY_SECRET_ACCOUNT" 2>/dev/null || true)"
+if [ -n "$SENTRY_DSN_VALUE" ]; then SENTRY_DSN="$SENTRY_DSN_VALUE"; fi
 SENTRY_DSN="${SENTRY_DSN:-}"
 SOURCE_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 if [ -z "$SENTRY_DSN" ]; then
-  echo "note: SENTRY_DSN unset in env and Infisical; package ships with Sentry inert"
+  echo "note: no SENTRY_DSN in the scoped reader at $SENTRY_SECRET_FOLDER or in the environment; package ships with Sentry inert"
 fi
 
 mkdir -p "$OUT"
