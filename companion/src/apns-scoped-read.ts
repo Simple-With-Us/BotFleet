@@ -73,7 +73,9 @@ export async function readApnsScopedSecret(
     );
     return { code: APNS_READ_OK, value: stdout.replace(/\r?\n$/, ""), reason: "ok" };
   } catch (err) {
-    const status = exitStatus(err);
+    // The boundary decodes the child's failure:  a value that is not an
+    // Error carries no exit status, so it is a refused read.
+    const status = exitStatus(err instanceof Error ? err : new Error("the scoped reader did not answer"));
     if (status === APNS_READ_ABSENT) return { code: APNS_READ_ABSENT, value: null, reason: "absent" };
     if (status === APNS_READ_USAGE) return { code: APNS_READ_USAGE, value: null, reason: "usage" };
     return { code: APNS_READ_REFUSED, value: null, reason: "refused" };
@@ -86,10 +88,8 @@ export async function readApnsScopedSecret(
  * Node puts the status on the error's `code`, and a child that was killed
  * has none:  a missing status is a refused read, never an absent name.
  */
-function exitStatus(err: unknown): number {
-  if (err instanceof Error && "code" in err) {
-    const status = Number(err.code);
-    if (Number.isInteger(status)) return status;
-  }
-  return 0;
+function exitStatus(err: Error): number {
+  if (!("code" in err)) return 0;
+  const status = Number(Reflect.get(err, "code"));
+  return Number.isInteger(status) ? status : 0;
 }
