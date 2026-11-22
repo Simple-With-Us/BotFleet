@@ -7,7 +7,7 @@
 // scripts/botfleet-server-start.sh and docs/audits/2026-09-24-efficiency-audit.md OP10.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -171,6 +171,59 @@ test("a genuine success resets the ledger", () => {
     const result = run(fixture, { threshold: 3 });
     assert.equal(result.status, 0);
     assert.throws(() => readFileSync(fixture.ledger, "utf8"), /ENOENT/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a live harness owner on another port exits 0 without exec'ing a second harness (BF-2465)", () => {
+  const fixture = makeFixture({ withDependencies: true });
+  try {
+    // The desktop app owns the data dir from another port: the :PORT health
+    // probe fails, but harness-owner.json names this test process, which is
+    // alive for exactly as long as the launcher needs to check.
+    writeFileSync(
+      join(fixture.dataDir, "harness-owner.json"),
+      JSON.stringify({ version: 1, pid: process.pid, port: 18799, nonce: "a".repeat(64) }),
+    );
+    const result = run(fixture, { threshold: 3 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /another harness owns the data dir; not starting a second harness/);
+    // The stub node's final exec would echo its arguments; it never ran.
+    assert.doesNotMatch(result.stdout, /--experimental-strip-types/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a dead harness owner does not block startup (BF-2465)", () => {
+  const fixture = makeFixture({ withDependencies: true });
+  try {
+    const deadPid = spawnSync("/bin/true", [], { encoding: "utf8" }).pid;
+    writeFileSync(
+      join(fixture.dataDir, "harness-owner.json"),
+      JSON.stringify({ version: 1, pid: deadPid, port: 18799, nonce: "a".repeat(64) }),
+    );
+    const result = run(fixture, { threshold: 3 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /--experimental-strip-types/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("an owner record from before this boot does not suppress startup (BF-2465)", () => {
+  const fixture = makeFixture({ withDependencies: true });
+  try {
+    // A pid recycled after reboot: the record names this live test process,
+    // but the file predates any real boot, so it cannot name a live owner.
+    const ownerFile = join(fixture.dataDir, "harness-owner.json");
+    writeFileSync(ownerFile, JSON.stringify({ version: 1, pid: process.pid, port: 18799, nonce: "a".repeat(64) }));
+    const longAgo = new Date("2000-01-01T00:00:00Z");
+    utimesSync(ownerFile, longAgo, longAgo);
+    const result = run(fixture, { threshold: 3 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /--experimental-strip-types/);
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
