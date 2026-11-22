@@ -8,13 +8,17 @@
 // implementation, so a regression is a red test rather than a bad archive
 // nobody notices until a rollback.
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   ARCHIVE_MARKER,
+  DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_FILES,
   MAX_PACKET_BYTES,
   assertRollbackJournalMode,
   archiveStore,
@@ -33,7 +37,12 @@ import {
 } from "./archive-node-store.mjs";
 import { parseEvidenceReceipt } from "./decommission-evidence-bundle.mjs";
 
+/* oxlint-disable eslint/no-irregular-whitespace -- Owner-required NBSP sentence gaps occur only in the prose comments of this module. */
+
 const ROOT_IS_ROOT = Boolean(process.getuid) && process.getuid() === 0;
+
+/** The archive command, run as a child process so its own refusal is the thing under test. */
+const CLI = join(dirname(fileURLToPath(import.meta.url)), "archive-node-store.mjs");
 
 /** A credential shape the shared redactor recognizes. */
 const TOKEN = "sk-ant-api03-" + "A".repeat(48);
@@ -41,6 +50,17 @@ const TOKEN = "sk-ant-api03-" + "A".repeat(48);
 /** A private scratch directory, which is what the archive requires. */
 function privateScratch(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
+}
+
+/**
+ * Run the archive command as a child process.
+ *
+ * The child is the CLI an operator runs, so its own exit code and its own
+ * refusal text are what the assertions read. The store is always named
+ * explicitly, so the real store on this host is never the one under test.
+ */
+function runArchiveCli(args) {
+  return spawnSync(process.execPath, [CLI, "archive", ...args], { encoding: "utf8" });
 }
 
 /**
@@ -862,3 +882,70 @@ test("a database that fails its integrity check is a verdict, and its handle is 
   const failure = health.checks.find((check) => check.name === "sqlite-integrity");
   assert.equal(failure.ok, false);
 });
+
+test("the default ceilings cover the owner's measured store", () => {
+  // The store this producer exists to archive holds 286,388 files and about
+  // 13 GB, and the capture that succeeded on 2026-11-22 was 286,257 files
+  // and 12,200,859,045 bytes. A default below either number means the
+  // plain command cannot capture the owner's own store.
+  assert.ok(DEFAULT_MAX_FILES > 286_388, "the file ceiling is above the measured store");
+  assert.ok(DEFAULT_MAX_FILES > 286_257, "the file ceiling is above the measured capture");
+  assert.ok(DEFAULT_MAX_BYTES > 13_000_000_000, "the byte ceiling is above the measured store");
+  assert.ok(DEFAULT_MAX_BYTES > 12_200_859_045, "the byte ceiling is above the measured capture");
+});
+
+test("the CLI refuses a ceiling value that is not a positive whole number", () => {
+  const store = makeStore();
+  const parent = privateScratch("capture-");
+  for (const value of ["abc", "0", "-1", "1.5", ""]) {
+    const result = runArchiveCli([
+      "--store", store,
+      "--out", join(parent, "capture"),
+      "--max-files", value,
+    ]);
+    assert.equal(result.status, 2, `"${value}" is refused with the usage exit code`);
+    assert.match(result.stderr, /archive-node-store refused/, `"${value}" is refused`);
+    assert.match(result.stderr, /--max-files/, `"${value}" names the flag it refuses`);
+    assert.ok(!existsSync(join(parent, "capture")), `"${value}" writes nothing`);
+  }
+});
+
+test("the CLI passes an explicit ceiling through to the capture", { skip: ROOT_IS_ROOT }, () => {
+  const store = makeStore();
+  const parent = privateScratch("capture-");
+  const result = runArchiveCli([
+    "--store", store,
+    "--out", join(parent, "capture"),
+    "--max-files", "1000000",
+    "--max-bytes", "1000000000",
+  ]);
+
+  assert.equal(result.status, 0, result.stderr);
+  const summary = JSON.parse(result.stdout);
+  assert.equal(summary.archived, true);
+  assert.equal(summary.maxFiles, 1000000, "the file ceiling the operator named is the one in force");
+  assert.equal(summary.maxBytes, 1000000000, "the byte ceiling the operator named is the one in force");
+  assert.ok(summary.files > 0);
+});
+
+test("a store above an explicit ceiling is refused, and the refusal names the ceiling", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  const parent = privateScratch("capture-");
+
+  // The file ceiling, through the CLI.
+  const files = runArchiveCli([
+    "--store", store,
+    "--out", join(parent, "capture-files"),
+    "--max-files", "1",
+  ]);
+  assert.equal(files.status, 2, files.stderr);
+  assert.match(files.stderr, /above the 1 ceiling/, "the file refusal names the ceiling");
+
+  // The byte ceiling, through the exported function.
+  await assert.rejects(
+    () => archiveStore({ storeRoot: store, outDir: join(parent, "capture-bytes"), maxBytes: 1 }),
+    /above the 1 byte ceiling/,
+  );
+});
+
+/* oxlint-enable eslint/no-irregular-whitespace */
