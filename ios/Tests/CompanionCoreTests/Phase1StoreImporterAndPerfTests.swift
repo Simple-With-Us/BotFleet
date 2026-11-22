@@ -562,6 +562,44 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(report.isFullyVerified == true)
     }
 
+    @Test("StoreImporter names a routine request receipt count divergence instead of only failing the verdict")
+    func storeImporterNamesReceiptCountDivergence() async throws {
+        let tempDir = try makeTempDir("receipt-divergence-test")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        try populateSourceFixture(in: tempDir)
+
+        // Seed the target with a receipt the source does not carry, so the
+        // receipt count pair diverges while every other surface matches.
+        // `isParityVerified` already gated on this pair; the report must
+        // also name it, or a failing receipt gives the operator no surface
+        // to look at (BF-2648 independent pass).
+        let db = try DatabaseService(path: tempDir.appendingPathComponent("native.sqlite").path)
+        try await db.recordRoutineRequestReceipt(RoutineRequestReceiptRecord(
+            requestId: "req-stray",
+            messageId: "m-stray",
+            botId: "bot-1",
+            threadId: "thread-bot-1",
+            action: "run_now",
+            fingerprintVersion: 1,
+            fingerprint: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            resultId: "run-stray",
+            appliedAt: 1_700_000_500
+        ))
+
+        let importer = StoreImporter(batchSize: 10)
+        let report = try await importer.importStore(from: tempDir, into: db)
+
+        #expect(report.sourceRoutineRequestReceiptCount == 0)
+        #expect(report.targetRoutineRequestReceiptCount == 1)
+        #expect(report.isParityVerified == false)
+        #expect(report.isFullyVerified == false)
+        #expect(report.mismatches.contains { $0.contains("routine_request_receipt") })
+        // The divergence is only the receipt pair: the message surfaces agree.
+        #expect(report.sourceMessageCount == report.targetMessageCount)
+        #expect(report.sourceBodyDigestSHA256 == report.targetBodyDigestSHA256)
+    }
+
     // MARK: - Review Fix: a cross-thread message id fails the import in the importer's own words
 
     @Test("The importer names both threads when a message id belongs to two of them")
