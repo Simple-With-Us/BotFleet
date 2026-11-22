@@ -240,6 +240,11 @@ finally { if (fd !== undefined) fs.closeSync(fd); }
 harness_owner_predates_boot() {
   local mtime="$1" boot
   boot="$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null | /usr/bin/sed -n 's/^{ sec = \([0-9]*\).*/\1/p')"
+  # Linux has no kern.boottime; /proc/stat carries the same epoch as btime.
+  # Production is macOS-only, but the launcher tests also run on Linux CI.
+  if [ -z "$boot" ] && [ -r /proc/stat ]; then
+    boot="$(/usr/bin/awk '/^btime/ { print $2 }' /proc/stat 2>/dev/null)"
+  fi
   case "$mtime" in '' | *[!0-9]*) return 1 ;; esac
   case "$boot" in '' | *[!0-9]*) return 1 ;; esac
   [ "$mtime" -lt "$boot" ]
