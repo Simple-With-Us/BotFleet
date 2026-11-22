@@ -85,6 +85,24 @@ public struct PhoneSettingsSnapshotLoader<Backend: PhonePairingBackend>: Sendabl
             routes: PhoneSettingsDisplay.routeRows(advertisement: advertisement)
         )
     }
+
+    /// Loads until the snapshot is self-consistent: a window rotation or
+    /// close between the three backend reads would otherwise pair a stale
+    /// window with a fresh advertisement and render a QR that fails pairing.
+    /// After each load the active window is re-read; on mismatch the whole
+    /// snapshot is reloaded, bounded by `maxAttempts` total loads so a
+    /// never-settling backend still terminates.
+    public func loadConsistent(maxAttempts: Int = 2) async -> PhoneSettingsSnapshot {
+        var snapshot = await load()
+        var attempts = 1
+        while attempts < max(1, maxAttempts) {
+            let current = await backend.activePairingWindow()
+            if current == snapshot.window { break }
+            snapshot = await load()
+            attempts += 1
+        }
+        return snapshot
+    }
 }
 
 /// Display rules for the Phone tab. Pure, so every rule is unit-tested.

@@ -1104,7 +1104,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// Loads the whole Phone tab snapshot through the same loader the
     /// contract tests exercise, so the tested path is the shipped path.
     public func loadPhoneSnapshot() async -> PhoneSettingsSnapshot {
-        await PhoneSettingsSnapshotLoader(backend: nativeListenerBackend).load()
+        await PhoneSettingsSnapshotLoader(backend: nativeListenerBackend).loadConsistent()
     }
 
     private func applyExitPolicy(for event: CompanionListenerExitEvent) async {

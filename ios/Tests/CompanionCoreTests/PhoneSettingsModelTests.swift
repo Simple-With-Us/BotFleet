@@ -16,6 +16,10 @@ struct PhoneSettingsModelTests {
         var devices: [PairedDevice] = []
         var advertisement: CompanionEndpointAdvertisement = CompanionEndpointAdvertisement()
         var revokedIds: [String] = []
+        /// Scripted answers for `activePairingWindow`, consumed in order.
+        /// When empty the test falls back to `window`.
+        var windowScript: [NativePairingWindow?] = []
+        var activeCalls = 0
 
         /// A valid-shape pairing credential: the parser only accepts
         /// `omb_pair_` tokens of exactly 52 bytes.
@@ -36,7 +40,9 @@ struct PhoneSettingsModelTests {
         }
 
         func activePairingWindow() async -> NativePairingWindow? {
-            window
+            activeCalls += 1
+            if !windowScript.isEmpty { return windowScript.removeFirst() }
+            return window
         }
 
         func pairedDevices() async -> [PairedDevice] {
@@ -134,17 +140,19 @@ struct PhoneSettingsModelTests {
         #expect(rows.map(\.kindLabel) == ["Tailscale"])
     }
 
-    @Test("The backend serves the last advertisement it was asked to serve")
-    func backendServesLastSetAdvertisement() async {
+    @Test("The backend never advertises what it did not serve")
+    func backendAdvertisesOnlyWhatItServed() async {
         // The closure only runs on start; this test never starts the
         // listener, so nothing is bound and no store is opened.
         let backend = NativeCompanionListenerBackend {
             fatalError("the cache test never starts the listener")
         }
         #expect(await backend.currentAdvertisement() == CompanionEndpointAdvertisement())
-        let advertisement = hostedAdvertisement()
-        await backend.setEndpointAdvertisement(advertisement)
-        #expect(await backend.currentAdvertisement() == advertisement)
+        // With no server running, asking for an advertisement must not
+        // change what the tab shows: the cache records only advertisements
+        // that were actually handed to a running server.
+        await backend.setEndpointAdvertisement(hostedAdvertisement())
+        #expect(await backend.currentAdvertisement() == CompanionEndpointAdvertisement())
     }
 
     @Test("No window means no invite, and no devices means an empty list")
@@ -156,6 +164,34 @@ struct PhoneSettingsModelTests {
         #expect(snapshot.devices.isEmpty)
         #expect(snapshot.routes.isEmpty)
     }
+
+    @Test("A rotating window is re-read until the snapshot is self-consistent")
+    func consistentLoadRetriesOnRotation() async {
+        let first = NativePairingWindow(code: "111111", qrCredential: FakePhoneBackend.fakeQRCredential, expiresAt: Date(timeIntervalSince1970: 1_700_000_100), attemptsRemaining: 3)
+        let second = NativePairingWindow(code: "222222", qrCredential: FakePhoneBackend.fakeQRCredential, expiresAt: Date(timeIntervalSince1970: 1_700_000_200), attemptsRemaining: 3)
+        let backend = FakePhoneBackend()
+        // First snapshot sees `first`; the re-read sees the rotated `second`,
+        // so the loader reloads once more and settles on `second`.
+        await backend.setWindowScript([first, second, second, second])
+        let loader = PhoneSettingsSnapshotLoader(backend: backend)
+        let snapshot = await loader.loadConsistent()
+        #expect(snapshot.window == second)
+        #expect(await backend.activeCallCount() >= 3)
+    }
+
+    @Test("A never-settling window still terminates within its attempt budget")
+    func consistentLoadAlwaysTerminates() async {
+        let first = NativePairingWindow(code: "111111", qrCredential: FakePhoneBackend.fakeQRCredential, expiresAt: Date(timeIntervalSince1970: 1_700_000_100), attemptsRemaining: 3)
+        let second = NativePairingWindow(code: "222222", qrCredential: FakePhoneBackend.fakeQRCredential, expiresAt: Date(timeIntervalSince1970: 1_700_000_200), attemptsRemaining: 3)
+        let backend = FakePhoneBackend()
+        // The window flips on every read; the loader must still return after
+        // maxAttempts snapshots instead of retrying forever.
+        await backend.setWindowScript([first, second, first, second, first, second, first, second])
+        let loader = PhoneSettingsSnapshotLoader(backend: backend)
+        let snapshot = await loader.loadConsistent(maxAttempts: 3)
+        #expect(snapshot.window == first || snapshot.window == second)
+        #expect(await backend.activeCallCount() <= 2 * 3 + 1)
+    }
 }
 
 // MARK: - Fake helpers (test-only setters; the protocol stays read-shaped)
@@ -163,6 +199,14 @@ struct PhoneSettingsModelTests {
 extension PhoneSettingsModelTests.FakePhoneBackend {
     func setAdvertisement(_ advertisement: CompanionEndpointAdvertisement) {
         self.advertisement = advertisement
+    }
+
+    func setWindowScript(_ script: [NativePairingWindow?]) {
+        self.windowScript = script
+    }
+
+    func activeCallCount() -> Int {
+        self.activeCalls
     }
 
     func setDevices(_ devices: [PairedDevice]) {
