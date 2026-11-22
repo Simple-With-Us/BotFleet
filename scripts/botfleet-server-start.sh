@@ -203,9 +203,11 @@ health() {
 }
 
 # Prints the pid named by harness-owner.json, or fails when there is no
-# readable record.  An unreadable or malformed record falls through to the
-# normal start, where the server's own ownership check refuses it by name;
-# guessing here would only hide that refusal.
+# readable record.  The record is validated with the same shape rules as
+# readRecord in electron/harness-ownership.mjs (version, port, nonce), so a
+# truncated or foreign file never suppresses startup.  An unreadable or
+# malformed record falls through to the normal start, where the server's own
+# ownership check refuses it by name; guessing here would only hide that.
 live_harness_owner_pid() {
   [ -f "$HARNESS_OWNER_FILE" ] || return 1
   "$NODE" --input-type=module -e '
@@ -217,11 +219,28 @@ try {
   if (!stat.isFile() || stat.size > 4096) process.exit(1);
   const value = JSON.parse(fs.readFileSync(fd, "utf8"));
   if (value === null || typeof value !== "object" || Array.isArray(value) ||
-      !Number.isInteger(value.pid) || value.pid <= 0) process.exit(1);
+      value.version !== 1 || !Number.isInteger(value.pid) || value.pid <= 0 ||
+      !Number.isInteger(value.port) || value.port < 1 || value.port > 65535 ||
+      typeof value.nonce !== "string" || !/^[a-f0-9]{64}$/.test(value.nonce)) process.exit(1);
   process.stdout.write(String(value.pid));
 } catch { process.exitCode = 1; }
 finally { if (fd !== undefined) fs.closeSync(fd); }
 ' -- "$HARNESS_OWNER_FILE" 2>/dev/null
+}
+
+# True when the owner record predates this boot.  kill -0 alone cannot tell
+# the record's owner from an unrelated process that recycled its pid after a
+# reboot; the record file's mtime can, because the owner writes it while
+# acquiring.  A record older than kern.boottime names a dead boot's harness
+# whatever lives at that pid now.  Unreadable clocks answer "not stale" so a
+# probe failure never starts a second harness beside a live owner.
+harness_owner_predates_boot() {
+  local mtime boot
+  mtime="$(/usr/bin/stat -f%m "$HARNESS_OWNER_FILE" 2>/dev/null)" || return 1
+  boot="$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null | /usr/bin/sed -n 's/^{ sec = \([0-9]*\).*/\1/p')"
+  case "$mtime" in '' | *[!0-9]*) return 1 ;; esac
+  case "$boot" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$mtime" -lt "$boot" ]
 }
 
 log() {
@@ -493,7 +512,7 @@ fi
 # below runs before exec, the storm stop never engages: 3,892 identical
 # crashes in 7 hours, one launchd relaunch every few seconds.  A live owner
 # is the same quiet state as a healthy port, so leave it alone the same way.
-if OWNER_PID="$(live_harness_owner_pid)" && [ -n "$OWNER_PID" ] && kill -0 "$OWNER_PID" 2>/dev/null; then
+if OWNER_PID="$(live_harness_owner_pid)" && [ -n "$OWNER_PID" ] && kill -0 "$OWNER_PID" 2>/dev/null && ! harness_owner_predates_boot; then
   log "harness-owner.json names live pid ${OWNER_PID}; another harness owns the data dir; not starting a second harness"
   reset_fail_ledger
   exit 0
