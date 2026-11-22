@@ -64,9 +64,21 @@ const ASC_SECRET_ACCOUNT = process.env.FLEET_INFISICAL_ASC_ACCOUNT || "fleet-too
 // Reads one value from Infisical Fleet-OPS through the shared scoped reader.
 // Returns "" when absent or unreadable;  never prints the value or the
 // reader's stderr.  FLEET_INFISICAL_READER is the test seam.
+//
+// Every read spawns the reader, and a credential resolution asks for the same
+// names more than once, so the answers are kept for the life of the process.
+// The cache holds what the reader said:  a name is read once, and a second
+// ask gets that answer rather than a second trip to the vault.
+const SCOPED_READ_CACHE = new Map();
+
 function scopedRead(name, folder, account) {
+  const key = `${folder}\u0000${account}\u0000${name}`;
+  const cached = SCOPED_READ_CACHE.get(key);
+  if (cached !== undefined) return cached;
   const got = readFleetSecret(name, folder, account);
-  return got.code === 0 && got.value !== null ? got.value : "";
+  const value = got.code === 0 && got.value !== null ? got.value : "";
+  SCOPED_READ_CACHE.set(key, value);
+  return value;
 }
 
 function base64url(input) {

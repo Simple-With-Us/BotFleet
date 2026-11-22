@@ -59,12 +59,16 @@ else
 fi
 
 # Where the notarization credentials live, and which account reads them.
-# The account is the consumer's own read-only service token; a grant covers
-# exactly one folder, so it is named here rather than guessed at runtime.
-NOTARY_SECRET_FOLDER="/botfleet-server"
-NOTARY_SECRET_ACCOUNT="${FLEET_INFISICAL_BOTFLEET_SERVER_SECRET_ACCOUNT:-}"
-# The Sentry DSN lives in its own folder, with its own account.
-SENTRY_SECRET_FOLDER="/botfleet-sentry"
+# They are the App Store Connect key, so they live in the fleet's App Store
+# Connect folder, and the account is that consumer's own read-only service
+# token:  a grant covers exactly one folder, so it is named here rather than
+# guessed at runtime.
+NOTARY_SECRET_FOLDER="/asc"
+NOTARY_SECRET_ACCOUNT="${FLEET_INFISICAL_ASC_ACCOUNT:-fleet-tools-mm-asc-ro}"
+# The Sentry DSN is a fleet-wide key, so it lives in the global keys folder
+# with its own account.  An account that is not provisioned is a refused read:
+# it never falls back to another consumer's grant.
+SENTRY_SECRET_FOLDER="/global-api-keys"
 SENTRY_SECRET_ACCOUNT="${FLEET_INFISICAL_SENTRY_ACCOUNT:-}"
 SKIP_NOTARIZE=0
 # The native assets live on their own release tag, exactly as the workflow
@@ -101,19 +105,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Resolve the Apple notarization credentials in the approved order.  The
-# environment wins; Infisical is the next source; the keychain profile below
+# Resolve the Apple notarization credentials.  The store is the authority:
+# the environment is not a source for a value, and the keychain profile below
 # is the machine-identity bootstrap and the last resort.  Nothing is printed.
+#
+# The folder holds the key under the ASC spelling the fleet's own reader uses
+# and under the Apple spelling the workflows use.  Both name the same
+# credential, so both are tried and the first answer wins.
 resolve_notary_credentials() {
-  if [ -z "${APPLE_API_KEY_P8:-}" ]; then
-    APPLE_API_KEY_P8="$(fleet_secret_get APPLE_API_KEY_P8 "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
-  fi
-  if [ -z "${APPLE_API_KEY_ID:-}" ]; then
-    APPLE_API_KEY_ID="$(fleet_secret_get APPLE_API_KEY_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
-  fi
-  if [ -z "${APPLE_API_ISSUER_ID:-}" ]; then
-    APPLE_API_ISSUER_ID="$(fleet_secret_get APPLE_API_ISSUER_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
-  fi
+  local value
+  value="$(fleet_secret_get ASC_KEY_P8 "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  [ -n "$value" ] || value="$(fleet_secret_get APPLE_API_KEY_P8 "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  APPLE_API_KEY_P8="$value"
+  value="$(fleet_secret_get ASC_KEY_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  [ -n "$value" ] || value="$(fleet_secret_get APPLE_API_KEY_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  APPLE_API_KEY_ID="$value"
+  value="$(fleet_secret_get ASC_ISSUER_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  [ -n "$value" ] || value="$(fleet_secret_get APPLE_API_ISSUER_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  APPLE_API_ISSUER_ID="$value"
 }
 
 # Open the API key on a file descriptor and unlink it at once, so the key is
@@ -160,15 +169,14 @@ fi
 (cd "$ROOT/ios" && xcodegen generate)
 
 # Native Sentry (BF-2541): same stamping as native-mac-release.yml.  The DSN
-# resolves environment-first, then Infisical, and is never printed; an empty
-# DSN packages with Sentry inert rather than failing the build.
-if [ -z "${SENTRY_DSN:-}" ]; then
-  SENTRY_DSN="$(fleet_secret_get SENTRY_DSN "$SENTRY_SECRET_FOLDER" "$SENTRY_SECRET_ACCOUNT" 2>/dev/null || true)"
-fi
+# comes from the store, is never printed, and is exported for the build only
+# after the read answered; an empty DSN packages with Sentry inert rather than
+# failing the build.
+SENTRY_DSN="$(fleet_secret_get SENTRY_DSN "$SENTRY_SECRET_FOLDER" "$SENTRY_SECRET_ACCOUNT" 2>/dev/null || true)"
 SENTRY_DSN="${SENTRY_DSN:-}"
 SOURCE_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 if [ -z "$SENTRY_DSN" ]; then
-  echo "note: SENTRY_DSN unset in env and Infisical; package ships with Sentry inert"
+  echo "note: the scoped reader has no SENTRY_DSN in $SENTRY_SECRET_FOLDER; package ships with Sentry inert"
 fi
 
 mkdir -p "$OUT"

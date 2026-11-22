@@ -146,7 +146,8 @@ fi
 # The App Store Connect credential's own read-only service token, and the
 # folder its names live in.
 ASC_SECRET_ACCOUNT="${FLEET_INFISICAL_ASC_ACCOUNT:-fleet-tools-mm-asc-ro}"
-# The Sentry token lives in its own folder, with its own account.
+# The Sentry token is a fleet-wide key, so it lives in the global keys
+# folder with its own account.
 SENTRY_SECRET_ACCOUNT="${FLEET_INFISICAL_SENTRY_ACCOUNT:-}"
 ASC_TMP_DIR=""
 # "staging" means a credential was resolved and the staging path was refused.
@@ -652,7 +653,7 @@ load_sentry_auth() {
     return 0
   fi
   local token
-  token="$(fleet_secret_get SENTRY_AUTH_TOKEN "/botfleet-sentry" "$SENTRY_SECRET_ACCOUNT" 2>/dev/null | tr -d '\r')" || token=""
+  token="$(fleet_secret_get SENTRY_AUTH_TOKEN "/global-api-keys" "$SENTRY_SECRET_ACCOUNT" 2>/dev/null | tr -d '\r')" || token=""
   if [[ -n "$token" ]]; then
     SENTRY_AUTH_TOKEN="$token"
     export SENTRY_AUTH_TOKEN

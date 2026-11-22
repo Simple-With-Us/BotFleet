@@ -50,7 +50,8 @@ else
   }
 fi
 # The Composio credential's own read-only service token.  A grant covers
-# exactly one folder, so the session and the API key each name their own.
+# exactly one folder, so the session and the API key each name their own:
+# the API key is a fleet-wide key and lives in the global keys folder.
 COMPOSIO_SECRET_ACCOUNT="${FLEET_INFISICAL_COMPOSIO_ACCOUNT:-}"
 COMPOSIO_SESSION_ACCOUNT="${FLEET_INFISICAL_COMPOSIO_SESSION_ACCOUNT:-}"
 PRINT_FOR="none"
@@ -76,7 +77,7 @@ resolve_api_key() {
     printf "%s" "$COMPOSIO_API_KEY"; return 0
   fi
   local key
-  key="$(fleet_secret_get COMPOSIO_API_KEY "/" "$COMPOSIO_SECRET_ACCOUNT" 2>/dev/null)" || key=""
+  key="$(fleet_secret_get COMPOSIO_API_KEY "/global-api-keys" "$COMPOSIO_SECRET_ACCOUNT" 2>/dev/null)" || key=""
   if [[ -z "$key" ]]; then
     echo "COMPOSIO_API_KEY not set and the scoped reader returned nothing" >&2
     return 1

@@ -16,31 +16,47 @@ import { performance } from "node:perf_hooks";
 
 import { readFleetSecret } from "./lib/fleet-infisical-read.mjs";
 
-// 1. Keys come from the environment first, then from the shared scoped reader
-//    (Mac, Infisical Fleet-OPS).  The value is captured and never printed; a
-//    missing reader or an absent key just means "not set".
+// 1. Keys come from the shared scoped reader (Mac, Infisical Fleet-OPS).  The
+//    store is the authority:  the environment is not a source for a value, and
+//    the value the store returned is exported for this process afterwards.  A
+//    missing reader, an absent name or a missing grant just means "not set".
 //
 //    The account is the consumer's own read-only service token, and a grant
-//    covers exactly one folder.
+//    covers exactly one folder.  It is read at call time, not at import, so a
+//    caller that sets it after the module loads still gets its own grant.
 const API_KEYS_FOLDER = "/global-api-keys";
-const API_KEYS_ACCOUNT = process.env.FLEET_INFISICAL_GLOBAL_API_KEYS_ACCOUNT || "";
 
 function scopedSecret(name) {
-  const got = readFleetSecret(name, API_KEYS_FOLDER, API_KEYS_ACCOUNT);
+  const account = process.env.FLEET_INFISICAL_GLOBAL_API_KEYS_ACCOUNT || "";
+  const got = readFleetSecret(name, API_KEYS_FOLDER, account);
   return got.code === 0 && got.value !== null ? got.value.trim() : "";
 }
 
-function secret(...names) {
+/**
+ * One key, resolved from the store.
+ *
+ * The names are the store's own names for the key, and `envName` is the name
+ * the client below reads.  The value is exported under that name, so the
+ * environment carries what the store said and never a hand-set copy of it.
+ *
+ * @param {string} envName the name the client reads
+ * @param {...string} names the store's names for the key, in order
+ * @returns {string | undefined}
+ */
+function secret(envName, ...names) {
   for (const name of names) {
-    const value = process.env[name] || scopedSecret(name);
-    if (value) return value;
+    const value = scopedSecret(name);
+    if (value) {
+      process.env[envName] = value;
+      return value;
+    }
   }
   return undefined;
 }
 
-const MINIMAX_API_KEY = secret("MINIMAX_API_KEY");
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || secret("DEEPSEEK_API_KEY_AGENT_BAR", "SHELLULAR2_DEEPSEEK_API_KEY");
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || secret("CT_OPENROUTER_API_KEY");
+const MINIMAX_API_KEY = secret("MINIMAX_API_KEY", "MINIMAX_API_KEY");
+const DEEPSEEK_API_KEY = secret("DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY_AGENT_BAR", "SHELLULAR2_DEEPSEEK_API_KEY");
+const OPENROUTER_API_KEY = secret("OPENROUTER_API_KEY", "CT_OPENROUTER_API_KEY");
 
 // 2. Standard Test Fixture (Realistic technical PR merge output)
 const SAMPLE_INPUT = `What I merged this run

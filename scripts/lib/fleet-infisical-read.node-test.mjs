@@ -49,18 +49,53 @@ function shellGet(env, name, folder, account) {
   );
 }
 
+/** The variables one reader fixture owns. */
+const READER_ENV_KEYS = ["FAKE_READER_ARGS", "FAKE_READER_MODE", "FAKE_READER_VALUE", "FLEET_INFISICAL_READER"];
+
+/**
+ * Run `body` with the reader's variables set, and put the host's own values
+ * back afterwards.
+ *
+ * The variables are saved one by one on purpose.  Replacing `process.env`
+ * with a plain object detaches it from the real environment on Node 26:  a
+ * child process then keeps the values from before the replacement, so the
+ * fake reader answered with the previous test's path and the absent case read
+ * as a refusal.  Node 22 copies the values into the environment instead, so
+ * the fault only shows on the newer runtime and the fixture has to work on
+ * both.
+ */
+function withReaderEnv(values, body) {
+  const saved = new Map(READER_ENV_KEYS.map((key) => [key, process.env[key]]));
+  try {
+    for (const [key, value] of Object.entries(values)) {
+      process.env[key] = value;
+    }
+    return body();
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
 function withReader(mode, body) {
   const dir = mkdtempSync(join(tmpdir(), "fleet-infisical-read-"));
   const argsFile = join(dir, "args");
-  const saved = { ...process.env };
   try {
-    process.env.FAKE_READER_ARGS = argsFile;
-    process.env.FAKE_READER_MODE = mode;
-    process.env.FAKE_READER_VALUE = FAKE_VALUE;
-    process.env.FLEET_INFISICAL_READER = fakeReader(dir);
-    return body({ dir, argsFile, env: { ...process.env } });
+    return withReaderEnv(
+      {
+        FAKE_READER_ARGS: argsFile,
+        FAKE_READER_MODE: mode,
+        FAKE_READER_VALUE: FAKE_VALUE,
+        FLEET_INFISICAL_READER: fakeReader(dir),
+      },
+      () => body({ dir, argsFile, env: { ...process.env } }),
+    );
   } finally {
-    process.env = saved;
     rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -114,22 +149,21 @@ test("a reader that refuses answers 4 and no value", () => {
 test("a missing reader fails closed, prints no value and does not hang", () => {
   const dir = mkdtempSync(join(tmpdir(), "fleet-infisical-read-missing-"));
   const missing = join(dir, "not-installed.py");
-  const saved = { ...process.env };
   try {
-    process.env.FLEET_INFISICAL_READER = missing;
-    const got = readFleetSecret("ASC_KEY_ID", "/asc", "fleet-tools-mm-asc-ro");
-    assert.equal(got.code, 4);
-    assert.equal(got.value, null);
-    assert.equal(got.reason, "reader-missing");
+    withReaderEnv({ FLEET_INFISICAL_READER: missing }, () => {
+      const got = readFleetSecret("ASC_KEY_ID", "/asc", "fleet-tools-mm-asc-ro");
+      assert.equal(got.code, 4);
+      assert.equal(got.value, null);
+      assert.equal(got.reason, "reader-missing");
 
-    const run = shellGet({ ...process.env }, "ASC_KEY_ID", "/asc", "fleet-tools-mm-asc-ro");
-    assert.notEqual(run.signal, "SIGTERM");
-    assert.equal(run.status, 4);
-    assert.equal(run.stdout, "");
-    assert.match(run.stderr, /reader is not installed/);
-    assert.ok(!run.stderr.includes(FAKE_VALUE));
+      const run = shellGet({ ...process.env }, "ASC_KEY_ID", "/asc", "fleet-tools-mm-asc-ro");
+      assert.notEqual(run.signal, "SIGTERM");
+      assert.equal(run.status, 4);
+      assert.equal(run.stdout, "");
+      assert.match(run.stderr, /reader is not installed/);
+      assert.ok(!run.stderr.includes(FAKE_VALUE));
+    });
   } finally {
-    process.env = saved;
     rmSync(dir, { recursive: true, force: true });
   }
 });
