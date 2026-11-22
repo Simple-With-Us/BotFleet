@@ -135,6 +135,6 @@ test("the alert payload mirrors the native shape", () => {
 test("the route table names every entry it serves", () => {
   assert.ok(BRIDGE_ALLOWED_ROUTES.length >= 10);
   for (const route of BRIDGE_ALLOWED_ROUTES) {
-    assert.ok(route.method && route.path && typeof route.local === "boolean" && route.description);
+    assert.ok(route.method && route.path && (route.local === true || route.local === false) && route.description);
   }
 });

@@ -110,7 +110,13 @@ export function openBridgePairingWindow({ code, token, ttlSeconds, maxAttempts, 
  * window stays spent, and a wrong credential costs one attempt.
  */
 export function redeemBridgePairingWindow({ window, presented, nowMs }) {
-  const current = { ...(window ?? {}), spent: Boolean(window?.spent) };
+  const current = {
+    code: window?.code ?? '',
+    tokenDigest: window?.tokenDigest ?? '',
+    expiresAtMs: window?.expiresAtMs ?? NaN,
+    attemptsLeft: window?.attemptsLeft ?? 0,
+    spent: Boolean(window?.spent),
+  };
   const now = Number(nowMs);
   if (current.spent) return { ok: false, reason: 'window already spent', window: current };
   if (!(now >= 0) || now >= current.expiresAtMs) {
@@ -146,7 +152,7 @@ export function bridgeDeviceDecision({ presentedToken, devices }) {
   if (!presented || !Array.isArray(devices)) return { ok: false, reason: 'device credential required' };
   const actual = Buffer.from(sha256Hex(presented), 'hex');
   for (const entry of devices) {
-    const digest = entry && typeof entry.tokenDigest === 'string' ? entry.tokenDigest : '';
+    const digest = entry?.tokenDigest ?? '';
     if (!/^[0-9a-f]{64}$/.test(digest)) continue;
     const expected = Buffer.from(digest, 'hex');
     if (expected.length === actual.length && crypto.timingSafeEqual(actual, expected)) {
