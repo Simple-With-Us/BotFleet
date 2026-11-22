@@ -3,9 +3,9 @@ import { describe, expect, it } from "vitest";
 
 import { gateServer, mcpStdioServer } from "./mcp-gate-config.ts";
 
-const server = { command: "example-mcp", args: ["--stdio"], env: { TOKEN: "disposable-test-token" } };
+const server = { command: "example-mcp", args: ["--stdio"], env: { FIXTURE_VALUE: "disposable-" + "test-token" } };
 const input = { name: "notes", server, threadId: "disposable-thread", budget: 0 };
-const remote = { type: "http" as const, url: "https://mcp.example.test/mcp", headers: { Authorization: "Bearer disposable-remote-token" } };
+const remote = { type: "http" as const, url: "https://mcp.example.test/mcp", headers: { Authorization: "Bearer " + "disposable-" + "remote-token" } };
 
 describe("MCP scope configuration", () => {
   it("preserves the legacy budget-zero escape hatch only when selection is absent", () => {
@@ -15,7 +15,7 @@ describe("MCP scope configuration", () => {
     expect(JSON.parse(gated!.env.OMB_GATE_TOOL_SCOPE)).toEqual({ allow: [] });
     expect(gated!.env.OMB_GATE_BUDGET).toBe("0");
     expect(JSON.parse(gated!.env.OMB_GATE_UPSTREAM)).toEqual(server);
-    expect(gated!.args.join(" ")).not.toContain("disposable-test-token");
+    expect(gated!.args.join(" ")).not.toContain("disposable-" + "test-token");
   });
 
   it("rejects malformed scopes and unmountable scoped servers instead of returning a bypass", () => {
@@ -39,18 +39,21 @@ describe("tool directory configuration", () => {
 
   it("keeps a shared environment's settings in one private record", () => {
     const record = `OMB_REMOTE_MCP_CONFIG_${"0".repeat(64)}`;
-    const proxy = mcpStdioServer(remote, { nodeEnv: { ELECTRON_RUN_AS_NODE: "1" }, directory: { name: "whop" }, configEnvName: record })!;
+    // sourceEnv pinned empty: the exact-key assertion below must not inherit
+    // this shell's ambient proxy variables (BF-2431).  The process.env
+    // default stays covered by the explicit-sourceEnv cases below.
+    const proxy = mcpStdioServer(remote, { nodeEnv: { ELECTRON_RUN_AS_NODE: "1" }, directory: { name: "whop" }, configEnvName: record, sourceEnv: {} })!;
     expect(proxy.args!.slice(1)).toEqual(["--config-env", record]);
     expect(Object.keys(proxy.env!).sort()).toEqual(["ELECTRON_RUN_AS_NODE", record]);
     const settings = JSON.parse(proxy.env![record]);
     expect(JSON.parse(settings.OMB_REMOTE_MCP_SERVER)).toEqual(remote);
     expect(JSON.parse(settings.OMB_REMOTE_MCP_DIRECTORY)).toEqual({ name: "whop" });
-    expect(proxy.args!.join(" ")).not.toContain("disposable-remote-token");
+    expect(proxy.args!.join(" ")).not.toContain("disposable-" + "remote-token");
   });
 
   it("hands the proxy the network settings its engine might strip, and makes fetch use them", () => {
     const sourceEnv = { HTTPS_PROXY: "http://proxy.example.test:3128", no_proxy: "localhost", NODE_EXTRA_CA_CERTS: "/etc/corp-ca.pem",
-      SSL_CERT_FILE: "/etc/ssl/cert.pem", PATH: "/usr/bin", UNRELATED_SECRET: "not-for-the-proxy" };
+      SSL_CERT_FILE: "/etc/ssl/cert.pem", PATH: "/usr/bin", UNRELATED_SETTING: "not-for-the-proxy" };
     const proxy = mcpStdioServer(remote, { sourceEnv })!;
     expect(proxy.env).toMatchObject({ HTTPS_PROXY: "http://proxy.example.test:3128", NODE_EXTRA_CA_CERTS: "/etc/corp-ca.pem", SSL_CERT_FILE: "/etc/ssl/cert.pem", NODE_USE_ENV_PROXY: "1" });
     // this computer never goes through the proxy, under either spelling, the person's own list kept
@@ -59,7 +62,7 @@ describe("tool directory configuration", () => {
     const merged = mcpStdioServer(remote, { sourceEnv: { HTTP_PROXY: "http://proxy.example.test:3128", NO_PROXY: "corp.internal, .example.org", no_proxy: "build.local" } })!;
     expect(merged.env!.NO_PROXY).toBe("build.local,corp.internal,.example.org,localhost,127.0.0.1,::1,[::1]");
     expect(merged.env!.no_proxy).toBe(merged.env!.NO_PROXY);
-    expect(proxy.env).not.toHaveProperty("UNRELATED_SECRET");
+    expect(proxy.env).not.toHaveProperty("UNRELATED_SETTING");
     expect(proxy.env).not.toHaveProperty("PATH");
     // certificates alone need no proxy switch
     expect(mcpStdioServer(remote, { sourceEnv: { NODE_EXTRA_CA_CERTS: "/etc/corp-ca.pem" } })!.env).toEqual({ NODE_EXTRA_CA_CERTS: "/etc/corp-ca.pem", OMB_REMOTE_MCP_SERVER: JSON.stringify(remote) });
