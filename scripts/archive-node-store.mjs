@@ -1424,6 +1424,21 @@ function ceilingArg(args, flag) {
 }
 
 /**
+ * The absolute ceiling that bounds one ceiling flag, or undefined for a flag
+ * this module does not name.
+ *
+ * The ceiling is a module constant, so it is applied whether or not a caller
+ * passes it.  A caller that omits the bound gets the same refusal a caller
+ * that names it gets, which is what keeps one function from holding two
+ * contracts.
+ */
+function absoluteCeilingFor(flag) {
+  if (flag === "--max-files") return ABSOLUTE_MAX_FILES;
+  if (flag === "--max-bytes") return ABSOLUTE_MAX_BYTES;
+  return undefined;
+}
+
+/**
  * A capture ceiling named on the command line, as a positive whole number.
  *
  * The value has to be a positive whole number:  zero, a negative number, a
@@ -1437,8 +1452,12 @@ function ceilingArg(args, flag) {
  * and the refusal names the value that was asked for and the ceiling that
  * bounds it.  The request is not clamped and not replaced by the ceiling:  a
  * ceiling the operator did not get is a ceiling the operator did not choose.
+ *
+ * The ceiling this flag carries is the module's own constant unless a caller
+ * names another one, so the bound cannot be skipped by leaving the argument
+ * out.
  */
-export function parseCeilingFlag(args, flag, absoluteCeiling) {
+export function parseCeilingFlag(args, flag, absoluteCeiling = absoluteCeilingFor(flag)) {
   const raw = ceilingArg(args, flag);
   if (raw === null) return undefined;
   if (!/^\d+$/.test(raw)) {

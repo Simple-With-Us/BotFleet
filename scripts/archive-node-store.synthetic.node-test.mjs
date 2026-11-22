@@ -21,6 +21,8 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  ABSOLUTE_MAX_BYTES,
+  ABSOLUTE_MAX_FILES,
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_FILES,
   archiveStore,
@@ -132,6 +134,19 @@ function listFiles(root, prefix = "") {
 test("the ceiling flags name the candidate pair this proof uses", () => {
   assert.equal(parseCeilingFlag(["--max-files", String(CANDIDATE_MAX_FILES)], "--max-files"), CANDIDATE_MAX_FILES);
   assert.equal(parseCeilingFlag([`--max-bytes=${CANDIDATE_MAX_BYTES}`], "--max-bytes"), CANDIDATE_MAX_BYTES);
+});
+
+test("a ceiling above the absolute one is refused with no bound named by the caller", () => {
+  assert.throws(
+    () => parseCeilingFlag(["--max-files", String(ABSOLUTE_MAX_FILES + 1)], "--max-files"),
+    /is above the absolute ceiling of 500000/,
+  );
+  assert.throws(
+    () => parseCeilingFlag([`--max-bytes=${ABSOLUTE_MAX_BYTES + 1}`], "--max-bytes"),
+    /is above the absolute ceiling of 34359738368/,
+  );
+  assert.equal(parseCeilingFlag(["--max-files", String(ABSOLUTE_MAX_FILES)], "--max-files"), ABSOLUTE_MAX_FILES);
+  assert.equal(parseCeilingFlag([`--max-bytes=${ABSOLUTE_MAX_BYTES}`], "--max-bytes"), ABSOLUTE_MAX_BYTES);
 });
 
 test("a store inside the candidate ceilings is captured by the command that names them", { skip: ROOT_IS_ROOT }, () => {
