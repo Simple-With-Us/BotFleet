@@ -25,6 +25,39 @@ This smoke runs the real path:
 | The artifact is the unsigned one and says so | the receipt must say `NOT DISTRIBUTABLE`, must not be distributable, must carry the `arm64` slice and must not claim a verified signature | `not distributable`, `no arm64 slice` |
 | The receipt and the reported identity are what the smoke expects | both go through a schema at the boundary, and every field the smoke reads is checked there | `does not match the expected shape` |
 
+## The Optional Host Is Independent Of The Standard GUI Release
+
+The optional native headless host ships on a path of its own, and it can never
+be the reason the standard signed GUI release fails.
+
+The GUI release is `native-mac-release.yml`.  It archives the app, signs it,
+notarizes it, staples it, packages the ZIP and the DMG from the stapled app and
+publishes the asset set.  It does not build the optional host, and it must not
+grow a step that does.  The separation is held by
+`scripts/native-host-independent-path.node-test.mjs`, which fails if the
+release workflow ever names the host packager or the host smoke, and which
+fails if the standard test chain ever grows the host's real packaging build.
+
+The host's own path is opt-in and separate.  `pnpm smoke:native-host-package`
+runs `scripts/native-host-package-smoke.mjs`, which packages the checkout with
+`scripts/package-native-host.mjs`, opens the archive again and asks the
+packaged executable for its own identity.  The packager writes its own receipt,
+`artifact.json`, beside the artifact, and it refuses to overwrite a receipt it
+already wrote.
+
+What the standard test chain keeps is the identity proof over synthetic
+binaries, `scripts/native-host-artifact.node-test.mjs`.  That proof costs a
+synthetic fixture and says nothing about a shipped artifact, so it belongs in
+the chain;  the real build does not, and it stays behind its own command.
+
+What stays with the owner, and is claimed by none of this:  the Developer ID
+identity and its grant, the notarization credentials, the installed and
+pre-login acceptance on a real Mac, the service credentials, and any decision
+to publish the host artifact.  A dedicated opt-in workflow for the host may be
+added later, and it must be a workflow file of its own:  a step inside the GUI
+release job would tie the optional host to the standard release, which is the
+one thing this separation exists to prevent.
+
 ## Running It
 
 It needs macOS and the Swift toolchain, because the package is built there:
