@@ -1,3 +1,5 @@
+/* oxlint-disable eslint/no-irregular-whitespace -- Owner-required NBSP sentence gaps occur only in the prose comments of this module. */
+
 // Archive the Node store read-only, then rehearse its restore (BF-2515).
 //
 // The Phase 6 decommission gate asks for `final-import-parity`:  the final
@@ -71,6 +73,14 @@
 // The read-only proof only means something for an account that is not root.
 // A root account writes through a read-only bit, so this script refuses to
 // run as root rather than report a read-only archive it did not have.
+//
+// The capture ceilings. The producer refuses rather than filling a disk: a
+// store above the file-count ceiling is refused before a byte is copied, and
+// a store above the byte ceiling is refused while it is copied. Both
+// ceilings are raised by the operator on the command line, because the store
+// this producer was written for holds more files and more bytes than the
+// values the producer used to ship, and a producer that cannot capture the
+// owner's own store is not evidence about the owner's own store.
 import { createHash } from "node:crypto";
 import {
   chmodSync, closeSync, copyFileSync, existsSync, mkdirSync,
@@ -96,11 +106,28 @@ export const CHECK_NAMES = {
   rollback: ["restore-rehearsal", "restored-health"],
 };
 
-/** The default capture ceiling: refuse rather than fill a disk. */
-export const DEFAULT_MAX_BYTES = 8 * 1024 * 1024 * 1024;
+/**
+ * The default capture ceiling on bytes: 32 GiB.
+ *
+ * The ceiling exists so the producer refuses rather than filling a disk, and
+ * the default is chosen above the owner's real store so that the plain
+ * command can capture it. The measured store is about 13 GB, and the capture
+ * that succeeded on 2026-11-22 was 286,257 files and 12,200,859,045 bytes,
+ * so 32 GiB leaves room for the store to keep growing and still refuses
+ * anything that is not this store.
+ */
+export const DEFAULT_MAX_BYTES = 32 * 1024 * 1024 * 1024;
 
-/** The default capture ceiling on file count. */
-export const DEFAULT_MAX_FILES = 200_000;
+/**
+ * The default capture ceiling on file count: 500,000 files.
+ *
+ * The same store holds 286,388 files, which the previous 200,000 default
+ * could not capture at all, so the default is chosen above the measured
+ * store with room to grow. An explicit ceiling is still honoured: an
+ * operator who names one lower than the store is refused, and the refusal
+ * names the ceiling and the measured size.
+ */
+export const DEFAULT_MAX_FILES = 500_000;
 
 /**
  * The largest file the evidence bundle will accept.  The bundle's reader
@@ -675,7 +702,7 @@ export async function archiveStore({ storeRoot, outDir, maxBytes = DEFAULT_MAX_B
     }
     if (row.kind === "sqlite-snapshot") snapshotOf.add(storeRelative);
     totalBytes += row.bytes;
-    if (totalBytes > maxBytes) throw new Error(`archive exceeded the ${maxBytes} byte ceiling`);
+    if (totalBytes > maxBytes) throw new Error(`archive reached ${totalBytes} bytes, above the ${maxBytes} byte ceiling`);
     manifestFiles.push(row);
   }
   excluded.sort((a, b) => a.path.localeCompare(b.path));
@@ -1257,6 +1284,48 @@ function flagValue(args, flag) {
   return index === -1 ? undefined : args[index + 1];
 }
 
+/**
+ * The raw value a ceiling flag carries, or null when the flag was not given.
+ *
+ * The flag may be written `--max-files 500000` or `--max-files=500000`. A
+ * flag that is present but carries no value at all comes back as the empty
+ * string rather than as null, because a ceiling the operator named and did
+ * not fill in is a refusal and not a default.
+ */
+function ceilingArg(args, flag) {
+  const index = args.indexOf(flag);
+  if (index !== -1) {
+    const next = args[index + 1];
+    return next === undefined ? "" : next;
+  }
+  const prefix = `${flag}=`;
+  const inline = args.find((arg) => arg.startsWith(prefix));
+  return inline === undefined ? null : inline.slice(prefix.length);
+}
+
+/**
+ * A capture ceiling named on the command line, as a positive whole number.
+ *
+ * The value has to be a positive whole number: zero, a negative number, a
+ * fraction or a value that is not a number at all is a usage refusal rather
+ * than a silent fall back to the default, because a ceiling the operator did
+ * not choose is a ceiling the operator did not set. An absent flag comes
+ * back as undefined, which is how the caller tells "not named" from "named
+ * and wrong".
+ */
+export function parseCeilingFlag(args, flag) {
+  const raw = ceilingArg(args, flag);
+  if (raw === null) return undefined;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`${flag} <count> must be a positive whole number`);
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${flag} <count> must be a positive whole number`);
+  }
+  return value;
+}
+
 let isEntry = false;
 try {
   isEntry = realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
@@ -1275,7 +1344,12 @@ if (isEntry) {
       const storeRoot = flagValue(args, "--store") ?? resolveStoreRoot();
       const outDir = flagValue(args, "--out");
       if (!outDir) throw new Error("--out <capture-directory> is required");
-      const { manifest } = await archiveStore({ storeRoot, outDir });
+      // The ceilings are the operator's to raise. A value that is not a
+      // positive whole number is refused here, where the reason can be said,
+      // rather than being silently replaced by the default.
+      const maxFiles = parseCeilingFlag(args, "--max-files") ?? DEFAULT_MAX_FILES;
+      const maxBytes = parseCeilingFlag(args, "--max-bytes") ?? DEFAULT_MAX_BYTES;
+      const { manifest } = await archiveStore({ storeRoot, outDir, maxFiles, maxBytes });
       console.log(JSON.stringify({
         archived: true,
         outDir: resolve(outDir),
@@ -1283,6 +1357,8 @@ if (isEntry) {
         bytes: manifest.totals.bytes,
         excluded: manifest.totals.excluded,
         readOnlyProved: manifest.readOnlyProved,
+        maxFiles,
+        maxBytes,
       }));
     } else if (command === "restore") {
       const archiveDir = flagValue(args, "--archive");
@@ -1323,7 +1399,7 @@ if (isEntry) {
       });
       console.log(JSON.stringify({ emitted: Object.keys(emitted) }));
     } else {
-      console.error("usage: node scripts/archive-node-store.mjs archive --store <root> --out <dir>");
+      console.error("usage: node scripts/archive-node-store.mjs archive --store <root> --out <dir> [--max-files <count>] [--max-bytes <bytes>]");
       console.error("       node scripts/archive-node-store.mjs restore --archive <dir> --into <scratch-root>");
       console.error("       node scripts/archive-node-store.mjs receipt --capture <dir> --request <request.json> --provenance-record <file> --provenance-source <https-url> --provenance-by <who> [--parity-report <file>]");
       process.exitCode = 2;
@@ -1332,3 +1408,5 @@ if (isEntry) {
     fail(error.message);
   }
 }
+
+/* oxlint-enable eslint/no-irregular-whitespace */
