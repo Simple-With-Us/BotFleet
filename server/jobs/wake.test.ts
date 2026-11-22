@@ -180,6 +180,33 @@ describe("job wakes", () => {
     expect(t.wakes).toHaveLength(1);
   });
 
+  it("parks a stopped bot's wake without a retry timer and logs once (BF-2454)", async () => {
+    const lines: string[] = [];
+    const delivered: string[] = [];
+    let stopped = true;
+    const t = setup({
+      log: (line) => lines.push(line),
+      startWake: async (_botId, _threadId, _prompt, jobIds) => {
+        if (stopped) throw Object.assign(new Error("This bot is stopped."), { status: 409, code: "bot_stopped" });
+        delivered.push(...jobIds);
+      },
+    });
+    t.finish(job("job_a"));
+    await t.fireTimers(); // the merge window: dispatch refused as stopped
+    expect(delivered).toEqual([]);
+    expect(t.queue.get("thread-a")?.map((item) => item.jobId)).toEqual(["job_a"]);
+    expect(t.coordinator.wakesLeft("thread-a")).toBe(3);
+    // settle-only: no 30-second retry timer is armed against a stopped bot
+    expect(t.timers.filter((timer) => !timer.cleared && timer.ms === 30_000)).toHaveLength(0);
+    expect(lines.filter((line) => line.includes("held: the bot is stopped"))).toHaveLength(1);
+    await t.fireTimers();
+    expect(lines.filter((line) => line.includes("held: the bot is stopped"))).toHaveLength(1);
+    stopped = false;
+    t.coordinator.botSettled("bot-a");
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(delivered).toEqual(["job_a"]);
+  });
+
   it("tries a wake that could not start again on a timer, with no turn settling", async () => {
     // a provider reload ended, or a stalled turn was released: the bot is
     // idle again, and no turn.completed will say so
