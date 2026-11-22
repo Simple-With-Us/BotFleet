@@ -53,7 +53,8 @@ test("the companion control page does not hang a sentence gap off a non-sentence
 
 // The owner ruling of 2026-10-25 named one exception:  the Claude Code Code tab and the
 // MiniMax Code chat pane.  The owner ruling of 2026-11-11 added the Z Code chat pane as
-// the third pane of that same exception.  Those panes take the `&nbsp;` entity plus a
+// the third pane of that same exception, and the owner ruling of 2026-11-21 added the
+// Antigravity chat pane as the fourth.  Those panes take the `&nbsp;` entity plus a
 // normal space, because they normalize a raw U+00A0 away and collapse two ASCII spaces.
 // Every other surface takes the real U+00A0.
 //
@@ -129,6 +130,10 @@ test("every copy that states the gap rule names the one chat-pane exception", ()
       `${copy.path} must name the Z Code chat pane as an exception`,
     );
     assert.ok(
+      rule.includes("Antigravity"),
+      `${copy.path} must name the Antigravity chat pane as an exception`,
+    );
+    assert.ok(
       rule.includes("Claude Code"),
       `${copy.path} must name the Claude Code Code tab as an exception`,
     );
@@ -140,34 +145,34 @@ test("every copy that states the gap rule names the one chat-pane exception", ()
   }
 });
 
-test("the operative rule pins the entity as the three chat panes' mechanism", () => {
+test("the operative rule pins the entity as the four chat panes' mechanism", () => {
   // Naming the exception is not enough:  the operative rule has to say which
-  // mechanism the three panes take, so a different one cannot slip through.
+  // mechanism the four panes take, so a different one cannot slip through.
   for (const copy of RULE_STATING_COPIES) {
     const rule = operativeRule(read(join(ROOT, copy.path)), copy);
     assert.ok(
       /`&nbsp;` entity plus a normal space/i.test(rule),
-      `${copy.path} must say the three chat panes take the entity plus a normal space`,
+      `${copy.path} must say the four chat panes take the entity plus a normal space`,
     );
   }
 });
 
 test("no operative rule bans the entity everywhere", () => {
   // A blanket ban refuses the entity without the "anywhere else" qualifier, so
-  // it contradicts the three chat panes that need it.  The qualifier is what
+  // it contradicts the four chat panes that need it.  The qualifier is what
   // makes the canonical wording legal, so the ban is matched up to it.
   const blanketBan = /never (?:write )?the `&nbsp;` entity(?!\s+anywhere else)/i;
   for (const copy of RULE_STATING_COPIES) {
     const rule = operativeRule(read(join(ROOT, copy.path)), copy);
     assert.ok(
       !blanketBan.test(rule),
-      `${copy.path} must not ban the entity everywhere; the three chat panes take it`,
+      `${copy.path} must not ban the entity everywhere; the four chat panes take it`,
     );
   }
 });
 
 test("no operative rule claims every chat pane takes the real U+00A0", () => {
-  // A blanket claim here contradicts the three panes, so a copy that still makes
+  // A blanket claim here contradicts the four panes, so a copy that still makes
   // it has not absorbed the exception.
   const blanketClaims = ["chat replies in every pane", "chat replies in any pane"];
   for (const copy of RULE_STATING_COPIES) {
@@ -175,14 +180,14 @@ test("no operative rule claims every chat pane takes the real U+00A0", () => {
     for (const claim of blanketClaims) {
       assert.ok(
         !rule.includes(claim),
-        `${copy.path} must not claim "${claim}" takes the real U+00A0; the three panes take the entity`,
+        `${copy.path} must not claim "${claim}" takes the real U+00A0; the four panes take the entity`,
       );
     }
   }
 });
 
 test("the 2026-10-25 history entry does not backdate the Z Code pane", () => {
-  // The live rule names three panes.  The dated history must not move Z Code
+  // The live rule names four panes.  The dated history must not move Z Code
   // back onto the 2026-10-25 reaffirmation, which named Claude Code and MiniMax
   // Code only.  Z Code belongs on the 2026-11-11 entry.
   const source = read(join(ROOT, ".claude/skills/sentence-gap/SKILL.md"));
@@ -199,6 +204,24 @@ test("the 2026-10-25 history entry does not backdate the Z Code pane", () => {
   assert.ok(octEntry.includes("MiniMax Code"), "2026-10-25 history must name MiniMax Code");
   assert.ok(!octEntry.includes("Z Code"), "2026-10-25 history must not name the Z Code pane");
   assert.ok(novEntry.includes("Z Code"), "2026-11-11 history must name the Z Code pane");
+});
+
+test("the 2026-11-21 history entry names the Antigravity pane and no earlier entry does", () => {
+  // Antigravity belongs on the 2026-11-21 entry only.  Earlier dated entries must not
+  // be rewritten to claim the pane was part of the exception before the owner added it.
+  const source = read(join(ROOT, ".claude/skills/sentence-gap/SKILL.md"));
+  const historyStart = source.indexOf("### History");
+  assert.notEqual(historyStart, -1, "sentence-gap must keep a History section");
+  const history = source.slice(historyStart);
+  const latest = history.indexOf("**2026-11-21 update");
+  const oct = history.indexOf("**2026-10-25 update");
+  const nov = history.indexOf("**2026-11-11 update");
+  assert.ok(latest !== -1 && oct > latest && nov > oct, "history must keep the 2026-11-21 entry before the 2026-10-25 and 2026-11-11 entries");
+  assert.ok(history.slice(latest, oct).includes("Antigravity"), "2026-11-21 history must name the Antigravity pane");
+  assert.ok(!history.slice(oct, nov).includes("Antigravity"), "2026-10-25 history must not name the Antigravity pane");
+  const next = history.indexOf("**2026-10-23 update", nov);
+  assert.ok(next > nov, "history must keep the 2026-10-23 entry after the 2026-11-11 entry");
+  assert.ok(!history.slice(nov, next).includes("Antigravity"), "2026-11-11 history must not name the Antigravity pane");
 });
 
 test("no operative rule closes the chat panes out of the exception", () => {
