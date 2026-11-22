@@ -17,9 +17,13 @@ import { performance } from "node:perf_hooks";
 import { readFleetSecret } from "./lib/fleet-infisical-read.mjs";
 
 // 1. Keys come from the shared scoped reader (Mac, Infisical Fleet-OPS).  The
-//    store is the authority:  the environment is not a source for a value, and
-//    the value the store returned is exported for this process afterwards.  A
-//    missing reader, an absent name or a missing grant just means "not set".
+//    order is this repository's own contract, the one INFISICAL.md states:
+//    the vault wins over the environment and over a file.  The store is read
+//    first and its answer is the key, and the value it returned is exported
+//    for this process afterwards.  A value the environment already carries is
+//    the second source and is used only when the store has nothing, which is
+//    what an operator's own shell is.  A missing reader, an absent name or a
+//    missing grant just means "not set".
 //
 //    The account is the consumer's own read-only service token, and a grant
 //    covers exactly one folder.  It is read at call time, not at import, so a
@@ -33,11 +37,13 @@ function scopedSecret(name) {
 }
 
 /**
- * One key, resolved from the store.
+ * One key, resolved from the store first and from the environment second.
  *
  * The names are the store's own names for the key, and `envName` is the name
- * the client below reads.  The value is exported under that name, so the
- * environment carries what the store said and never a hand-set copy of it.
+ * the client below reads.  The value the store answered is exported under
+ * that name, so the environment carries what the store said; a value the
+ * environment already held is left alone and used only when the store has
+ * nothing.
  *
  * @param {string} envName the name the client reads
  * @param {...string} names the store's names for the key, in order
@@ -51,7 +57,8 @@ function secret(envName, ...names) {
       return value;
     }
   }
-  return undefined;
+  const carried = process.env[envName];
+  return carried ? carried : undefined;
 }
 
 const MINIMAX_API_KEY = secret("MINIMAX_API_KEY", "MINIMAX_API_KEY");

@@ -105,9 +105,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Resolve the Apple notarization credentials.  The store is the authority:
-# the environment is not a source for a value, and the keychain profile below
-# is the machine-identity bootstrap and the last resort.  Nothing is printed.
+# Resolve the Apple notarization credentials.  Nothing is printed.
+#
+# The order is the store's own contract, the one this repository's
+# INFISICAL.md states:  the vault wins over the environment and over a file.
+# The scoped reader is read first and its answer is the credential; a value
+# the environment already carries is the second source and is used only when
+# the store has nothing, which is the transport the workflows use for the
+# value they read from the vault themselves.  The keychain profile below is
+# the machine-identity bootstrap and the last resort.
 #
 # The folder holds the key under the ASC spelling the fleet's own reader uses
 # and under the Apple spelling the workflows use.  Both name the same
@@ -116,13 +122,13 @@ resolve_notary_credentials() {
   local value
   value="$(fleet_secret_get ASC_KEY_P8 "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
   [ -n "$value" ] || value="$(fleet_secret_get APPLE_API_KEY_P8 "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
-  APPLE_API_KEY_P8="$value"
+  if [ -n "$value" ]; then APPLE_API_KEY_P8="$value"; fi
   value="$(fleet_secret_get ASC_KEY_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
   [ -n "$value" ] || value="$(fleet_secret_get APPLE_API_KEY_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
-  APPLE_API_KEY_ID="$value"
+  if [ -n "$value" ]; then APPLE_API_KEY_ID="$value"; fi
   value="$(fleet_secret_get ASC_ISSUER_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
   [ -n "$value" ] || value="$(fleet_secret_get APPLE_API_ISSUER_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
-  APPLE_API_ISSUER_ID="$value"
+  if [ -n "$value" ]; then APPLE_API_ISSUER_ID="$value"; fi
 }
 
 # Open the API key on a file descriptor and unlink it at once, so the key is
@@ -168,15 +174,17 @@ if ! command -v xcodegen >/dev/null; then
 fi
 (cd "$ROOT/ios" && xcodegen generate)
 
-# Native Sentry (BF-2541): same stamping as native-mac-release.yml.  The DSN
-# comes from the store, is never printed, and is exported for the build only
-# after the read answered; an empty DSN packages with Sentry inert rather than
-# failing the build.
-SENTRY_DSN="$(fleet_secret_get SENTRY_DSN "$SENTRY_SECRET_FOLDER" "$SENTRY_SECRET_ACCOUNT" 2>/dev/null || true)"
+# Native Sentry (BF-2541): same stamping as native-mac-release.yml.  The
+# store is read first and its answer is the DSN; a value the environment
+# already carries is kept only when the store has none.  The DSN is never
+# printed, and an empty DSN packages with Sentry inert rather than failing
+# the build.
+SENTRY_DSN_VALUE="$(fleet_secret_get SENTRY_DSN "$SENTRY_SECRET_FOLDER" "$SENTRY_SECRET_ACCOUNT" 2>/dev/null || true)"
+if [ -n "$SENTRY_DSN_VALUE" ]; then SENTRY_DSN="$SENTRY_DSN_VALUE"; fi
 SENTRY_DSN="${SENTRY_DSN:-}"
 SOURCE_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 if [ -z "$SENTRY_DSN" ]; then
-  echo "note: the scoped reader has no SENTRY_DSN in $SENTRY_SECRET_FOLDER; package ships with Sentry inert"
+  echo "note: no SENTRY_DSN in the scoped reader at $SENTRY_SECRET_FOLDER or in the environment; package ships with Sentry inert"
 fi
 
 mkdir -p "$OUT"
