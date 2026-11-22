@@ -15,18 +15,21 @@
 # lengths and appcast are all produced after stapling, never before.
 #
 # Signing material is never read from this repo and never printed.  The Apple
-# notarization credentials are resolved in the fleet's approved order: the
-# environment first, then Infisical through the scoped reader, and only then
-# this machine's own notarytool keychain profile, which is a bootstrap
-# identity rather than a shared secret store:
+# notarization credentials are resolved in the store's order: Infisical
+# through the scoped reader first, the environment second, and only then this
+# machine's own notarytool keychain profile, which is a bootstrap identity
+# rather than a shared secret store.  The store's answer is the credential, so
+# a stale exported value cannot displace it; the environment is the second
+# source and is used only when the store has nothing, which is the value the
+# workflows fetch from the vault themselves with the infisical-secrets action:
 #   APPLE_API_KEY_P8   App Store Connect API private key (PEM)
 #   APPLE_API_KEY_ID   the key's id, and APPLE_API_ISSUER_ID its issuer
 #   NOTARY_PROFILE     notarytool keychain profile (default: AC_PASSWORD)
 #   MAC_SIGN_IDENTITY  Keychain identity (default: Developer ID Application)
 #   SPARKLE_EDDSA_KEY  sign_update private key file; required with
 #                       sign_update on PATH for distributable packaging
-#   SENTRY_DSN         native Sentry DSN (BF-2541); environment first, then
-#                       Infisical through the scoped reader, never printed.
+#   SENTRY_DSN         native Sentry DSN (BF-2541); the scoped reader first,
+#                       the environment second, never printed.
 #                       Empty is fine: the package ships with Sentry inert,
 #                       exactly like the release workflow.
 #
