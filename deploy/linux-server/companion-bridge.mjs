@@ -354,14 +354,29 @@ function isCredentialFieldName(key) {
  * credential costs the cleartext itself.
  */
 const CREDENTIAL_VALUE_PATTERNS = [
-  OMB_PAIR_TOKEN,
-  /^\d{6}$/,
+  // The pairing token this module mints, matched as a SUBSTRING:  a token
+  // written inside a longer note is still that token, and an anchored
+  // match would let it ride back out inside the note.
+  /omb_pair_[A-Za-z0-9_-]{43}/,
+  // The six digit pairing code, matched as a standalone run of six digits.
+  // The digit lookarounds keep a longer number from producing one, so a
+  // count of 20261122 is not read as a code, while a code written inside a
+  // longer note still is.
+  /(?<!\d)\d{6}(?!\d)/,
   /\bst\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})*/,
-  /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/i,
-  /^[A-Za-z][A-Za-z0-9-]{2,}\s+[A-Za-z0-9._~+/=-]{12,}$/,
+  // The authorization schemes this module family handles, and no more:  a
+  // generic "any word then a long token" pattern dropped benign metadata,
+  // because an ordinary description can end in a twelve character word.
+  /\b(?:Bearer|Basic|Token|ApiKey|HOBAuth|OAuth)\s+[A-Za-z0-9._~+/=-]{12,}/i,
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?/,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
 ];
+
+/** How deep the value walk goes before a value is dropped as unknown. */
+const MAX_VALUE_WALK_DEPTH = 6;
+
+/** How many nodes the value walk visits before a value is dropped. */
+const MAX_VALUE_WALK_NODES = 256;
 
 /**
  * Whether one caller value carries a credential. A name can be guessed by
@@ -375,17 +390,53 @@ const CREDENTIAL_VALUE_PATTERNS = [
  * its name is. That reading does not depend on the value looking like a
  * credential, so a code or token written in a shape this list does not know
  * is still caught.
+ *
+ * The walk descends into objects and arrays, because a caller value that is
+ * an object is kept as that object and a credential nested inside it would
+ * otherwise ride back out untouched:  the shapes are tested against every
+ * string leaf, and a nested key whose NAME carries a credential drops the
+ * whole value, the same rule the top level applies. The walk is bounded in
+ * depth and in the nodes it visits, and it fails closed: a value that
+ * reaches either bound is dropped rather than kept.
  */
 function isCredentialFieldValue(value, digests = {}) {
-  const text = String(value ?? '');
-  for (const pattern of CREDENTIAL_VALUE_PATTERNS) {
-    if (pattern.test(text)) return true;
-  }
-  for (const held of [digests.codeDigest, digests.tokenDigest]) {
-    const digest = String(held ?? '');
-    if (digest !== '' && sha256Hex(text) === digest) return true;
-  }
-  return false;
+  const wanted = [digests.codeDigest, digests.tokenDigest]
+    .map((held) => String(held ?? ''))
+    .filter((digest) => digest !== '');
+  const isCredentialText = (text) => {
+    for (const pattern of CREDENTIAL_VALUE_PATTERNS) {
+      if (pattern.test(text)) return true;
+    }
+    for (const digest of wanted) {
+      if (sha256Hex(text) === digest) return true;
+    }
+    return false;
+  };
+  let visited = 0;
+  const walk = (current, depth) => {
+    if (depth > MAX_VALUE_WALK_DEPTH) return true;
+    visited += 1;
+    if (visited > MAX_VALUE_WALK_NODES) return true;
+    if (current === null || current === undefined) return false;
+    // `Object(current) === current` is true for an object, an array or a
+    // function and false for a primitive, which is the object test this
+    // repo uses in place of a runtime typeof.
+    if (Object(current) !== current) return isCredentialText(String(current));
+    if (Array.isArray(current)) {
+      for (const item of current) {
+        if (walk(item, depth + 1)) return true;
+      }
+      return false;
+    }
+    for (const key of Object.keys(current)) {
+      // A nested key that carries a credential drops the whole value, the
+      // same rule the top level applies to a field name.
+      if (isCredentialFieldName(key)) return true;
+      if (walk(current[key], depth + 1)) return true;
+    }
+    return false;
+  };
+  return walk(value, 0);
 }
 
 /**
@@ -418,7 +469,8 @@ function normalizeWindow(window) {
     if (key === 'codeDigest' || key === 'tokenDigest' || key === 'expiresAtMs' || key === 'attemptsLeft' || key === 'spent' || key === 'replay') continue;
     if (isCredentialFieldName(key)) continue;
     if (kept >= MAX_WINDOW_METADATA_KEYS) break;
-    if (isCredentialFieldValue(source[key], { codeDigest: source.codeDigest, tokenDigest: source.tokenDigest })) continue;
+    // The size is measured first, so the value walk below only ever sees a
+    // value whose serialized length is already bounded.
     let size = 0;
     try {
       size = JSON.stringify(source[key] ?? null)?.length ?? 0;
@@ -426,6 +478,7 @@ function normalizeWindow(window) {
       continue;
     }
     if (!Number.isFinite(size) || size > MAX_WINDOW_METADATA_CHARS) continue;
+    if (isCredentialFieldValue(source[key], { codeDigest: source.codeDigest, tokenDigest: source.tokenDigest })) continue;
     extra[key] = source[key];
     kept += 1;
   }

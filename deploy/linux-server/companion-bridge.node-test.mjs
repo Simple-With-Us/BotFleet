@@ -361,6 +361,64 @@ test("the window's own credential is dropped under any name by its digest", () =
   assert.ok(!("statusCode" in decision.window), "the window's own code must not ride back out in cleartext");
 });
 
+test("a credential nested inside a caller object is dropped", () => {
+  // A caller value that is an object is kept as that object, so a
+  // credential nested inside it would ride back out unless the walk
+  // descends into it.
+  const window = {
+    ...openWindow(),
+    note: { label: "operator note", secret: "cleartext-value" },
+    list: ["plain", { nested: PROOF }],
+    nested: { deeper: { token: "cleartext" } },
+  };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  for (const key of ["note", "list", "nested"]) {
+    assert.ok(!(key in decision.window), `${key} must not keep a nested credential`);
+  }
+});
+
+test("a credential embedded in a longer value is dropped", () => {
+  // The pairing token and the pairing code are matched as substrings, so
+  // writing either inside a longer note does not carry it back out.
+  const window = {
+    ...openWindow(),
+    statusCode: `the code is 123456 for today`,
+    encode: `token omb_pair_${"a".repeat(43)} attached`,
+  };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  for (const key of ["statusCode", "encode"]) {
+    assert.ok(!(key in decision.window), `${key} must not keep an embedded credential`);
+  }
+});
+
+test("a benign long phrase is not read as a credential", () => {
+  // The authorization shape is scoped to the schemes it names, so an
+  // ordinary description that ends in a long word keeps its value.
+  const window = {
+    ...openWindow(),
+    statusCode: "operator configuration",
+    encode: "utf8 with an explanation",
+    unicode: "please review the documentation",
+  };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.equal(decision.window.statusCode, "operator configuration");
+  assert.equal(decision.window.encode, "utf8 with an explanation");
+  assert.equal(decision.window.unicode, "please review the documentation");
+});
+
+test("a longer number is not read as a six digit code", () => {
+  // The six digit shape is bounded by digit lookarounds, so a longer run of
+  // digits is not read as a code.
+  const window = { ...openWindow(), statusCode: 20261122, postcode: "20261122" };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.equal(decision.window.statusCode, 20261122);
+  assert.equal(decision.window.postcode, "20261122");
+});
+
 test("a benign value under an allowlisted name survives", () => {
   const window = { ...openWindow(), statusCode: 200, postcode: "60601", unicode: "yes", encode: "utf8" };
   const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
