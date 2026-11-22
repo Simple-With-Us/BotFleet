@@ -516,6 +516,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     },
     defaultModels: [
       { id: "gemini-3.8-flash-high", display: "Gemini 3.8 Flash (High)", ctxTokens: 1_000_000 },
+      { id: "gemini-4-hydrogen", display: "Gemini 4 Hydrogen", ctxTokens: 1_000_000 },
       { id: "gemini-4-hydrogen-xhigh", display: "Gemini 4 Hydrogen (XHigh)", ctxTokens: 1_000_000 },
       { id: "gemini-4-hydrogen-high", display: "Gemini 4 Hydrogen (High)", ctxTokens: 1_000_000 },
       { id: "gemini-4-hydrogen-medium", display: "Gemini 4 Hydrogen (Medium)", ctxTokens: 1_000_000 },
@@ -523,6 +524,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       { id: "gemini-4-argon-high", display: "Gemini 4 Argon (High)", ctxTokens: 1_000_000 },
       { id: "gemini-4-argon-medium", display: "Gemini 4 Argon (Medium)", ctxTokens: 1_000_000 },
       { id: "gemini-4-argon-low", display: "Gemini 4 Argon (Low)", ctxTokens: 1_000_000 },
+      { id: "gemini-4-neon", display: "Gemini 4 Neon", ctxTokens: 1_000_000 },
       { id: "gemini-3.1-pro-high", display: "Gemini 3.1 Pro (High)", ctxTokens: 1_000_000 },
       { id: "gemini-3.1-pro-low", display: "Gemini 3.1 Pro (Low)", ctxTokens: 1_000_000 },
       { id: "gemini-3.8-flash-medium", display: "Gemini 3.8 Flash (Medium)", ctxTokens: 1_000_000 },

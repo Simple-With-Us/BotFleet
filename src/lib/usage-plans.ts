@@ -72,6 +72,8 @@ export const FALLBACK_MODEL_NAMES: Record<string, string> = {
   "deepseek-reasoner": "DeepSeek Reasoner",
   "gpt-4o": "GPT-4o",
   "gpt-4o-mini": "GPT-4o mini",
+  "gemini-4-hydrogen": "Gemini 4 Hydrogen",
+  "gemini-4-neon": "Gemini 4 Neon",
   "gemini-2.5-pro": "Gemini 2.5 Pro",
   "gemini-2.5-flash": "Gemini 2.5 Flash",
   "gemini-2.0-flash": "Gemini 2.0 Flash",
