@@ -381,6 +381,41 @@ test("a credential nested inside a caller object is dropped", () => {
   }
 });
 
+test("a value with a custom toJSON cannot smuggle a credential past the check", () => {
+  // The value is checked as the JSON the caller's own toJSON writes, so a
+  // toJSON that hides a cleartext credential is checked as a benign string.
+  // The window therefore has to keep what was checked, not the live object
+  // the toJSON spoke for.
+  const window = {
+    ...openWindow(),
+    note: { label: "operator note", token: PROOF, toJSON() { return "benign-looking"; } },
+  };
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.equal(decision.window.note, "benign-looking", "the window keeps the checked value");
+  assert.ok(!JSON.stringify(decision.window).includes(PROOF), "the hidden credential does not ride back out");
+});
+
+test("a getter that answers twice cannot smuggle a credential past the check", () => {
+  // The window reads a value once and keeps what it read. A getter that
+  // answers benignly the first time and with a credential the second time
+  // must never be read a second time.
+  let reads = 0;
+  const window = { ...openWindow() };
+  Object.defineProperty(window, "note", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return reads === 1 ? "operator-note" : PROOF;
+    },
+  });
+  const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
+  assert.equal(decision.ok, true);
+  assert.equal(reads, 1, "the window reads the value once");
+  assert.equal(decision.window.note, "operator-note");
+  assert.ok(!JSON.stringify(decision.window).includes(PROOF), "the second answer does not ride back out");
+});
+
 test("a credential embedded in a longer value is dropped", () => {
   // The pairing token and the pairing code are matched as substrings, so
   // writing either inside a longer note does not carry it back out.

@@ -388,14 +388,21 @@ const CREDENTIAL_VALUE_PATTERNS = [
  * this check runs on every value the bridge is about to keep, under any
  * name at all.
  *
- * The value is read through its SERIALIZED form rather than through the
- * live object. The caller has already refused anything whose serialized
- * length passes the size gate, so the text handed here is bounded, and the
- * structure that text describes is bounded with it. The serialized length
- * is therefore the only bound there is: there is no depth limit and no node
- * limit, so a credential nested at any depth is still a leaf in that
- * structure and is still found, while a benign value that is merely wide or
- * deep is kept, because nothing about it carries a credential.
+ * The caller hands this check the PARSED form of the value it read through
+ * JSON, and that is the form the window keeps as well, so the value that is
+ * checked and the value that is kept are the same value. Reading the
+ * serialized form first is what makes that possible: a value with a custom
+ * toJSON, or a getter that answers twice, would otherwise be checked as one
+ * value and kept as another, and a cleartext credential could hide in the
+ * difference.
+ *
+ * The parsed form is bounded by the length of the serialized text, because
+ * the caller has already refused anything longer than the size gate. The
+ * serialized length is therefore the only bound there is: there is no depth
+ * limit and no node limit, so a credential nested at any depth is still a
+ * leaf in that structure and is still found, while a benign value that is
+ * merely wide or deep is kept, because nothing about it carries a
+ * credential.
  *
  * The digests the window itself carries are the exact answer on top of the
  * shapes: a value whose digest is the stored code digest or the stored
@@ -411,7 +418,7 @@ const CREDENTIAL_VALUE_PATTERNS = [
  * whole value, the same rule the top level applies. A value that cannot be
  * serialized or parsed is dropped, which is the fail-closed direction.
  */
-function isCredentialFieldValue(serialized, digests = {}) {
+function isCredentialFieldValue(value, digests = {}) {
   const wanted = [digests.codeDigest, digests.tokenDigest]
     .map((held) => String(held ?? ''))
     .filter((digest) => digest !== '');
@@ -424,13 +431,6 @@ function isCredentialFieldValue(serialized, digests = {}) {
     }
     return false;
   };
-  let parsed;
-  try {
-    parsed = JSON.parse(String(serialized ?? ''));
-  } catch {
-    // A value that cannot be read back is a credential: fail closed.
-    return true;
-  }
   const walk = (current) => {
     if (current === null || current === undefined) return false;
     // `Object(current) === current` is true for an object, an array or a
@@ -451,7 +451,7 @@ function isCredentialFieldValue(serialized, digests = {}) {
     }
     return false;
   };
-  return walk(parsed);
+  return walk(value);
 }
 
 /**
@@ -493,18 +493,30 @@ function normalizeWindow(window) {
     if (key === 'codeDigest' || key === 'tokenDigest' || key === 'expiresAtMs' || key === 'attemptsLeft' || key === 'spent' || key === 'replay') continue;
     if (isCredentialFieldName(key)) continue;
     if (kept >= MAX_WINDOW_METADATA_KEYS) break;
-    // The value is serialized once: the size gate reads that text, and the
-    // value check reads the structure the same text describes.
+    // The value is read once and serialized once, and the structure that
+    // text describes is what the check reads and what the window keeps, so
+    // the checked value and the kept value can never be two different
+    // values.
+    const value = source[key];
     let serialized = null;
     try {
-      serialized = JSON.stringify(source[key] ?? null);
+      serialized = JSON.stringify(value ?? null);
     } catch {
       continue;
     }
     const size = serialized?.length ?? 0;
     if (!Number.isFinite(size) || size > MAX_WINDOW_METADATA_CHARS) continue;
-    if (isCredentialFieldValue(serialized, { codeDigest: source.codeDigest, tokenDigest: source.tokenDigest })) continue;
-    extra[key] = source[key];
+    let parsed = null;
+    try {
+      parsed = JSON.parse(serialized);
+    } catch {
+      // A value that cannot be read back is not a value the window keeps.
+      continue;
+    }
+    if (isCredentialFieldValue(parsed, { codeDigest: source.codeDigest, tokenDigest: source.tokenDigest })) continue;
+    // A value the caller left absent stays absent: the parsed form of an
+    // undefined value is null, and a null is a value the caller never wrote.
+    extra[key] = value === undefined ? undefined : parsed;
     kept += 1;
   }
   return {
