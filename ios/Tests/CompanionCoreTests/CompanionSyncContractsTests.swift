@@ -320,11 +320,11 @@ struct CompanionSyncContractsTests {
             serverName: "Ada's Mac",
             port: 8810,
             tailnetHost: "evil@ada-mac.tail0000.ts.net",
-            lanHosts: ["bad:9000", "ctrl\u{0001}host", "192.168.1.25"],
+            lanHosts: ["bad:9000", "[fe80::1]:9000", "ctrl\u{0001}host", "fe80::1", "[2001:db8::1]", "192.168.1.25"],
             allowCleartextLAN: true
         )
-        #expect(sanitized.endpoints.map(\.url) == ["http://192.168.1.25:8810"])
-        #expect(sanitized.hosts == ["192.168.1.25"])
+        #expect(sanitized.endpoints.map(\.url) == ["http://[fe80::1]:8810", "http://[2001:db8::1]:8810", "http://192.168.1.25:8810"])
+        #expect(sanitized.hosts == ["fe80::1", "2001:db8::1", "192.168.1.25"])
 
         let opened = CompanionEndpointAdvertisement.build(
             serverName: "Ada's Mac",
@@ -370,7 +370,8 @@ struct CompanionSyncContractsTests {
         #expect(await server.activePairingWindow() == nil)
         let window = await server.openPairingWindow()
         #expect(window.code.count == 6)
-        #expect(window.code.allSatisfy(\.isNumber))
+        let codeAllDigits = window.code.allSatisfy(\.isNumber)
+        #expect(codeAllDigits)
         #expect(window.qrCredential?.hasPrefix("omb_pair_") == true)
         #expect(window.qrCredential?.utf8.count == 52)
         #expect(await server.activePairingWindow() == window)
@@ -632,7 +633,7 @@ struct CompanionSyncContractsTests {
         ))
         #expect(fleetResp.bodyString.contains("\"pushTokensRegistered\":1"))
 
-        let health = try await client.pushHealth()
+        let health = try await client.pushSenderHealth()
         #expect(health.configured == false)
         #expect(health.tokensRegistered == 1)
 
@@ -645,7 +646,7 @@ struct CompanionSyncContractsTests {
         let restarted = NativeCompanionServer(database: db, deviceStoreURL: paths.store)
         let restartedHarness = SyncContractHarness(server: restarted)
         defer { restartedHarness.close() }
-        let restartedHealth = try await restartedHarness.client(token: paired.response.token).pushHealth()
+        let restartedHealth = try await restartedHarness.client(token: paired.response.token).pushSenderHealth()
         #expect(restartedHealth.tokensRegistered == 1)
 
         // Revoking the device drops its push & Live Activity tokens from disk.
@@ -753,7 +754,7 @@ struct CompanionSyncContractsTests {
         await transport.resetCaptured()
         await transport.enqueue(statusCode: 410, jsonBody: "{\"reason\":\"Unregistered\"}")
         _ = await server.publishNotification(approval)
-        let after410 = try await harness.client(token: tokenDisconnected).pushHealth()
+        let after410 = try await harness.client(token: tokenDisconnected).pushSenderHealth()
         #expect(after410.sent == 1)
         #expect(after410.failed == 1)
         #expect(after410.tokensRegistered == 1) // connectedHex remains registered; disconnectedHex was cleared
@@ -764,7 +765,7 @@ struct CompanionSyncContractsTests {
         await transport.resetCaptured()
         await transport.enqueue(statusCode: 403, jsonBody: "{\"reason\":\"InvalidProviderToken\"}")
         _ = await server.publishNotification(approval)
-        let after403 = try await harness.client(token: tokenDisconnected).pushHealth()
+        let after403 = try await harness.client(token: tokenDisconnected).pushSenderHealth()
         #expect(after403.keyRejected == "403 InvalidProviderToken")
 
         // Subsequent publishNotification must not call APNs transport while keyRejected is latched.

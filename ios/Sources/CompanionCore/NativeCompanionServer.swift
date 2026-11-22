@@ -1,5 +1,10 @@
 import CryptoKit
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 #if canImport(Network)
 import Network
 #endif
@@ -213,12 +218,30 @@ public struct CompanionEndpointAdvertisement: Sendable, Equatable {
         )
     }
 
+    private static func isValidIPv6Literal(_ candidate: String) -> String? {
+        var bare = candidate
+        if bare.hasPrefix("["), bare.hasSuffix("]"), bare.count > 2 {
+            bare = String(bare.dropFirst().dropLast())
+        }
+        guard !bare.isEmpty, bare.contains(":") else { return nil }
+        var addr = in6_addr()
+        guard bare.withCString({ inet_pton(AF_INET6, $0, &addr) == 1 }) else {
+            return nil
+        }
+        return bare
+    }
+
     private static func cleanCandidateHost(_ raw: String) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               trimmed.utf8.count <= 253,
-              !trimmed.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F }),
-              !trimmed.contains(where: { $0.isWhitespace || "/?#:@".contains($0) }) else {
+              !trimmed.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F }) else {
+            return nil
+        }
+        if let ipv6 = isValidIPv6Literal(trimmed) {
+            return ipv6
+        }
+        guard !trimmed.contains(where: { $0.isWhitespace || "/?#:@[]".contains($0) }) else {
             return nil
         }
         return trimmed
