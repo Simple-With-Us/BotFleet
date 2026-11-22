@@ -26,7 +26,7 @@ struct MacPhoneSettings: View {
     @State private var routes: [PhoneRouteRow] = []
     @State private var serverName: String = ""
     @State private var errorMessage: String?
-    @State private var qrCache: [String: NSImage] = [:]
+    @State private var renderedQR: NSImage? = nil
     private static let qrContext = CIContext()
 
     var body: some View {
@@ -76,7 +76,7 @@ struct MacPhoneSettings: View {
         GroupBox("Pairing Code") {
             VStack(alignment: .leading, spacing: 12) {
                 if let window, let inviteURL {
-                    if let qr = qrImageCached(from: inviteURL) {
+                    if let qr = renderedQR {
                         Image(nsImage: qr)
                             .resizable()
                             .interpolation(.none)
@@ -190,18 +190,15 @@ struct MacPhoneSettings: View {
         } else {
             inviteURL = nil
         }
+        if let inviteURL {
+            renderedQR = qrImage(from: inviteURL.absoluteString)
+        } else {
+            renderedQR = nil
+        }
     }
 
     private func phoneDate(_ seconds: Double) -> String {
         Date(timeIntervalSince1970: seconds).formatted(date: .abbreviated, time: .omitted)
-    }
-
-    private func qrImageCached(from url: URL) -> NSImage? {
-        let key = url.absoluteString
-        if let cached = qrCache[key] { return cached }
-        guard let image = qrImage(from: key) else { return nil }
-        qrCache[key] = image
-        return image
     }
 
     private func qrImage(from string: String) -> NSImage? {
