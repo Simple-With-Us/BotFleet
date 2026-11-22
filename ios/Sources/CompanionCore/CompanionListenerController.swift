@@ -318,6 +318,12 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
     public func stop() async {
         guard let server else { return }
         await server.stopListening()
+        // The server keeps its last advertisement across a socket stop, so
+        // clearing only the backend cache would leave a stop/start cycle
+        // serving stale routes while the tab reports none.  Both sides are
+        // cleared together: a restart serves nothing until fresh routes are
+        // set, and the tab agrees with `GET /api/companion/endpoints`.
+        await server.setEndpointAdvertisement(CompanionEndpointAdvertisement())
         lastAdvertisement = CompanionEndpointAdvertisement()
     }
 

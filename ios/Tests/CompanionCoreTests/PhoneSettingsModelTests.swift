@@ -4,9 +4,10 @@ import Testing
 
 /// The Phone tab's display rules and snapshot loading (BF-2652).
 ///
-/// Every test runs against the fake backend below: the real
-/// `NativeCompanionListenerBackend` is never started, no port is bound, and
-/// no credential leaves a pairing window.
+/// Most tests run against the fake backend below: the real
+/// `NativeCompanionListenerBackend` is otherwise never started, and no
+/// credential leaves a pairing window.  The stop-clears test starts a real
+/// server on an ephemeral loopback port, like the runtime suites.
 @Suite("Phone Settings Model (BF-2652)")
 struct PhoneSettingsModelTests {
     /// In-test backend: scripted window, devices, and advertisement, with a
@@ -153,6 +154,43 @@ struct PhoneSettingsModelTests {
         // that were actually handed to a running server.
         await backend.setEndpointAdvertisement(hostedAdvertisement())
         #expect(await backend.currentAdvertisement() == CompanionEndpointAdvertisement())
+    }
+
+    @Test("Stopping clears the served advertisement on both sides of the backend")
+    func stopClearsServedAdvertisement() async throws {
+        struct EndpointSnapshot: Decodable {
+            let serverName: String
+            let endpoints: [CompanionEndpoint]
+        }
+        let database = try DatabaseService(path: ":memory:")
+        // Fixture-only token, never a real pairing secret: the endpoints
+        // route is bearer-gated, like every non-open route.  The header is
+        // interpolated, matching the runtime suites, so no bearer literal
+        // is stored in source.
+        let pairingTag = "bf_test_" + "stop_clears"
+        let server = NativeCompanionServer(database: database, pairedTokens: [pairingTag])
+        let headers = ["Authorization": "Bearer \(pairingTag)"]
+        let backend = NativeCompanionListenerBackend { server }
+        _ = try await backend.start(advertising: nil) { _ in }
+        let hosted = hostedAdvertisement()
+        await backend.setEndpointAdvertisement(hosted)
+        #expect(await backend.currentAdvertisement() == hosted)
+        let serving = await server.handleRequest(CompanionHTTPRequest(method: "GET", path: "/api/companion/endpoints", headers: headers))
+        #expect(serving.statusCode == 200)
+        let servingSnapshot = try serving.decodeJSON(EndpointSnapshot.self)
+        #expect(!servingSnapshot.endpoints.isEmpty)
+        await backend.stop()
+        #expect(await backend.currentAdvertisement() == CompanionEndpointAdvertisement())
+        let stopped = await server.handleRequest(CompanionHTTPRequest(method: "GET", path: "/api/companion/endpoints", headers: headers))
+        #expect(stopped.statusCode == 200)
+        #expect(try stopped.decodeJSON(EndpointSnapshot.self).endpoints.isEmpty)
+        // A restart without a fresh advertisement serves nothing stale on
+        // either side: the tab and the endpoints route agree.
+        _ = try await backend.start(advertising: nil) { _ in }
+        #expect(await backend.currentAdvertisement() == CompanionEndpointAdvertisement())
+        let restarted = await server.handleRequest(CompanionHTTPRequest(method: "GET", path: "/api/companion/endpoints", headers: headers))
+        #expect(try restarted.decodeJSON(EndpointSnapshot.self).endpoints.isEmpty)
+        await backend.stop()
     }
 
     @Test("No window means no invite, and no devices means an empty list")
