@@ -29,6 +29,7 @@
 //     until it starts or something else delivers its notices.
 
 import type { JobSnapshot } from "../../shared/jobs.ts";
+import { isBotStoppedError } from "../bot-stop-policy.ts";
 import type { JobNoticeItem } from "../steer-queue.ts";
 
 export interface JobWakeDeps {
@@ -105,6 +106,8 @@ export class JobWakeCoordinator {
   private readonly waiting = new Map<string, string>();
   /** threadId → the retry timer of a waiting wake. */
   private readonly retries = new Map<string, WakeTimer>();
+  /** threadIds whose bot-stopped hold has been logged once (BF-2454). */
+  private readonly stoppedLogged = new Set<string>();
 
   constructor(deps: JobWakeDeps) {
     this.deps = deps;
@@ -150,10 +153,13 @@ export class JobWakeCoordinator {
     }
   }
 
-  /** Hold a due wake until the bot settles, and try again on a timer too. */
-  private park(threadId: string, botId: string): void {
+  /** Hold a due wake until the bot settles, and try again on a timer too.
+   *  A stopped bot parks without the timer (BF-2454): its stop lifts only
+   *  when a person starts it again, and that start settles a turn, which is
+   *  what delivers the wake.  Polling it every 30 s forever only logs. */
+  private park(threadId: string, botId: string, retryTimer = true): void {
     this.waiting.set(threadId, botId);
-    if (this.retries.has(threadId)) return;
+    if (!retryTimer || this.retries.has(threadId)) return;
     const timer = this.setTimer(() => {
       this.retries.delete(threadId);
       const waitingBot = this.waiting.get(threadId);
@@ -176,6 +182,7 @@ export class JobWakeCoordinator {
     this.scheduled.delete(threadId);
     this.unpark(threadId);
     this.used.delete(threadId);
+    this.stoppedLogged.delete(threadId);
   }
 
   /** Wakes left on this thread before the owner has to type.  Test seam. */
@@ -220,11 +227,22 @@ export class JobWakeCoordinator {
     this.used.set(threadId, (this.used.get(threadId) ?? 0) + 1);
     try {
       await this.deps.startWake(botId, threadId, wakePrompt(items), items.map((item) => item.jobId));
+      this.stoppedLogged.delete(threadId);
     } catch (error) {
       // Not delivered: the notices go back, the wake is not spent, and the
       // next settle tries again.
       this.used.set(threadId, Math.max(0, (this.used.get(threadId) ?? 1) - 1));
       this.deps.restoreNotices(threadId, items);
+      if (isBotStoppedError(error)) {
+        // Stopped on purpose: park for the next settle with no retry timer
+        // and one log line per thread (BF-2454), not a 30 s poll forever.
+        this.park(threadId, botId, false);
+        if (!this.stoppedLogged.has(threadId)) {
+          this.stoppedLogged.add(threadId);
+          this.deps.log?.(`[jobs] wake for ${threadId.slice(0, 8)} held: the bot is stopped; it will go out when the bot next settles`);
+        }
+        return;
+      }
       this.park(threadId, botId);
       this.deps.log?.(`[jobs] wake for ${threadId.slice(0, 8)} did not start: ${error instanceof Error ? error.message : String(error)}`);
     }
