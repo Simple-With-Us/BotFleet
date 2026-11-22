@@ -89,7 +89,9 @@ export async function readApnsScopedSecret(
  * has none:  a missing status is a refused read, never an absent name.
  */
 function exitStatus(err: Error): number {
+  // The `in` check narrows the error to the shape that carries a status,
+  // so the code is read as a property and not through a dynamic lookup.
   if (!("code" in err)) return 0;
-  const status = Number(Reflect.get(err, "code"));
+  const status = Number(err.code);
   return Number.isInteger(status) ? status : 0;
 }
