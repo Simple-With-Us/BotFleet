@@ -439,7 +439,7 @@ test("asc-api.mjs never reads a named path as a credential source", () => {
   // Every environment PEM is parsed before it is accepted, so a truncated key
   // is a credential error rather than a signer stack trace.
   assert.match(asc, /normalizePrivateKey/);
-  assert.match(asc, /import \{ normalizePrivateKey \} from "\.\/asc-key\.mjs"/);
+  assert.match(asc, /import \{ normalizePrivateKey, writePrivateKeyFile \} from "\.\/asc-key\.mjs"/);
 });
 
 test("asc-api.mjs says what it tried instead of failing on a missing file", () => {
@@ -505,6 +505,10 @@ test("asc-api.mjs stays dependency-free: it runs from a bare directory with no n
     writeFileSync(join(client, "version-plan.mjs"), read("scripts/ios-fleet/version-plan.mjs"));
     writeFileSync(join(client, "shared-build.mjs"), read("scripts/ios-fleet/shared-build.mjs"));
     writeFileSync(join(lib, "fleet-infisical-read.mjs"), read("scripts/lib/fleet-infisical-read.mjs"));
+    // The client reads the store through the shared fetch helper, which sits one
+    // level up from scripts/ios-fleet:  a missing sibling is
+    // ERR_MODULE_NOT_FOUND, which is the same failure this test exists to catch.
+    writeFileSync(join(tmp, "infisical-fetch.mjs"), read("scripts/infisical-fetch.mjs"));
     const run = spawnSync(process.execPath, [copy, "latest-build-seq", "app.botfleet.ios", "1.0"], {
       encoding: "utf8",
       env: { PATH: process.env.PATH || "", HOME: tmp },

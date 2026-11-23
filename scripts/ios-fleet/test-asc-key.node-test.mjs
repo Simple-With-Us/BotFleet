@@ -303,15 +303,22 @@ test("the writer keeps mode 600 on a file that already existed", () => {
 test("the child's environment is an allowlist, not a copy of the parent's", () => {
   //  A wholesale copy hands every credential on the operator's machine to the
   //  child, including the ones that have nothing to do with App Store Connect.
+  //  The allowlist carries the STORE BINDING and never a credential name:  the
+  //  key material resolves in the client, so it has no business in the
+  //  environment of anything (owner ruling, November 22, 2026).
   const child = clientEnvironment(
-    { PATH: "/usr/bin", HOME: "/tmp/home", SECRET_TOKEN: "leaked", ASC_KEY_ID: "KEY1" },
-    { ASC_KEY_P8: envKeyPem }
+    { PATH: "/usr/bin", HOME: "/tmp/home", SECRET_TOKEN: "leaked", ASC_KEY_ID: "KEY1", ASC_KEY_P8: envKeyPem, INFISICAL_TOKEN: "reader-token" },
+    {}
   );
-  assert.deepEqual(Object.keys(child).sort(), ["ASC_KEY_ID", "ASC_KEY_P8", "HOME", "PATH"]);
+  assert.deepEqual(Object.keys(child).sort(), ["HOME", "INFISICAL_TOKEN", "PATH"]);
   assert.equal(child.SECRET_TOKEN, undefined, "an unrelated credential crossed over");
-  assert.equal(child.ASC_KEY_P8, envKeyPem);
+  assert.equal(child.ASC_KEY_ID, undefined, "a credential name crossed over");
+  assert.equal(child.ASC_KEY_P8, undefined, "the key material crossed over");
+  assert.equal(child.INFISICAL_TOKEN, "reader-token", "the store binding did not cross over");
   assert.ok(CLIENT_ENV_ALLOWLIST.includes("PATH"));
   assert.ok(!CLIENT_ENV_ALLOWLIST.includes("SECRET_TOKEN"));
+  assert.ok(!CLIENT_ENV_ALLOWLIST.includes("ASC_KEY_P8"));
+  assert.ok(!CLIENT_ENV_ALLOWLIST.includes("ASC_KEY_ID"));
 });
 
 test("the client takes the key from the store and ignores a complete environment", async () => {
