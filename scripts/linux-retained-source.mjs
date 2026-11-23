@@ -33,6 +33,10 @@ export const ClosureReceiptSchema = z.strictObject({
 
 export const LINUX_ENTRY_POINTS = [
   ["server/index.ts", "runtime"], ["deploy/linux-server/owner-gate.mjs", "runtime"],
+  ["deploy/linux-server/companion-bridge-server.mjs", "runtime"],
+  ["deploy/linux-server/companion-bridge-state.mjs", "runtime"],
+  ["deploy/linux-server/companion-bridge.node-test.mjs", "verification"],
+  ["deploy/linux-server/companion-bridge-server.node-test.mjs", "verification"],
   ["vite.config.ts", "ui-build"], ["src/main.tsx", "ui-build"],
   ["scripts/compile-clutch-dep.mjs", "install"],
   ["deploy/linux-server/dependency-install.node-test.mjs", "verification"],
@@ -51,6 +55,7 @@ export const LINUX_REQUIRED_INPUTS = [
   "deploy/linux-server/uninstall.sh", "deploy/linux-server/start.sh", "deploy/linux-server/check-storage.mjs",
   "deploy/linux-server/read-harness-token.mjs", "deploy/linux-server/render-resources.mjs",
   "deploy/linux-server/botfleet-server.service.in", "deploy/linux-server/botfleet-owner-gate.service.in",
+  "deploy/linux-server/botfleet-companion-bridge.service.in",
   "server/drivers/pi-mcp-extension.ts", "scripts/computer-vm-cli/manifest.json",
 ];
 const FORBIDDEN_MAC_PATHS = /^(?:electron\/(?:main|preload|updater[^/]*)\.|scripts\/(?:botfleet-server-start\.sh|launchd\/))/;

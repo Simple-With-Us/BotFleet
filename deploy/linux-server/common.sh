@@ -46,6 +46,23 @@ INFISICAL_READ_TOKEN_FILE="${BF_ROOT}/config/infisical-read-token"
 SERVER_UNIT="botfleet-server.service"
 GATE_UNIT="botfleet-owner-gate.service"
 
+# The companion bridge unit, and the switch that installs it.  The bridge is
+# default-off: with BF_COMPANION_BRIDGE unset, install.sh, update.sh and
+# uninstall.sh behave exactly as they do without it, and the bridge is never
+# written, enabled or started.  Set it to 1 to install and enable it.
+BRIDGE_UNIT="botfleet-companion-bridge.service"
+BF_COMPANION_BRIDGE="${BF_COMPANION_BRIDGE:-0}"
+
+# The bridge listens on loopback only.  The port is fixed in code
+# (deploy/linux-server/companion-bridge-server.mjs), like the owner gate's,
+# because `tailscale serve` has to point at exactly that port.
+BRIDGE_PORT="8797"
+
+# The tailnet https port the bridge's route is published on.  The owner gate
+# takes TS_HTTPS_PORT; the bridge takes its own, so publishing the bridge
+# never disturbs the harness's route.
+TS_BRIDGE_HTTPS_PORT="${TS_BRIDGE_HTTPS_PORT:-8800}"
+
 say() {
   printf '==> %s\n' "$*"
 }
