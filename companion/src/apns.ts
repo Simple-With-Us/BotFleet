@@ -183,7 +183,20 @@ async function scopedVaultGet(name: string): Promise<{ value: string | null; rea
 async function sharedKeyId(): Promise<{ id: string | null; reason: string }> {
   const got = await scopedVaultGet(SHARED_APNS_KEY_ID_NAME);
   const id = got.value?.trim();
-  return { id: id && KEY_ID_PATTERN.test(id) ? id : null, reason: got.reason };
+  if (id && KEY_ID_PATTERN.test(id)) return { id, reason: got.reason };
+  // A value that is present but is not an Apple key id is a misconfiguration,
+  // not an absence:  the read SUCCEEDED, so the read's own reason is empty
+  // and forwarding it would clear the reason and hide the misconfiguration
+  // from the status.  The reason names the name and the folder and never a
+  // value.
+  if (got.value !== null) {
+    const detail = id ? "is malformed (expected an Apple key id)" : "is empty";
+    return {
+      id: null,
+      reason: `the APNs name ${SHARED_APNS_KEY_ID_NAME} ${detail} in the scoped Infisical folder ${apnsSecretFolder()}`,
+    };
+  }
+  return { id: null, reason: got.reason };
 }
 
 /** The read itself, away from the cache check.

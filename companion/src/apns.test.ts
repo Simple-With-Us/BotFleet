@@ -3536,6 +3536,23 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     expect(SHARED_APNS_KEY_ID).toBe("HSJ98QN95V");
   });
 
+  it.skipIf(process.platform === "win32")("names a malformed stored key id instead of reporting nothing", async () => {
+    process.env.FLEET_INFISICAL_READER = fakeReader(
+      `name = sys.argv[2]\nif name == "APNS_KEY_P8":\n    sys.stdout.write(${pemScript(testP8())})\nelif name == "APNS_KEY_ID":\n    sys.stdout.write("not a key id")\nelse:\n    sys.exit(3)`,
+    );
+    // The material is there, so the key loads and the built-in id stands in
+    // for the one the store named.
+    expect((await loadApnsConfig())?.keyId).toBe(SHARED_APNS_KEY_ID);
+    // The misconfiguration is visible:  the read SUCCEEDED, so an empty
+    // reason would hide it and the status would name the built-in id as if
+    // the store had answered.  The reason names the name and the folder and
+    // never carries the value.
+    const reason = apnsKeyReadReason();
+    expect(reason).toContain("APNS_KEY_ID");
+    expect(reason).toContain("malformed");
+    expect(reason).not.toContain("not a key id");
+  });
+
   // The read ceiling is the difference between "the vault answered" and "the
   // sidecar turned pushes off".  A ceiling below the vault's own latency does
   // not slow the sidecar down, it removes the key:  the read is killed, the
