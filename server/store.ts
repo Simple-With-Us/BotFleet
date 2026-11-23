@@ -2785,8 +2785,22 @@ export class Store {
     const previousThreadId = previous?.threadId ?? opts?.previousThreadId;
     const turns = previous?.usage?.turns ?? 0;
     const messages = previousThreadId ? this.messageCountFor(previousThreadId) : 0;
-    this.clearAutomationKey(botId, automationKey);
     const title = opts?.title?.trim() || previous?.title || "Automation";
+    // BF-2556: the replacement takes the live title, so a predecessor that
+    // still carries it would leave the task list holding two threads with
+    // the exact same name.  Retire the old one under a dated archived name,
+    // disambiguated when a same-day predecessor already took that name.
+    // createTask below persists the rename with the new task.
+    if (previous && previous.title === title) {
+      const baseArchivedTitle = `${title} (archived ${new Date().toISOString().slice(0, 10)})`;
+      const takenTitles = new Set((bot.tasks ?? []).filter((task) => task !== previous).map((task) => task.title));
+      let archivedTitle = baseArchivedTitle;
+      for (let n = 2; takenTitles.has(archivedTitle); n += 1) {
+        archivedTitle = `${baseArchivedTitle} (${n})`;
+      }
+      previous.title = archivedTitle;
+    }
+    this.clearAutomationKey(botId, automationKey);
     const activate = opts?.activate ?? true;
     // createTask reunites on a matching key — we already cleared it.
     const neu = this.createTask(botId, title, activate, automationKey, previous?.workspaceContext);

@@ -2019,6 +2019,8 @@ describe("a bot stopped in BotFleet", () => {
     await waitFor(() => attempts >= 2, "a retry");
     expect(botStatus(hub, "bot-plumber")?.pending).toBe(1);
     expect(logs.some((line) => line.includes("the bot is off"))).toBe(false);
+    // BF-2454: the stop is told once, not once per retry for six hours
+    expect(logs.filter((line) => line.includes("turn not started (the bot is stopped)"))).toHaveLength(1);
     skew = 6 * 3600_000 + 60_000;
     await waitFor(() => botStatus(hub, "bot-plumber")?.pending === 0, "the six-hour drop");
     expect(logs.some((line) => line.includes("older than 6h"))).toBe(true);

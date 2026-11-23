@@ -87,6 +87,7 @@ const unitSchema = z.object({
   attempts: z.number(),
   notBefore: z.number(),
   held: z.string().optional(),
+  stopLogged: z.boolean().optional(),
   dropped: z.number().optional(),
 }).strict();
 /** One queued owner notice, parsed on its own so a single damaged entry can

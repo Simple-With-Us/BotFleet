@@ -180,6 +180,97 @@ describe("job wakes", () => {
     expect(t.wakes).toHaveLength(1);
   });
 
+  it("parks a stopped bot's wake without a retry timer and logs once (BF-2454)", async () => {
+    const lines: string[] = [];
+    const delivered: string[] = [];
+    let stopped = true;
+    const t = setup({
+      log: (line) => lines.push(line),
+      startWake: async (_botId, _threadId, _prompt, jobIds) => {
+        if (stopped) throw Object.assign(new Error("This bot is stopped."), { status: 409, code: "bot_stopped" });
+        delivered.push(...jobIds);
+      },
+    });
+    t.finish(job("job_a"));
+    await t.fireTimers(); // the merge window: dispatch refused as stopped
+    expect(delivered).toEqual([]);
+    expect(t.queue.get("thread-a")?.map((item) => item.jobId)).toEqual(["job_a"]);
+    expect(t.coordinator.wakesLeft("thread-a")).toBe(3);
+    // settle-only: no 30-second retry timer is armed against a stopped bot
+    expect(t.timers.filter((timer) => !timer.cleared && timer.ms === 30_000)).toHaveLength(0);
+    expect(lines.filter((line) => line.includes("held: the bot is stopped"))).toHaveLength(1);
+    await t.fireTimers();
+    expect(lines.filter((line) => line.includes("held: the bot is stopped"))).toHaveLength(1);
+    stopped = false;
+    t.coordinator.botSettled("bot-a");
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(delivered).toEqual(["job_a"]);
+  });
+
+  it("calls off an already-armed retry when a stopped refusal parks settle-only (BF-2454)", async () => {
+    const delivered: string[] = [];
+    let stopped = false;
+    const t = setup({
+      startWake: async (_botId, _threadId, _prompt, jobIds) => {
+        if (stopped) throw Object.assign(new Error("This bot is stopped."), { status: 409, code: "bot_stopped" });
+        delivered.push(...jobIds);
+      },
+    });
+    // A busy park arms the 30-second retry timer first.
+    t.state.busy.add("bot-a");
+    t.finish(job("job_a"));
+    await t.fireTimers();
+    const retry = t.timers.find((timer) => timer.ms === 30_000 && !timer.cleared)!;
+    expect(retry).toBeDefined();
+    // A second completion fires while that timer is still armed, and this
+    // dispatch meets the stop instead: the armed poll is called off.  Fire
+    // only the 5-second merge timer, as real time would reach it first.
+    t.state.busy.delete("bot-a");
+    stopped = true;
+    t.finish(job("job_b"));
+    const merge = t.timers.find((timer) => !timer.cleared && timer.ms === 5_000)!;
+    merge.fn();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(delivered).toEqual([]);
+    expect(retry.cleared).toBe(true);
+    expect(t.timers.filter((timer) => !timer.cleared && timer.ms === 30_000)).toHaveLength(0);
+    stopped = false;
+    t.coordinator.botSettled("bot-a");
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(delivered).toEqual(["job_a", "job_b"]);
+  });
+
+  it("keeps retrying an off bot's wake on the timer, logging the hold once (BF-2454)", async () => {
+    const lines: string[] = [];
+    const delivered: string[] = [];
+    let off = true;
+    const t = setup({
+      log: (line) => lines.push(line),
+      startWake: async (_botId, _threadId, _prompt, jobIds) => {
+        if (off) throw Object.assign(new Error("This bot is off."), { status: 409, code: "bot_off" });
+        delivered.push(...jobIds);
+      },
+    });
+    t.finish(job("job_a"));
+    await t.fireTimers(); // the merge window: dispatch refused while off
+    expect(delivered).toEqual([]);
+    expect(t.queue.get("thread-a")?.map((item) => item.jobId)).toEqual(["job_a"]);
+    expect(t.coordinator.wakesLeft("thread-a")).toBe(3);
+    // Turn On starts and settles no turn, so the retry timer must stay armed.
+    expect(t.timers.filter((timer) => !timer.cleared && timer.ms === 30_000)).toHaveLength(1);
+    expect(lines.filter((line) => line.includes("held: the bot is off"))).toHaveLength(1);
+
+    // Still off at the retry: it stays queued, re-arms, and stays silent.
+    await t.fireTimers();
+    expect(delivered).toEqual([]);
+    expect(t.timers.filter((timer) => !timer.cleared && timer.ms === 30_000)).toHaveLength(1);
+    expect(lines.filter((line) => line.includes("held: the bot is off"))).toHaveLength(1);
+
+    off = false;
+    await t.fireTimers();
+    expect(delivered).toEqual(["job_a"]);
+  });
+
   it("tries a wake that could not start again on a timer, with no turn settling", async () => {
     // a provider reload ended, or a stalled turn was released: the bot is
     // idle again, and no turn.completed will say so
