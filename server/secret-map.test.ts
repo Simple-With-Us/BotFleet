@@ -225,10 +225,50 @@ describe("resolving a mapped field", () => {
     expect(secretSource("minimax.url")).toBe("infisical");
   });
 
-  it("falls through an empty value in the store instead of blanking the local one", () => {
+  it("never reads a mapped credential from the environment once a store is configured", () => {
+    //  The store owns the name once it is configured:  an empty answer is
+    //  an absent credential, and neither the environment copy nor the file
+    //  copy is a second source (owner ruling, November 22, 2026).  The file
+    //  is the app's own store, so it still applies for a name the store does
+    //  not hold.
     const cfg: AppConfig = { composio: { apiKey: SENTINEL_FILE } };
     setInfisicalSnapshot(new Map([["COMPOSIO_API_KEY", ""]]), ["COMPOSIO_API_KEY"]);
-    const rows = resolveSecretFields(cfg, {}, infisicalSnapshot());
+    const rows = resolveSecretFields(cfg, { COMPOSIO_API_KEY: SENTINEL_ENV }, infisicalSnapshot());
+    expect(cfg.composio?.apiKey).toBe(SENTINEL_FILE);
+    expect(rows.find((row) => row.id === "composio.apiKey")?.source).toBe("file");
+    expect(rows.find((row) => row.id === "composio.apiKey")?.hasValue).toBe(true);
+  });
+
+  it("ignores the environment copy of a mapped name once a store is configured", () => {
+    //  The environment carries no copy of a value:  with a store
+    //  configured, the environment answer is not a source at all.
+    const cfg: AppConfig = {};
+    setInfisicalSnapshot(new Map([["COMPOSIO_API_KEY", ""]]), ["COMPOSIO_API_KEY"]);
+    const rows = resolveSecretFields(cfg, { COMPOSIO_API_KEY: SENTINEL_ENV }, infisicalSnapshot());
+    expect(cfg.composio?.apiKey).toBeUndefined();
+    expect(rows.find((row) => row.id === "composio.apiKey")?.source).toBe("none");
+    expect(rows.find((row) => row.id === "composio.apiKey")?.hasValue).toBe(false);
+  });
+
+  it("keeps the app's own credential store value when the store does not hold the name", () => {
+    //  The desktop shell's encrypted store reaches the server it spawns
+    //  through the environment, and the app's own configuration marks it
+    //  (`credentialStorage: "external"`).  That is the app's own store and
+    //  not an ambient environment copy:  the fleet store still outranks it,
+    //  and an environment value with no marker stays out of the way.
+    const cfg: AppConfig = { deepseek: { key: SENTINEL_ENV, credentialStorage: "external" } };
+    setInfisicalSnapshot(new Map([["COMPOSIO_API_KEY", SENTINEL_VAULT]]), ["COMPOSIO_API_KEY"]);
+    const rows = resolveSecretFields(cfg, { DEEPSEEK_API_KEY: SENTINEL_ENV }, infisicalSnapshot());
+    expect(cfg.deepseek?.key).toBe(SENTINEL_ENV);
+    expect(rows.find((row) => row.id === "deepseek.key")?.source).toBe("env");
+    expect(rows.find((row) => row.id === "composio.apiKey")?.source).toBe("infisical");
+  });
+
+  it("keeps the app's own configuration when no store is configured", () => {
+    //  A host with no store configured has no store to own the name, so the
+    //  file and the environment still apply.
+    const cfg: AppConfig = { composio: { apiKey: SENTINEL_FILE } };
+    const rows = resolveSecretFields(cfg, { COMPOSIO_API_KEY: SENTINEL_ENV }, null);
     expect(cfg.composio?.apiKey).toBe(SENTINEL_FILE);
     expect(rows.find((row) => row.id === "composio.apiKey")?.source).toBe("file");
   });

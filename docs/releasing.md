@@ -126,8 +126,10 @@ the same repository.
 The hand-cut path still works when Actions is down or a release needs
 surgery: `pnpm package:mac:release`, gate both applications with
 `codesign --verify --deep --strict`,
-notarize with the local keychain profile (`xcrun notarytool submit …
---keychain-profile AC_PASSWORD`), staple, re-zip, regenerate blockmaps and
+notarize with the identity the store names (`xcrun notarytool submit …
+--keychain-profile "$NOTARY_PROFILE"`, where `NOTARY_PROFILE` is read from
+Infisical `/asc` for the packaging account, never from the environment and
+never defaulted), staple, re-zip, regenerate blockmaps and
 `node scripts/regenerate-mac-feed.mjs`, upload to the matching
 `Simple-With-Us/BotFleet` release, publish, and always verify the
 published bytes against the published feed by downloading them back.

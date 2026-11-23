@@ -2,6 +2,7 @@
 // Model Context Protocol (MCP) Server for BotFleet
 // Standard JSON-RPC 2.0 stdio transport for external agent orchestration (Hermes, Claude Desktop, Cursor, etc.).
 import readline from "node:readline";
+import { loadConfig, sentryDsnConfigured } from "../server/config.ts";
 import { initSentry } from "../server/sentry.ts";
 import { withMcpToolCallSpan } from "../server/sentry-mcp.ts";
 
@@ -1782,7 +1783,13 @@ export async function drainInFlight(
 
 // Start stdio interface when executed directly
 if (process.argv[1] && (process.argv[1].endsWith("mcp-server.ts") || process.argv[1].endsWith("mcp-server.js"))) {
-  await initSentry();
+  // The DSN comes from the app's own configuration and never from the
+  // environment (owner ruling, November 22, 2026:  the environment carries no
+  // copy of a value).  This process holds no store binding of its own, so
+  // when the fleet store owns the DSN this optional reporting stays off here
+  // and the app's own server is the surface that reports;  with no store the
+  // app's own configuration is the source.
+  await initSentry(sentryDsnConfigured(loadConfig()));
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,

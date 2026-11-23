@@ -10,7 +10,11 @@ test("Electron main initializes @sentry/electron without a hardcoded DSN", () =>
   const main = readFileSync(join(ROOT, "electron/main.mjs"), "utf8");
   assert.match(main, /@sentry\/electron\/main/);
   assert.match(main, /function initDesktopSentry/);
-  assert.match(main, /SENTRY_DSN \|\| process\.env\.VITE_SENTRY_DSN/);
+  //  The environment carries no copy of a value:  the DSN comes from the
+  //  app's own settings, and an inherited one is never read.
+  assert.doesNotMatch(main, /process\.env\.SENTRY_DSN/);
+  assert.doesNotMatch(main, /process\.env\.VITE_SENTRY_DSN/);
+  assert.match(main, /readConfigFile\(desktopConfigPath\(\)\)\?\.observability\?\.sentryDsn/);
   assert.doesNotMatch(main, /^\s*sendDefaultPii\s*:/m);
   assert.match(main, /dataCollection:\s*\{[\s\S]*?userInfo:\s*false/);
   assert.match(main, /cookies:\s*false/);
