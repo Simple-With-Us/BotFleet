@@ -76,6 +76,10 @@ export async function bridgeApnsMaterial({
   if (!serviceToken) {
     return { available: false, keyId: '', teamId: '', p8: null, reason: 'no scoped Infisical token is configured' };
   }
+  // The pin is normalized once, the same way bridgeApnsSecretNames does it,
+  // so a caller that hands over a non-string disables APNs cleanly instead
+  // of throwing on a method the value does not have.
+  const pinnedKey = String(pin ?? '').trim();
   const names = bridgeApnsSecretNames(pin);
   let secrets;
   try {
@@ -87,7 +91,7 @@ export async function bridgeApnsMaterial({
   }
   const shared = secrets?.[BRIDGE_APNS_SHARED_P8_NAME];
   const p8 = Object.prototype.toString.call(shared) === '[object String]' ? shared : '';
-  const pinnedName = pin.trim() ? `AUTHKEY_${pin.trim()}` : '';
+  const pinnedName = pinnedKey ? `AUTHKEY_${pinnedKey}` : '';
   const p8Value = p8 || (pinnedName ? String(secrets?.[pinnedName] ?? '') : '');
   // The key id and the team id both come from the vault.  A pinned key id
   // names its own key material, and the vault's own APNS_KEY_ID has to be
@@ -105,7 +109,7 @@ export async function bridgeApnsMaterial({
       reason: `the vault names no APNs key id (${BRIDGE_APNS_SHARED_KEY_ID_NAME})`,
     };
   }
-  if (pinnedName && keyId !== pin.trim()) {
+  if (pinnedName && keyId !== pinnedKey) {
     return {
       available: false,
       keyId,

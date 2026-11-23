@@ -475,6 +475,58 @@ export class BridgeState {
 }
 
 /**
+ * The window fields the bridge itself reads.  Caller metadata never takes
+ * one of these names:  a metadata entry called `spent` or `tokenDigest`
+ * would rewrite the spend state, the attempt budget or a digest, which is
+ * the caller changing a security field the window owns.
+ */
+const RESERVED_WINDOW_KEYS = new Set([
+  'codeDigest',
+  'tokenDigest',
+  'expiresAtMs',
+  'attemptsLeft',
+  'spent',
+  'replay',
+]);
+
+/** The most caller metadata entries one window carries. */
+const BRIDGE_WINDOW_METADATA_MAX_KEYS = 8;
+
+/** The most serialized characters caller metadata takes across all entries. */
+const BRIDGE_WINDOW_METADATA_MAX_CHARS = 1024;
+
+/**
+ * The caller metadata a window carries, bounded and stripped of its own
+ * field names.
+ *
+ * A reserved key is dropped, a value that cannot be read back is dropped,
+ * and the copy stops at eight keys or 1024 serialized characters, so an
+ * open call cannot hand the window an unbounded appendix.
+ *
+ * @param {Record<string, unknown>} metadata
+ * @returns {Record<string, unknown>}
+ */
+export function boundedWindowMetadata(metadata) {
+  const carried = {};
+  let characters = 0;
+  for (const [key, value] of Object.entries(metadata ?? {})) {
+    if (Object.keys(carried).length >= BRIDGE_WINDOW_METADATA_MAX_KEYS) break;
+    if (RESERVED_WINDOW_KEYS.has(key)) continue;
+    let serialized;
+    try {
+      serialized = JSON.stringify(value);
+    } catch {
+      continue;
+    }
+    if (serialized === undefined) continue;
+    if (characters + serialized.length > BRIDGE_WINDOW_METADATA_MAX_CHARS) break;
+    characters += serialized.length;
+    carried[key] = value;
+  }
+  return carried;
+}
+
+/**
  * Open a pairing window.
  *
  * The code and the token are handed back to the caller once, in the clear:
@@ -494,8 +546,9 @@ export function bridgeOpenPairingWindow({ state, nowMs, ttlSeconds = BRIDGE_WIND
     return { ok: false, reason: error instanceof Error ? error.message : 'the pairing window could not be opened' };
   }
   // Caller metadata rides along on the window, so a redeem answer can carry
-  // what the operator attached to the window it opened.
-  state.window = { ...window, ...metadata };
+  // what the operator attached to the window it opened, but only under a
+  // name the window does not own and within the bounds above.
+  state.window = { ...window, ...boundedWindowMetadata(metadata) };
   return { ok: true, code, token: pairingToken, expiresAtMs: window.expiresAtMs, attemptsLeft: window.attemptsLeft };
 }
 
@@ -688,7 +741,11 @@ async function readJsonBody(req, limit = 64 * 1024) {
 /**
  * Create the bridge listener.
  *
- * @param {{state: BridgeState, owners?: Set<string>|string, publicOrigin?: string, tokenSha256?: string|null, upstreamHost?: string, upstreamPort?: number|string, log?: (message: string) => void, now?: () => number, persist?: (state: BridgeState) => void}} options
+ * @param {{state: BridgeState, owners?: Set<string>|string, publicOrigin?: string, tokenSha256?: string|null, upstreamHost?: string, upstreamPort?: number|string, log?: (message: string) => void, now?: () => number, persist?: (state: BridgeState) => boolean}} options
+ *   The persist callback answers whether the state reached durable storage.
+ *   `false` (or a throw) fails every trust-extending route closed for that
+ *   change:  a pairing or a revocation that only lives in memory is one a
+ *   restart forgets, so the caller hears a 503 instead of an unearned 200.
  * @returns {import('node:http').Server}
  */
 export function createCompanionBridge({
@@ -700,7 +757,7 @@ export function createCompanionBridge({
   upstreamPort = BRIDGE_UPSTREAM_PORT,
   log,
   now = () => Date.now(),
-  persist = () => {},
+  persist = () => true,
 } = {}) {
   if (!state || !isObject(state)) throw new Error('createCompanionBridge needs the bridge state');
   const logger = isCallable(log) ? log : () => {};
@@ -708,11 +765,23 @@ export function createCompanionBridge({
   const host = String(upstreamHost || BRIDGE_UPSTREAM_HOST);
   const upstreamAgent = new http.Agent({ keepAlive: false });
 
+  // The persist callback is normalized once:  a throw and a `false` answer
+  // are the same fact, and neither may reach a caller as a success.  Every
+  // route that extends trust checks its own save, so a failing durable
+  // store fails those routes closed while proxying continues.
+  const persistState = (current) => {
+    try {
+      return persist(current) !== false;
+    } catch {
+      return false;
+    }
+  };
+
   const server = http.createServer((req, res) => {
     // Every request runs on its own, so a failure in one may not take the
     // listener with it:  the backstop logs the reason and answers 500 if
     // nothing was written yet.
-    void handleRequest({ req, res, state, owners, publicOrigin, tokenSha256, host, port, upstreamAgent, logger, now, persist }).catch((error) => {
+    void handleRequest({ req, res, state, owners, publicOrigin, tokenSha256, host, port, upstreamAgent, logger, now, persist: persistState }).catch((error) => {
       logger(`[companion-bridge] request failed: ${error instanceof Error ? error.message : String(error)}`);
       if (!res.headersSent) respondJson(res, 500, { error: 'the request could not be handled' });
       else res.destroy();
@@ -791,6 +860,12 @@ async function handleRequest({
 /**
  * Answer one of the bridge's own routes.
  *
+ * Every route that extends trust checks its own save and fails closed:  a
+ * window opened, a device paired or a revocation applied while the durable
+ * store refuses writes answers 503 rather than a success the disk did not
+ * earn, because a restart would drop what memory holds.  Proxying is not a
+ * trust extension, so it continues on the registry the bridge holds.
+ *
  * @param {object} input
  * @returns {Promise<void>}
  */
@@ -801,6 +876,10 @@ async function handleLocalRoute({ req, res, method, url, state, logger, now, per
     respondJson(res, 200, { serverName: '', endpoints: [] });
     return;
   }
+
+  const unsaved = () => {
+    respondJson(res, 503, { error: 'the durable state could not be saved, so the change is not confirmed' });
+  };
 
   if (method === 'POST' && path === '/api/companion/pairing/open') {
     const body = await readJsonBody(req);
@@ -823,7 +902,11 @@ async function handleLocalRoute({ req, res, method, url, state, logger, now, per
       respondJson(res, 500, { error: opened.reason });
       return;
     }
-    persist(state);
+    if (!persist(state)) {
+      logger('[companion-bridge] the durable state refused a save; the window is not confirmed');
+      unsaved();
+      return;
+    }
     respondJson(res, 200, {
       code: opened.code,
       token: opened.token,
@@ -844,7 +927,12 @@ async function handleLocalRoute({ req, res, method, url, state, logger, now, per
       respondJson(res, 400, { error: 'the pairing redeem does not match the contract' });
       return;
     }
-    const presented = String(parsed.data.token ?? parsed.data.code ?? parsed.data.credential ?? '');
+    // The three fields are one credential in three shapes, so the first one
+    // the caller actually sent is the credential:  an empty token field must
+    // not shadow a code the same body carries.
+    const presented = [parsed.data.token, parsed.data.code, parsed.data.credential]
+      .map((value) => String(value ?? ''))
+      .find((value) => value !== '') ?? '';
     if (!presented) {
       respondJson(res, 400, { error: 'a pairing code or token is required' });
       return;
@@ -859,11 +947,22 @@ async function handleLocalRoute({ req, res, method, url, state, logger, now, per
     });
     if (!redeemed.ok) {
       logger(`[companion-bridge] refused a pairing redeem: ${redeemed.reason}`);
+      // The refusal and its burned attempt are real in memory either way;
+      // a save that fails here costs the operator one attempt count after a
+      // restart, not the refusal itself.
       persist(state);
       respondJson(res, 403, { error: redeemed.reason });
       return;
     }
-    persist(state);
+    if (!persist(state)) {
+      // A pairing the durable state cannot hold is not confirmed to the
+      // phone:  the minted credential never leaves the bridge, and a retry
+      // after a save succeeds would answer as a replay with no credential,
+      // so the operator opens a fresh window and pairs again.
+      logger('[companion-bridge] the durable state refused a save; the redeem is not confirmed');
+      unsaved();
+      return;
+    }
     respondJson(res, 200, {
       deviceId: redeemed.deviceId,
       credential: redeemed.credential,
@@ -881,7 +980,15 @@ async function handleLocalRoute({ req, res, method, url, state, logger, now, per
   if (method === 'DELETE' && path.startsWith('/api/companion/devices/')) {
     const deviceId = decodeURIComponent(path.slice('/api/companion/devices/'.length));
     const revoked = state.registry.revokeDevice(deviceId, now());
-    persist(state);
+    if (revoked && !persist(state)) {
+      // A revocation the durable state cannot hold would be a revocation a
+      // restart forgets, which is a revocation that does not exist.  The
+      // in-memory revocation stays and keeps guarding, but the answer is an
+      // honest 503 rather than a 200 the disk did not earn.
+      logger('[companion-bridge] the durable state refused a save; the revocation is memory-only');
+      unsaved();
+      return;
+    }
     respondJson(res, revoked ? 200 : 404, revoked ? { revoked: true, deviceId } : { error: 'unknown device' });
     return;
   }
@@ -1117,10 +1224,12 @@ async function main() {
     persist: (current) => {
       try {
         saveBridgeState(statePath, current.toState());
+        return true;
       } catch (error) {
         process.stderr.write(
           `${new Date().toISOString()} [companion-bridge] the durable state could not be written: ${error?.message ?? 'unknown error'}\n`,
         );
+        return false;
       }
     },
   });

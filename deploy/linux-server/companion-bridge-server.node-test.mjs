@@ -37,6 +37,7 @@ import {
   BridgeState,
   bridgeTokenMatches,
   bridgeUpstreamHeaders,
+  boundedWindowMetadata,
   createCompanionBridge,
   isBridgeLoopbackAddress,
   parseBridgeArgs,
@@ -867,4 +868,237 @@ test('the APNs locus is off, with a reason, when the vault holds no key', async 
   });
   assert.equal(notAKey.available, false);
   assert.match(notAKey.reason, /not a private key/);
+});
+
+test('a non-string APNs pin disables the locus instead of throwing', async () => {
+  // A number, an object and a boolean are all "no pin":  the locus answers
+  // off with its reason rather than throwing on a method the value lacks.
+  for (const pin of [123, { keyId: 'ABCDE12345' }, true]) {
+    const material = await bridgeApnsMaterial({
+      serviceToken: 'st.fixture_token_value_0001',
+      pin,
+      fetchImpl: async () => ({ ok: true, async json() { return { secrets: [] }; } }),
+    });
+    assert.equal(material.available, false);
+    assert.equal(Object.prototype.toString.call(material.reason), '[object String]');
+    assert.ok(material.reason.length > 0);
+  }
+
+  // The pinned path keeps working and still has to agree with the vault.
+  const disagreeing = await bridgeApnsMaterial({
+    serviceToken: 'st.fixture_token_value_0001',
+    pin: 'ZZZZ99999',
+    fetchImpl: async () => ({
+      ok: true,
+      async json() {
+        return {
+          secrets: [
+            { secretKey: 'APNS_KEY_P8', secretValue: FIXTURE_PEM },
+            { secretKey: 'APNS_KEY_ID', secretValue: 'ABCDE12345' },
+            { secretKey: 'APNS_TEAM_ID', secretValue: 'CC8UTF7ATG' },
+          ],
+        };
+      },
+    }),
+  });
+  assert.equal(disagreeing.available, false);
+  assert.match(disagreeing.reason, /does not match the vault/);
+});
+
+test('an empty token field does not shadow a code the same body carries', async () => {
+  const bridge = await startBridge();
+  try {
+    const opened = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/open',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: '{}',
+    });
+    assert.equal(opened.status, 200);
+    // The old selection read the first field by name with ?? and so read the
+    // empty token as the credential; the first field the caller actually
+    // sent is the one that counts.
+    const redeemed = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/redeem',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ token: '', code: opened.json.code, deviceId: 'phone-shadow' }),
+    });
+    assert.equal(redeemed.status, 200);
+    assert.ok(redeemed.json.credential);
+    assert.equal(redeemed.json.replayed, false);
+
+    // A body with every field empty is still refused.
+    const none = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/redeem',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ token: '', code: '', credential: '' }),
+    });
+    assert.equal(none.status, 400);
+    assert.match(none.json.error, /code or token/);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('caller metadata cannot rewrite a window field the bridge owns', async () => {
+  const bridge = await startBridge();
+  try {
+    const opened = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/open',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({
+        metadata: {
+          spent: true,
+          attemptsLeft: 0,
+          expiresAtMs: 0,
+          codeDigest: 'f'.repeat(64),
+          tokenDigest: '0'.repeat(64),
+          replay: { forged: true },
+          note: 'opened from the desk',
+        },
+      }),
+    });
+    assert.equal(opened.status, 200);
+    const window = bridge.state.window;
+    assert.ok(window, 'the window exists');
+    // The reserved fields are the minted ones, not the caller's.
+    assert.equal(window.spent, false);
+    assert.equal(window.attemptsLeft, BRIDGE_WINDOW_MAX_ATTEMPTS);
+    assert.equal(window.expiresAtMs, opened.json.expiresAtMs);
+    assert.equal(window.replay, null);
+    assert.match(window.codeDigest, /^[0-9a-f]{64}$/);
+    assert.match(window.tokenDigest, /^[0-9a-f]{64}$/);
+    assert.notEqual(window.codeDigest, 'f'.repeat(64));
+    // The benign key rides along.
+    assert.equal(window.note, 'opened from the desk');
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('caller metadata is bounded to eight keys and 1024 serialized characters', () => {
+  const twelve = {};
+  for (let index = 0; index < 12; index += 1) twelve[`key${index}`] = index;
+  const bounded = boundedWindowMetadata(twelve);
+  assert.equal(Object.keys(bounded).length, 8);
+
+  const oversized = { small: 'ok', huge: 'x'.repeat(2000) };
+  const carried = boundedWindowMetadata(oversized);
+  assert.deepEqual(carried, { small: 'ok' });
+
+  // A value that cannot be read back is dropped, not thrown over.
+  const cyclic = {};
+  cyclic.self = cyclic;
+  assert.deepEqual(boundedWindowMetadata({ cyclic }), {});
+
+  // A reserved key costs nothing:  it is dropped before the bounds count it.
+  const mixed = boundedWindowMetadata({ spent: true, note: 'kept', one: 1, two: 2 });
+  assert.deepEqual(mixed, { note: 'kept', one: 1, two: 2 });
+});
+
+test('a failing durable save pauses the trust-extending routes and a working save resumes them', async () => {
+  let savesWork = true;
+  const bridge = await startBridge({
+    bridgeOptions: {
+      persist: () => savesWork,
+    },
+  });
+  try {
+    // The window opens while saves work, and the fixture pairs a device.
+    const device = await bridge.pair('phone-save');
+    assert.ok(device.credential);
+
+    // The save starts failing:  open, redeem and revoke all answer 503.
+    savesWork = false;
+    const openRefused = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/open',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: '{}',
+    });
+    assert.equal(openRefused.status, 503);
+    assert.match(openRefused.json.error, /could not be saved/);
+
+    const redeemRefused = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/redeem',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ code: '000000', deviceId: 'phone-2' }),
+    });
+    // A wrong credential is still a refusal while saves fail:  the refusal
+    // holds in memory, and its burned attempt is the only thing a lost save
+    // costs.
+    assert.equal(redeemRefused.status, 403);
+
+    // A proxied route keeps working:  the in-memory registry still guards
+    // it, and proxying extends no trust the state would have to hold.
+    const proxied = await call(bridge.port, {
+      method: 'GET',
+      path: '/api/fleet',
+      headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
+    });
+    assert.equal(proxied.status, 200);
+
+    // The revoke still takes hold in memory even while the save is failing,
+    // so a revoked device stays refused; the 503 only says the durable copy
+    // did not happen.
+    const revokeRefused = await call(bridge.port, {
+      method: 'DELETE',
+      path: '/api/companion/devices/phone-save',
+    });
+    assert.equal(revokeRefused.status, 503);
+    const revokedProxy = await call(bridge.port, {
+      method: 'GET',
+      path: '/api/fleet',
+      headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
+    });
+    assert.equal(revokedProxy.status, 403);
+
+    // The save works again and the routes come back.
+    savesWork = true;
+    const openResumed = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/open',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: '{}',
+    });
+    assert.equal(openResumed.status, 200);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('a redeem whose save fails is not confirmed to the phone', async () => {
+  let savesWork = true;
+  const bridge = await startBridge({
+    bridgeOptions: {
+      persist: () => savesWork,
+    },
+  });
+  try {
+    const opened = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/open',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: '{}',
+    });
+    assert.equal(opened.status, 200);
+    savesWork = false;
+    const redeemed = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/redeem',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ code: opened.json.code, deviceId: 'phone-unconfirmed' }),
+    });
+    // The window was spent and the device added in memory, but the phone is
+    // not told a pairing happened, so no credential leaves the bridge.
+    assert.equal(redeemed.status, 503);
+    assert.equal(redeemed.json.credential, undefined);
+    assert.equal(bridge.state.registry.activeIds().includes('phone-unconfirmed'), true);
+  } finally {
+    await bridge.close();
+  }
 });
