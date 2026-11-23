@@ -29,8 +29,10 @@ struct TasksRoutinesView: View {
             }
 
             Section("Routines") {
-                if routines.isEmpty && !loading {
-                    ContentUnavailableView("No routines", systemImage: "calendar.badge.plus", description: Text("Schedule recurring or one-time agent work."))
+                if loading && routines.isEmpty {
+                    ProgressView("Loading routines…")
+                } else if routines.isEmpty {
+                    ContentUnavailableView("No routines", systemImage: "calendar.badge.plus", description: Text("Schedule recurring or one-time bot work."))
                 }
                 ForEach(routines) { routine in
                     let canToggle = routine.canToggle()
@@ -63,7 +65,9 @@ struct TasksRoutinesView: View {
             }
 
             Section("Run receipts") {
-                if runs.isEmpty && !loading {
+                if loading && runs.isEmpty {
+                    ProgressView("Loading run receipts…")
+                } else if runs.isEmpty {
                     Text("Completed, waiting, failed, and manually started runs appear here.")
                         .foregroundStyle(.secondary)
                 }
@@ -167,7 +171,7 @@ private struct RoutineRow: View {
             else { Image(systemName: "calendar.badge.exclamationmark").frame(width: 42, height: 42) }
             VStack(alignment: .leading, spacing: 3) {
                 Text(routine.name).font(.headline)
-                Text("\(bot?.name ?? "Deleted agent") · \(routine.schedule.summary) · \(routine.runLocation.label)")
+                Text("\(bot?.name ?? "Deleted bot") · \(routine.schedule.summary) · \(routine.runLocation.label)")
                     .font(.caption).foregroundStyle(.secondary).lineLimit(2)
             }
             Spacer()
@@ -234,7 +238,7 @@ private struct RoutineRunRow: View {
                 Image(systemName: run.status.symbol).foregroundStyle(run.status.tint)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(run.routineName)
-                    Text("\(bot?.name ?? "Deleted agent") · \(Date(timeIntervalSince1970: run.scheduledFor / 1_000).formatted(date: .abbreviated, time: .shortened))")
+                    Text("\(bot?.name ?? "Deleted bot") · \(Date(timeIntervalSince1970: run.scheduledFor / 1_000).formatted(date: .abbreviated, time: .shortened))")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -294,14 +298,22 @@ private struct RoutineEditorView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Work") {
+                Section {
                     TextField("Routine name", text: $name)
-                    Picker("Agent", selection: $botId) {
-                        Text("Choose an agent").tag("")
+                    Picker("Bot", selection: $botId) {
+                        Text("Choose a bot").tag("")
                         ForEach(session.state.bots.filter { $0.hidden != true }) { bot in Text(bot.name).tag(bot.id) }
                     }
-                    TextField("What should the agent do?", text: $prompt, axis: .vertical).lineLimit(4...10)
+                    TextField("What should the bot do?", text: $prompt, axis: .vertical).lineLimit(4...10)
                     Stepper("Allow up to \(duration) minutes", value: $duration, in: 15...240, step: 15)
+                } header: {
+                    Text("Work")
+                } footer: {
+                    if let reason = workBlockReason {
+                        Text(reason)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 Section {
@@ -324,9 +336,9 @@ private struct RoutineEditorView: View {
                     Text("Where does it run?")
                 } footer: {
                     if runOn == .bot {
-                        Text("Uses this agent's selected model and computer setting on the paired computer.")
+                        Text("Uses this bot's selected model and computer setting on the paired computer.")
                     } else if runAvailability?.cloudReady == true {
-                        Text("Runs the agent and its tools inside its Box virtual machine. The VM wakes automatically for each run; keep BotFleet running so its scheduler can launch the job.")
+                        Text("Runs the bot and its tools inside its Box virtual machine. The VM wakes automatically for each run; keep BotFleet running so its scheduler can launch the job.")
                     } else {
                         Text("This existing Cloud desktop choice is preserved, but it cannot run until the paired computer has a configured Box API key and an available Box agent.")
                     }
@@ -368,7 +380,14 @@ private struct RoutineEditorView: View {
                 } header: {
                     Text("Schedule")
                 } footer: {
-                    Text("Later runs of the same routine continue the previous task.\u{00A0} No cron syntax is used.")
+                    VStack(alignment: .leading, spacing: 4) {
+                        if let reason = scheduleBlockReason {
+                            Text(reason)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                        Text("Later runs of the same routine continue the previous task.\u{00A0} No cron syntax is used.")
+                    }
                 }
             }
             .navigationTitle(routine == nil ? "New routine" : "Edit routine")
@@ -377,7 +396,8 @@ private struct RoutineEditorView: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") { Task { await save() } }
-                        .disabled(saving || kind == .unknown || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || botId.isEmpty || (kind == .daily && weekdays.isEmpty))
+                        .disabled(saving || saveBlockReason != nil)
+                        .accessibilityHint(saveBlockReason ?? "Saves the routine")
                 }
             }
             .onAppear { if botId.isEmpty { botId = session.state.bots.first(where: { $0.hidden != true })?.id ?? "" } }
@@ -386,6 +406,28 @@ private struct RoutineEditorView: View {
                 availabilityLoaded = true
             }
         }
+    }
+
+    /// What the routine still needs before it can be saved, as one short
+    /// line.  The disabled Save button gave no reason at all, so the work
+    /// needed to unblock it was guesswork.
+    private var saveBlockReason: String? {
+        scheduleBlockReason ?? workBlockReason
+    }
+
+    /// The missing piece in the Work section, if any.
+    private var workBlockReason: String? {
+        if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Name the routine." }
+        if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Say what the bot should do." }
+        if botId.isEmpty { return "Choose the bot that runs it." }
+        return nil
+    }
+
+    /// The missing piece in the Schedule section, if any.
+    private var scheduleBlockReason: String? {
+        if kind == .unknown { return "Choose One time or Selected days." }
+        if kind == .daily && weekdays.isEmpty { return "Pick at least one day." }
+        return nil
     }
 
     private var cloudSelectable: Bool {
