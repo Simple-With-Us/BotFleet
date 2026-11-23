@@ -25,7 +25,7 @@ Verification uses these isolated fixtures:
 - [Model fallback on quota chips](quota-fallback.md) — provider failover when quota is exhausted
 - [Mac updater transaction](mac-updater.md) — signed update delivery and application
 - [Independent server controls](server-controls.md) — native menu bar controls, startup policy and protected VM shutdown
-- [Placement and ownership](placement.md) — shared job contract, local identity and sixteen required multi-host acceptance recipes
+- [Placement and ownership](placement.md) — shared job contract, local identity and seventeen required multi-host acceptance recipes
 - [Host headroom](headroom.md) — inventory, honest enforcement, pressure, storage isolation and authorized server fixture evidence
 - [Native host package smoke](native-host-package.md) — the real packager, the real archive and the packaged executable's own identity
 - [Staged candidate smoke test](staged-candidate-smoke.md) — the pre-activation probe that runs a candidate before anything live is touched

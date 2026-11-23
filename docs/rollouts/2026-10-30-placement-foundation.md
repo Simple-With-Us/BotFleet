@@ -8,7 +8,7 @@ The existing local registry still starts local jobs through the same admission a
 
 Job persistence, snapshots and SSE accept optional controller/worker identities, lease id, epoch and placement/queue reasons.  Swift decodes the same optional fields and the three new statuses while retaining its unknown-status fallback.  Legacy records without those fields still load.  The legacy local process lifecycle leaves placement states and another host's active records unchanged.
 
-The placement evidence checker and [sixteen recipes](../verification/placement.md) gate later retirement of the Mac-local Node stack.  The state builder never infers `placement-evidence` from completed issues.  Every assertion in the checked-in example remains false, including all live evidence.
+The placement evidence checker and [seventeen recipes](../verification/placement.md) gate later retirement of the Mac-local Node stack.  The state builder never infers `placement-evidence` from completed issues.  Every assertion in the checked-in example remains false, including all live evidence.
 
 ## Validation
 
