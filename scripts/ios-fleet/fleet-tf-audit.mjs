@@ -393,7 +393,7 @@ async function main() {
     console.error(`fleet-tf-audit: could not read config: ${err.message}`);
     process.exit(2);
   }
-  const client = createAscApi();
+  const client = await createAscApi();
   if (!client.ok) {
     console.error(`fleet-tf-audit: ${client.error}`);
     process.exit(2);

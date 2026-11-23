@@ -3469,18 +3469,29 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     expect(keyPreview("")).toBe("unavailable");
   });
 
-  it.skipIf(process.platform === "win32")("reads AUTHKEY_<KEY_ID> through the scoped reader and never a file under the home folder", async () => {
+  it.skipIf(process.platform === "win32")("reads the key the STORE names, and never a file under the home folder", async () => {
+    // The store decides which key is read:  it names the key in `APNS_KEY_ID`
+    // and holds that key's material in `AUTHKEY_<KEY_ID>`.  A key id in the
+    // environment is not a source and is never consulted.
     const argsFile = join(dir, "args");
     process.env.FLEET_INFISICAL_READER = fakeReader(
-      `with open(${JSON.stringify(argsFile)}, "w") as fh:\n    fh.write(" ".join(sys.argv[1:]))\nsys.stdout.write(${pemScript(testP8())})`,
+      `name = sys.argv[2]\nwith open(${JSON.stringify(argsFile)}, "a") as fh:\n    fh.write(" ".join(sys.argv[1:]) + "\\n")\nif name == "APNS_KEY_ID":\n    sys.stdout.write("KEY1234567")\nelif name == "AUTHKEY_KEY1234567":\n    sys.stdout.write(${pemScript(testP8())})\nelse:\n    sys.exit(3)`,
     );
-    process.env.APNS_KEY_ID = "KEY1234567";
+    // A stale hand-set key id must not change what is read.
+    process.env.APNS_KEY_ID = "STALEKEY01";
     const config = await loadApnsConfig();
     expect(config?.keyId).toBe("KEY1234567");
     expect(config?.p8).toContain("BEGIN PRIVATE KEY");
-    expect(readFileSync(argsFile, "utf8").trim()).toBe(
+    // The material and the key id are read side by side, so the order the
+    // reader saw them in is not fixed:  the set of reads is what matters.
+    const calls = readFileSync(argsFile, "utf8").trim().split("\n");
+    expect(calls).toHaveLength(3);
+    expect(calls).toEqual(expect.arrayContaining([
+      "get APNS_KEY_P8 --folder /apns --project fleet-ops --account fixture-apns-ro",
+      "get APNS_KEY_ID --folder /apns --project fleet-ops --account fixture-apns-ro",
       "get AUTHKEY_KEY1234567 --folder /apns --project fleet-ops --account fixture-apns-ro",
-    );
+    ]));
+    expect(calls.join(" ")).not.toContain("STALEKEY01");
     expect(apnsKeySource()).toBe("Infisical AUTHKEY_KEY1234567");
   });
 
@@ -3492,11 +3503,29 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     const config = await loadApnsConfig();
     expect(config?.keyId).toBe("ROTATED001");
     expect(config?.p8).toContain("BEGIN PRIVATE KEY");
-    expect(readFileSync(argsFile, "utf8").trim().split("\n")).toEqual([
+    const calls = readFileSync(argsFile, "utf8").trim().split("\n");
+    expect(calls).toHaveLength(2);
+    expect(calls).toEqual(expect.arrayContaining([
       "get APNS_KEY_P8 --folder /apns --project fleet-ops --account fixture-apns-ro",
       "get APNS_KEY_ID --folder /apns --project fleet-ops --account fixture-apns-ro",
-    ]);
+    ]));
     expect(apnsKeySource()).toBe("Infisical APNS_KEY_P8");
+  });
+
+  it.skipIf(process.platform === "win32")("reads the material and the key id side by side", async () => {
+    // The two names are independent:  the id does not depend on the material.
+    // The material read waits for the id read to start and refuses to answer
+    // if it never does, so a read that ran the two one after the other could
+    // not get its material and the key would stay off.
+    const marker = join(dir, "id-read-started");
+    const markerPath = JSON.stringify(marker);
+    process.env.FLEET_INFISICAL_READER = fakeReader(
+      `import os\nname = sys.argv[2]\nif name == "APNS_KEY_ID":\n    with open(${markerPath}, "w") as fh:\n        fh.write("started")\n    sys.stdout.write("KEY1234567")\nelif name == "APNS_KEY_P8":\n    for _ in range(60):\n        if os.path.exists(${markerPath}):\n            break\n        time.sleep(0.05)\n    else:\n        sys.exit(3)\n    sys.stdout.write(${pemScript(testP8())})\nelse:\n    sys.exit(3)`,
+    );
+    resetApnsKeyCache();
+    const config = await loadApnsConfig();
+    expect(config?.p8).toContain("BEGIN PRIVATE KEY");
+    expect(config?.keyId).toBe("KEY1234567");
   });
 
   it.skipIf(process.platform === "win32")("falls back to the shared key id when Infisical has no usable APNS_KEY_ID", async () => {
@@ -3505,6 +3534,23 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     );
     expect((await loadApnsConfig())?.keyId).toBe(SHARED_APNS_KEY_ID);
     expect(SHARED_APNS_KEY_ID).toBe("HSJ98QN95V");
+  });
+
+  it.skipIf(process.platform === "win32")("names a malformed stored key id instead of reporting nothing", async () => {
+    process.env.FLEET_INFISICAL_READER = fakeReader(
+      `name = sys.argv[2]\nif name == "APNS_KEY_P8":\n    sys.stdout.write(${pemScript(testP8())})\nelif name == "APNS_KEY_ID":\n    sys.stdout.write("not a key id")\nelse:\n    sys.exit(3)`,
+    );
+    // The material is there, so the key loads and the built-in id stands in
+    // for the one the store named.
+    expect((await loadApnsConfig())?.keyId).toBe(SHARED_APNS_KEY_ID);
+    // The misconfiguration is visible:  the read SUCCEEDED, so an empty
+    // reason would hide it and the status would name the built-in id as if
+    // the store had answered.  The reason names the name and the folder and
+    // never carries the value.
+    const reason = apnsKeyReadReason();
+    expect(reason).toContain("APNS_KEY_ID");
+    expect(reason).toContain("malformed");
+    expect(reason).not.toContain("not a key id");
   });
 
   // The read ceiling is the difference between "the vault answered" and "the
@@ -3587,8 +3633,11 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
       `with open(${JSON.stringify(calls)}, "a") as fh:\n    fh.write(" ".join(sys.argv[1:]) + "\\n")\ntime.sleep(0.3)\nsys.exit(3)`,
     );
     resetApnsKeyCache();
+    // One sequence is the shared material name and, when it is not there, the
+    // name of the key the store names:  two reads for a store that holds
+    // neither, and still only ONE sequence for the two callers.
     await Promise.all([loadApnsConfig(), apnsKeyStamp()]);
-    expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(1);
+    expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(2);
   });
 
   it.skipIf(process.platform === "win32")("ignores a read ceiling that is not a positive number", async () => {
@@ -3629,7 +3678,9 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     );
     expect(await loadApnsConfig()).toBeNull();
     expect(await apnsKeyStamp()).toBeNull();
-    expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(1);
+    // The failed read is the shared material name and the name of the key the
+    // store names:  two reads, and no second sequence straight after.
+    expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(2);
   });
 
   it.skipIf(process.platform === "win32")("keeps the last good key id when only the id read fails, and stamps the id", async () => {
@@ -3655,10 +3706,16 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     }
   });
 
-  it("uses the shared key id with an injected APNS_P8 and no pinned id", async () => {
-    process.env.FLEET_INFISICAL_READER = fakeReader("sys.exit(3)");
+  it("uses the built-in shared key id when the store names no id, and ignores an injected APNS_P8", async () => {
+    process.env.FLEET_INFISICAL_READER = fakeReader(
+      `name = sys.argv[2]\nif name == "APNS_KEY_P8":\n    sys.stdout.write(${pemScript(testP8())})\nelse:\n    sys.exit(3)`,
+    );
+    // An injected copy is not a source:  the store is asked, and the store
+    // answers.  The key id falls back to the built-in one because the store
+    // named none.
     process.env.APNS_P8 = testP8();
-    expect((await loadApnsConfig())?.keyId).toBe("HSJ98QN95V");
+    expect((await loadApnsConfig())?.keyId).toBe(SHARED_APNS_KEY_ID);
+    expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
   });
 
   it.skipIf(process.platform === "win32")("stamps the key with a digest, so a rotated key changes the stamp", async () => {
@@ -3702,15 +3759,40 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     expect(await apnsKeyStamp()).toBeNull();
   });
 
-  it("prefers APNS_P8 and then APNS_P8_PATH over Infisical", async () => {
+  it("never uses APNS_P8 or APNS_P8_PATH, and fails closed with a redacted reason", async () => {
+    // The environment is never a source (owner ruling, November 22, 2026):
+    // a stale value, a stale path and a stale key id are all ignored.  The
+    // store is asked, and when it cannot answer the key is off, the reason
+    // names the account it needed, and no value appears anywhere.
+    const stale = "stale-apns-pem-value";
+    const staleFile = join(dir, "Stale.p8");
+    writeFileSync(staleFile, stale, { mode: 0o600 });
+    process.env.APNS_P8 = stale;
+    process.env.APNS_P8_PATH = staleFile;
+    process.env.APNS_KEY_ID = "STALEKEY01";
+
+    // An empty store.
     process.env.FLEET_INFISICAL_READER = fakeReader("sys.exit(3)");
-    process.env.APNS_P8 = testP8();
-    expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
-    delete process.env.APNS_P8;
-    const file = join(dir, "AuthKey.p8");
-    writeFileSync(file, testP8(), { mode: 0o600 });
-    process.env.APNS_P8_PATH = file;
-    expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
-    expect(apnsKeySource()).toBe(file);
+    expect(await loadApnsConfig()).toBeNull();
+    expect(await apnsKeyStamp()).toBeNull();
+    const emptyReason = apnsKeyReadReason();
+    expect(emptyReason).toMatch(/fixture-apns-ro/);
+    expect(emptyReason).not.toContain(stale);
+    expect(emptyReason).not.toContain(staleFile);
+    expect(emptyReason).not.toContain("STALEKEY01");
+    expect(apnsKeySource()).toBe("Infisical APNS_KEY_P8");
+    expect(apnsKeySource()).not.toContain(stale);
+    expect(apnsKeySource()).not.toContain(staleFile);
+
+    // A denied store.
+    resetApnsKeyCache();
+    process.env.FLEET_INFISICAL_READER = fakeReader("sys.exit(4)");
+    expect(await loadApnsConfig()).toBeNull();
+    const deniedReason = apnsKeyReadReason();
+    expect(deniedReason).toMatch(/fixture-apns-ro/);
+    expect(deniedReason).toMatch(/refused/);
+    expect(deniedReason).not.toContain(stale);
+    expect(deniedReason).not.toContain(staleFile);
+    expect(deniedReason).not.toContain("STALEKEY01");
   });
 });

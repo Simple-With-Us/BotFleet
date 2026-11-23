@@ -96,11 +96,15 @@
 # fleet runners).
 #
 # Secrets (never printed):
-#   ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8  (env first; else Infisical via the
-#   shared scoped reader: /asc ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8, written
-#   to a 0600 temp file and deleted on exit).  A path in ASC_KEY_PATH is NOT a
+#   The App Store Connect credential comes from the STORE and from nowhere
+#   else:  the client resolves it through this consumer's own named account
+#   (the shared scoped reader, /asc) or through the read-only service token a
+#   hosted job binds, and writes it to a 0600 temp file for the Apple tools
+#   that need a key on disk.  The environment carries no copy of the
+#   credential:  ASC_KEY_ID and ASC_ISSUER_ID are public labels, and the key
+#   material never enters the environment.  A path in ASC_KEY_PATH is NOT a
 #   credential source:  it is ignored wherever it appears.
-#   or Xcode-signed-in session for destination=upload export
+#   A destination=upload export may also use a Xcode-signed-in session.
 #   SENTRY_AUTH_TOKEN  (dSYM + Size Analysis upload; env or the scoped reader)
 #   SENTRY_DSN         (injected into xcodebuild so Cocoa plist $(SENTRY_DSN) is set)
 #
@@ -127,9 +131,10 @@ ASC_NODE="${IOS_FLEET_NODE:-node}"
 FLEET_DIR="$(cd "$(dirname "$0")" && pwd)"
 APPS_JSON="${FLEET_DIR}/apps.json"
 TEAM_ID="CC8UTF7ATG"
-# AFC-359: App Store Connect credentials come from the environment (CI sets them) or
-# Infisical Fleet-OPS via the shared scoped reader.  Nothing is read from the old
-# secrets folder.
+# The App Store Connect credential comes from Infisical Fleet-OPS:  through the
+# shared scoped reader with this consumer's own named account, or through the
+# read-only service token a hosted job binds.  Nothing is read from the old
+# secrets folder, and the environment is not a source either.
 #
 # The helper resolves the reader, names the consumer's own service-token
 # account and fails closed when there is no reader or no grant.  A helper that
@@ -146,6 +151,9 @@ fi
 # The App Store Connect credential's own read-only service token, and the
 # folder its names live in.
 ASC_SECRET_ACCOUNT="${FLEET_INFISICAL_ASC_ACCOUNT:-fleet-tools-mm-asc-ro}"
+# The folder the credential's names live in.  The client reads /asc first and
+# then the folder a bound service token is pointed at.
+ASC_SECRET_FOLDER="/asc"
 # The Sentry token is a fleet-wide key, so it lives in the global keys
 # folder with its own account.
 SENTRY_SECRET_ACCOUNT="${FLEET_INFISICAL_SENTRY_ACCOUNT:-}"
@@ -337,11 +345,9 @@ key_issuer_label() {
 # and its key decodes to a PEM, so a diagnostic never names a key the client
 # skipped.
 #
-# Only material the ENVIRONMENT already holds is read.  The vault is never
-# asked for the key material here:  a diagnostic must not cause a secret
-# read.  The vault's KEY ID and ISSUER ID are read when no environment source
-# qualifies, because both are public labels that travel in every request
-# header.
+# Only the public LABELS are read:  the key id and the issuer id are labels
+# that travel in every request header, and a diagnostic must not cause a
+# secret read, so the key material is never asked for here.
 #
 # The result is the public key id in ASC_DIAG_KEY_ID and the public issuer id
 # in ASC_DIAG_ISSUER_ID.  NOTHING taken out of the key is reported:  a masked
@@ -350,64 +356,28 @@ key_issuer_label() {
 ASC_DIAG_KEY_ID=""
 ASC_DIAG_ISSUER_ID=""
 asc_resolve_diagnostic_credential() {
-  local v="" id="" issuer=""
-  if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]]; then
-    case "$APPLE_API_KEY_P8_BASE64" in
-      *BEGIN*) v="$APPLE_API_KEY_P8_BASE64" ;;
-      *) v="$(base64 --decode <<< "$APPLE_API_KEY_P8_BASE64" 2>/dev/null)" || v="" ;;
-    esac
-    if [[ -n "$v" ]] && node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$v"; then
-      id="$APPLE_API_KEY_ID"
-      issuer="$APPLE_API_ISSUER_ID"
-    else
-      #  The client skips a source whose key is not a usable PEM and goes on
-      #  to the NEXT source, so this diagnostic must not name it -- and must
-      #  not stop looking for the source the client did use.
-      v=""
-    fi
-  fi
-  #  The client falls through to the environment source when the CI trio is
-  #  absent or unusable, so this branch is evaluated on its own and NOT as an
-  #  alternative to the CI branch:  an elif would leave a valid ASC_*
-  #  credential unreported whenever an APPLE_* trio is present but invalid.
-  if [[ -z "$id" && -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_P8:-}" ]]; then
-    if node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$ASC_KEY_P8"; then
-      v="$ASC_KEY_P8"
-      id="$ASC_KEY_ID"
-      issuer="$ASC_ISSUER_ID"
-    fi
-  fi
-  if [[ -z "$id" ]]; then
-    #  The client's last source is Infisical /asc.  Only the KEY ID and the
-    #  ISSUER ID are read from it:  both are public labels, not key
-    #  material.
-    id="${ASC_KEY_ID:-}"
-    [[ -n "$id" ]] || id="$(fs_get ASC_KEY_ID /asc 2>/dev/null || true)"
-    issuer="${ASC_ISSUER_ID:-}"
-    [[ -n "$issuer" ]] || issuer="$(fs_get ASC_ISSUER_ID /asc 2>/dev/null || true)"
-  fi
-  v=""
-  ASC_DIAG_KEY_ID="$id"
-  ASC_DIAG_ISSUER_ID="$issuer"
+  #  The store is the only source.  Only the KEY ID and the ISSUER ID are
+  #  read:  both are public labels that travel in every request header, and
+  #  the key material is never read for a diagnostic.  The client reads them
+  #  from the store -- its own named account, or the bound service token --
+  #  and prints nothing but the two labels.
+  local labels=""
+  labels="$("$ASC_NODE" "${FLEET_DIR}/asc-api.mjs" credential-labels 2>/dev/null || true)"
+  IFS=$'\t' read -r ASC_DIAG_KEY_ID ASC_DIAG_ISSUER_ID <<< "$labels"
 }
 
 # Load ASC credentials into the CURRENT shell (must not run inside $(...) or the
 # exported ASC_* vars are discarded with the subshell). Sets AUTH_MODE to
 # "api_key" or "none". Never prints secret values.
 #
-# WHY THE KEY IS HANDED OVER IN THE ENVIRONMENT (AFC-459, Kody rule 42 on the
-# CodeCaps PR #271 review):  the private key is a secret, and the approved
-# secret sources are the process environment, a captured scoped-reader read
-# and bootstrap-only Keychain credentials.  A caller-supplied file is not
-# one of them, so the node client never reads a key file.  This shell layer
-# owns the credential for altool and Xcode, so it hands the key to the client
-# in the environment, which is where the client looks for it.
-#
-# THE CREDENTIAL IS RESOLVED FROM THREE PLACES:
-#   1. CI: the APPLE_API_* names the ship workflow exports from Infisical
-#   2. ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 already in the environment
-#   3. Mac: Infisical Fleet-OPS through the scoped reader, /asc ASC_KEY_ID,
-#      ASC_ISSUER_ID and ASC_KEY_P8.
+# THE CREDENTIAL IS RESOLVED FROM THE STORE, AND FROM NOWHERE ELSE:
+#   the client reads it through this consumer's own named account (the shared
+#   scoped reader, Infisical Fleet-OPS /asc), or through the read-only service
+#   token a hosted job binds, and writes it to the 0600 staging file the
+#   Apple tools need a key on disk to read.  The environment carries no copy
+#   of the credential, so a hand-set value can never displace the reviewed
+#   grant (owner ruling, November 22, 2026), and the client never reads a key
+#   file either.
 # A disk credential is not a source at all:  a named ASC_KEY_PATH is ignored,
 # so a stale or foreign path in an operator's shell can never sign the upload
 # with the wrong key.  The key material never enters a command argument and
@@ -415,6 +385,10 @@ asc_resolve_diagnostic_credential() {
 load_secrets() {
   AUTH_MODE="none"
   ASC_AUTH_FAILURE=""
+  #  An inherited credential is not a source:  the names the environment may
+  #  carry are cleared before anything is read, so a hand-set value can
+  #  never displace the reviewed grant and never reaches a child.
+  unset ASC_KEY_P8 ASC_KEY_ID ASC_ISSUER_ID APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
   #  A named ASC_KEY_PATH is not a credential source.  It is remembered only
   #  so the run can say that it ignored it, and it is cleared here:  an
   #  inherited path must never reach xcodebuild when the resolution below
@@ -422,187 +396,71 @@ load_secrets() {
   #  Only the staging copy written from the resolved credential is exported.
   local named_path="${ASC_KEY_PATH:-}"
   unset ASC_KEY_PATH
-  local kid="${ASC_KEY_ID:-}" iss="${ASC_ISSUER_ID:-}" key_pem="" rc=0
-  local key_path="" asc_kid="" key_src=""
+  local kid="" iss="" key_path="" staged="" rc=0
 
-  # 1. CI: the APPLE_API_* names the ship workflow exports from Infisical.
-  #    The p8 is base64 there, so it is decoded here, and it never travels in
-  #    an argument:  the here-string hands it to the decoder on stdin.
-  if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]]; then
-    case "$APPLE_API_KEY_P8_BASE64" in
-      *BEGIN*) key_pem="$APPLE_API_KEY_P8_BASE64" ;;
-      *) key_pem="$(base64 --decode <<< "$APPLE_API_KEY_P8_BASE64" 2>/dev/null)" || key_pem="" ;;
-    esac
-    if [[ -n "$key_pem" ]]; then
-      rc=0
-      node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$key_pem" || rc=$?
-      if [[ "$rc" -eq 3 ]]; then
-        #  The credential was resolved and then rejected.  That is a
-        #  credential failure, not a missing key:  the owner has to fix the
-        #  value that is there, not create a key that already exists.
-        #  The rejected value is named by its SOURCE, its KEY ID and its
-        #  ISSUER ID, and by nothing that came out of the key:  every byte of
-        #  a private-key body is secret, so there is no fragment of it that
-        #  may be shown.
-        log "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it (source APPLE_API_KEY_P8_BASE64, key id $(key_label "${APPLE_API_KEY_ID:-}"), issuer id $(key_issuer_label "${APPLE_API_ISSUER_ID:-}"))"
-        key_pem=""
-        ASC_AUTH_FAILURE="credential"
-      elif [[ "$rc" -ne 0 ]]; then
-        #  The validator itself failed (a crash, a missing node):  it never
-        #  classified the credential, so this run must not classify it
-        #  either.  Calling it a bad credential would send the owner to
-        #  re-export a key that is perfectly fine.
-        log "could not check APPLE_API_KEY_P8_BASE64; the key validator failed with status ${rc}"
-        key_pem=""
-        ASC_AUTH_FAILURE="writer"
-      else
-        kid="$APPLE_API_KEY_ID"
-        iss="$APPLE_API_ISSUER_ID"
-        key_src="APPLE_API_KEY_P8_BASE64"
-      fi
-    else
-      #  The value did not decode at all, so it failed local validation
-      #  before it could be looked at:  it is named by its source, its key
-      #  id and its issuer id, and by nothing taken out of the key.
-      logerr "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it (source APPLE_API_KEY_P8_BASE64, key id $(key_label "${APPLE_API_KEY_ID:-}"), issuer id $(key_issuer_label "${APPLE_API_ISSUER_ID:-}"))"
-      #  Same class as the validate refusal above:  a credential that was
-      #  resolved and cannot be used.
-      ASC_AUTH_FAILURE="credential"
-    fi
-    if [[ -z "$key_pem" ]]; then
-      #  An unusable source is removed from the environment.  The client looks
-      #  for these names first, so leaving them behind would have it resolve a
-      #  broken credential instead of the one this shell layer resolved.
-      unset APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
-    fi
-  fi
-
-  # 2. An ambient ASC_KEY_P8.  It is only usable when it really is a PEM
-  #    private key and comes with the key id and issuer it belongs to.
-  if [[ -z "$key_pem" && -n "${ASC_KEY_P8:-}" ]]; then
-    if [[ -z "$kid" || -z "$iss" ]]; then
-      #  A credential without the id and issuer it belongs to is unusable
-      #  here, so it failed local validation:  it is named by its source and
-      #  by its public labels, and by nothing taken out of the key.
-      log "ASC_KEY_P8 is set without ASC_KEY_ID and ASC_ISSUER_ID; ignoring it (source ASC_KEY_P8, key id $(key_label "$kid"), issuer id $(key_issuer_label "$iss"))"
-      unset ASC_KEY_P8
-    else
-      rc=0
-      node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$ASC_KEY_P8" || rc=$?
-      if [[ "$rc" -eq 3 ]]; then
-        #  The credential failed local validation:  it is named by its
-        #  source, its key id and its issuer id, and by nothing taken out of
-        #  the key.
-        log "ASC_KEY_P8 is set but does not hold a PEM private key; ignoring it (source ASC_KEY_P8, key id $(key_label "$kid"), issuer id $(key_issuer_label "$iss"))"
-        #  The client would refuse this value, so it is removed from the
-        #  environment:  the client has to see the credential this shell layer
-        #  resolved, not one that cannot be used.
-        unset ASC_KEY_P8
-        #  Resolved and then rejected, so it is a credential failure and not a
-        #  missing key.
-        ASC_AUTH_FAILURE="credential"
-      elif [[ "$rc" -ne 0 ]]; then
-        #  The validator itself failed (a crash, a missing node):  it never
-        #  classified the credential, so this run must not classify it
-        #  either.  Calling it a bad credential would send the owner to
-        #  re-export a key that is perfectly fine.
-        log "could not check ASC_KEY_P8; the key validator failed with status ${rc}"
-        unset ASC_KEY_P8
-        ASC_AUTH_FAILURE="writer"
-      else
-        key_pem="$ASC_KEY_P8"
-        key_src="ASC_KEY_P8"
-        #  A usable credential was found, so an earlier rejection of another
-        #  source no longer describes this run.
-        ASC_AUTH_FAILURE=""
-      fi
-    fi
-  fi
-
-  # 3. The Mac: Infisical Fleet-OPS through the scoped reader.  Nothing is
-  #    read from the old secrets folder (AFC-359) and nothing is read from a
-  #    named path (AFC-459).
-  if [[ -z "$key_pem" ]]; then
-    asc_kid="$(fs_get ASC_KEY_ID /asc 2>/dev/null || true)"
-    [[ -n "$kid" ]] || kid="$asc_kid"
-    [[ -n "$iss" ]] || iss="$(fs_get ASC_ISSUER_ID /asc)" || iss=""
-    if [[ -z "$kid" || -z "$iss" ]]; then
-      log "ASC credentials missing: set ASC_KEY_ID/ASC_ISSUER_ID/ASC_KEY_P8 in the environment, or add ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8 to Infisical /asc"
-      return 0
-    fi
-    # /asc holds one key.  A key id from the environment that differs from it
-    # has no Infisical copy:  fail with a clear message rather than guess.
-    if [[ "$kid" == "$asc_kid" ]]; then
-      key_pem="$(fs_get ASC_KEY_P8 /asc)" || key_pem=""
-      key_src="Infisical /asc"
-    fi
-    if [[ -z "$key_pem" ]]; then
-      log "no .p8 for key ${kid}: Infisical /asc ASC_KEY_P8 holds a different key (or is unreadable);  export ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 for this key"
-      return 0
-    fi
-    #  A usable credential was found, so an earlier rejection of another
-    #  source no longer describes this run.
-    ASC_AUTH_FAILURE=""
-  fi
-
-  # The key has to be in a mode-600 file for altool and Xcode, and in the
-  # environment for the node client, which never reads a file.  The file is
-  # written FROM the resolved credential, so it is never read back as one.
+  #  THE STORE IS THE ONLY SOURCE.  The client resolves the credential from
+  #  the store -- this consumer's own named account through the shared scoped
+  #  reader, or the read-only service token a hosted job binds -- and writes
+  #  the key to the staging file the Apple tools read.  The material never
+  #  enters this shell's environment, so a hand-set value can never displace
+  #  the reviewed grant.
+  #
+  #  A disk credential is not a source either:  the named ASC_KEY_PATH above
+  #  is ignored, and the staged file below is a materialisation for the Apple
+  #  tools, not a credential source.
   asc_tmp_dir || {
     # The credential was resolved and the directory it has to be staged in
     # could not be created.  That is a path failure and not a crash.
-    log "could not stage the ASC key; the credential was resolved and the staging directory could not be created"
+    log "could not stage the ASC key; the staging directory could not be created"
     ASC_AUTH_FAILURE="staging"
-    key_pem=""
     return 0
   }
-  key_path="${ASC_TMP_DIR}/AuthKey_${kid}.p8"
-  #  The writer says WHICH failure it was through its exit code:  3 is a value
-  #  the Apple tools cannot use, 2 is a path or a file that could not be used.
-  #  The two are reported differently, so the code is kept rather than folded
-  #  into "something went wrong".
-  #
-  #  Only the exit code is read.  The helper's own message is never captured
-  #  into a shell variable, because the repo's key-capture guard refuses a
-  #  `$( ... )` that mentions asc-key.mjs, and a captured message could carry
-  #  the key into a trace.
+  #  The client classifies its own failures through its exit code:  1 is no
+  #  credential at all, 3 is a credential the Apple tools cannot use, 2 is a
+  #  staging path that could not be used, and anything else is the client
+  #  itself failing, which classifies neither the credential nor the path.
+  #  Only the public labels and the staged path come back:  the key material
+  #  stays in the client.
   rc=0
-  node "${FLEET_DIR}/asc-key.mjs" write "$key_path" <<< "$key_pem" || rc=$?
+  staged="$("$ASC_NODE" "${FLEET_DIR}/asc-api.mjs" stage-key "${ASC_TMP_DIR}")" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
-    # Leaving AUTH_MODE as none is correct in every case, and calling any of
-    # them a missing key is not.
-    if [[ "$rc" -eq 3 ]]; then
-      # The credential was resolved and it is not a usable PEM private key.
-      # It is named by its source, by its key id and by its issuer id -- both
-      # public labels that travel in every request header and are not part of
-      # the key -- and by NOTHING taken from the key itself:  every byte of a
-      # private-key body is secret, so there is no fragment of it that may be
-      # shown.
-      log "could not stage the ASC key; the credential was resolved but it is not a usable PEM private key (source ${key_src:-unknown}, key id $(key_label "$kid"), issuer id $(key_issuer_label "$iss"))"
-      ASC_AUTH_FAILURE="credential"
-    elif [[ "$rc" -eq 2 ]]; then
-      # The credential was resolved.  The staging path was refused.
-      log "could not stage the ASC key; the credential was resolved and the staging path was refused"
-      ASC_AUTH_FAILURE="staging"
-    else
-      # The writer itself failed:  a crash, a missing node, a signal.  It
-      # classified neither the key nor the path, so this must not be reported
-      # as either one.
-      log "could not stage the ASC key; the key writer failed with status ${rc}"
-      ASC_AUTH_FAILURE="writer"
-    fi
-    key_pem=""
+    case "$rc" in
+      1)
+        log "ASC credentials missing: the store did not answer for account ${ASC_SECRET_ACCOUNT} in ${ASC_SECRET_FOLDER}, and no service token is bound"
+        ASC_AUTH_FAILURE="missing"
+        ;;
+      2)
+        log "could not stage the ASC key; the staging path was refused"
+        ASC_AUTH_FAILURE="staging"
+        ;;
+      3)
+        log "could not stage the ASC key; the credential the store holds is not a usable PEM private key"
+        ASC_AUTH_FAILURE="credential"
+        ;;
+      *)
+        log "could not stage the ASC key; the client failed with status ${rc}"
+        ASC_AUTH_FAILURE="writer"
+        ;;
+    esac
+    return 0
+  fi
+  IFS=$'\t' read -r kid iss key_path <<< "$staged"
+  if [[ -z "$kid" || -z "$iss" || -z "$key_path" ]]; then
+    log "could not stage the ASC key; the client did not report the staged credential"
+    ASC_AUTH_FAILURE="writer"
     return 0
   fi
   # altool searches API_PRIVATE_KEYS_DIR first, so no symlink into ~/.appstoreconnect is needed.
   export API_PRIVATE_KEYS_DIR="$ASC_TMP_DIR"
-  export ASC_KEY_ID="$kid" ASC_ISSUER_ID="$iss" ASC_KEY_P8="$key_pem"
-  # The staged path is a materialisation for the Apple tools, not a credential
-  # source:  the client takes the key from the environment.
+  #  The key id and the issuer id are public labels that travel in every
+  #  request header.  The material is not exported:  the client takes the key
+  #  from the store.
+  export ASC_KEY_ID="$kid" ASC_ISSUER_ID="$iss"
+  #  The staged path is a materialisation for the Apple tools, not a
+  #  credential source:  the client takes the key from the store.
   export ASC_KEY_PATH="$key_path"
-  key_pem=""
   if [[ -n "$named_path" && "$named_path" != "$key_path" ]]; then
-    log "ASC_KEY_PATH is not a credential source; the credential came from the environment or from Infisical"
+    log "ASC_KEY_PATH is not a credential source; the credential came from the store"
   fi
   AUTH_MODE="api_key"
   return 0
@@ -618,12 +476,11 @@ asc_client() {
 # the version queries below run, so this cannot rely on the exported ASC_*
 # names -- it checks each source asc-api.mjs knows about.
 asc_credential_available() {
-  [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]] && return 0
-  [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_P8:-}" ]] && return 0
-  # The scoped reader is the last source:  it is there when the helper and
-  # the reader are both installed, and its read still has to succeed.  A seam
-  # that points at a missing or unreadable file is not a source, so the five
-  # callers skip instead of asking a reader that cannot answer.
+  #  The store is the only source:  this consumer's own named account through
+  #  the shared scoped reader, or the read-only service token a hosted job
+  #  binds.  This is a cheap pre-check -- it says whether a credential is
+  #  obtainable AT ALL, and the resolution itself happens in load_secrets().
+  [[ -n "${INFISICAL_TOKEN:-}" ]] && return 0
   [[ -n "${FLEET_INFISICAL_READER:-}" && -f "${FLEET_INFISICAL_READER}" && -r "${FLEET_INFISICAL_READER}" ]] && return 0
   [[ -f "$HOME/apps/infisical-scoped/infisical-scoped.py" ]] && return 0
   return 1
@@ -1895,7 +1752,7 @@ if [[ -n "$UPLOAD_ONLY_IPA" ]]; then
     if [[ "$(asc_upload_block)" == "writer" ]]; then
       die "upload-only: the key writer itself failed.  It classified neither the credential nor the path, so this is not a missing key and not a path failure."
     fi
-    die "upload-only requires ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 (env) or Infisical /asc (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8)"
+    die "upload-only requires the App Store Connect credential in the store:  Infisical /asc for account ${ASC_SECRET_ACCOUNT} (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8), or the read-only service token a hosted job binds"
   fi
   link_private_key "$ASC_KEY_PATH" "$ASC_KEY_ID"
   log "uploading existing package via altool (api key)"
@@ -2248,8 +2105,7 @@ if [[ "$AUTH_MODE" != "api_key" ]]; then
     log "Owner handoff:"
     log "  1) Export the .p8 again in App Store Connect (App Manager+)"
     log "  2) Store that file as ASC_KEY_P8 in Infisical Fleet-OPS /asc"
-    log "  3) Or export ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 for this run"
-    log "  4) Re-run: bash $0 $APP_KEY --upload-only \"$PACKAGE\""
+    log "  3) Re-run: bash $0 $APP_KEY --upload-only \"$PACKAGE\""
     exit 3
   fi
   if [[ "$(asc_upload_block)" == "writer" ]]; then
@@ -2263,8 +2119,7 @@ if [[ "$AUTH_MODE" != "api_key" ]]; then
   log "  1) Create ASC API key (App Manager+) in App Store Connect"
   log "  2) Store ASC_KEY_ID and ASC_ISSUER_ID in Infisical Fleet-OPS /asc"
   log "  3) Store the .p8 as ASC_KEY_P8 in Infisical /asc"
-  log "  4) Or export ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 for this run"
-  log "  5) Re-run: bash $0 $APP_KEY --upload-only \"$PACKAGE\""
+  log "  4) Re-run: bash $0 $APP_KEY --upload-only \"$PACKAGE\""
   log "Also ensure App Store Connect has an app record for ${BUNDLE_ID}."
   exit 3
 fi

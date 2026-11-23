@@ -31,15 +31,20 @@ reaches it — there is no shipped default, and none has ever been in source.
 
 The Mac harness resolves, in order:
 
-1. `process.env.SENTRY_DSN` or `process.env.BOTFLEET_SENTRY_DSN` — source
-   `env`.  An operator (CI, a LaunchAgent `EnvironmentVariables` block) can
-   pin a value this way; Settings shows the DSN field disabled with "Set by
-   the environment on this computer" and the source reads "Environment".
-2. `~/.botfleet/config.json` `observability.sentryDsn` — source `config`.
-   This is the normal path: set it once from Settings → Observability.
-3. Nothing configured — source `none`.  The boot log prints
+1. The store, through `~/.botfleet/config.json` `observability.sentryDsn`
+   — source `config`.  This is the normal path: set it once from Settings →
+   Observability, or in the store.
+2. Nothing configured — source `none`.  The boot log prints
    `[sentry] disabled: no DSN configured (set one in Settings > Observability)`
    and nothing is sent.
+
+The environment is not a source.  `process.env.SENTRY_DSN` and
+`process.env.BOTFLEET_SENTRY_DSN` are never read, and the desktop's
+`process.env.VITE_SENTRY_DSN` is never read either: the owner's ruling of
+November 22, 2026 says every secret resolves from Infisical and the
+environment carries no copy of a value.  A CI workflow that exports the DSN
+into a step's environment is a workflow residue, tracked in OPS-1108; the
+runtime does not read it.
 
 The kill switch is explicit, not implicit.  A DSN being present is not enough
 to silently start reporting forever, and it is not enough to silently stop

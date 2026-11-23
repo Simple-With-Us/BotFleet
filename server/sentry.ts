@@ -12,9 +12,9 @@ import { runtimeBuildIdentity } from "./runtime-identity.ts";
 export type SentryNode = typeof import("@sentry/node");
 type SentryIntegration = Parameters<SentryNode["addIntegration"]>[0];
 
-/** How the harness got its DSN.  `env` means a CI runner or the LaunchAgent
- * pinned one, which is why Settings shows the DSN field disabled. */
-export type SentrySource = "env" | "config" | "none";
+/** How the harness got its DSN.  `config` means the store or the app's own
+ * settings answered it;  the environment never does. */
+export type SentrySource = "config" | "none";
 
 export interface SentryRuntimeInput {
   dsn: string | null;
@@ -182,12 +182,12 @@ function dsnDigest(dsn: string): string {
   return createHash("sha256").update(dsn.trim()).digest("hex");
 }
 
-export function sentryDsnFromEnv(
-  env: NodeJS.ProcessEnv = process.env,
-): string | undefined {
-  const raw = (env.SENTRY_DSN || env.BOTFLEET_SENTRY_DSN || "").trim();
-  return raw || undefined;
-}
+/** The DSN is not read from the environment.
+ *
+ * The environment carries no copy of a value (owner ruling, November 22,
+ * 2026):  the DSN comes from the store through the resolved config, and a
+ * host that has no store has no DSN.  The optional reporting stays off
+ * rather than turning on an ambient credential. */
 
 const UNKNOWN_COMMIT = "0".repeat(40);
 const RELEASE_SHA = /^[0-9a-f]{7,40}$/i;
@@ -650,18 +650,22 @@ export function sentryRuntimeState(): SentryRuntimeState {
   return { ...runtimeState };
 }
 
-/** Env-only entry point, kept for callers that boot before app config is
- * loaded.  The observability manager is the richer path. */
-export async function initSentry(env: NodeJS.ProcessEnv = process.env): Promise<boolean> {
+/** Entry point for callers that boot before the observability manager is
+ * configured.  The DSN is passed in, because it comes from the store through
+ * the resolved config and never from the environment;  without one the
+ * optional reporting stays off. */
+export async function initSentry(
+  dsn: string | null = null,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<boolean> {
   if (initialized) return true;
   if (env.VITEST === "true" || env.NODE_ENV === "test") return false;
-  const dsn = sentryDsnFromEnv(env);
   const tracesSampleRate = Number(env.SENTRY_TRACES_SAMPLE_RATE ?? "0.2");
   const aiTracesSampleRate = Number(env.SENTRY_AI_TRACES_SAMPLE_RATE ?? "1.0");
   const httpTracesSampleRate = Number(env.SENTRY_HTTP_TRACES_SAMPLE_RATE ?? "0.1");
   const uiTracesSampleRate = Number(env.SENTRY_UI_TRACES_SAMPLE_RATE ?? "0.1");
   return (await applySentryConfig({
-    dsn: dsn ?? null,
+    dsn: dsn ? dsn.trim() || null : null,
     enabled: true,
     environment: (env.SENTRY_ENV || env.NODE_ENV || "production").trim() || "production",
     tracesSampleRate: Number.isFinite(tracesSampleRate)
@@ -677,7 +681,7 @@ export async function initSentry(env: NodeJS.ProcessEnv = process.env): Promise<
       ? Math.min(Math.max(uiTracesSampleRate, 0), 1)
       : 0.1,
     logsEnabled: true,
-    source: dsn ? "env" : "none",
+    source: dsn ? "config" : "none",
     release: sentryReleaseName(env, runtimeBuildIdentity.sourceCommit),
   })).active;
 }
