@@ -23,7 +23,7 @@ Environment="PATH=@BF_ROOT@/node/bin:@BF_ROOT@/home/.local/bin:/usr/local/bin:/u
 # The bridge reads its configuration from Infisical.  The only local item is
 # this read-only Infisical service token: a regular file owned by the service
 # user, mode 0600.
-ExecStart=@NODE_BIN@ @BF_CODE@/deploy/linux-server/companion-bridge-server.mjs --bootstrap-token-file @BF_ROOT@/config/infisical-read-token
+ExecStart=@NODE_BIN@ @BF_CODE@/deploy/linux-server/companion-bridge-server.mjs --bootstrap-token-file @BF_ROOT@/config/infisical-read-token --state-file @BF_ROOT@/data/companion-bridge/state.json
 ExecStartPre=@NODE_BIN@ @BF_ROOT@/bin/check-storage.mjs @BF_ROOT@/data
 StandardOutput=journal
 StandardError=journal

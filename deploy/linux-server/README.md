@@ -213,9 +213,14 @@ Tailscale Serve stays inside the tailnet.  Never enable Funnel:  Funnel is pub
 
 The bridge owns its own pairing window, its own device registry and its own advertisement; no secret is shared with the Mac.  The registry holds digests only: a redeemed credential is shown to the phone once and kept as its sha256, compared with a timing-safe comparison, and a malformed entry is skipped rather than trusted.  A revoked device keeps its row, so a replayed pairing cannot mint a fresh credential for it.
 
+### Its Own State
+
+
+The bridge keeps its device registry and its pairing window in one state file, under the fleet volume, written owner-only and replaced atomically.  A paired phone that forgets its pairing after a restart is a phone the owner has to pair again, and a revocation a restart forgets is a revocation that does not exist.  The file holds digests only: the device credential itself is never written down, so a copied state file cannot be replayed as a credential.  A state file that is a symlink, that anyone but the owner can read, or that has a second name is refused rather than read.
+
 ### The APNs Sender
 
-The bridge reads its APNs key material through the scoped read-only Infisical path (`APNS_KEY_P8` and `APNS_KEY_ID`, or `AUTHKEY_<KEY_ID>` for a pinned key) and through nothing else.  It does not read the environment for a key, and it does not create a key or a grant: the sender is off until the owner has put key material in the vault.  The startup line says which of those it is, and never prints a value.
+The bridge reads its APNs key material through the scoped read-only Infisical path (`APNS_KEY_P8` and `APNS_KEY_ID`, or `AUTHKEY_<KEY_ID>` for a pinned key) and through nothing else.  The key id and the team id come from the vault as well, never from source:  a governed identifier pinned in code goes stale and reads as one nobody reviewed.  With no key id or no team id in the vault, the sender is off and the startup line says which name is missing.  It does not read the environment for a key, and it does not create a key or a grant: the sender is off until the owner has put key material in the vault.  The startup line says which of those it is, and never prints a value.
 
 ### Verifying It, In Isolation
 

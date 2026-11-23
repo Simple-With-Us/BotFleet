@@ -13,6 +13,10 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import http from 'node:http';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync } from 'node:fs';
+import net from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -42,6 +46,7 @@ import {
   bridgeApnsNamesSummary,
   bridgeApnsSecretNames,
 } from './companion-bridge-apns.mjs';
+import { loadBridgeState, saveBridgeState } from './companion-bridge-state.mjs';
 
 /** A header value the test asserts on, assembled so the relay's secret scan
  * reads this file clean. */
@@ -110,10 +115,30 @@ async function startBridge(options = {}) {
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
+
+  // The bridge holds its own device registry, and a proxied route needs a
+  // device the bridge knows, so the fixture pairs one first.
+  const pair = async (deviceId = 'phone-1') => {
+    const opened = await call(port, {
+      method: 'POST',
+      path: '/api/companion/pairing/open',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: '{}',
+    });
+    const redeemed = await call(port, {
+      method: 'POST',
+      path: '/api/companion/pairing/redeem',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ code: opened.json.code, deviceId }),
+    });
+    return { credential: redeemed.json.credential, deviceId };
+  };
+
   return {
     port,
     state,
     harness,
+    pair,
     close: async () => {
       await new Promise((resolve) => server.close(resolve));
       await harness.close();
@@ -241,8 +266,10 @@ test('a proxied route crosses with its query byte for byte', async () => {
     },
   });
   try {
+    const device = await bridge.pair();
     const response = await call(bridge.port, {
       path: '/api/threads/thread-1?since=12%3A34&filter=a$b&x=1&x=2',
+      headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
     });
     assert.equal(response.status, 200);
     assert.equal(seen.path, '/api/threads/thread-1');
@@ -263,10 +290,14 @@ test('a proxied request body reaches the harness unchanged', async () => {
   });
   try {
     const body = JSON.stringify({ prompt: 'hello', nested: { a: [1, 2] } });
+    const device = await bridge.pair();
     await call(bridge.port, {
       method: 'POST',
       path: '/api/threads/thread-1/messages',
-      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      headers: ownerHeaders({
+        'content-type': 'application/json',
+        authorization: `Bearer ${device.credential}`,
+      }),
       body,
     });
     assert.equal(seen.body, body);
@@ -275,7 +306,7 @@ test('a proxied request body reaches the harness unchanged', async () => {
   }
 });
 
-test('the owner gate token never crosses the upstream hop, and the host becomes loopback', () => {
+test('the upstream hop carries the sidecar allowlist and nothing else', () => {
   const headers = bridgeUpstreamHeaders({
     'x-botfleet-gate-token': OWNER_TOKEN,
     'tailscale-user-login': 'owner@example.com',
@@ -285,15 +316,23 @@ test('the owner gate token never crosses the upstream hop, and the host becomes 
     authorization: `Bearer ${DEVICE_CREDENTIAL}`,
     connection: 'keep-alive',
     'keep-alive': 'timeout=5',
+    accept: 'application/json',
     'content-type': 'application/json',
+    'last-event-id': 'stream:12',
   }, 8799);
   assert.equal(headers['x-botfleet-gate-token'], undefined);
   assert.equal(headers['tailscale-user-login'], undefined);
   assert.equal(headers['x-forwarded-for'], undefined);
   assert.equal(headers.origin, undefined);
   assert.equal(headers['keep-alive'], undefined);
+  // The phone's own device credential is the bridge's business:  it does
+  // not travel to the harness, which sees a plain loopback caller.
+  assert.equal(headers.authorization, undefined);
   assert.equal(headers.host, '127.0.0.1:8799');
-  assert.equal(headers.authorization, `Bearer ${DEVICE_CREDENTIAL}`);
+  assert.equal(headers.accept, 'application/json');
+  assert.equal(headers['content-type'], 'application/json');
+  assert.equal(headers['last-event-id'], 'stream:12');
+  assert.equal(headers['x-botfleet-companion'], '1');
 });
 
 test('the response headers come back without the upstream framing headers', () => {
@@ -530,21 +569,132 @@ test('the loopback classifier accepts the mapped IPv6 form and refuses the rest'
   assert.equal(isBridgeLoopbackAddress(undefined), false);
 });
 
-test('the command line takes exactly the bootstrap token file', () => {
-  const parsed = parseBridgeArgs(['--bootstrap-token-file', '/path/to/token']);
+test('the command line takes the bootstrap token file and the state file', () => {
+  const parsed = parseBridgeArgs(['--bootstrap-token-file', '/path/to/token', '--state-file', '/path/to/state.json']);
   assert.equal(parsed.ok, true);
   assert.equal(parsed.bootstrapTokenFile, '/path/to/token');
+  assert.equal(parsed.statePath, '/path/to/state.json');
 
-  const equals = parseBridgeArgs(['--bootstrap-token-file=/path/to/token']);
+  const equals = parseBridgeArgs(['--bootstrap-token-file=/path/to/token', '--state-file=/path/to/state.json']);
   assert.equal(equals.ok, true);
 
   const missing = parseBridgeArgs([]);
   assert.equal(missing.ok, false);
   assert.match(missing.error, /--bootstrap-token-file/);
 
-  const unknown = parseBridgeArgs(['--bootstrap-token-file', '/x', '--other']);
+  const noState = parseBridgeArgs(['--bootstrap-token-file', '/x']);
+  assert.equal(noState.ok, false);
+  assert.match(noState.error, /--state-file/);
+
+  const unknown = parseBridgeArgs(['--bootstrap-token-file', '/x', '--state-file', '/y', '--other']);
   assert.equal(unknown.ok, false);
   assert.match(unknown.error, /unknown argument/);
+});
+
+test('a proxied route needs a device the bridge knows, and a revoked one is refused', async () => {
+  let reached = 0;
+  const bridge = await startBridge({
+    harnessHandler: (req, res) => {
+      reached += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    },
+  });
+  try {
+    // No device credential at all:  the bridge refuses before the harness.
+    const anonymous = await call(bridge.port, { path: '/api/fleet' });
+    assert.equal(anonymous.status, 403);
+    assert.equal(reached, 0);
+
+    // A credential the bridge never issued is refused as well.
+    const stranger = await call(bridge.port, {
+      path: '/api/fleet',
+      headers: ownerHeaders({ authorization: `Bearer ${DEVICE_CREDENTIAL}` }),
+    });
+    assert.equal(stranger.status, 403);
+    assert.equal(reached, 0);
+
+    // A paired device reaches the harness.
+    const device = await bridge.pair();
+    const allowed = await call(bridge.port, {
+      path: '/api/fleet',
+      headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
+    });
+    assert.equal(allowed.status, 200);
+    assert.equal(reached, 1);
+
+    // A revoked device does not.
+    await call(bridge.port, { method: 'DELETE', path: `/api/companion/devices/${device.deviceId}` });
+    const revoked = await call(bridge.port, {
+      path: '/api/fleet',
+      headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
+    });
+    assert.equal(revoked.status, 403);
+    assert.equal(reached, 1);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('a client that hangs up mid-body does not take the listener with it', async () => {
+  const bridge = await startBridge();
+  try {
+    // A request whose body never finishes:  the listener answers it as a
+    // request that was not received, and keeps serving.
+    const socket = net.connect(bridge.port, '127.0.0.1');
+    await new Promise((resolve) => socket.once('connect', resolve));
+    socket.write(
+      'POST /api/companion/pairing/open HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{',
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    socket.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // The listener is still there.
+    const health = await call(bridge.port, { path: '/__bridge/health' });
+    assert.equal(health.status, 200);
+    assert.equal(health.json.ok, true);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('the durable state round-trips through its file', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'bf-bridge-state-'));
+  chmodSync(root, 0o700);
+  try {
+    const path = join(root, 'state.json');
+    // A missing state file is an empty state, not an error.
+    assert.equal(loadBridgeState(path).existed, false);
+
+    const registry = new BridgeDeviceRegistry();
+    registry.addDevice({ id: 'phone-1', name: 'Phone', token: 'credential-one', pairedAtMs: 3 });
+    const state = new BridgeState({ registry, window: { codeDigest: 'a'.repeat(64) } });
+    saveBridgeState(path, state.toState());
+
+    const loaded = loadBridgeState(path);
+    assert.equal(loaded.existed, true);
+    const restored = new BridgeState(loaded.state);
+    assert.equal(restored.registry.activeIds()[0], 'phone-1');
+    assert.equal(restored.window.codeDigest, 'a'.repeat(64));
+
+    // The state file holds no credential, only its digest.
+    const bytes = readFileSync(path, 'utf8');
+    assert.equal(bytes.includes('credential-one'), false);
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+
+    // A file anyone but the owner can read is refused rather than read.
+    chmodSync(path, 0o644);
+    assert.throws(() => loadBridgeState(path), /readable beyond its owner/);
+    chmodSync(path, 0o600);
+
+    // A symlink is refused too.
+    const link = join(root, 'link.json');
+    symlinkSync(path, link);
+    assert.throws(() => loadBridgeState(link), /symlink/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('the minted shapes are the ones the phone accepts', () => {
@@ -564,9 +714,9 @@ test('the state round-trips through its own serialization', () => {
 });
 
 test('the APNs locus asks for the declared names and reads the key through the scoped path', async () => {
-  assert.deepEqual(bridgeApnsSecretNames(''), ['APNS_KEY_P8', 'APNS_KEY_ID']);
-  assert.deepEqual(bridgeApnsSecretNames('ABCDE12345'), ['AUTHKEY_ABCDE12345']);
-  assert.equal(bridgeApnsNamesSummary(''), 'APNS_KEY_P8, APNS_KEY_ID');
+  assert.deepEqual(bridgeApnsSecretNames(''), ['APNS_KEY_P8', 'APNS_KEY_ID', 'APNS_TEAM_ID']);
+  assert.deepEqual(bridgeApnsSecretNames('ABCDE12345'), ['AUTHKEY_ABCDE12345', 'APNS_KEY_ID', 'APNS_TEAM_ID']);
+  assert.equal(bridgeApnsNamesSummary(''), 'APNS_KEY_P8, APNS_KEY_ID, APNS_TEAM_ID');
 
   const requested = [];
   const material = await bridgeApnsMaterial({
@@ -579,7 +729,8 @@ test('the APNs locus asks for the declared names and reads the key through the s
           return {
             secrets: [
               { secretKey: 'APNS_KEY_P8', secretValue: FIXTURE_PEM },
-              { secretKey: 'APNS_KEY_ID', secretValue: 'HSJ98QN95V' },
+              { secretKey: 'APNS_KEY_ID', secretValue: 'ABCDE12345' },
+              { secretKey: 'APNS_TEAM_ID', secretValue: 'CC8UTF7ATG' },
             ],
           };
         },
@@ -587,7 +738,8 @@ test('the APNs locus asks for the declared names and reads the key through the s
     },
   });
   assert.equal(material.available, true);
-  assert.equal(material.keyId, 'HSJ98QN95V');
+  assert.equal(material.keyId, 'ABCDE12345');
+  assert.equal(material.teamId, 'CC8UTF7ATG');
   assert.match(material.p8, /BEGIN PRIVATE KEY/);
   assert.equal(requested.length, 1);
   assert.match(requested[0].url, /\/api\/v3\/secrets\/raw/);
@@ -602,7 +754,7 @@ test('the APNs locus is off, with a reason, when the vault holds no key', async 
   });
   assert.equal(empty.available, false);
   assert.equal(empty.p8, null);
-  assert.match(empty.reason, /no APNs key material/);
+  assert.match(empty.reason, /names no APNs key id/);
 
   const noToken = await bridgeApnsMaterial({});
   assert.equal(noToken.available, false);
@@ -619,7 +771,15 @@ test('the APNs locus is off, with a reason, when the vault holds no key', async 
     serviceToken: 'st.fixture_token_value_0001',
     fetchImpl: async () => ({
       ok: true,
-      async json() { return { secrets: [{ secretKey: 'APNS_KEY_P8', secretValue: 'not-a-key' }] }; },
+      async json() {
+        return {
+          secrets: [
+            { secretKey: 'APNS_KEY_P8', secretValue: 'not-a-key' },
+            { secretKey: 'APNS_KEY_ID', secretValue: 'ABCDE12345' },
+            { secretKey: 'APNS_TEAM_ID', secretValue: 'CC8UTF7ATG' },
+          ],
+        };
+      },
     }),
   });
   assert.equal(notAKey.available, false);

@@ -247,6 +247,7 @@ run systemctl enable --now "$SERVER_UNIT" "$GATE_UNIT"
 if [ "$BF_COMPANION_BRIDGE" = "1" ]; then
   say "installing the companion bridge unit (BF_COMPANION_BRIDGE=1)"
   render_unit "$SCRIPT_DIR/botfleet-companion-bridge.service.in" "/etc/systemd/system/$BRIDGE_UNIT"
+  run install -d -m 0700 -o "$BF_USER" -g "$BF_GROUP" "$BF_ROOT/data/companion-bridge"
   run systemctl daemon-reload
   run systemctl enable --now "$BRIDGE_UNIT"
   note "the bridge listens on 127.0.0.1:${BRIDGE_PORT} and reaches the harness on 127.0.0.1:${HARNESS_PORT}"

@@ -22,16 +22,10 @@
 
 import { readInfisicalSecrets } from '../../electron/infisical-read.mjs';
 
-/** The fleet's shared APNs key (Simple With Us team CC8UTF7ATG). */
-export const BRIDGE_APNS_TEAM_ID = 'CC8UTF7ATG';
-
-/** The shared key id, used when no other key is pinned. */
-export const BRIDGE_APNS_SHARED_KEY_ID = 'HSJ98QN95V';
-
 /** The vault name of the shared key material. */
 export const BRIDGE_APNS_SHARED_P8_NAME = 'APNS_KEY_P8';
 
-/** The vault name of the shared key id. */
+/** The vault name of the key id. */
 export const BRIDGE_APNS_SHARED_KEY_ID_NAME = 'APNS_KEY_ID';
 
 /**
@@ -46,9 +40,21 @@ export const BRIDGE_APNS_SHARED_KEY_ID_NAME = 'APNS_KEY_ID';
  */
 export function bridgeApnsSecretNames(pin = '') {
   const keyId = String(pin ?? '').trim();
-  if (!keyId) return [BRIDGE_APNS_SHARED_P8_NAME, BRIDGE_APNS_SHARED_KEY_ID_NAME];
-  return [`AUTHKEY_${keyId}`];
+  const names = keyId
+    ? [`AUTHKEY_${keyId}`, BRIDGE_APNS_SHARED_KEY_ID_NAME]
+    : [BRIDGE_APNS_SHARED_P8_NAME, BRIDGE_APNS_SHARED_KEY_ID_NAME];
+  names.push(BRIDGE_APNS_TEAM_ID_NAME);
+  return names;
 }
+
+/**
+ * The team id the sender signs for.
+ *
+ * It is read from the vault like the key material, because a team id
+ * pinned in source goes stale when the team changes and reads as a
+ * governed identifier that was never reviewed.
+ */
+export const BRIDGE_APNS_TEAM_ID_NAME = 'APNS_TEAM_ID';
 
 /**
  * Read the APNs material for the Linux sender through the scoped path.
@@ -68,7 +74,7 @@ export async function bridgeApnsMaterial({
   timeoutMs = 20_000,
 } = {}) {
   if (!serviceToken) {
-    return { available: false, keyId: '', p8: null, reason: 'no scoped Infisical token is configured' };
+    return { available: false, keyId: '', teamId: '', p8: null, reason: 'no scoped Infisical token is configured' };
   }
   const names = bridgeApnsSecretNames(pin);
   let secrets;
@@ -77,18 +83,51 @@ export async function bridgeApnsMaterial({
     if (fetchImpl) read.fetchImpl = fetchImpl;
     secrets = await readInfisicalSecrets(read);
   } catch {
-    return { available: false, keyId: '', p8: null, reason: 'the scoped APNs path could not be read' };
+    return { available: false, keyId: '', teamId: '', p8: null, reason: 'the scoped APNs path could not be read' };
   }
   const shared = secrets?.[BRIDGE_APNS_SHARED_P8_NAME];
   const p8 = Object.prototype.toString.call(shared) === '[object String]' ? shared : '';
-  const pinned = names.length === 1 ? names[0] : '';
-  const p8Value = p8 || (pinned ? String(secrets?.[pinned] ?? '') : '');
-  const keyId = String(secrets?.[BRIDGE_APNS_SHARED_KEY_ID_NAME] ?? '').trim()
-    || (pinned ? pin.trim() : BRIDGE_APNS_SHARED_KEY_ID);
+  const pinnedName = pin.trim() ? `AUTHKEY_${pin.trim()}` : '';
+  const p8Value = p8 || (pinnedName ? String(secrets?.[pinnedName] ?? '') : '');
+  // The key id and the team id both come from the vault.  A pinned key id
+  // names its own key material, and the vault's own APNS_KEY_ID has to be
+  // that key: a pin that disagrees with the vault is a configuration
+  // mistake, and signing with one of them is a guess.
+  const vaultKeyId = String(secrets?.[BRIDGE_APNS_SHARED_KEY_ID_NAME] ?? '').trim();
+  const keyId = vaultKeyId;
+  const teamId = String(secrets?.[BRIDGE_APNS_TEAM_ID_NAME] ?? '').trim();
+  if (!keyId) {
+    return {
+      available: false,
+      keyId: '',
+      teamId,
+      p8: null,
+      reason: `the vault names no APNs key id (${BRIDGE_APNS_SHARED_KEY_ID_NAME})`,
+    };
+  }
+  if (pinnedName && keyId !== pin.trim()) {
+    return {
+      available: false,
+      keyId,
+      teamId,
+      p8: null,
+      reason: `the pinned APNs key id does not match the vault's (${BRIDGE_APNS_SHARED_KEY_ID_NAME})`,
+    };
+  }
+  if (!teamId) {
+    return {
+      available: false,
+      keyId,
+      teamId: '',
+      p8: null,
+      reason: `the vault names no APNs team id (${BRIDGE_APNS_TEAM_ID_NAME})`,
+    };
+  }
   if (!p8Value) {
     return {
       available: false,
       keyId,
+      teamId,
       p8: null,
       reason: 'the vault holds no APNs key material for this sender',
     };
@@ -97,11 +136,12 @@ export async function bridgeApnsMaterial({
     return {
       available: false,
       keyId,
+      teamId,
       p8: null,
       reason: 'the APNs key material is not a private key',
     };
   }
-  return { available: true, keyId, p8: p8Value, reason: '' };
+  return { available: true, keyId, teamId, p8: p8Value, reason: '' };
 }
 
 /**

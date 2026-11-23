@@ -13,6 +13,7 @@
     {"path":"deploy/linux-server/companion-bridge-apns.mjs","category":"runtime","reason":"Import from deploy/linux-server/companion-bridge-server.mjs"},
     {"path":"deploy/linux-server/companion-bridge-server.mjs","category":"runtime","reason":"Linux entry point"},
     {"path":"deploy/linux-server/companion-bridge-server.node-test.mjs","category":"verification","reason":"Linux entry point"},
+    {"path":"deploy/linux-server/companion-bridge-state.mjs","category":"runtime","reason":"Linux entry point"},
     {"path":"deploy/linux-server/companion-bridge.mjs","category":"runtime","reason":"Import from deploy/linux-server/companion-bridge-server.mjs"},
     {"path":"deploy/linux-server/companion-bridge.node-test.mjs","category":"verification","reason":"Linux entry point"},
     {"path":"deploy/linux-server/dependency-install.node-test.mjs","category":"verification","reason":"Linux entry point"},

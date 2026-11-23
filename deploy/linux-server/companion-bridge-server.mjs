@@ -59,6 +59,7 @@ import {
   readInfisicalSecrets,
 } from '../../electron/infisical-read.mjs';
 import { bridgeApnsMaterial } from './companion-bridge-apns.mjs';
+import { loadBridgeState, saveBridgeState } from './companion-bridge-state.mjs';
 
 /** The loopback address the listener binds.  Never a routable address. */
 export const BRIDGE_HOST = '127.0.0.1';
@@ -86,12 +87,6 @@ const OWNER_LOGIN_HEADER = 'tailscale-user-login';
 
 /** The route the listener answers for itself, without touching the harness. */
 const BRIDGE_HEALTH_PATH = '/__bridge/health';
-
-/** Hop-by-hop headers, which never cross the upstream hop. */
-const HOP_BY_HOP_HEADERS = new Set([
-  'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
-  'te', 'trailer', 'transfer-encoding', 'upgrade',
-]);
 
 /**
  * True when the value is a string.
@@ -551,42 +546,32 @@ function respondJson(res, status, payload) {
 /**
  * The headers a proxied request carries upstream.
  *
- * Every identity, edge, forwarding and hop-by-hop header is dropped, and
- * the Host becomes the loopback harness address, so the harness sees a
- * plain loopback caller and nothing else.  The phone's own device
- * credential travels, because the harness authenticates it.
+ * This is the same allowlist the Node companion sidecar uses
+ * (`companion/src/proxy.ts`), because the bridge is in the same position:
+ * it authenticates the phone itself, and the harness sees a plain loopback
+ * caller.  An allowlist rather than a blocklist is the point: the phone's
+ * own device credential is the bridge's business and means nothing to the
+ * harness, so it does not travel, and neither does any other identity,
+ * edge, forwarding or hop-by-hop header.
  *
  * @param {Record<string, string|string[]|undefined>|undefined} headers
  * @param {number|string} upstreamPort
  * @returns {Record<string, string|string[]>}
  */
 export function bridgeUpstreamHeaders(headers, upstreamPort) {
-  const out = {};
-  const connectionTokens = new Set();
-  const connection = bridgeHeaderValue(headers, 'connection');
-  if (connection) {
-    for (const token of connection.split(',')) {
-      const name = token.trim().toLowerCase();
-      if (name) connectionTokens.add(name);
-    }
-  }
-  for (const [rawName, rawValue] of Object.entries(headers || {})) {
-    const name = rawName.toLowerCase();
-    if (name === 'host') continue;
-    if (rawValue === undefined || rawValue === null) continue;
-    if (HOP_BY_HOP_HEADERS.has(name)) continue;
-    if (connectionTokens.has(name)) continue;
-    if (name === 'origin' || name === 'referer') continue;
-    if (name.startsWith('sec-fetch-')) continue;
-    if (name.startsWith('tailscale-')) continue;
-    if (name.startsWith('x-forwarded-')) continue;
-    if (name.startsWith('cf-')) continue;
-    if (name === 'forwarded' || name === 'cdn-loop') continue;
-    // The owner gate token belongs to this listener only.  It never crosses
-    // the upstream hop.
-    if (name === OWNER_TOKEN_HEADER) continue;
-    out[name] = rawValue;
-  }
+  const out = {
+    accept: String(bridgeHeaderValue(headers, 'accept') ?? '*/*'),
+    // The stamp the harness reads as "a phone reached this through a
+    // companion".  The phone cannot add it itself: the bridge sets it on
+    // the way in.
+    'x-botfleet-companion': '1',
+  };
+  const contentType = bridgeHeaderValue(headers, 'content-type');
+  if (contentType) out['content-type'] = contentType;
+  // Last-Event-ID is how a reconnecting phone asks for the gap.  Dropping
+  // it would turn every resume into a full re-hydration, silently.
+  const lastEventId = bridgeHeaderValue(headers, 'last-event-id');
+  if (lastEventId) out['last-event-id'] = lastEventId;
   out.host = `127.0.0.1:${upstreamPort}`;
   return out;
 }
@@ -636,10 +621,16 @@ function pathOf(url) {
 async function readJsonBody(req, limit = 64 * 1024) {
   const chunks = [];
   let total = 0;
-  for await (const chunk of req) {
-    total += chunk.length;
-    if (total > limit) return { ok: false, reason: 'the request body is too large' };
-    chunks.push(chunk);
+  try {
+    for await (const chunk of req) {
+      total += chunk.length;
+      if (total > limit) return { ok: false, reason: 'the request body is too large' };
+      chunks.push(chunk);
+    }
+  } catch {
+    // The client hung up mid-body.  That is a normal end to a request, and
+    // it is answered as one rather than as a failure of the listener.
+    return { ok: false, reason: 'the request body was not received' };
   }
   const text = Buffer.concat(chunks).toString('utf8');
   if (!text.trim()) return { ok: true, value: {} };
@@ -678,7 +669,14 @@ export function createCompanionBridge({
   const upstreamAgent = new http.Agent({ keepAlive: false });
 
   const server = http.createServer((req, res) => {
-    void handleRequest({ req, res, state, owners, publicOrigin, tokenSha256, host, port, upstreamAgent, logger, now, persist });
+    // Every request runs on its own, so a failure in one may not take the
+    // listener with it:  the backstop logs the reason and answers 500 if
+    // nothing was written yet.
+    void handleRequest({ req, res, state, owners, publicOrigin, tokenSha256, host, port, upstreamAgent, logger, now, persist }).catch((error) => {
+      logger(`[companion-bridge] request failed: ${error instanceof Error ? error.message : String(error)}`);
+      if (!res.headersSent) respondJson(res, 500, { error: 'the request could not be handled' });
+      else res.destroy();
+    });
   });
 
   // A long server-sent event stream must never be cut short by a timeout.
@@ -729,6 +727,21 @@ async function handleRequest({
 
   if (decision.local) {
     await handleLocalRoute({ req, res, method, url, decision, state, logger, now, persist });
+    return;
+  }
+
+  // A proxied route is the harness's route, so the device credential that
+  // reaches it is the harness's own.  The bridge still holds its own
+  // registry, and a device the bridge revoked may not reach the harness
+  // through the bridge at all:  the bridge checks its registry before it
+  // forwards, so a revocation takes effect here and not only on the Mac.
+  const device = state.registry.decide(
+    bridgePresentedDeviceCredential(req.headers),
+    bridgePresentedDeviceId(req.headers),
+  );
+  if (!device.ok) {
+    logger(`[companion-bridge] refused ${method} ${pathOf(url)}: ${device.reason}`);
+    respondJson(res, 403, { error: device.reason });
     return;
   }
 
@@ -838,6 +851,7 @@ async function handleLocalRoute({ req, res, method, url, state, logger, now, per
  */
 function proxyRequest({ req, res, method, url, decision, host, port, upstreamAgent, logger }) {
   const target = new URL(decision.upstream, `http://${host}:${port}`);
+  let upstreamResponse = null;
   const upstream = http.request({
     hostname: host,
     port,
@@ -845,10 +859,11 @@ function proxyRequest({ req, res, method, url, decision, host, port, upstreamAge
     method,
     headers: bridgeUpstreamHeaders(req.headers, port),
     agent: upstreamAgent,
-  }, (upstreamResponse) => {
-    res.writeHead(upstreamResponse.statusCode ?? 502, bridgeDownstreamHeaders(upstreamResponse.headers));
-    upstreamResponse.pipe(res);
-    upstreamResponse.on('error', () => res.destroy());
+  }, (response) => {
+    upstreamResponse = response;
+    res.writeHead(response.statusCode ?? 502, bridgeDownstreamHeaders(response.headers));
+    response.pipe(res);
+    response.on('error', () => res.destroy());
   });
   upstream.on('error', (error) => {
     logger(`[companion-bridge] upstream failed for ${method} ${pathOf(url)}: ${error.message}`);
@@ -858,6 +873,13 @@ function proxyRequest({ req, res, method, url, decision, host, port, upstreamAge
   req.pipe(upstream);
   req.on('error', () => upstream.destroy());
   upstream.on('close', () => req.destroy());
+  // A client that hangs up ends the whole hop, including a long-lived
+  // event stream:  otherwise the upstream connection outlives the request
+  // that opened it.
+  res.on('close', () => {
+    upstream.destroy();
+    upstreamResponse?.destroy();
+  });
 }
 
 /**
@@ -872,6 +894,7 @@ function proxyRequest({ req, res, method, url, decision, host, port, upstreamAge
 export function parseBridgeArgs(argv) {
   const args = Array.isArray(argv) ? argv : [];
   let bootstrapTokenFile = '';
+  let statePath = '';
   for (let index = 0; index < args.length; index += 1) {
     const arg = String(args[index]);
     if (arg === '--bootstrap-token-file') {
@@ -887,6 +910,19 @@ export function parseBridgeArgs(argv) {
       bootstrapTokenFile = arg.slice('--bootstrap-token-file='.length);
       continue;
     }
+    if (arg === '--state-file') {
+      const value = args[index + 1];
+      if (!value || String(value).startsWith('--')) {
+        return { ok: false, error: '--state-file needs a path' };
+      }
+      statePath = String(value);
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('--state-file=')) {
+      statePath = arg.slice('--state-file='.length);
+      continue;
+    }
     return { ok: false, error: `unknown argument: ${arg}` };
   }
   if (!bootstrapTokenFile) {
@@ -898,7 +934,16 @@ export function parseBridgeArgs(argv) {
         'Infisical service token file',
     };
   }
-  return { ok: true, bootstrapTokenFile };
+  if (!statePath) {
+    return {
+      ok: false,
+      error:
+        '--state-file <path> is required: the bridge keeps its device ' +
+        'registry and its pairing window there, so a restart does not forget ' +
+        'a pairing or a revocation',
+    };
+  }
+  return { ok: true, bootstrapTokenFile, statePath };
 }
 
 /**
@@ -958,6 +1003,7 @@ async function main() {
     fail(`companion bridge: ${args.error}`);
     return;
   }
+  const statePath = args.statePath;
 
   let serviceToken;
   try {
@@ -998,8 +1044,32 @@ async function main() {
       `${apns.available ? 'key material present' : `off (${apns.reason})`}\n`,
   );
 
-  const state = new BridgeState();
-  const server = createCompanionBridge({ state, owners, publicOrigin, tokenSha256 });
+  // The durable state:  a paired phone that forgets its pairing after a
+  // restart is a phone the owner has to pair again, and a revocation a
+  // restart forgets is a revocation that does not exist.
+  let state;
+  try {
+    const loaded = loadBridgeState(statePath);
+    state = new BridgeState(loaded.state ?? {});
+  } catch (error) {
+    fail(`companion bridge: the durable state could not be read: ${error?.message ?? 'unknown error'}`);
+    return;
+  }
+  const server = createCompanionBridge({
+    state,
+    owners,
+    publicOrigin,
+    tokenSha256,
+    persist: (current) => {
+      try {
+        saveBridgeState(statePath, current.toState());
+      } catch (error) {
+        process.stderr.write(
+          `${new Date().toISOString()} [companion-bridge] the durable state could not be written: ${error?.message ?? 'unknown error'}\n`,
+        );
+      }
+    },
+  });
 
   server.on('error', (error) => {
     process.stderr.write(`${new Date().toISOString()} [companion-bridge] server error: ${error.message}\n`);

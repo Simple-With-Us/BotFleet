@@ -34,6 +34,7 @@ export const ClosureReceiptSchema = z.strictObject({
 export const LINUX_ENTRY_POINTS = [
   ["server/index.ts", "runtime"], ["deploy/linux-server/owner-gate.mjs", "runtime"],
   ["deploy/linux-server/companion-bridge-server.mjs", "runtime"],
+  ["deploy/linux-server/companion-bridge-state.mjs", "runtime"],
   ["deploy/linux-server/companion-bridge.node-test.mjs", "verification"],
   ["deploy/linux-server/companion-bridge-server.node-test.mjs", "verification"],
   ["vite.config.ts", "ui-build"], ["src/main.tsx", "ui-build"],
