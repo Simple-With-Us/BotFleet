@@ -1,5 +1,9 @@
 # Electron Main Process Responsibility Inventory (BF-2498)
 
+Its companion map, the no-delete inventory that classifies every piece of this
+stack by what still depends on it, is in
+[The Electron No-Delete Map](native-rewrite-no-delete-map.md).
+
 Every responsibility the Electron main process owns today, and the native
 owner that takes it. This is the Electron-side companion to
 [`native-rewrite-port-inventory.md`](native-rewrite-port-inventory.md) (BF-2502),
