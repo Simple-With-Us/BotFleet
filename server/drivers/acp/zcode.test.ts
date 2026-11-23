@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { EFFORT_LEVELS, type ProviderInstance } from "../../contracts.ts";
 import { ensureDirs } from "../../config.ts";
+import { setKnownDirsForTests } from "../../env-path.ts";
 import { removeTempDir } from "../../testing/cleanup.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import { BUILT_IN_DRIVERS } from "../builtIn.ts";
@@ -464,5 +465,90 @@ describe("ZCode ACP turns (fake bridge)", () => {
     expect(methods).toContain("session/load");
     expect(methods).not.toContain("session/new");
     expect(methods).toContain("session/prompt");
+  });
+});
+
+describe("ZCode ACP dispatch version gate (BF-2468)", () => {
+  it("probes --version once across gated turns, while snapshot still probes fresh", async () => {
+    ensureDirs();
+    const dir = scratchDir("botfleet-zcode-acp-ttl-");
+    const countFile = join(dir, "version-calls");
+    // A bridge too old for the gate: every turn refuses before any session
+    // spawns, so the shim only ever has to answer --version, and counts.
+    writeFileSync(
+      join(dir, "zcode-acp-server"),
+      [
+        "#!/usr/bin/env node",
+        'const fs = require("node:fs");',
+        `const countFile = ${JSON.stringify(countFile)};`,
+        'let n = 0; try { n = Number(fs.readFileSync(countFile, "utf8")) || 0; } catch {}',
+        'if (process.argv.includes("--version")) fs.writeFileSync(countFile, String(n + 1));',
+        'console.log("0.1.0");',
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    // Probes resolve the bare binary name through augmentedPath().
+    // OMB_EXTRA_PATH leads that merge, ahead of any real bridge this Mac
+    // has installed; the known-dirs seam drops the cached merge with it.
+    const previousExtraPath = process.env.OMB_EXTRA_PATH;
+    process.env.OMB_EXTRA_PATH = dir;
+    setKnownDirsForTests([dir]);
+    let instance: ProviderInstance | undefined;
+    let recorder: EventRecorder | undefined;
+    try {
+      instance = await ZcodeAcpDriver.create({
+        instanceId: "zcode-acp-ttl",
+        displayName: "ZCode",
+        environment: {},
+        enabled: true,
+        config: { cli: "zcode-acp-server", fullAuto: false },
+      });
+      recorder = recordEvents(instance.adapter);
+      await instance!.adapter.sendTurn({ text: "run the check", threadId: "zcode-acp-ttl-1" });
+      const first = await recorder!.until((event) => event.type === "turn.completed" && event.threadId === "zcode-acp-ttl-1");
+      expect(first).toMatchObject({ ok: false });
+      expect(readFileSync(countFile, "utf8")).toBe("1");
+      await instance!.adapter.sendTurn({ text: "run the check", threadId: "zcode-acp-ttl-2" });
+      const second = await recorder!.until((event) => event.type === "turn.completed" && event.threadId === "zcode-acp-ttl-2");
+      expect(second).toMatchObject({ ok: false });
+      // The dispatch gate answered from the remembered version: no second spawn.
+      expect(readFileSync(countFile, "utf8")).toBe("1");
+      // An in-place upgrade changes the binary identity (mtime/size), so the
+      // gate re-probes at once instead of refusing from cache for the window.
+      // The turn then refuses for sign-in, which is past the gate.
+      writeFileSync(
+        join(dir, "zcode-acp-server"),
+        [
+          "#!/usr/bin/env node",
+          'const fs = require("node:fs");',
+          `const countFile = ${JSON.stringify(countFile)};`,
+          'let n = 0; try { n = Number(fs.readFileSync(countFile, "utf8")) || 0; } catch {}',
+          'if (process.argv.includes("--version")) fs.writeFileSync(countFile, String(n + 1));',
+          'console.log("9.9.9");',
+          "// upgraded fixture: this line also changes the file size, so the",
+          "// binary identity differs even where mtime granularity is coarse",
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      await instance!.adapter.sendTurn({ text: "run the check", threadId: "zcode-acp-ttl-3" });
+      await recorder!.until((event) => event.type === "turn.completed" && event.threadId === "zcode-acp-ttl-3");
+      expect(readFileSync(countFile, "utf8")).toBe("2");
+      await instance!.adapter.sendTurn({ text: "run the check", threadId: "zcode-acp-ttl-4" });
+      await recorder!.until((event) => event.type === "turn.completed" && event.threadId === "zcode-acp-ttl-4");
+      // The upgraded binary's answer is now the remembered one: cached again.
+      expect(readFileSync(countFile, "utf8")).toBe("2");
+      // A snapshot is the freshness path: it probes again on purpose.
+      const snap = await instance!.snapshot();
+      expect(snap.version).toBe("9.9.9");
+      expect(readFileSync(countFile, "utf8")).toBe("3");
+    } finally {
+      recorder?.stop();
+      await instance?.dispose();
+      if (previousExtraPath === undefined) delete process.env.OMB_EXTRA_PATH;
+      else process.env.OMB_EXTRA_PATH = previousExtraPath;
+      setKnownDirsForTests(null);
+    }
   });
 });
