@@ -914,6 +914,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       // Expires KNOWN_VERSION_MAX_AGE_MS after the CLI last answered, so a
       // CLI that wedges for good settles as "did not answer in time".
       const lastKnownVersion = new LastKnownAnswer<string>();
+      /** The binary the remembered version came from.  A config that names a
+       *  different binary must never be answered from this memory. */
+      let lastProbedCli: string | null = null;
+      /** Start order of the probe that supplied `lastProbedCli`, mirroring
+       *  LastKnownAnswer's own ordering so a slow older probe cannot claim
+       *  a newer probe's remembered version for a different binary. */
+      let lastProbedOrder = 0;
       /** One `--version` probe, with what went wrong when it produced no
        * version — so a timeout can be told apart from a missing binary. */
       const probeCliVersion = (effective: AcpConfig, env: Record<string, string | undefined>) =>
@@ -926,6 +933,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             const trimmed = err ? null : stdout.trim();
             const elapsedMs = Date.now() - startedAt;
             if (trimmed) {
+              if (order >= lastProbedOrder) {
+                lastProbedOrder = order;
+                lastProbedCli = effective.cli;
+              }
               lastKnownVersion.record(trimmed, order);
               resolve({ version: trimmed, error: null, elapsedMs });
             } else {
@@ -945,8 +956,18 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
           });
         });
-      const cliVersion = async (effective: AcpConfig, env: Record<string, string | undefined>) =>
-        (await probeCliVersion(effective, env)).version;
+      /** The dispatch gate's version: one the same binary answered inside
+       *  the remembered window stands without spawning `--version` again on
+       *  every turn (BF-2468).  `snapshot()` deliberately still probes
+       *  fresh, so a binary that breaks retires there instead of living on
+       *  its last answer; the turn spawn itself remains the final check. */
+      const cliVersion = async (effective: AcpConfig, env: Record<string, string | undefined>) => {
+        if (effective.cli === lastProbedCli) {
+          const cached = lastKnownVersion.get();
+          if (cached !== null) return cached;
+        }
+        return (await probeCliVersion(effective, env)).version;
+      };
       const base = (threadId: string, turnId: string) => ({
         eventId: newEventId(),
         provider: DRIVER_KIND,
