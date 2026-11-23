@@ -125,7 +125,7 @@ final class MacPhase3VoiceSystemUITests: XCTestCase {
         XCTAssertEqual(engine.state, .failed(.noMicrophoneAvailable))
         XCTAssertEqual(
             MacVoiceFailure.noMicrophoneAvailable.message,
-            "No microphone found.  Connect a microphone, then try again."
+            "No microphone found.\u{00A0} Connect a microphone, then try again."
         )
     }
 
@@ -174,13 +174,13 @@ final class MacPhase3VoiceSystemUITests: XCTestCase {
         engine.pauseCapture()
         XCTAssertEqual(
             engine.state,
-            .paused(reason: "Listening paused.  Tap to resume when you're ready.")
+            .paused(reason: "Listening paused.\u{00A0} Select to resume when you're ready.")
         )
         XCTAssertEqual(engine.state.accessibilityLabel, "Listening paused")
         engine.handleAudioInterruptionEnded()
         XCTAssertEqual(
             engine.state,
-            .paused(reason: "Listening paused.  Tap to resume when you're ready.")
+            .paused(reason: "Listening paused.\u{00A0} Select to resume when you're ready.")
         )
         XCTAssertFalse(engine.isMicrophoneHardwareOpen)
 
@@ -194,39 +194,39 @@ final class MacPhase3VoiceSystemUITests: XCTestCase {
     func testExactVoiceFailureProductCopyAndPersonalVoiceFallback() {
         XCTAssertEqual(
             MacVoiceFailure.microphoneRefused(isCall: false).message,
-            "Dictation needs Microphone access.  Enable it in System Settings, then try again."
+            "Dictation needs Microphone access.\u{00A0} Enable it in System Settings, then try again."
         )
         XCTAssertEqual(
             MacVoiceFailure.microphoneRefused(isCall: true).message,
-            "Calls need Microphone access.  Enable it in System Settings, then try again."
+            "Calls need Microphone access.\u{00A0} Enable it in System Settings, then try again."
         )
         XCTAssertEqual(
             MacVoiceFailure.speechRecognitionRefused(isCall: false).message,
-            "Dictation needs Speech Recognition access.  Enable it in System Settings, then try again."
+            "Dictation needs Speech Recognition access.\u{00A0} Enable it in System Settings, then try again."
         )
         XCTAssertEqual(
             MacVoiceFailure.speechRecognitionRefused(isCall: true).message,
-            "Calls need Speech Recognition access.  Enable it in System Settings, then try again."
+            "Calls need Speech Recognition access.\u{00A0} Enable it in System Settings, then try again."
         )
         XCTAssertEqual(
             MacVoiceFailure.noMicrophoneAvailable.message,
-            "No microphone found.  Connect a microphone, then try again."
+            "No microphone found.\u{00A0} Connect a microphone, then try again."
         )
         XCTAssertEqual(
             MacVoiceFailure.languageNotSupported.message,
-            "Dictation isn't available for this language.  Choose a different language in Settings."
+            "Dictation isn't available for this language.\u{00A0} Choose a different language in Settings."
         )
         XCTAssertEqual(
             MacVoiceFailure.microphoneBusy.message,
-            "Couldn't start the microphone.  Check that no other app is using it, then try again."
+            "Couldn't start the microphone.\u{00A0} Check that no other app is using it, then try again."
         )
         XCTAssertEqual(
             MacVoiceFailure.recognitionFailedMidSession.message,
-            "Couldn't transcribe that.  Your draft is unchanged."
+            "Couldn't transcribe that.\u{00A0} Your draft is unchanged."
         )
         XCTAssertEqual(
             MacVoiceFailure.playbackFailed.message,
-            "Couldn't play the voice.  The reply is shown as text instead."
+            "Couldn't play the voice.\u{00A0} The reply is shown as text instead."
         )
         XCTAssertEqual(MacVoiceFailure.microphoneRefused(isCall: false).actionButtonTitle, "Open Settings")
         XCTAssertEqual(MacVoiceFailure.languageNotSupported.actionButtonTitle, "Open Settings")
@@ -337,7 +337,7 @@ final class MacPhase3VoiceSystemUITests: XCTestCase {
         XCTAssertEqual(disconnected.iconState, .connectionLost)
         XCTAssertEqual(
             disconnected.statusLine,
-            "Connection lost.  Your bots will reconnect on their own"
+            "Connection lost.\u{00A0} Your bots will reconnect on their own"
         )
     }
 
@@ -366,7 +366,7 @@ final class MacPhase3VoiceSystemUITests: XCTestCase {
         XCTAssertFalse(manager.handleRecordedKey(keyCode: 49, carbonModifiers: 256))
         XCTAssertEqual(
             manager.inlineCollisionError,
-            "That shortcut is used by another app.  Choose a different one."
+            "That shortcut is used by another app.\u{00A0} Choose a different one."
         )
         XCTAssertFalse(manager.binding(for: .showOrHideBotFleet).isEnabled)
 
@@ -517,13 +517,13 @@ final class MacPhase3VoiceSystemUITests: XCTestCase {
         XCTAssertEqual(
             deniedDecision,
             .suppressedPermissionDenied(
-                statusBanner: "Notifications are off.  Bots that need you will wait in the menubar",
+                statusBanner: "Notifications are off.\u{00A0} Bots that need you will wait in the menubar",
                 actionTitle: "Open Settings"
             )
         )
         XCTAssertEqual(
             deniedCoordinator.settingsStatusBanner,
-            "Notifications are off.  Bots that need you will wait in the menubar"
+            "Notifications are off.\u{00A0} Bots that need you will wait in the menubar"
         )
         XCTAssertEqual(deniedCoordinator.settingsActionTitle, "Open Settings")
     }

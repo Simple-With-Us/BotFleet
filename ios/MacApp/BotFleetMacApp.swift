@@ -60,6 +60,9 @@ struct BotFleetMacApp: App {
     /// One updater for the app lifetime (BF-2628).  The service starts once,
     /// below, and Sparkle owns scheduling, verification and installation.
     private let updater: NativeMacUpdater
+    /// One label for the deliberate shutdown, so the Fleet menu and the
+    /// Settings panel cannot drift apart on the same action.
+    private static let shutDownActionLabel = "Shut Down Server & Local VM"
 
     @MainActor
     init() {
@@ -145,7 +148,7 @@ struct BotFleetMacApp: App {
                 }
                 .keyboardShortcut(.escape, modifiers: [.command, .shift])
 
-                Button("Shut Down Server & Local VM") {
+                Button(BotFleetMacApp.shutDownActionLabel) {
                     Task { await session.shutDownServerAndLocalVM() }
                 }
                 .disabled(session.isShuttingDownServer)
@@ -214,7 +217,7 @@ struct BotFleetMacApp: App {
                                         Button(role: .destructive) {
                                             Task { await session.shutDownServerAndLocalVM() }
                                         } label: {
-                                            Text(session.isShuttingDownServer ? "Shutting Down…" : "Shut Down Server & Local VM")
+                                            Text(session.isShuttingDownServer ? "Shutting Down…" : BotFleetMacApp.shutDownActionLabel)
                                         }
                                         .disabled(session.isShuttingDownServer)
 
@@ -237,17 +240,20 @@ struct BotFleetMacApp: App {
                             MacResourcesSettings(coordinator: session.resources)
                         } else if section == .secrets {
                             MacSecretsSettings(servers: session.servers)
-                        } else if section == .permissions,
-                                  let banner = session.notificationCoordinator.settingsStatusBanner {
-                            Text(banner)
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
+                        } else if section == .permissions {
+                            if let banner = session.notificationCoordinator.settingsStatusBanner {
+                                Text(banner)
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                            } else {
+                                Text(session.capabilities.versionStamp)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
                         } else if section == .phone {
                             MacPhoneSettings(session: session)
                         } else {
-                            Text(session.capabilities.versionStamp)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
+                            settingsPlaceholder(for: section)
                         }
 
                         Spacer()
@@ -262,5 +268,37 @@ struct BotFleetMacApp: App {
             .frame(width: 620, height: 500)
         }
         #endif
+    }
+
+    /// Honest empty state for the settings sections whose product areas are
+    /// still being built (BF-2688, BF-2689).
+    ///
+    /// The section heading above already names the tab, so this only has to
+    /// say what the section will hold and that it is not available yet.
+    private func settingsPlaceholder(for section: MacSettingsSection) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(settingsPlaceholderDetail(for: section))
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+            Text(session.capabilities.versionStamp)
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    /// The one sentence each not-yet-built settings section shows.
+    private func settingsPlaceholderDetail(for section: MacSettingsSection) -> String {
+        switch section {
+        case .models:
+            return "Model selection and per-bot model defaults will live here.\u{00A0} This section is not available yet."
+        case .voice:
+            return "Voice capture, routing and dictation settings will live here.\u{00A0} This section is not available yet."
+        case .shortcuts:
+            return "Keyboard shortcuts and global hotkeys will live here.\u{00A0} This section is not available yet."
+        case .lifecycle:
+            return "Server and local VM lifecycle settings will live here.\u{00A0} This section is not available yet."
+        default:
+            return "This section is not available yet."
+        }
     }
 }

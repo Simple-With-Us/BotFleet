@@ -54,6 +54,15 @@ struct MacContextMeterStrip: View {
         )
     }
 
+    /// The meter's fill for the current reading:  the app accent normally, and
+    /// the system warning colour once the conversation nears its context
+    /// window.  The system colour follows the appearance, so the pill keeps
+    /// its contrast in Dark Mode instead of staying one fixed hue.
+    private var meterFill: Color {
+        guard let percent = reading.percent else { return .accentColor }
+        return percent >= ContextMeterMath.notePercent ? Color(.systemOrange) : .accentColor
+    }
+
     @ViewBuilder
     private var meter: some View {
         if let percent = reading.percent, let bar = reading.bar, let label = reading.percentLabel {
@@ -61,7 +70,7 @@ struct MacContextMeterStrip: View {
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.secondary.opacity(0.2))
                     Capsule()
-                        .fill(percent >= ContextMeterMath.notePercent ? Color.orange : Color.accentColor)
+                        .fill(meterFill)
                         .frame(width: 64 * CGFloat(bar) / 100)
                 }
                 .frame(width: 64, height: 6)
@@ -96,10 +105,13 @@ struct MacContextMeterStrip: View {
             .controlSize(.small)
             .disabled(pending)
         case let .disabled(reason):
+            // The engine refuses the compact command for now, so the button
+            // stays disabled and carries the reason for VoiceOver.
             Button(ContextMeterMath.compactLabel) {}
                 .controlSize(.small)
                 .disabled(true)
                 .help(reason)
+                .accessibilityHint(reason)
         }
     }
 

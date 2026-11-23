@@ -28,6 +28,7 @@ struct MacPhoneSettings: View {
     @State private var errorMessage: String?
     @State private var renderedQR: NSImage? = nil
     @State private var renderedQRKey: String? = nil
+    @State private var revoking: PairedDevice? = nil
 
     var body: some View {
         ScrollView {
@@ -67,9 +68,24 @@ struct MacPhoneSettings: View {
                         .foregroundColor(.red)
                 }
             }
-            .padding(24)
         }
         .task(id: session.companionListenerEnabled) { await reload() }
+        .confirmationDialog("Revoke Phone?", isPresented: Binding(get: { revoking != nil }, set: { if !$0 { revoking = nil } })) {
+            if let device = revoking {
+                Button("Revoke Phone", role: .destructive) {
+                    Task {
+                        if await session.revokePairedPhone(id: device.id) {
+                            await reload()
+                        } else {
+                            errorMessage = "Could not revoke \(device.name).\u{00A0} Try again."
+                        }
+                        revoking = nil
+                    }
+                }
+            }
+        } message: {
+            Text("Revoking forgets this phone's pairing.\u{00A0} It has to pair again before it can send or receive messages.")
+        }
     }
 
     private var pairingCard: some View {
@@ -81,6 +97,7 @@ struct MacPhoneSettings: View {
                             .resizable()
                             .interpolation(.none)
                             .frame(width: 180, height: 180)
+                            .accessibilityLabel("Pairing Code QR")
                     }
                     Text(PhoneSettingsDisplay.groupedCode(window.code))
                         .font(.system(size: 32, weight: .semibold, design: .monospaced))
@@ -98,7 +115,7 @@ struct MacPhoneSettings: View {
                         Task {
                             errorMessage = nil
                             if await session.openPhonePairingWindow() == nil {
-                                errorMessage = "Could not open a pairing window. Make sure the listener is on."
+                                errorMessage = "Could not open a pairing window.\u{00A0} Make sure the listener is on."
                             }
                             await reload()
                         }
@@ -127,14 +144,8 @@ struct MacPhoneSettings: View {
                                     .foregroundColor(.secondary)
                             }
                             Spacer()
-                            Button("Revoke") {
-                                Task {
-                                    if await session.revokePairedPhone(id: device.id) {
-                                        await reload()
-                                    } else {
-                                        errorMessage = "Could not revoke \(device.name). Try again."
-                                    }
-                                }
+                            Button("Revoke…", role: .destructive) {
+                                revoking = device
                             }
                         }
                         Divider()
@@ -205,7 +216,7 @@ struct MacPhoneSettings: View {
                 } else {
                     renderedQRKey = nil
                     renderedQR = nil
-                    errorMessage = "Could not draw the pairing code. Tap Refresh to try again."
+                    errorMessage = "Could not draw the pairing code.\u{00A0} Select Refresh to try again."
                 }
             }
         } else {

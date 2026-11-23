@@ -41,7 +41,8 @@ public struct MacRootView: View {
                 }) {
                     Image(systemName: session.showCuaViewer ? "display.fill" : "display")
                 }
-                .help("Toggle Computer Use Agent (CUA) live viewer")
+                .help("Toggle Computer Use Bot (CUA) live viewer")
+                .accessibilityLabel("Toggle Computer Use Bot Live Viewer")
             }
             ToolbarItem(placement: .automatic) {
                 MacStatusPillView(
@@ -54,6 +55,7 @@ public struct MacRootView: View {
                     Image(systemName: "arrow.clockwise")
                 }
                 .help("Reconnect to local harness")
+                .accessibilityLabel("Reconnect to Local Harness")
             }
         }
     }
@@ -141,6 +143,7 @@ struct MacSidebarView: View {
                             HStack {
                                 Image(systemName: "person.3.fill")
                                     .foregroundColor(.accentColor)
+                                    .accessibilityHidden(true)
                                 Text(room.name)
                                     .font(.body)
                                 Spacer()
@@ -159,9 +162,24 @@ struct MacSidebarView: View {
 
             Divider()
 
+            // The last fleet action that failed, so a button that did not do
+            // what was asked says why instead of leaving the person guessing.
+            if let fleetActionError = session.fleetActionErrorMessage {
+                Text(fleetActionError)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             HStack {
                 Button(action: {
                     session.activeSettingsSection = .general
+                    // Selecting the section is not enough on its own:  the
+                    // Settings window has to come forward too, or the button
+                    // reads as dead.
+                    session.presentSettingsScene()
                 }) {
                     Label("Settings", systemImage: "gearshape")
                 }
@@ -181,11 +199,18 @@ struct MacSidebarView: View {
                 }
 
                 Button(action: {
-                    // Quick add bot
+                    // Quick add bot.  The session owns the request, the
+                    // in-flight flag and the failure text, so the button
+                    // only starts the work and stays out of the way while it
+                    // runs.
+                    Task { await session.createBot() }
                 }) {
                     Image(systemName: "plus")
                 }
                 .buttonStyle(.plain)
+                .disabled(session.isCreatingBot)
+                .accessibilityLabel("Add Bot")
+                .help("Add Bot")
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
             }
@@ -217,6 +242,10 @@ struct MacBotRowView: View {
                     .background(Color.accentColor.opacity(0.12))
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                     .help(mascotExpression.displayLabel)
+                    // The row already names the bot, the expression and the
+                    // status, so the picture stays out of VoiceOver and the
+                    // person hears the row once, not twice.
+                    .accessibilityHidden(true)
 
                 Circle()
                     .fill(statusDotColor)
@@ -275,6 +304,9 @@ struct MacBotRowView: View {
 
 struct MacThreadListView: View {
     @EnvironmentObject private var session: MacSession
+    /// Whether the person asked for the main thread and there was none to
+    /// open, so the row can say so instead of doing nothing.
+    @State private var isShowingMissingThreadNotice = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -299,6 +331,7 @@ struct MacThreadListView: View {
                             .background(Color.accentColor.opacity(0.12))
                             .clipShape(RoundedRectangle(cornerRadius: 6))
                             .help(activeExpression.displayLabel)
+                            .accessibilityLabel(activeExpression.displayLabel)
                     }
                     VStack(alignment: .leading, spacing: 2) {
                         Text(session.activeTitle)
@@ -317,8 +350,21 @@ struct MacThreadListView: View {
 
                 List {
                     Section("Conversations") {
-                        NavigationLink(destination: EmptyView()) {
+                        Button(action: {
+                            guard session.activeMainThreadId != nil else {
+                                isShowingMissingThreadNotice = true
+                                return
+                            }
+                            isShowingMissingThreadNotice = false
+                            session.selectMainThread()
+                        }) {
                             Label("Main Thread", systemImage: "bubble.left.and.bubble.right.fill")
+                        }
+
+                        if isShowingMissingThreadNotice {
+                            Text("No conversation yet.\u{00A0} This selection has not started a thread.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
                         }
                     }
 
@@ -344,9 +390,15 @@ struct MacThreadListView: View {
                     Image(systemName: "sidebar.left")
                         .font(.largeTitle)
                         .foregroundColor(.secondary)
-                    Text("Select a conversation")
+                        .accessibilityHidden(true)
+                    Text("No Conversation Selected")
                         .font(.title3)
                         .foregroundColor(.secondary)
+                    Text("Choose a bot or room from the sidebar to view transcripts and start a conversation.")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 360)
                     Spacer()
                 }
                 .frame(maxWidth: .infinity)
@@ -428,8 +480,9 @@ struct MacDetailChatView: View {
                     Image(systemName: "message")
                         .font(.system(size: 40))
                         .foregroundColor(.secondary)
+                        .accessibilityHidden(true)
                     Text("No Conversation Selected")
-                        .font(.title2)
+                        .font(.title3)
                         .foregroundColor(.secondary)
                     Text("Choose a bot or room from the sidebar to view transcripts and start a conversation.")
                         .font(.subheadline)
@@ -475,6 +528,7 @@ struct MacMessageBubbleView: View {
                     .frame(width: 28, height: 28)
                     .background(Color.accentColor.opacity(0.12))
                     .clipShape(Circle())
+                    .accessibilityHidden(true)
             }
 
             VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
@@ -533,6 +587,7 @@ struct MacMessageBubbleView: View {
                     .resizable()
                     .frame(width: 28, height: 28)
                     .foregroundColor(.secondary)
+                    .accessibilityHidden(true)
             } else {
                 Spacer(minLength: 48)
             }
@@ -557,6 +612,7 @@ struct MacStreamingBubbleView: View {
                 .frame(width: 28, height: 28)
                 .background(Color.accentColor.opacity(0.12))
                 .clipShape(Circle())
+                .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
@@ -594,6 +650,7 @@ struct MacReasoningChamberView: View {
             HStack(spacing: 6) {
                 Image(systemName: "brain")
                     .foregroundColor(.purple)
+                    .accessibilityHidden(true)
                 Text("Thought Process")
                     .font(.caption)
                     .fontWeight(.medium)
@@ -632,6 +689,11 @@ struct MacComposerBar: View {
                 }
                 .buttonStyle(.plain)
                 .padding(.horizontal, 12)
+                // One element with one announcement:  the reason is the label
+                // and the button trait keeps the banner selectable.
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(reason)
+                .accessibilityAddTraits(.isButton)
             } else if case .failed(let failure) = session.voiceState {
                 HStack(spacing: 8) {
                     Text(failure.message)
@@ -658,6 +720,7 @@ struct MacComposerBar: View {
                         RoundedRectangle(cornerRadius: 8)
                             .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
                     )
+                    .accessibilityLabel("Message Composer")
                     .focused($isComposerFocused)
                     .onChange(of: session.composerFocusToken) { _, _ in
                         isComposerFocused = true
@@ -688,6 +751,7 @@ struct MacComposerBar: View {
                     }
                     .buttonStyle(.plain)
                     .help("Stop turn")
+                    .accessibilityLabel("Stop Turn")
                 } else {
                     Button(action: {
                         let text = inputText
@@ -707,6 +771,7 @@ struct MacComposerBar: View {
                     .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || session.isSending)
                     .keyboardShortcut(.return, modifiers: [.command])
                     .help("Send turn (⌘Return)")
+                    .accessibilityLabel("Send Turn")
                 }
             }
             .padding(12)
@@ -784,6 +849,7 @@ struct MacCuaInspectorView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundColor(.orange)
+                        .accessibilityLabel("Warning")
                     Text(banner)
                         .font(.caption)
                         .foregroundColor(.primary)
@@ -804,6 +870,7 @@ struct MacCuaInspectorView: View {
                         Image(systemName: "display")
                             .font(.system(size: 32))
                             .foregroundColor(.secondary)
+                            .accessibilityHidden(true)
                         Text(session.isCuaStreaming ? "Waiting for the first frame…" : "CUA Standby")
                             .font(.subheadline)
                             .foregroundColor(.secondary)

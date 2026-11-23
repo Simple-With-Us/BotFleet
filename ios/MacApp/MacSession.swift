@@ -140,6 +140,13 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     @Published public var voiceRouteBanner: String?
     @Published public var activeSettingsSection: MacSettingsSection = .general
     @Published public var allBotsPaused: Bool = false
+    /// Whether an add-bot request is in flight, so the sidebar's button can
+    /// hold still instead of firing a second request.
+    @Published public private(set) var isCreatingBot: Bool = false
+    /// The last failure of a fleet action the person asked for, so the
+    /// window can say what did not work instead of leaving a button that
+    /// appears to have done nothing.
+    @Published public private(set) var fleetActionErrorMessage: String?
     /// The composer's text.  The session owns it so the menubar can compose
     /// and dictate without a view in the window being the source of truth.
     @Published public var composerDraft: String = ""
@@ -501,6 +508,57 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         presentSettingsScene()
     }
 
+    // MARK: - Fleet Actions
+
+    /// Adds a bot through the harness and selects it.
+    ///
+    /// The roster is refetched after the create, the same way the
+    /// connection loop does, so the sidebar shows the new bot without
+    /// waiting for the next event frame.  A failure is reported to the
+    /// person:  an add button that silently does nothing is worse than no
+    /// add button at all.
+    public func createBot() async {
+        guard !isCreatingBot else { return }
+        guard let client else {
+            fleetActionErrorMessage = "There is no harness to add the bot to."
+            return
+        }
+        isCreatingBot = true
+        fleetActionErrorMessage = nil
+        defer { isCreatingBot = false }
+        do {
+            let bot = try await client.createBot()
+            let fleet = try await client.fleet()
+            state.hydrate(fleet)
+            selection = .bot(bot.id)
+            selectedThreadId = bot.threadId
+            syncSystemSurfaces(force: true)
+        } catch {
+            NSLog("Failed to create bot: %@", error.localizedDescription)
+            fleetActionErrorMessage = "The bot could not be added: \(error.localizedDescription)"
+        }
+    }
+
+    /// The thread the conversation list opens for the current selection.
+    ///
+    /// A bot's own thread comes first;  a bot that has only nested tasks
+    /// opens its first task.  `nil` means there is nothing to open yet, and
+    /// the caller says so instead of showing a blank transcript.
+    public var activeMainThreadId: String? {
+        if let bot = activeBot {
+            if !bot.threadId.isEmpty { return bot.threadId }
+            return bot.tasks?.first?.threadId
+        }
+        if let room = activeRoom, !room.threadId.isEmpty { return room.threadId }
+        return nil
+    }
+
+    /// Opens the current selection's main thread.
+    public func selectMainThread() {
+        guard let threadId = activeMainThreadId else { return }
+        selectedThreadId = threadId
+    }
+
     // MARK: - Menubar Actions
 
     /// Brings the main window forward.
@@ -547,8 +605,46 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     }
 
     /// Pauses or resumes every bot.
+    ///
+    /// The pause is the harness's own On/Off switch, so every bot is asked
+    /// separately:  one bot that refuses must not leave the rest paused, and
+    /// the person is told which ones did not change.  The flag stays the
+    /// source of truth for the menu title, so the next click asks for the
+    /// opposite of what this one asked for.
     public func togglePauseResumeAll() {
-        allBotsPaused.toggle()
+        let pausing = !allBotsPaused
+        allBotsPaused = pausing
+        Task { @MainActor [weak self] in
+            await self?.applyPauseResumeToAllBots(pausing: pausing)
+        }
+    }
+
+    /// Asks the harness to turn every bot off or on, then refetches the
+    /// roster so the sidebar shows what actually changed.
+    private func applyPauseResumeToAllBots(pausing: Bool) async {
+        guard let client else {
+            fleetActionErrorMessage = "There is no harness to pause the bots on."
+            return
+        }
+        let bots = state.bots
+        guard !bots.isEmpty else {
+            fleetActionErrorMessage = "There are no bots to pause or resume."
+            return
+        }
+        var unchanged: [String] = []
+        for bot in bots {
+            do {
+                _ = try await client.updateProfile(botId: bot.id, patch: BotProfilePatch(off: pausing))
+            } catch {
+                unchanged.append(bot.name)
+            }
+        }
+        if let fleet = try? await client.fleet() {
+            state.hydrate(fleet)
+        }
+        fleetActionErrorMessage = unchanged.isEmpty
+            ? nil
+            : "Could not \(pausing ? "pause" : "resume") \(unchanged.joined(separator: ", "))."
     }
 
     /// Opens the app's Settings.

@@ -23,7 +23,10 @@ struct MacServersSettings: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("This Mac runs your bots.\u{00A0} Testing a saved server checks its connection.")
                 .font(.callout).foregroundStyle(.secondary)
-            if coordinator.hosts.allSatisfy(\.isLocal) {
+            // The empty state belongs to no saved host at all:  This Mac is
+            // itself a saved host, so a list holding only the local host
+            // still has a row of its own to show.
+            if coordinator.hosts.isEmpty {
                 Text("No server added.\u{00A0} BotFleet runs on this Mac.\u{00A0} Add a server if you have one.")
                     .font(.callout).foregroundStyle(.secondary)
             }
@@ -62,7 +65,7 @@ struct MacServersSettings: View {
                     }
                 }
             }.disabled(!coordinator.isLoaded)
-            Button("Add A Server…") { editor = .add }.disabled(!coordinator.isLoaded)
+            Button("Add a Server…") { editor = .add }.disabled(!coordinator.isLoaded)
             if !coordinator.isLoaded {
                 Button("Reload Servers") { Task { await coordinator.load() } }
             }
@@ -99,7 +102,7 @@ private struct ServerEditorSheet: View {
         VStack(alignment: .leading, spacing: 16) {
             switch editor {
             case .add:
-                Text("Add A Server").font(.headline)
+                Text("Add a Server").font(.headline)
                 TextField("Name", text: $name)
                 TextField("Server URL", text: $address)
                 Text("Use an HTTPS address.\u{00A0} You can enter a token when you test the server.").font(.caption)
