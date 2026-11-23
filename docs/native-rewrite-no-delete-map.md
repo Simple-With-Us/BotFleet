@@ -72,7 +72,7 @@ moved since, and both are visible in the tree rather than in a comment:
 - **The Electron surface is 136 tracked files.**  The Nov 4 checklist counted
   133 and 99 non-test files.  The gap is the native helper relocation
   (#1531) and the files that came with it.
-- **The Linux closure now carries seven `electron/` files**, and it is the
+- **The Linux closure now carries eight `electron/` files**, and it is the
   only consumer of most of them:  `app-paths.mjs`, `config-file-lock.mjs`,
   `credential-restore.mjs`, `harness-ownership.mjs`, `infisical-read.mjs`,
   `persist-on-exit-policy.mjs`, `runtime-identity.mjs` and
@@ -98,7 +98,6 @@ Electron packaging imports them, so they leave with the shell and not before.
 | `electron/managed-composio.mjs`, `electron/external-url.mjs`, `electron/open-file.mjs`, `electron/save-file.mjs`, `electron/package-link.mjs` | Electron-side helpers with no consumer outside `electron/` |
 | `electron/remote-credential-guard.mjs`, `electron/secure-credentials.mjs`, `electron/secure-credential-state.mjs`, `electron/credential-patch.node-test.mjs` | the Electron credential store; the native path is BF-2506 and BF-2622 |
 | `electron/speech.mjs`, `electron/skill-recorder.mjs`, `electron/assemblyai.mjs`, `electron/build-speech-helper.mjs`, `electron/build-recorder-helper.mjs` | the Electron voice helpers and the two build helpers that produce the native helper bundles |
-| `electron/workspace-credentials.mjs` | **shared**:  it is also in the Linux closure, so its removal is a shared-sequence item |
 | The Electron half of the packaging:  `electron-builder.yml`, the `electron` entries in `package.json`, `electron-updater`, `electron-builder` and `esbuild` in `devDependencies`, `@sentry/electron` in `dependencies` | the packaging and the Electron runtime |
 | The Electron half of the release workflows | `release.yml` and `mac-commit-build.yml` build the Electron shell; `native-mac-release.yml` builds the native one.  The Electron halves go at Step 6; the shared jobs stay |
 
@@ -118,6 +117,9 @@ These are live today, and each is marked with what keeps it alive.
 - `electron/harness-ownership.mjs` — the harness's ownership proof.
 - `electron/credential-restore.mjs`, `electron/workspace-credentials.mjs` —
   the harness's credential restore and the workspace credential file.
+  `workspace-credentials.mjs` is retained only while the server runs:  its
+  Step 6 removal is a shared-sequence item with the root manifest, and
+  it is deliberately not in the REMOVABLE-AT-STEP-6 table above.
 - `electron/config-file-lock.mjs`, `electron/persist-on-exit-policy.mjs`,
   `electron/app-paths.mjs` — the harness's configuration and data paths.
 - `electron/infisical-read.mjs` — the scoped Infisical read that the owner
