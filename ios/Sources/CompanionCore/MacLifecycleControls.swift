@@ -20,6 +20,14 @@ public struct MacLifecycleSettings: Codable, Equatable, Sendable {
         self.allowRemoteDesktopLaunch = allowRemoteDesktopLaunch
         self.persistOnExit = persistOnExit
     }
+
+    /// The desktop-launch gate the native companion listener keeps (BF-2690):
+    /// the grant the harness reported, and closed while it is unknown, so a
+    /// Mac that never read a grant refuses `POST /api/desktop/open` exactly
+    /// like one that withheld it.
+    public var nativeDesktopLaunchAllowed: Bool {
+        allowRemoteDesktopLaunch ?? false
+    }
 }
 
 /// Decision evaluated when the macOS desktop app is quitting.

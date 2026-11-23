@@ -271,20 +271,23 @@ State of each piece, from the tree:
   can prove which copy opens.  That proof is the one-copy install described
   above.  The endpoint is still a **BF-2514** row, because it dies with the
   Node harness.
-* The native route performs no launch, and since #2127 it says so.  `handleDesktopOpen`
-  in `ios/Sources/CompanionCore/NativeCompanionServer.swift:1382-1401`
-  enforces both BF-2489 gates (a loopback caller, then the
-  `allowRemoteDesktopLaunch` setting), then looks for an optional
-  `onDesktopOpen` action.  With none installed it answers `501` ("Opening the
-  desktop app is not available on this Mac"), and only an installed action that
-  succeeds yields `launched: true`.  Neither non-test construction of the
-  server passes that action (`ios/MacApp/MacSession.swift:248`, and
-  `makeServer()` at
-  `ios/Sources/CompanionCore/NativeMacCompanionRuntime.swift:168`), so the
-  native route answers `501` today and no native code opens the app.
-  `desktopOpenReturns501WhenLaunchActionUnset` in
-  `ios/Tests/CompanionCoreTests/Phase5BotServicesTests.swift` pins that answer.
-  No launch action exists on the native side yet.
+* The native route brings the app forward since BF-2690.  `handleDesktopOpen`
+  in `ios/Sources/CompanionCore/NativeCompanionServer.swift` enforces both
+  BF-2489 gates (a loopback caller, then the `allowRemoteDesktopLaunch`
+  setting), then runs the installed `onDesktopOpen` action.  With none
+  installed it still answers `501` ("Opening the desktop app is not available
+  on this Mac"), and only an installed action that succeeds yields
+  `launched: true`.  The Mac app builds its listener's server with that
+  action, through `CompanionDesktopLaunchWiring` in
+  `ios/MacApp/MacSession.swift`: it brings the main window forward the way the
+  menubar does, and the gate is mirrored from the owner's Mac settings, where
+  a grant the harness never reported stays closed.  The headless host's
+  `makeServer()` at `ios/Sources/CompanionCore/NativeMacCompanionRuntime.swift`
+  passes no action, so it keeps answering `501`: it has no window to bring
+  forward.  `desktopOpenReturns501WhenLaunchActionUnset` in
+  `ios/Tests/CompanionCoreTests/Phase5BotServicesTests.swift` pins the answer
+  without an action, and `CompanionDesktopLaunchWiringTests.swift` in the same
+  directory pins the wiring.
 * The 7-day soak sign-off is Jay's, and it is gated on the native app being
   the daily driver — which is the BF-2497 deliverable.
 
