@@ -227,7 +227,17 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         let nativeRuntimeBox = MacNativeRuntimeBox()
         self.nativeProcessSupervisor = nativeProcessSupervisor
         self.nativeRuntimeBox = nativeRuntimeBox
-        let backend = NativeCompanionListenerBackend(port: 0, options: listenerOptions) {
+        // BF-2690: the action behind the phone's "Open on Mac".  It brings the
+        // app forward without reading the session, so it is given here, before
+        // the session exists.  The gate it sits behind is mirrored from the
+        // owner's Mac settings by `mirrorDesktopLaunchGate`.
+        let backend = NativeCompanionListenerBackend(
+            port: 0,
+            options: listenerOptions,
+            desktopLaunch: CompanionDesktopLaunchWiring(
+                onDesktopOpen: { await MacSession.bringApplicationForward() }
+            )
+        ) { desktopLaunch in
             // A store of the listener's own, under the Mac's data directory,
             // created only when the listener is first turned on.  Where the
             // native engine's store finally lives is BF-2504's call; this
@@ -249,7 +259,15 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
                 processSupervisor: nativeProcessSupervisor
             )
             nativeRuntimeBox.store(macRuntime)
-            return NativeCompanionServer(database: database, deviceStoreURL: deviceStoreURL, nativeRuntime: macRuntime.runtime)
+            return NativeCompanionServer(
+                database: database,
+                deviceStoreURL: deviceStoreURL,
+                config: CompanionServerConfig(
+                    allowRemoteDesktopLaunch: desktopLaunch.allowRemoteDesktopLaunch
+                ),
+                nativeRuntime: macRuntime.runtime,
+                onDesktopOpen: desktopLaunch.onDesktopOpen
+            )
         }
         self.companionListener = CompanionListenerController(
             backend: backend,
@@ -505,6 +523,15 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
 
     /// Brings the main window forward.
     public func activateMainWindow() {
+        Self.bringApplicationForward()
+    }
+
+    /// The AppKit half of bringing the app forward.  It reads `NSApp` and its
+    /// windows, never the session, so the companion listener's desktop-launch
+    /// action (BF-2690) can run it without holding a session: the phone's
+    /// "Open on Mac" and the menubar bring the same window forward the same
+    /// way.
+    static func bringApplicationForward() {
         #if os(macOS)
         NSApp.activate(ignoringOtherApps: true)
         if let window = NSApp.windows.first(where: { $0.isVisible }) {
@@ -1012,6 +1039,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
             merged.allowRemoteDesktopLaunch = lifecycleSettings.allowRemoteDesktopLaunch
         }
         lifecycleSettings = merged
+        await mirrorDesktopLaunchGate()
     }
 
     public func saveLifecycleSettings(_ settings: MacLifecycleSettings) async {
@@ -1021,6 +1049,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         case .saved(let saved):
             lifecycleSettings = saved
             lifecycleErrorMessage = nil
+            await mirrorDesktopLaunchGate()
         case .failed(let restored, let message):
             // The write was rejected, so the toggles go back to the last value
             // the harness actually accepted.
@@ -1028,6 +1057,18 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
             lifecycleErrorMessage = message
             NSLog("Failed to save lifecycle settings: %@", message)
         }
+    }
+
+    // MARK: - Desktop Launch (BF-2690)
+
+    /// Keeps the native companion listener's `POST /api/desktop/open` gate on
+    /// the grant the owner set in Mac settings, so the phone's "Open on Mac"
+    /// is refused by the native route exactly when those settings disable it.
+    /// A grant the harness never reported stays closed.
+    private func mirrorDesktopLaunchGate() async {
+        await nativeListenerBackend.setAllowRemoteDesktopLaunch(
+            lifecycleSettings.nativeDesktopLaunchAllowed
+        )
     }
 
     public func shutDownServerAndLocalVM() async {
