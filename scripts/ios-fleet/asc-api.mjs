@@ -144,6 +144,42 @@ export function credentialSource(folder, kind) {
     : `Infisical ${folder} (scoped reader, account ${ASC_SECRET_ACCOUNT})`;
 }
 
+// The credential's parts, taken whole from one source.
+//
+// A value that is only whitespace is not a value.  The parts of one
+// credential belong to one source:  the reader's triple when it answered
+// with all three, and otherwise the token's complete set from one folder,
+// which replaces the reader's partial one instead of filling it.
+export function credentialParts(reader, stored) {
+  const readerKeyId = String((reader && reader.keyId) || "").trim();
+  const readerIssuerId = String((reader && reader.issuerId) || "").trim();
+  const readerMaterial = String((reader && reader.material) || "").trim();
+  if (readerKeyId && readerIssuerId && readerMaterial) {
+    return { keyId: readerKeyId, issuerId: readerIssuerId, material: readerMaterial };
+  }
+  const values = (stored && stored.values) || new Map();
+  return {
+    keyId: String(values.get("ASC_KEY_ID") || values.get("APPLE_API_KEY_ID") || "").trim(),
+    issuerId: String(values.get("ASC_ISSUER_ID") || values.get("APPLE_API_ISSUER_ID") || "").trim(),
+    material: String(values.get("ASC_KEY_P8") || values.get("APPLE_API_KEY_P8") || values.get("APPLE_API_KEY_P8_BASE64") || "").trim(),
+  };
+}
+
+// The two public labels, taken as one pair from one source.  A key id from
+// one folder and an issuer id from another is a pair that was never issued.
+export function labelPair(reader, stored) {
+  const readerKeyId = String((reader && reader.keyId) || "").trim();
+  const readerIssuerId = String((reader && reader.issuerId) || "").trim();
+  if (readerKeyId && readerIssuerId) {
+    return { keyId: readerKeyId, issuerId: readerIssuerId };
+  }
+  const values = (stored && stored.values) || new Map();
+  return {
+    keyId: String(values.get("ASC_KEY_ID") || values.get("APPLE_API_KEY_ID") || "").trim(),
+    issuerId: String(values.get("ASC_ISSUER_ID") || values.get("APPLE_API_ISSUER_ID") || "").trim(),
+  };
+}
+
 // The public labels the store holds for this consumer's key.
 //
 // The key id and the issuer id are labels that travel in every request
@@ -152,20 +188,21 @@ export function credentialSource(folder, kind) {
 async function resolveCredentialLabels() {
   const folder = ASC_SECRET_FOLDER;
   const account = ASC_SECRET_ACCOUNT;
-  const readerKeyId = scopedRead("ASC_KEY_ID", folder, account) || scopedRead("APPLE_API_KEY_ID", folder, account);
-  const readerIssuerId = scopedRead("ASC_ISSUER_ID", folder, account) || scopedRead("APPLE_API_ISSUER_ID", folder, account);
+  const reader = {
+    keyId: scopedRead("ASC_KEY_ID", folder, account) || scopedRead("APPLE_API_KEY_ID", folder, account),
+    issuerId: scopedRead("ASC_ISSUER_ID", folder, account) || scopedRead("APPLE_API_ISSUER_ID", folder, account),
+  };
   // THE TWO LABELS ARE ONE PAIR.  A key id from one folder and an issuer id
   // from another is a pair that was never issued, so the pair is taken whole
   // from one source:  the reader's pair when it answered with both, and
   // otherwise the token's complete pair, which replaces the reader's partial
-  // one instead of filling it.
-  if (readerKeyId && readerIssuerId) {
-    return { keyId: readerKeyId.trim(), issuerId: readerIssuerId.trim() };
-  }
-  const stored = await storeRead(ASC_LABEL_GROUPS);
-  const keyId = stored.values.get("ASC_KEY_ID") || stored.values.get("APPLE_API_KEY_ID") || "";
-  const issuerId = stored.values.get("ASC_ISSUER_ID") || stored.values.get("APPLE_API_ISSUER_ID") || "";
-  return { keyId: keyId.trim(), issuerId: issuerId.trim() };
+  // one instead of filling it.  A label that is only whitespace is not a
+  // label, and it does not keep the token's pair from being used.
+  const readerIsWhole = Boolean(
+    String(reader.keyId || "").trim() && String(reader.issuerId || "").trim()
+  );
+  const stored = readerIsWhole ? null : await storeRead(ASC_LABEL_GROUPS);
+  return labelPair(reader, stored);
 }
 
 // The store read for a host that binds a service token.
@@ -299,11 +336,13 @@ const RESOLUTION_NOTES = [];
 async function resolveCredential() {
   const folder = ASC_SECRET_FOLDER;
   const account = ASC_SECRET_ACCOUNT;
-  let keyId = scopedRead("ASC_KEY_ID", folder, account) || scopedRead("APPLE_API_KEY_ID", folder, account);
-  let issuerId = scopedRead("ASC_ISSUER_ID", folder, account) || scopedRead("APPLE_API_ISSUER_ID", folder, account);
-  let material = scopedRead("ASC_KEY_P8", folder, account)
-    || scopedRead("APPLE_API_KEY_P8", folder, account)
-    || scopedRead("APPLE_API_KEY_P8_BASE64", folder, account);
+  const reader = {
+    keyId: scopedRead("ASC_KEY_ID", folder, account) || scopedRead("APPLE_API_KEY_ID", folder, account),
+    issuerId: scopedRead("ASC_ISSUER_ID", folder, account) || scopedRead("APPLE_API_ISSUER_ID", folder, account),
+    material: scopedRead("ASC_KEY_P8", folder, account)
+      || scopedRead("APPLE_API_KEY_P8", folder, account)
+      || scopedRead("APPLE_API_KEY_P8_BASE64", folder, account),
+  };
   // A host with no scoped reader reaches the store through its own service
   // token instead.  Both are the same store and the same names;  neither
   // puts a copy of the credential in the environment.
@@ -313,19 +352,19 @@ async function resolveCredential() {
   // one folder, so the token's answer REPLACES the reader's partial one
   // instead of filling it:  a key id from one folder and the material from
   // another is a triple that fails authentication as the wrong key.
-  let source = credentialSource(folder, "reader");
-  if (!keyId || !issuerId || !material) {
-    const stored = await storeRead(ASC_STORE_GROUPS);
-    if (stored.folder) {
-      keyId = stored.values.get("ASC_KEY_ID") || stored.values.get("APPLE_API_KEY_ID") || "";
-      issuerId = stored.values.get("ASC_ISSUER_ID") || stored.values.get("APPLE_API_ISSUER_ID") || "";
-      material = stored.values.get("ASC_KEY_P8")
-        || stored.values.get("APPLE_API_KEY_P8")
-        || stored.values.get("APPLE_API_KEY_P8_BASE64")
-        || "";
-      source = credentialSource(stored.folder, "token");
-    }
-  }
+  const readerIsWhole = Boolean(
+    String(reader.keyId || "").trim()
+    && String(reader.issuerId || "").trim()
+    && String(reader.material || "").trim()
+  );
+  const stored = readerIsWhole ? null : await storeRead(ASC_STORE_GROUPS);
+  const parts = credentialParts(reader, stored);
+  const keyId = parts.keyId;
+  const issuerId = parts.issuerId;
+  const material = parts.material;
+  const source = readerIsWhole
+    ? credentialSource(folder, "reader")
+    : (stored && stored.folder ? credentialSource(stored.folder, "token") : credentialSource(folder, "reader"));
   if (!keyId) RESOLUTION_NOTES.push(`no key id in ${folder} for account ${account}`);
   if (!issuerId) RESOLUTION_NOTES.push(`no issuer id in ${folder} for account ${account}`);
   if (!material) RESOLUTION_NOTES.push(`no key material in ${folder} for account ${account}`);

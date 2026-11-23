@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { normalizePrivateKey, writePrivateKeyFile, CLIENT_ENV_ALLOWLIST, clientEnvironment } from "./asc-key.mjs";
-import { credentialSource, isKeyId, readStoreSecrets } from "./asc-api.mjs";
+import { credentialParts, credentialSource, isKeyId, labelPair, readStoreSecrets } from "./asc-api.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const helper = join(here, "asc-key.mjs");
@@ -583,6 +583,39 @@ test("the labels are taken as one pair from one folder", async () => {
   });
   assert.equal(found.folder, null, "a label pair was taken from two folders");
   assert.equal(found.values.size, 0, "a label pair was assembled");
+});
+
+test("a label that is only whitespace is not a label", () => {
+  //  A blank label is trimmed before the presence is decided, so it cannot
+  //  stand in for a real one and cannot keep the store's complete pair from
+  //  being used.
+  const stored = {
+    values: new Map([["ASC_KEY_ID", "TOKENKEY001"], ["ASC_ISSUER_ID", "token-issuer"]]),
+    folder: "/asc",
+  };
+  assert.deepEqual(
+    labelPair({ keyId: "   ", issuerId: "reader-issuer" }, stored),
+    { keyId: "TOKENKEY001", issuerId: "token-issuer" },
+    "a blank label kept the store's pair from being used",
+  );
+  assert.deepEqual(
+    labelPair({ keyId: "READERKEY01", issuerId: "reader-issuer" }, stored),
+    { keyId: "READERKEY01", issuerId: "reader-issuer" },
+    "the reader's own pair was not used",
+  );
+  assert.deepEqual(
+    labelPair({ keyId: "   ", issuerId: "   " }, { values: new Map(), folder: null }),
+    { keyId: "", issuerId: "" },
+    "a blank label became a key id",
+  );
+  assert.deepEqual(
+    credentialParts(
+      { keyId: "   ", issuerId: "reader-issuer", material: "READERPEM" },
+      { values: new Map([["ASC_KEY_ID", "TOKENKEY001"], ["ASC_KEY_P8", "TOKENPEM"]]), folder: "/asc" },
+    ),
+    { keyId: "TOKENKEY001", issuerId: "", material: "TOKENPEM" },
+    "a blank label kept the store's parts from being used",
+  );
 });
 
 test("the provenance names the grant that read the credential", () => {
