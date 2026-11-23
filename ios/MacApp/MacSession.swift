@@ -719,7 +719,15 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         _ = try? policyStore.clearStoppedMarker(for: .appLaunch)
         // The native companion listener starts with the app when the
         // setting is on; off by default, so this is a no-op today.
+        //
+        // The lifecycle settings are read before the listener starts, so the
+        // desktop-launch gate the listener's server is built with is the
+        // grant the owner actually stored.  A listener that opened its socket
+        // first would answer `403` to the phone's "Open on Mac" until the
+        // next settings round-trip, which reads as a broken button rather
+        // than as a setting that has not been read yet.
         Task { @MainActor [weak self] in
+            await self?.refreshLifecycleSettings()
             await self?.companionListener.applyLaunch()
         }
         let generation = connectionGeneration
