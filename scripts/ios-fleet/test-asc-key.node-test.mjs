@@ -536,6 +536,55 @@ test("a credential split across two folders is never assembled", async () => {
   assert.equal(found.values.size, 0, "a split credential was assembled");
 });
 
+test("the labels are taken as one pair from one folder", async () => {
+  //  The key id and the issuer id are one pair:  a diagnostic that names a
+  //  pair from two folders names a credential that was never issued.  The
+  //  store read answers with the first folder that holds the WHOLE pair.
+  const fakeFetch = async (url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/api/v2/service-token") {
+      return {
+        ok: true,
+        json: async () => ({
+          workspace: "fleet-ops",
+          scopes: [
+            { environment: "prod", secretPath: "/asc" },
+            { environment: "prod", secretPath: "/asc-folder" },
+          ],
+          permissions: ["read"],
+          expiresAt: null,
+        }),
+      };
+    }
+    const secretPath = parsed.searchParams.get("secretPath") || "/";
+    const secrets = secretPath === "/asc"
+      ? [{ secretKey: "ASC_KEY_ID", secretValue: "SPLITKEY001" }]
+      : [{ secretKey: "ASC_ISSUER_ID", secretValue: "split-issuer" }];
+    return {
+      ok: true,
+      json: async () => ({
+        secrets: secrets.map((secret) => ({
+          ...secret,
+          workspace: "fleet-ops",
+          environment: "prod",
+          secretPath,
+          secretValueHidden: false,
+        })),
+      }),
+    };
+  };
+  const found = await readStoreSecrets([["ASC_KEY_ID"], ["ASC_ISSUER_ID"]], {
+    fetchImpl: fakeFetch,
+    siteUrl: "https://store.invalid",
+    token: "reader-token",
+    projectId: "fleet-ops",
+    environment: "prod",
+    paths: ["/asc", "/asc-folder"],
+  });
+  assert.equal(found.folder, null, "a label pair was taken from two folders");
+  assert.equal(found.values.size, 0, "a label pair was assembled");
+});
+
 test("the provenance names the grant that read the credential", () => {
   //  The status line and the refusal name the grant that answered, so a
   //  reader that is not the one that read the credential is never named.

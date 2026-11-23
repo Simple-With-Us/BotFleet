@@ -152,13 +152,19 @@ export function credentialSource(folder, kind) {
 async function resolveCredentialLabels() {
   const folder = ASC_SECRET_FOLDER;
   const account = ASC_SECRET_ACCOUNT;
-  let keyId = scopedRead("ASC_KEY_ID", folder, account) || scopedRead("APPLE_API_KEY_ID", folder, account);
-  let issuerId = scopedRead("ASC_ISSUER_ID", folder, account) || scopedRead("APPLE_API_ISSUER_ID", folder, account);
-  if (!keyId || !issuerId) {
-    const stored = await storeRead(ASC_LABEL_GROUPS);
-    keyId = keyId || stored.values.get("ASC_KEY_ID") || stored.values.get("APPLE_API_KEY_ID") || "";
-    issuerId = issuerId || stored.values.get("ASC_ISSUER_ID") || stored.values.get("APPLE_API_ISSUER_ID") || "";
+  const readerKeyId = scopedRead("ASC_KEY_ID", folder, account) || scopedRead("APPLE_API_KEY_ID", folder, account);
+  const readerIssuerId = scopedRead("ASC_ISSUER_ID", folder, account) || scopedRead("APPLE_API_ISSUER_ID", folder, account);
+  // THE TWO LABELS ARE ONE PAIR.  A key id from one folder and an issuer id
+  // from another is a pair that was never issued, so the pair is taken whole
+  // from one source:  the reader's pair when it answered with both, and
+  // otherwise the token's complete pair, which replaces the reader's partial
+  // one instead of filling it.
+  if (readerKeyId && readerIssuerId) {
+    return { keyId: readerKeyId.trim(), issuerId: readerIssuerId.trim() };
   }
+  const stored = await storeRead(ASC_LABEL_GROUPS);
+  const keyId = stored.values.get("ASC_KEY_ID") || stored.values.get("APPLE_API_KEY_ID") || "";
+  const issuerId = stored.values.get("ASC_ISSUER_ID") || stored.values.get("APPLE_API_ISSUER_ID") || "";
   return { keyId: keyId.trim(), issuerId: issuerId.trim() };
 }
 
