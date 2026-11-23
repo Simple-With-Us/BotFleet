@@ -72,11 +72,16 @@ moved since, and both are visible in the tree rather than in a comment:
 - **The Electron surface is 136 tracked files.**  The Nov 4 checklist counted
   133 and 99 non-test files.  The gap is the native helper relocation
   (#1531) and the files that came with it.
-- **The Linux closure now carries eight `electron/` files**, and it is the
-  only consumer of most of them:  `app-paths.mjs`, `config-file-lock.mjs`,
+- **The Linux closure now carries seven `electron/` files**, and it is the
+  only consumer of most of them:  `config-file-lock.mjs`,
   `credential-restore.mjs`, `harness-ownership.mjs`, `infisical-read.mjs`,
   `persist-on-exit-policy.mjs`, `runtime-identity.mjs` and
-  `workspace-credentials.mjs`.  The `electron/` directory is not
+  `workspace-credentials.mjs`.  That is the exact set
+  `deploy/linux-server/retained-source.json` pins, so the count and the
+  list are one fact, and `app-paths.mjs` is not in the closure:  the
+  server reaches its data-dir rules through its own code, and the
+  comment beside it names the desktop helper as provenance, not as an
+  import.  The `electron/` directory is not
   "the desktop shell" as a whole:  it also holds the Node runtime's
   configuration, credential and ownership helpers, and the Linux server runs
   them today.
@@ -95,7 +100,7 @@ Electron packaging imports them, so they leave with the shell and not before.
 | `electron/desktop-viewer.cjs`, `electron/desktop-workspace.cjs` | the Electron desktop viewer and workspace, with the native replacements already shipped (BF-2481, BF-2539) |
 | `electron/cua-connection.cjs`, `electron/cua-linux.cjs`, `electron/cua-linux-runtime.cjs`, `electron/cua-linux-bundle.cjs`, `electron/cua-permissions-status.mjs`, `electron/screen-preview.cjs` | the Electron CUA path; the native driver and capture live in `ios/Sources/CompanionCore` |
 | `electron/android-device.mjs`, `electron/control-plane-client.mjs`, `electron/companion.mjs`, `electron/companion-entry.mjs`, `electron/companion-origin-gateway.mjs` | the Electron companion client, its entry point and its origin gateway; the native listener is the replacement |
-| `electron/managed-composio.mjs`, `electron/external-url.mjs`, `electron/open-file.mjs`, `electron/save-file.mjs`, `electron/package-link.mjs` | Electron-side helpers with no consumer outside `electron/` |
+| `electron/managed-composio.mjs`, `electron/external-url.mjs`, `electron/open-file.mjs`, `electron/save-file.mjs`, `electron/package-link.mjs`, `electron/app-paths.mjs` | Electron-side helpers with no consumer outside `electron/` (`app-paths.mjs` is cited in server comments as provenance for the same rule, never imported) |
 | `electron/remote-credential-guard.mjs`, `electron/secure-credentials.mjs`, `electron/secure-credential-state.mjs`, `electron/credential-patch.node-test.mjs` | the Electron credential store; the native path is BF-2506 and BF-2622 |
 | `electron/speech.mjs`, `electron/skill-recorder.mjs`, `electron/assemblyai.mjs`, `electron/build-speech-helper.mjs`, `electron/build-recorder-helper.mjs` | the Electron voice helpers and the two build helpers that produce the native helper bundles |
 | The Electron half of the packaging:  `electron-builder.yml`, the `electron` entries in `package.json`, `electron-updater`, `electron-builder` and `esbuild` in `devDependencies`, `@sentry/electron` in `dependencies` | the packaging and the Electron runtime |
@@ -120,8 +125,12 @@ These are live today, and each is marked with what keeps it alive.
   `workspace-credentials.mjs` is retained only while the server runs:  its
   Step 6 removal is a shared-sequence item with the root manifest, and
   it is deliberately not in the REMOVABLE-AT-STEP-6 table above.
-- `electron/config-file-lock.mjs`, `electron/persist-on-exit-policy.mjs`,
-  `electron/app-paths.mjs` — the harness's configuration and data paths.
+- `electron/config-file-lock.mjs`, `electron/persist-on-exit-policy.mjs` —
+  the harness's configuration and persistence rules.  `app-paths.mjs`
+  is not here on purpose:  the Linux closure does not carry it, the
+  server imports nothing from it (the matching comment in
+  `server/data-dir.ts` cites it as provenance), so it belongs to the
+  REMOVABLE-AT-STEP-6 class with the rest of the shell's own helpers.
 - `electron/infisical-read.mjs` — the scoped Infisical read that the owner
   gate, the Linux harness and the bridge all use.  Retained by the server.
 
@@ -138,7 +147,7 @@ harness starts with, which is why this is Step 5's work and not Step 6's.
 
 `deploy/linux-server/` installs `botfleet-server.service`, which runs
 `node server/index.ts` behind `botfleet-owner-gate.service`, and the retained
-closure carries the eight `electron/` helpers above.  The service is the
+closure carries the seven `electron/` helpers above.  The service is the
 server-owned placement's controller, and it is the thing BF-2515's Step 5
 moves.
 
@@ -234,7 +243,7 @@ Owned by another row, where the order matters more than the class.
 | `server/`, `companion/`, the Node build chain | BF-2515 | Step 5 comes first, because the server is the runtime Electron retires |
 | The root `package.json` | BF-2515 and BF-2485 together | BF-2515 removes the desktop manifest, BF-2485 removes `main`, `dev:desktop` and the Electron dependencies at Step 6 |
 | `shared/` | shared | the server keeps it; the Electron shell shares it |
-| `deploy/linux-server/retained-source.json` | BF-2633 | the Linux closure carries the eight `electron/` helpers, so changing them changes the closure and the retention receipt |
+| `deploy/linux-server/retained-source.json` | BF-2633 | the Linux closure carries the seven `electron/` helpers, so changing them changes the closure and the retention receipt |
 | `docs/native-rewrite-electron-inventory.md` | BF-2485 and BF-2498 | this map is its companion, not its replacement |
 | The release workflows | BF-2486 and BF-2485 | the native pipeline is BF-2486's; the Electron halves are BF-2485's Step 6 |
 
