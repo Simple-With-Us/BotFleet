@@ -56,12 +56,32 @@ const staging = mkdtempSync(join(tmpdir(), "omb-smoke-"));
 const home = mkdtempSync(join(tmpdir(), "omb-smoke-home-"));
 const dataDir = join(home, ".botfleet");
 mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+// The DSN the packaged SDK must load.  It is a loopback address with a fake
+// key, so the SDK parses it, initializes against it, and no event ever leaves
+// the machine.
+const LOOPBACK_DSN = "https://0123456789abcdef0123456789abcdef@127.0.0.1:1/1";
+const LOOPBACK_DSN_KEY = "0123456789abcdef0123456789abcdef";
+// A DIFFERENT fake DSN, and the one the process inherits.  The environment
+// carries no copy of a value (owner ruling, November 22, 2026), so this one
+// must never be the answer.  It is here so the smoke can prove the packaged
+// server resolved the DSN from its own configuration and not from what it
+// inherited.  It is a loopback address too, so nothing leaves the machine
+// either way.
+const STALE_ENV_DSN = "https://99999999999999999999999999999999@127.0.0.1:9/9";
+const STALE_ENV_DSN_KEY = "99999999999999999999999999999999";
+
 // Keep package validation independent of host CLI discovery and authentication.
-writeFileSync(
-  join(dataDir, "config.json"),
-  JSON.stringify(packagedSmokeConfig(home)),
-  { mode: 0o600 },
-);
+// The observability block is what the packaged server resolves the DSN from:
+// the inherited environment value is not a source, so the DSN the SDK loads
+// has to be in the configuration the packaged server reads for itself.
+const writeSmokeConfig = (targetHome, targetDataDir, withObservability) => {
+  const config = packagedSmokeConfig(targetHome);
+  if (withObservability) {
+    config.observability = { sentryDsn: LOOPBACK_DSN, tracesSampleRate: 0 };
+  }
+  writeFileSync(join(targetDataDir, "config.json"), JSON.stringify(config), { mode: 0o600 });
+};
+writeSmokeConfig(home, dataDir, true);
 
 // OMB_SMOKE_DIST lets the release workflow aim this at a packaged app's
 // Resources/server tree instead of the repo build.
@@ -83,9 +103,12 @@ const child = spawn(runtime.command, [join(staging, "server", "index.js")], {
     BOTFLEET_DISABLE_CONTAINER_RUNTIME: "1",
     DOCKER_HOST: "unix:///nonexistent.sock",
     CONTAINER_HOST: "unix:///nonexistent.sock",
-    // This fake loopback DSN exercises SDK loading without contacting the
-    // owner's Sentry project.  The staged server has no node_modules.
-    SENTRY_DSN: "https://0123456789abcdef0123456789abcdef@127.0.0.1:1/1",
+    // The STALE copy of a DSN this process inherits.  It is deliberately not
+    // the DSN the server must use:  the packaged server resolves the DSN from
+    // its own configuration, and the assertions below fail if this one is
+    // ever read.  Both addresses are loopback with fake keys, so nothing
+    // leaves the machine either way.
+    SENTRY_DSN: STALE_ENV_DSN,
     SENTRY_TRACES_SAMPLE_RATE: "0",
   },
   stdio: ["ignore", "pipe", "pipe"],
@@ -158,11 +181,27 @@ if (listening) {
     headers: { authorization: `Bearer ${owner.nonce}` },
   });
   const observability = observabilityResponse.ok ? await observabilityResponse.json() : null;
+  // The allowed provenance is the packaged server's OWN configuration.  The
+  // inherited environment value is not a source, so the status must not name
+  // it, and the host and project id must be the ones the configuration
+  // carries:  the inherited DSN points at another loopback port and another
+  // project, so a preference for the environment shows up here.
   if (!observabilityResponse.ok || !observability?.configured || !observability?.enabled ||
-      observability?.source !== "env" || observability?.lastError !== null ||
+      observability?.source !== "config" || observability?.lastError !== null ||
       observability?.host !== "127.0.0.1:1" || observability?.projectId !== "1") {
     cleanup();
-    throw new Error("Packaged Sentry SDK did not initialize from the synthetic loopback DSN");
+    throw new Error("Packaged Sentry SDK did not initialize from the configured loopback DSN");
+  }
+  // The redaction guarantee.  The route hands the authenticated renderer the
+  // DSN on purpose, so the check is on the fields the status itself owns and
+  // on what the process wrote to its own log:  a DSN key belongs in neither.
+  const statusFields = { ...observability };
+  delete statusFields.dsn;
+  const statusText = JSON.stringify(statusFields);
+  if (statusText.includes(LOOPBACK_DSN_KEY) || statusText.includes(STALE_ENV_DSN_KEY) ||
+      output.includes(LOOPBACK_DSN_KEY) || output.includes(STALE_ENV_DSN_KEY)) {
+    cleanup();
+    throw new Error("Packaged observability status or log disclosed a DSN key");
   }
 }
 
@@ -259,6 +298,96 @@ if (listening) {
   } catch (error) {
     mcpReport = { exit, stdout, stderr, error: String(error) };
   }
+}
+
+// The stale-environment-only negative case.  The same packaged tree and the
+// same inherited environment, with a configuration that carries no DSN:  the
+// only DSN in reach is the one the process inherited, and the environment is
+// not a source, so the optional reporting must come up OFF rather than
+// adopting it.  A separate throwaway home keeps this boot independent of the
+// first one's owner identity.
+if (listening) {
+  const negativePort = 30000 + Math.floor(Math.random() * 9000);
+  const negativeHome = mkdtempSync(join(tmpdir(), "omb-smoke-home-"));
+  const negativeDataDir = join(negativeHome, ".botfleet");
+  mkdirSync(negativeDataDir, { recursive: true, mode: 0o700 });
+  writeSmokeConfig(negativeHome, negativeDataDir, false);
+
+  if (child.exitCode === null) {
+    child.kill("SIGKILL");
+    await new Promise((resolve) => child.once("exit", resolve));
+  }
+
+  // The environment of the second boot.  It is the first boot's environment
+  // exactly, so the inherited DSN is still there and still not a source.
+  const negativeEnv = {
+    ...runtime.env,
+    HOME: negativeHome,
+    USERPROFILE: negativeHome,
+    OMB_PORT: String(negativePort),
+    BOTFLEET_DISABLE_CONTAINER_RUNTIME: "1",
+    DOCKER_HOST: "unix:///nonexistent.sock",
+    CONTAINER_HOST: "unix:///nonexistent.sock",
+    SENTRY_DSN: STALE_ENV_DSN,
+    SENTRY_TRACES_SAMPLE_RATE: "0",
+  };
+  if (process.env.PATH) negativeEnv.PATH = process.env.PATH;
+  if (process.env.SystemRoot) negativeEnv.SystemRoot = process.env.SystemRoot;
+
+  const negativeChild = spawn(runtime.command, [join(staging, "server", "index.js")], {
+    cwd: staging,
+    env: negativeEnv,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let negativeOutput = "";
+  negativeChild.stdout.on("data", (chunk) => (negativeOutput += chunk));
+  negativeChild.stderr.on("data", (chunk) => (negativeOutput += chunk));
+
+  const negativeDeadline = Date.now() + 60_000;
+  let negativeListening = false;
+  while (Date.now() < negativeDeadline) {
+    if (negativeChild.exitCode !== null) break;
+    try {
+      const res = await fetch(`http://127.0.0.1:${negativePort}/api/health`);
+      if (res.ok && (await res.json().catch(() => null))?.ready !== false) {
+        negativeListening = true;
+        break;
+      }
+    } catch {
+      /* not up yet */
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  if (!negativeListening) {
+    negativeChild.kill("SIGKILL");
+    cleanup();
+    throw new Error(
+      `the packaged server never served /api/health for the stale-environment case: ${negativeOutput.trim().slice(0, 400)}`,
+    );
+  }
+
+  const negativeOwner = JSON.parse(
+    readFileSync(join(negativeHome, ".botfleet", "harness-owner.json"), "utf8"),
+  );
+  const negativeResponse = await fetch(`http://127.0.0.1:${negativePort}/api/observability`, {
+    headers: { authorization: `Bearer ${negativeOwner.nonce}` },
+  });
+  const negativeObservability = negativeResponse.ok ? await negativeResponse.json() : null;
+  negativeChild.kill("SIGKILL");
+  if (!negativeResponse.ok || negativeObservability?.configured !== false ||
+      negativeObservability?.enabled !== false || negativeObservability?.source !== "none" ||
+      negativeObservability?.host !== null || negativeObservability?.projectId !== null) {
+    cleanup();
+    throw new Error(
+      `the packaged server adopted a DSN it inherited from the environment: ${JSON.stringify(negativeObservability)}`,
+    );
+  }
+  if (JSON.stringify(negativeObservability).includes(STALE_ENV_DSN_KEY)) {
+    cleanup();
+    throw new Error("the stale-environment case disclosed the inherited DSN key");
+  }
+  rmSync(negativeHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  console.log("packaged server ignored the DSN it inherited from the environment ✓");
 }
 
 cleanup();
