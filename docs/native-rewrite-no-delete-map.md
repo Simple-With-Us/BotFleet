@@ -79,9 +79,11 @@ moved since, and both are visible in the tree rather than in a comment:
   `workspace-credentials.mjs`.  That is the exact set
   `deploy/linux-server/retained-source.json` pins, so the count and the
   list are one fact, and `app-paths.mjs` is not in the closure:  the
-  server reaches its data-dir rules through its own code, and the
-  comment beside it names the desktop helper as provenance, not as an
-  import.  The `electron/` directory is not
+  server runtime reaches its data-dir rules through its own code, and
+  the comment beside it names the desktop helper as provenance.  The
+  server's parity test does import it, which is a retention fact of
+  its own — see the retained list below.
+  The `electron/` directory is not
   "the desktop shell" as a whole:  it also holds the Node runtime's
   configuration, credential and ownership helpers, and the Linux server runs
   them today.
@@ -100,7 +102,7 @@ Electron packaging imports them, so they leave with the shell and not before.
 | `electron/desktop-viewer.cjs`, `electron/desktop-workspace.cjs` | the Electron desktop viewer and workspace, with the native replacements already shipped (BF-2481, BF-2539) |
 | `electron/cua-connection.cjs`, `electron/cua-linux.cjs`, `electron/cua-linux-runtime.cjs`, `electron/cua-linux-bundle.cjs`, `electron/cua-permissions-status.mjs`, `electron/screen-preview.cjs` | the Electron CUA path; the native driver and capture live in `ios/Sources/CompanionCore` |
 | `electron/android-device.mjs`, `electron/control-plane-client.mjs`, `electron/companion.mjs`, `electron/companion-entry.mjs`, `electron/companion-origin-gateway.mjs` | the Electron companion client, its entry point and its origin gateway; the native listener is the replacement |
-| `electron/managed-composio.mjs`, `electron/external-url.mjs`, `electron/open-file.mjs`, `electron/save-file.mjs`, `electron/package-link.mjs`, `electron/app-paths.mjs` | Electron-side helpers with no consumer outside `electron/` (`app-paths.mjs` is cited in server comments as provenance for the same rule, never imported) |
+| `electron/managed-composio.mjs`, `electron/external-url.mjs`, `electron/open-file.mjs`, `electron/save-file.mjs`, `electron/package-link.mjs` | Electron-side helpers with no consumer outside `electron/` |
 | `electron/remote-credential-guard.mjs`, `electron/secure-credentials.mjs`, `electron/secure-credential-state.mjs`, `electron/credential-patch.node-test.mjs` | the Electron credential store; the native path is BF-2506 and BF-2622 |
 | `electron/speech.mjs`, `electron/skill-recorder.mjs`, `electron/assemblyai.mjs`, `electron/build-speech-helper.mjs`, `electron/build-recorder-helper.mjs` | the Electron voice helpers and the two build helpers that produce the native helper bundles |
 | The Electron half of the packaging:  `electron-builder.yml`, the `electron` entries in `package.json`, `electron-updater`, `electron-builder` and `esbuild` in `devDependencies`, `@sentry/electron` in `dependencies` | the packaging and the Electron runtime |
@@ -125,12 +127,16 @@ These are live today, and each is marked with what keeps it alive.
   `workspace-credentials.mjs` is retained only while the server runs:  its
   Step 6 removal is a shared-sequence item with the root manifest, and
   it is deliberately not in the REMOVABLE-AT-STEP-6 table above.
-- `electron/config-file-lock.mjs`, `electron/persist-on-exit-policy.mjs` —
-  the harness's configuration and persistence rules.  `app-paths.mjs`
-  is not here on purpose:  the Linux closure does not carry it, the
-  server imports nothing from it (the matching comment in
-  `server/data-dir.ts` cites it as provenance), so it belongs to the
-  REMOVABLE-AT-STEP-6 class with the rest of the shell's own helpers.
+- `electron/config-file-lock.mjs`, `electron/persist-on-exit-policy.mjs`,
+  `electron/app-paths.mjs` — the harness's configuration and data paths.
+  The two closure files run the Linux server;  `app-paths.mjs` does not
+  (the retained closure pins seven helpers and this is not one), but
+  the server's own parity test imports it:
+  `server/data-dir.test.ts` line 7 takes `botfleetDataDir` from
+  `../electron/app-paths.mjs`, so deleting the file breaks
+  `pnpm test`.  It is retained until BF-2515's server-side cleanup
+  retires that import, and its runtime non-presence in the Linux
+  closure is a separate fact from its test-side retention.
 - `electron/infisical-read.mjs` — the scoped Infisical read that the owner
   gate, the Linux harness and the bridge all use.  Retained by the server.
 
