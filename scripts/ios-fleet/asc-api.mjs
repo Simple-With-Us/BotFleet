@@ -71,15 +71,19 @@ export function isKeyId(value) {
   return /^[A-Za-z0-9]{1,64}$/.test(String(value || ""));
 }
 
-// The names this consumer may read, in the order it prefers them.
-const ASC_STORE_NAMES = [
-  "ASC_KEY_ID",
-  "APPLE_API_KEY_ID",
-  "ASC_ISSUER_ID",
-  "APPLE_API_ISSUER_ID",
-  "ASC_KEY_P8",
-  "APPLE_API_KEY_P8",
-  "APPLE_API_KEY_P8_BASE64",
+// The parts of the credential, and the names each part may live under.
+// Every group is one value:  the first name that answers is the value.
+const ASC_STORE_GROUPS = [
+  ["ASC_KEY_ID", "APPLE_API_KEY_ID"],
+  ["ASC_ISSUER_ID", "APPLE_API_ISSUER_ID"],
+  ["ASC_KEY_P8", "APPLE_API_KEY_P8", "APPLE_API_KEY_P8_BASE64"],
+];
+
+// The two public labels on their own:  a diagnostic reads these and never
+// the material.
+const ASC_LABEL_GROUPS = [
+  ["ASC_KEY_ID", "APPLE_API_KEY_ID"],
+  ["ASC_ISSUER_ID", "APPLE_API_ISSUER_ID"],
 ];
 
 // The consumer's own read-only service token, when the host binds one.
@@ -132,6 +136,14 @@ function scopedRead(name, folder, account) {
   return value;
 }
 
+// The provenance of a resolved credential:  it names the folder that
+// answered and the grant that read it.  It never names a value.
+export function credentialSource(folder, kind) {
+  return kind === "token"
+    ? `Infisical ${folder} (service token binding)`
+    : `Infisical ${folder} (scoped reader, account ${ASC_SECRET_ACCOUNT})`;
+}
+
 // The public labels the store holds for this consumer's key.
 //
 // The key id and the issuer id are labels that travel in every request
@@ -143,9 +155,9 @@ async function resolveCredentialLabels() {
   let keyId = scopedRead("ASC_KEY_ID", folder, account) || scopedRead("APPLE_API_KEY_ID", folder, account);
   let issuerId = scopedRead("ASC_ISSUER_ID", folder, account) || scopedRead("APPLE_API_ISSUER_ID", folder, account);
   if (!keyId || !issuerId) {
-    const stored = await storeRead(["ASC_KEY_ID", "APPLE_API_KEY_ID", "ASC_ISSUER_ID", "APPLE_API_ISSUER_ID"]);
-    keyId = keyId || stored.get("ASC_KEY_ID") || stored.get("APPLE_API_KEY_ID") || "";
-    issuerId = issuerId || stored.get("ASC_ISSUER_ID") || stored.get("APPLE_API_ISSUER_ID") || "";
+    const stored = await storeRead(ASC_LABEL_GROUPS);
+    keyId = keyId || stored.values.get("ASC_KEY_ID") || stored.values.get("APPLE_API_KEY_ID") || "";
+    issuerId = issuerId || stored.values.get("ASC_ISSUER_ID") || stored.values.get("APPLE_API_ISSUER_ID") || "";
   }
   return { keyId: keyId.trim(), issuerId: issuerId.trim() };
 }
@@ -158,13 +170,18 @@ async function resolveCredentialLabels() {
 //
 // A folder this token may not read is not an error here:  the read moves on
 // to the next folder, and the reason never names a value.  A folder that
-// answers with NONE of the names is not the folder that holds them, so the
-// read moves on as well:  the first answer for a name wins, and a folder
-// that is not the grant's own cannot displace it.
+// answers with none of the parts is not the folder that holds them, so the
+// read moves on as well.
+//
+// THE PARTS OF ONE CREDENTIAL BELONG TOGETHER.  A key id from one folder and
+// the material from another is a triple that fails authentication as the
+// wrong key, so the answer is the FIRST folder that holds a complete set,
+// and the folder that answered travels with the values so the caller can
+// name the grant that read them.
 //
 // The fetch is injectable so a test can drive the folder walk without a
 // network, and the defaults are the host's own binding.
-export async function readStoreSecrets(names, {
+export async function readStoreSecrets(groups, {
   fetchImpl = fetch,
   siteUrl = ASC_STORE_SITE_URL,
   token = ASC_STORE_TOKEN,
@@ -172,8 +189,9 @@ export async function readStoreSecrets(names, {
   environment = ASC_STORE_ENVIRONMENT,
   paths = ASC_STORE_PATHS,
 } = {}) {
-  const found = new Map();
-  if (!token || !projectId) return found;
+  const empty = { values: new Map(), folder: null };
+  if (!token || !projectId) return empty;
+  const names = groups.flat();
   for (const secretPath of paths) {
     let values;
     try {
@@ -191,15 +209,24 @@ export async function readStoreSecrets(names, {
       // answer.  The next folder is tried, and nothing is printed.
       continue;
     }
-    for (const [name, value] of values) {
-      if (!found.has(name)) found.set(name, value);
+    const complete = groups.every((group) => group.some((name) => values.has(name)));
+    if (!complete) continue;
+    const chosen = new Map();
+    for (const group of groups) {
+      for (const name of group) {
+        if (values.has(name)) {
+          chosen.set(name, values.get(name));
+          break;
+        }
+      }
     }
+    return { values: chosen, folder: secretPath };
   }
-  return found;
+  return empty;
 }
 
-async function storeRead(names) {
-  return readStoreSecrets(names);
+async function storeRead(groups) {
+  return readStoreSecrets(groups);
 }
 
 function base64url(input) {
@@ -274,15 +301,24 @@ async function resolveCredential() {
   // A host with no scoped reader reaches the store through its own service
   // token instead.  Both are the same store and the same names;  neither
   // puts a copy of the credential in the environment.
+  //
+  // THE CREDENTIAL IS WHOLE.  A reader that answered with only some of the
+  // parts is not a credential, and the token's answer is a complete set from
+  // one folder, so the token's answer REPLACES the reader's partial one
+  // instead of filling it:  a key id from one folder and the material from
+  // another is a triple that fails authentication as the wrong key.
+  let source = credentialSource(folder, "reader");
   if (!keyId || !issuerId || !material) {
-    const stored = await storeRead(ASC_STORE_NAMES);
-    keyId = keyId || stored.get("ASC_KEY_ID") || stored.get("APPLE_API_KEY_ID") || "";
-    issuerId = issuerId || stored.get("ASC_ISSUER_ID") || stored.get("APPLE_API_ISSUER_ID") || "";
-    material = material
-      || stored.get("ASC_KEY_P8")
-      || stored.get("APPLE_API_KEY_P8")
-      || stored.get("APPLE_API_KEY_P8_BASE64")
-      || "";
+    const stored = await storeRead(ASC_STORE_GROUPS);
+    if (stored.folder) {
+      keyId = stored.values.get("ASC_KEY_ID") || stored.values.get("APPLE_API_KEY_ID") || "";
+      issuerId = stored.values.get("ASC_ISSUER_ID") || stored.values.get("APPLE_API_ISSUER_ID") || "";
+      material = stored.values.get("ASC_KEY_P8")
+        || stored.values.get("APPLE_API_KEY_P8")
+        || stored.values.get("APPLE_API_KEY_P8_BASE64")
+        || "";
+      source = credentialSource(stored.folder, "token");
+    }
   }
   if (!keyId) RESOLUTION_NOTES.push(`no key id in ${folder} for account ${account}`);
   if (!issuerId) RESOLUTION_NOTES.push(`no issuer id in ${folder} for account ${account}`);
@@ -302,7 +338,7 @@ async function resolveCredential() {
     keyId: trimmedKeyId,
     issuerId: issuerId.trim(),
     privateKeyPem: pem,
-    source: `Infisical ${folder} (scoped reader, account ${account})`
+    source
   };
 }
 

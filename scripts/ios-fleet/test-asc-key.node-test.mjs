@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { normalizePrivateKey, writePrivateKeyFile, CLIENT_ENV_ALLOWLIST, clientEnvironment } from "./asc-key.mjs";
-import { isKeyId, readStoreSecrets } from "./asc-api.mjs";
+import { credentialSource, isKeyId, readStoreSecrets } from "./asc-api.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const helper = join(here, "asc-key.mjs");
@@ -470,7 +470,7 @@ test("the store read walks to the folder that holds the names", async () => {
         }];
     return { ok: true, json: async () => ({ secrets }) };
   };
-  const found = await readStoreSecrets(["ASC_KEY_ID"], {
+  const found = await readStoreSecrets([["ASC_KEY_ID"]], {
     fetchImpl: fakeFetch,
     siteUrl: "https://store.invalid",
     token: "reader-token",
@@ -478,9 +478,75 @@ test("the store read walks to the folder that holds the names", async () => {
     environment: "prod",
     paths: ["/asc", "/asc-folder"],
   });
-  assert.equal(found.get("ASC_KEY_ID"), "STOREKEY0002", "the second folder was never read");
+  assert.equal(found.values.get("ASC_KEY_ID"), "STOREKEY0002", "the second folder was never read");
+  assert.equal(found.folder, "/asc-folder", "the answering folder was not reported");
   assert.ok(asked.some((u) => u.includes("secretPath=%2Fasc")), "the first folder was never read");
   assert.ok(asked.some((u) => u.includes("secretPath=%2Fasc-folder")), "the second folder was never read");
+});
+
+test("a credential split across two folders is never assembled", async () => {
+  //  The parts of one key belong together.  A folder that holds the key id
+  //  and a folder that holds the material are two different folders, and
+  //  combining them is a triple that fails authentication as the wrong key.
+  const fakeFetch = async (url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/api/v2/service-token") {
+      return {
+        ok: true,
+        json: async () => ({
+          workspace: "fleet-ops",
+          scopes: [
+            { environment: "prod", secretPath: "/asc" },
+            { environment: "prod", secretPath: "/asc-folder" },
+          ],
+          permissions: ["read"],
+          expiresAt: null,
+        }),
+      };
+    }
+    const secretPath = parsed.searchParams.get("secretPath") || "/";
+    const secrets = secretPath === "/asc"
+      ? [{ secretKey: "ASC_KEY_ID", secretValue: "SPLITKEY001" }]
+      : [{ secretKey: "ASC_KEY_P8", secretValue: "SPLITKEYPEM" }];
+    return {
+      ok: true,
+      json: async () => ({
+        secrets: secrets.map((secret) => ({
+          ...secret,
+          workspace: "fleet-ops",
+          environment: "prod",
+          secretPath,
+          secretValueHidden: false,
+        })),
+      }),
+    };
+  };
+  const found = await readStoreSecrets(
+    [["ASC_KEY_ID"], ["ASC_ISSUER_ID"], ["ASC_KEY_P8"]],
+    {
+      fetchImpl: fakeFetch,
+      siteUrl: "https://store.invalid",
+      token: "reader-token",
+      projectId: "fleet-ops",
+      environment: "prod",
+      paths: ["/asc", "/asc-folder"],
+    },
+  );
+  assert.equal(found.folder, null, "a split credential was taken from two folders");
+  assert.equal(found.values.size, 0, "a split credential was assembled");
+});
+
+test("the provenance names the grant that read the credential", () => {
+  //  The status line and the refusal name the grant that answered, so a
+  //  reader that is not the one that read the credential is never named.
+  assert.equal(
+    credentialSource("/asc", "reader"),
+    "Infisical /asc (scoped reader, account fleet-tools-mm-asc-ro)",
+  );
+  assert.equal(
+    credentialSource("/asc-folder", "token"),
+    "Infisical /asc-folder (service token binding)",
+  );
 });
 
 test("a key id that is not a key id is refused and nothing is staged", async () => {

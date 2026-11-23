@@ -64,4 +64,4 @@ description = "Synthetic loopback DSN key in the packaged-server smoke"
 targetRules = ["generic-api-key"]
 condition = "AND"
 paths = ['''^scripts/smoke-packaged-server\.mjs$''']
-regexes = ['''0123456789abcdef0123456789abcdef''']
+regexes = ['''0123456789abcdef0123456789abcdef''', '''99999999999999999999999999999999''']
