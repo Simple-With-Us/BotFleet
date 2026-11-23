@@ -23,7 +23,10 @@ struct MacServersSettings: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("This Mac runs your bots.\u{00A0} Testing a saved server checks its connection.")
                 .font(.callout).foregroundStyle(.secondary)
-            if coordinator.hosts.allSatisfy(\.isLocal) {
+            //  This Mac IS a host, so the empty state belongs to an empty
+            //  list.  The old check asked whether every host is local and
+            //  said "No server added" while listing This Mac.
+            if coordinator.hosts.isEmpty {
                 Text("No server added.\u{00A0} BotFleet runs on this Mac.\u{00A0} Add a server if you have one.")
                     .font(.callout).foregroundStyle(.secondary)
             }

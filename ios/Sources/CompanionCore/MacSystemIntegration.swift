@@ -185,7 +185,7 @@ public enum MacMenubarMenuItem: Equatable, Sendable {
     case composeNewMessage
     case dictateMessage
     case waitingBot(MacWaitingBotItem)
-    case togglePauseResumeAll(title: String, isPaused: Bool)
+    case togglePauseResumeAll(title: String, isPaused: Bool, isAvailable: Bool, unavailableReason: String)
     case settings
     case quitBotFleet
 
@@ -204,12 +204,39 @@ public enum MacMenubarMenuItem: Equatable, Sendable {
             return "Dictate Message"
         case .waitingBot(let item):
             return item.menuTitle
-        case .togglePauseResumeAll(let title, _):
+        case .togglePauseResumeAll(let title, _, _, _):
             return title
         case .settings:
             return "Settings"
         case .quitBotFleet:
             return "Quit BotFleet"
+        }
+    }
+
+    /// Whether the row does anything when it is clicked.
+    ///
+    /// A row that is in the menu but cannot act has to say so, because a
+    /// click that changes nothing looks like a working control.
+    public var isActionable: Bool {
+        switch self {
+        case .togglePauseResumeAll(_, _, let isAvailable, _):
+            return isAvailable
+        case .openBotFleet, .composeNewMessage, .dictateMessage, .waitingBot, .settings, .quitBotFleet:
+            return true
+        case .separator, .statusLine:
+            return false
+        }
+    }
+
+    /// Why a row cannot act, for the operator who clicked it.
+    public var unavailableReason: String? {
+        switch self {
+        case .togglePauseResumeAll(_, _, let isAvailable, let reason):
+            return isAvailable ? nil : reason
+        case .openBotFleet, .composeNewMessage, .dictateMessage, .waitingBot, .settings, .quitBotFleet:
+            return nil
+        case .separator, .statusLine:
+            return nil
         }
     }
 }
@@ -288,6 +315,14 @@ public struct MacMenubarState: Equatable, Sendable {
         allBotsPaused ? "Resume All Bots" : "Pause All Bots"
     }
 
+    /// Why the fleet-wide pause row cannot do anything yet.
+    ///
+    /// Pausing every bot is a fleet-wide behaviour change and the wake path
+    /// is not allowed to change under it, so the row says so instead of
+    /// pretending to pause.  It never sends a pause and never changes a wake.
+    public static let pauseResumeUnavailableCopy =
+        "Pausing every bot is not available yet.  Your bots keep running."
+
     /// Builds the menubar menu items in the exact specification order:
     /// 1. `"Open BotFleet"`
     /// 2. Separator
@@ -314,7 +349,12 @@ public struct MacMenubarState: Equatable, Sendable {
             items.append(.waitingBot(waiting))
         }
         items.append(.separator)
-        items.append(.togglePauseResumeAll(title: pauseResumeTitle, isPaused: allBotsPaused))
+        items.append(.togglePauseResumeAll(
+            title: pauseResumeTitle,
+            isPaused: allBotsPaused,
+            isAvailable: false,
+            unavailableReason: Self.pauseResumeUnavailableCopy
+        ))
         items.append(.settings)
         items.append(.separator)
         items.append(.quitBotFleet)
@@ -447,9 +487,20 @@ public final class MacMenubarController: NSObject {
                 item.target = self
                 item.representedObject = waiting.id
                 menu.addItem(item)
-            case .togglePauseResumeAll(let title, _):
-                let item = NSMenuItem(title: title, action: #selector(handleTogglePauseResume), keyEquivalent: "")
+            case .togglePauseResumeAll(let title, _, let isAvailable, let unavailableReason):
+                //  An unavailable row is greyed out and carries the reason in
+                //  its tooltip, so a click cannot look like it paused
+                //  anything.
+                let item = NSMenuItem(
+                    title: title,
+                    action: isAvailable ? #selector(handleTogglePauseResume) : nil,
+                    keyEquivalent: ""
+                )
                 item.target = self
+                item.isEnabled = isAvailable
+                if !isAvailable {
+                    item.toolTip = unavailableReason
+                }
                 menu.addItem(item)
             case .settings:
                 let item = NSMenuItem(title: "Settings", action: #selector(handleOpenSettings), keyEquivalent: ",")
