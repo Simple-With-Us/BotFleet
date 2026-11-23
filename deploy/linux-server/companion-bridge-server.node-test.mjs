@@ -636,6 +636,89 @@ test('a proxied route needs a device the bridge knows, and a revoked one is refu
   }
 });
 
+test('the pairing routes refuse a body that does not match their contract', async () => {
+  const bridge = await startBridge();
+  try {
+    // An unknown key on the open route is a refusal, not a silent ride
+    // along into the window's metadata.
+    const unknown = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/open',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ code: '123456', unexpected: 'value' }),
+    });
+    assert.equal(unknown.status, 400);
+
+    // The same on the redeem route.
+    const unknownRedeem = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/redeem',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ code: '123456', unexpected: 'value' }),
+    });
+    assert.equal(unknownRedeem.status, 400);
+
+    // A body that is not an object at all is refused the same way.
+    const notAnObject = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/open',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify(['not', 'an', 'object']),
+    });
+    assert.equal(notAnObject.status, 400);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('a device that cannot be added does not burn the pairing window', async () => {
+  const bridge = await startBridge();
+  try {
+    const opened = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/open',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: '{}',
+    });
+    // The same device id twice: the second add is refused.
+    const first = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/redeem',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ code: opened.json.code, deviceId: 'phone-1' }),
+    });
+    assert.equal(first.status, 200);
+
+    // A new window, redeemed with a device id that is already paired.
+    const second = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/open',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: '{}',
+    });
+    const refused = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/redeem',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ code: second.json.code, deviceId: 'phone-1' }),
+    });
+    assert.equal(refused.status, 403);
+
+    // The window was not spent by the refused attempt, so the phone can
+    // redeem it again with a device id of its own.
+    const retry = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/redeem',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ code: second.json.code, deviceId: 'phone-2' }),
+    });
+    assert.equal(retry.status, 200);
+    assert.equal(retry.json.deviceId, 'phone-2');
+  } finally {
+    await bridge.close();
+  }
+});
+
 test('a client that hangs up mid-body does not take the listener with it', async () => {
   const bridge = await startBridge();
   try {

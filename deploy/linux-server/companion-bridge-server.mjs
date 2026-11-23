@@ -42,6 +42,7 @@
 
 import crypto from 'node:crypto';
 import http from 'node:http';
+import { z } from 'zod';
 import { pathToFileURL } from 'node:url';
 
 import {
@@ -296,6 +297,42 @@ export function bridgeMintPairingToken() {
 }
 
 /**
+ * The pairing-open body.
+ *
+ * The window carries whatever the operator attached to it, so the open
+ * route takes the metadata as it is; the four fields the bridge itself
+ * reads are named here, and the schema is strict, so an unknown key is a
+ * refusal rather than a silent ride along.
+ */
+const PairingOpenSchema = z.strictObject({
+  code: z.string().max(64).optional(),
+  token: z.string().max(256).optional(),
+  deviceId: z.string().max(64).optional(),
+  deviceName: z.string().max(120).optional(),
+  requestId: z.string().max(128).optional(),
+  // The operator's own metadata for the window, under one named field:  an
+  // unknown top-level key is refused rather than riding along, and the
+  // window core bounds what the metadata may hold.
+  metadata: z.record(z.string().max(64), z.unknown()).optional(),
+});
+
+/**
+ * The pairing-redeem body.
+ *
+ * The credential is either the QR token or the typed code, the device id
+ * names the device the phone asked for, and the request id is what makes
+ * a lost response replayable instead of a lock-out.
+ */
+const PairingRedeemSchema = z.strictObject({
+  code: z.string().max(64).optional(),
+  token: z.string().max(256).optional(),
+  credential: z.string().max(256).optional(),
+  deviceId: z.string().max(64).optional(),
+  deviceName: z.string().max(120).optional(),
+  requestId: z.string().max(128).optional(),
+});
+
+/**
  * The bridge's device registry: digests only, and never a cleartext
  * credential.
  *
@@ -498,7 +535,10 @@ export function bridgeRedeemPairing({ state, presented, requestId = '', replayDe
   const credential = bridgeMintDeviceCredential();
   const added = state.registry.addDevice({ id: deviceId, name: deviceName, token: credential, pairedAtMs: nowMs });
   if (!added.ok) {
-    state.window = result.window;
+    // The device could not be added, so the window was not spent:  a phone
+    // that is refused here would otherwise be left with no device and no
+    // retry, which is the lock-out the single-spend rule exists to avoid.
+    state.window = window;
     return { ok: false, reason: added.reason };
   }
   state.window = result.window;
@@ -768,11 +808,16 @@ async function handleLocalRoute({ req, res, method, url, state, logger, now, per
       respondJson(res, 400, { error: body.reason });
       return;
     }
-    const metadata = {};
-    for (const [key, value] of Object.entries(body.value)) {
-      if (key === 'code' || key === 'token' || key === 'deviceId' || key === 'deviceName' || key === 'requestId') continue;
-      metadata[key] = value;
+    const parsed = PairingOpenSchema.safeParse(body.value);
+    if (!parsed.success) {
+      respondJson(res, 400, { error: 'the pairing request does not match the contract' });
+      return;
     }
+    // The window carries the operator's metadata, and the window core
+    // bounds it:  it keeps at most eight small keys, drops a field whose
+    // name or value looks like a credential, and drops a value it cannot
+    // read back.
+    const metadata = parsed.data.metadata ?? {};
     const opened = bridgeOpenPairingWindow({ state, nowMs: now(), metadata });
     if (!opened.ok) {
       respondJson(res, 500, { error: opened.reason });
@@ -794,7 +839,12 @@ async function handleLocalRoute({ req, res, method, url, state, logger, now, per
       respondJson(res, 400, { error: body.reason });
       return;
     }
-    const presented = String(body.value.token ?? body.value.code ?? '');
+    const parsed = PairingRedeemSchema.safeParse(body.value);
+    if (!parsed.success) {
+      respondJson(res, 400, { error: 'the pairing redeem does not match the contract' });
+      return;
+    }
+    const presented = String(parsed.data.token ?? parsed.data.code ?? parsed.data.credential ?? '');
     if (!presented) {
       respondJson(res, 400, { error: 'a pairing code or token is required' });
       return;
@@ -802,9 +852,9 @@ async function handleLocalRoute({ req, res, method, url, state, logger, now, per
     const redeemed = bridgeRedeemPairing({
       state,
       presented,
-      requestId: String(body.value.requestId ?? ''),
-      replayDeviceId: String(body.value.deviceId ?? ''),
-      deviceName: String(body.value.deviceName ?? ''),
+      requestId: String(parsed.data.requestId ?? ''),
+      replayDeviceId: String(parsed.data.deviceId ?? ''),
+      deviceName: String(parsed.data.deviceName ?? ''),
       nowMs: now(),
     });
     if (!redeemed.ok) {
@@ -877,8 +927,12 @@ function proxyRequest({ req, res, method, url, decision, host, port, upstreamAge
   // event stream:  otherwise the upstream connection outlives the request
   // that opened it.
   res.on('close', () => {
-    upstream.destroy();
-    upstreamResponse?.destroy();
+    // Only a response that did not finish tears the upstream down:  a
+    // finished one has already had its upstream end with it.
+    if (!res.writableFinished) {
+      upstream.destroy();
+      upstreamResponse?.destroy();
+    }
   });
 }
 
