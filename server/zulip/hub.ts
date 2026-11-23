@@ -2118,6 +2118,9 @@ export class ZulipHub {
       const ids = new Set(batch.map((item) => item.id));
       session.markHandled(ids);
       unit.items = unit.items.filter((item) => !ids.has(item.id));
+      // A partially retired unit is a new episode for whatever remains: a
+      // later stop refusal for those items tells the log again (BF-2454).
+      if (unit.items.length) delete unit.stopLogged;
       if (!unit.items.length) state.pending = state.pending.filter((candidate) => candidate !== unit);
       session.indexPending();
       return unit.items.length;
@@ -2149,6 +2152,19 @@ export class ZulipHub {
         // same, so the batch is dropped rather than held for the bot.
         retireBatch();
         this.log(`[zulip] ${session.role}: turn not started (the bot is off); dropped`);
+      } else if (codeOf(e) === "bot_stopped") {
+        // A stop lifts only when a person starts the bot again, so the work
+        // is held on the same backoff as a busy refusal -- but silently
+        // after the first telling (BF-2454): one log line per unit, not one
+        // per retry for the whole six hours the hold can last.  Attempts
+        // still count, because they are what grows the backoff to its cap.
+        unit.attempts += 1;
+        const base = this.deps.timings?.retryBaseMs ?? 5_000;
+        unit.notBefore = now + Math.min(base * 2 ** Math.min(unit.attempts - 1, 6), 5 * 60_000);
+        if (!unit.stopLogged) {
+          unit.stopLogged = true;
+          this.log(`[zulip] ${session.role}: turn not started (the bot is stopped); holding until it starts again`);
+        }
       } else if (status === 409 || status === 503) {
         unit.attempts += 1;
         const base = this.deps.timings?.retryBaseMs ?? 5_000;
