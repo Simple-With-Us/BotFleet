@@ -123,8 +123,13 @@ child.stderr.on("data", (chunk) => (output += chunk));
 // the kill raises EPERM; Linux runners can raise EACCES the same way. Scratch
 // cleanup must never decide whether the build is good — it failed a green run
 // on Windows once already, and see f66d30f for the same lesson on Linux.
+// The negative case's child is tracked here too, so an assertion that fails
+// before it is stopped still leaves no server behind.
+let negativeChild = null;
+
 const cleanup = () => {
   child.kill("SIGKILL");
+  if (negativeChild) negativeChild.kill("SIGKILL");
   for (const dir of [staging, home]) {
     try {
       rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
@@ -334,7 +339,7 @@ if (listening) {
   if (process.env.PATH) negativeEnv.PATH = process.env.PATH;
   if (process.env.SystemRoot) negativeEnv.SystemRoot = process.env.SystemRoot;
 
-  const negativeChild = spawn(runtime.command, [join(staging, "server", "index.js")], {
+  negativeChild = spawn(runtime.command, [join(staging, "server", "index.js")], {
     cwd: staging,
     env: negativeEnv,
     stdio: ["ignore", "pipe", "pipe"],
@@ -373,7 +378,13 @@ if (listening) {
     headers: { authorization: `Bearer ${negativeOwner.nonce}` },
   });
   const negativeObservability = negativeResponse.ok ? await negativeResponse.json() : null;
-  negativeChild.kill("SIGKILL");
+  // Stop it and WAIT for it to be gone:  removing its home while it still
+  // holds files races the removal, and an assertion that throws before the
+  // kill would leave the server running.
+  if (negativeChild.exitCode === null) {
+    negativeChild.kill("SIGKILL");
+    await new Promise((resolve) => negativeChild.once("exit", resolve));
+  }
   if (!negativeResponse.ok || negativeObservability?.configured !== false ||
       negativeObservability?.enabled !== false || negativeObservability?.source !== "none" ||
       negativeObservability?.host !== null || negativeObservability?.projectId !== null) {
