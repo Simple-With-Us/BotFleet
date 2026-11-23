@@ -80,7 +80,7 @@ moved since, and both are visible in the tree rather than in a comment:
   `deploy/linux-server/retained-source.json` pins, so the count and the
   list are one fact, and `app-paths.mjs` is not in the closure:  the
   server runtime reaches its data-dir rules through its own code, and
-  the comment beside it names the desktop helper as provenance.  The
+  the comment beside it names the desktop helper as provenance.  The
   server's parity test does import it, which is a retention fact of
   its own — see the retained list below.
   The `electron/` directory is not
