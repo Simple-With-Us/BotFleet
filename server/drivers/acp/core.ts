@@ -933,42 +933,41 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
        *  dispatch (the mtime/size read that detects an in-place upgrade).
        *  A remembered path that stops answering falls back to the walk. */
       let identityPathCache = { pathValue: "", byCli: new Map<string, string>() };
+      /** One candidate's identity, or null when the spawn would not run
+       *  it: execvp skips non-executable files, so accepting one as the
+       *  identity could key the memory on a file the probe never ran. */
+      const identityOf = (candidate: string): string | null => {
+        try {
+          const stat = statSync(candidate);
+          if (!stat.isFile()) return null;
+          if (process.platform !== "win32" && (stat.mode & 0o111) === 0) return null;
+          return `${candidate}:${stat.mtimeMs}:${stat.size}`;
+        } catch {
+          return null;
+        }
+      };
       /** The identity above for one cli string, resolved the way the probe
        *  spawn resolves it (augmented PATH), or null when no file answers —
        *  an unresolvable binary is never answered from memory. */
       const cliIdentityKey = (cli: string): string | null => {
-        if (isAbsolute(cli) || cli.includes("/")) {
-          try {
-            const stat = statSync(cli);
-            return stat.isFile() ? `${cli}:${stat.mtimeMs}:${stat.size}` : null;
-          } catch {
-            return null;
-          }
-        }
+        if (isAbsolute(cli) || cli.includes("/")) return identityOf(cli);
         const pathValue = augmentedPath();
         if (pathValue !== identityPathCache.pathValue) {
           identityPathCache = { pathValue, byCli: new Map() };
         }
         const remembered = identityPathCache.byCli.get(cli);
         if (remembered) {
-          try {
-            const stat = statSync(remembered);
-            if (stat.isFile()) return `${remembered}:${stat.mtimeMs}:${stat.size}`;
-          } catch {
-            // The remembered file is gone; walk again below.
-          }
+          const identity = identityOf(remembered);
+          if (identity) return identity;
+          // The remembered file is gone or stopped being executable; walk again.
           identityPathCache.byCli.delete(cli);
         }
         for (const dir of pathValue.split(delimiter).filter(Boolean)) {
           const candidate = join(dir, cli);
-          try {
-            const stat = statSync(candidate);
-            if (stat.isFile()) {
-              identityPathCache.byCli.set(cli, candidate);
-              return `${candidate}:${stat.mtimeMs}:${stat.size}`;
-            }
-          } catch {
-            // Not in this directory; keep looking down the PATH.
+          const identity = identityOf(candidate);
+          if (identity) {
+            identityPathCache.byCli.set(cli, candidate);
+            return identity;
           }
         }
         return null;
