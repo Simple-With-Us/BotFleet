@@ -12,7 +12,7 @@
 // never committed, and nothing reaches the network beyond a local server.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createPublicKey, createVerify, generateKeyPairSync } from "node:crypto";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { normalizePrivateKey, writePrivateKeyFile, CLIENT_ENV_ALLOWLIST, clientEnvironment } from "./asc-key.mjs";
+import { isKeyId, readStoreSecrets } from "./asc-api.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const helper = join(here, "asc-key.mjs");
@@ -430,6 +431,94 @@ test("the client ignores a broken APPLE_API_KEY_P8_BASE64 in the environment", a
   } finally {
     server.close();
   }
+});
+
+test("the store read walks to the folder that holds the names", async () => {
+  //  A grant covers one folder, and the names may live in the folder the
+  //  token is pointed at rather than in the consumer's own.  A folder that
+  //  answers with none of the names must not end the walk:  the credential in
+  //  the second folder is the credential in play.
+  const asked = [];
+  const fakeFetch = async (url) => {
+    const parsed = new URL(url);
+    asked.push(parsed.pathname + parsed.search);
+    if (parsed.pathname === "/api/v2/service-token") {
+      // The token's own scopes:  the two folders this consumer may read.
+      return {
+        ok: true,
+        json: async () => ({
+          workspace: "fleet-ops",
+          scopes: [
+            { environment: "prod", secretPath: "/asc" },
+            { environment: "prod", secretPath: "/asc-folder" },
+          ],
+          permissions: ["read"],
+          expiresAt: null,
+        }),
+      };
+    }
+    const secretPath = parsed.searchParams.get("secretPath") || "/";
+    const secrets = secretPath === "/asc"
+      ? []
+      : [{
+          secretKey: "ASC_KEY_ID",
+          secretValue: "STOREKEY0002",
+          workspace: "fleet-ops",
+          environment: "prod",
+          secretPath,
+          secretValueHidden: false,
+        }];
+    return { ok: true, json: async () => ({ secrets }) };
+  };
+  const found = await readStoreSecrets(["ASC_KEY_ID"], {
+    fetchImpl: fakeFetch,
+    siteUrl: "https://store.invalid",
+    token: "reader-token",
+    projectId: "fleet-ops",
+    environment: "prod",
+    paths: ["/asc", "/asc-folder"],
+  });
+  assert.equal(found.get("ASC_KEY_ID"), "STOREKEY0002", "the second folder was never read");
+  assert.ok(asked.some((u) => u.includes("secretPath=%2Fasc")), "the first folder was never read");
+  assert.ok(asked.some((u) => u.includes("secretPath=%2Fasc-folder")), "the second folder was never read");
+});
+
+test("a key id that is not a key id is refused and nothing is staged", async () => {
+  //  The key id becomes part of a file name, so a value that is not a key id
+  //  must never name a path.  The client refuses it before it writes, and the
+  //  staging directory stays empty.
+  assert.equal(isKeyId("ABCDE12345"), true);
+  assert.equal(isKeyId("../../escape"), false);
+  assert.equal(isKeyId("a/b"), false);
+  assert.equal(isKeyId(""), false);
+  const reader = join(root, "traversal-reader.py");
+  writeFileSync(reader, [
+    "import sys",
+    "name = sys.argv[2]",
+    "if name == \"ASC_KEY_ID\":",
+    "    sys.stdout.write(\"../../escape\")",
+    "elif name == \"ASC_ISSUER_ID\":",
+    "    sys.stdout.write(\"store-issuer\")",
+    "elif name == \"ASC_KEY_P8\":",
+    "    import os.path",
+    "    here = os.path.dirname(os.path.abspath(__file__))",
+    `    with open(os.path.join(here, "store-key-0.p8")) as fh:`,
+    "        sys.stdout.write(fh.read())",
+    "else:",
+    "    sys.exit(3)"
+  ].join("\n"));
+  chmodSync(reader, 0o755);
+  const staging = join(root, "staging-traversal");
+  mkdirSync(staging, { recursive: true });
+  const result = await spawnNode([client, "stage-key", staging], {
+    PATH: safePath,
+    HOME: join(root, "home-traversal"),
+    FLEET_INFISICAL_READER: reader,
+    FLEET_INFISICAL_ASC_ACCOUNT: "fixture-asc-ro",
+  });
+  assert.equal(result.code, 3, "a key id that is not a key id was accepted");
+  assert.match(result.stderr, /not a PEM private key|not a key id/);
+  assert.deepEqual(readdirSync(staging), [], "a file was staged for a key id that is not one");
 });
 
 test("the key never travels in the command arguments", async () => {

@@ -64,6 +64,13 @@ import {
 const ASC_SECRET_FOLDER = "/asc";
 const ASC_SECRET_ACCOUNT = process.env.FLEET_INFISICAL_ASC_ACCOUNT || "fleet-tools-mm-asc-ro";
 
+// The shape of an App Store Connect key id.  It is the one label that
+// becomes part of a file path, so a value that is not a key id is refused
+// before it can name anything on disk.
+export function isKeyId(value) {
+  return /^[A-Za-z0-9]{1,64}$/.test(String(value || ""));
+}
+
 // The names this consumer may read, in the order it prefers them.
 const ASC_STORE_NAMES = [
   "ASC_KEY_ID",
@@ -150,25 +157,49 @@ async function resolveCredentialLabels() {
 // never a copy of the credential.
 //
 // A folder this token may not read is not an error here:  the read moves on
-// to the next folder, and the reason never names a value.
-async function storeRead(names) {
-  if (!ASC_STORE_TOKEN || !ASC_STORE_PROJECT_ID) return new Map();
-  for (const secretPath of ASC_STORE_PATHS) {
+// to the next folder, and the reason never names a value.  A folder that
+// answers with NONE of the names is not the folder that holds them, so the
+// read moves on as well:  the first answer for a name wins, and a folder
+// that is not the grant's own cannot displace it.
+//
+// The fetch is injectable so a test can drive the folder walk without a
+// network, and the defaults are the host's own binding.
+export async function readStoreSecrets(names, {
+  fetchImpl = fetch,
+  siteUrl = ASC_STORE_SITE_URL,
+  token = ASC_STORE_TOKEN,
+  projectId = ASC_STORE_PROJECT_ID,
+  environment = ASC_STORE_ENVIRONMENT,
+  paths = ASC_STORE_PATHS,
+} = {}) {
+  const found = new Map();
+  if (!token || !projectId) return found;
+  for (const secretPath of paths) {
+    let values;
     try {
-      return await listSecretsRaw({
-        siteUrl: ASC_STORE_SITE_URL,
-        token: ASC_STORE_TOKEN,
-        projectId: ASC_STORE_PROJECT_ID,
-        environment: ASC_STORE_ENVIRONMENT,
+      values = await listSecretsRaw({
+        siteUrl,
+        token,
+        projectId,
+        environment,
         secretPath,
         names,
+        fetchImpl,
       });
     } catch {
       // This folder is not one the token may read, or the store did not
       // answer.  The next folder is tried, and nothing is printed.
+      continue;
+    }
+    for (const [name, value] of values) {
+      if (!found.has(name)) found.set(name, value);
     }
   }
-  return new Map();
+  return found;
+}
+
+async function storeRead(names) {
+  return readStoreSecrets(names);
 }
 
 function base64url(input) {
@@ -257,13 +288,18 @@ async function resolveCredential() {
   if (!issuerId) RESOLUTION_NOTES.push(`no issuer id in ${folder} for account ${account}`);
   if (!material) RESOLUTION_NOTES.push(`no key material in ${folder} for account ${account}`);
   if (!keyId || !issuerId || !material) return { reason: "missing" };
+  const trimmedKeyId = keyId.trim();
+  if (!isKeyId(trimmedKeyId)) {
+    RESOLUTION_NOTES.push(`the key id in ${folder} is not a key id`);
+    return { reason: "credential" };
+  }
   const pem = normalizePrivateKey(decodeP8(material));
   if (!pem) {
     RESOLUTION_NOTES.push(`the key material in ${folder} is not a PEM private key`);
     return { reason: "credential" };
   }
   return {
-    keyId: keyId.trim(),
+    keyId: trimmedKeyId,
     issuerId: issuerId.trim(),
     privateKeyPem: pem,
     source: `Infisical ${folder} (scoped reader, account ${account})`
