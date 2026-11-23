@@ -3482,12 +3482,15 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     const config = await loadApnsConfig();
     expect(config?.keyId).toBe("KEY1234567");
     expect(config?.p8).toContain("BEGIN PRIVATE KEY");
+    // The material and the key id are read side by side, so the order the
+    // reader saw them in is not fixed:  the set of reads is what matters.
     const calls = readFileSync(argsFile, "utf8").trim().split("\n");
-    expect(calls).toEqual([
+    expect(calls).toHaveLength(3);
+    expect(calls).toEqual(expect.arrayContaining([
       "get APNS_KEY_P8 --folder /apns --project fleet-ops --account fixture-apns-ro",
       "get APNS_KEY_ID --folder /apns --project fleet-ops --account fixture-apns-ro",
       "get AUTHKEY_KEY1234567 --folder /apns --project fleet-ops --account fixture-apns-ro",
-    ]);
+    ]));
     expect(calls.join(" ")).not.toContain("STALEKEY01");
     expect(apnsKeySource()).toBe("Infisical AUTHKEY_KEY1234567");
   });
@@ -3500,11 +3503,29 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     const config = await loadApnsConfig();
     expect(config?.keyId).toBe("ROTATED001");
     expect(config?.p8).toContain("BEGIN PRIVATE KEY");
-    expect(readFileSync(argsFile, "utf8").trim().split("\n")).toEqual([
+    const calls = readFileSync(argsFile, "utf8").trim().split("\n");
+    expect(calls).toHaveLength(2);
+    expect(calls).toEqual(expect.arrayContaining([
       "get APNS_KEY_P8 --folder /apns --project fleet-ops --account fixture-apns-ro",
       "get APNS_KEY_ID --folder /apns --project fleet-ops --account fixture-apns-ro",
-    ]);
+    ]));
     expect(apnsKeySource()).toBe("Infisical APNS_KEY_P8");
+  });
+
+  it.skipIf(process.platform === "win32")("reads the material and the key id side by side", async () => {
+    // The two names are independent:  the id does not depend on the material.
+    // The material read waits for the id read to start and refuses to answer
+    // if it never does, so a read that ran the two one after the other could
+    // not get its material and the key would stay off.
+    const marker = join(dir, "id-read-started");
+    const markerPath = JSON.stringify(marker);
+    process.env.FLEET_INFISICAL_READER = fakeReader(
+      `import os\nname = sys.argv[2]\nif name == "APNS_KEY_ID":\n    with open(${markerPath}, "w") as fh:\n        fh.write("started")\n    sys.stdout.write("KEY1234567")\nelif name == "APNS_KEY_P8":\n    for _ in range(60):\n        if os.path.exists(${markerPath}):\n            break\n        time.sleep(0.05)\n    else:\n        sys.exit(3)\n    sys.stdout.write(${pemScript(testP8())})\nelse:\n    sys.exit(3)`,
+    );
+    resetApnsKeyCache();
+    const config = await loadApnsConfig();
+    expect(config?.p8).toContain("BEGIN PRIVATE KEY");
+    expect(config?.keyId).toBe("KEY1234567");
   });
 
   it.skipIf(process.platform === "win32")("falls back to the shared key id when Infisical has no usable APNS_KEY_ID", async () => {

@@ -477,6 +477,10 @@ export const CLI_LOGIN_FIELDS: readonly CliLoginFieldSpec[] = [
   },
 ] as const;
 
+/** The marker the desktop shell writes beside a field whose value lives in
+ * the app's own credential store. */
+const OWN_STORE_MARKER_PATH = ["credentialStorage"] as const;
+
 /** True when this field's value lives in the app's own credential store.
  *
  * The desktop shell keeps those values OS-encrypted (safeStorage) and hands
@@ -486,9 +490,10 @@ export const CLI_LOGIN_FIELDS: readonly CliLoginFieldSpec[] = [
  * and not an ambient environment copy:  the fleet store still outranks it,
  * and an environment value with no marker stays out of the way entirely. */
 function ownCredentialStore(cfg: AppConfig, spec: SecretFieldSpec): boolean {
-  const section = (cfg as Record<string, unknown>)[spec.section];
-  if (!section || typeof section !== "object") return false;
-  return (section as Record<string, unknown>).credentialStorage === "external";
+  // The marker sits beside the field in the same section, so the same safe
+  // reader that walks a field's path reads it:  no dictionary access and no
+  // runtime type check of its own.
+  return readField(cfg, spec, OWN_STORE_MARKER_PATH) === "external";
 }
 
 /** The environment names whose value the app's own credential store holds.
@@ -574,12 +579,12 @@ export function vaultNames(): readonly string[] {
   return snapshotNames;
 }
 
-function readField(cfg: AppConfig, spec: SecretFieldSpec): string | undefined {
+function readField(cfg: AppConfig, spec: SecretFieldSpec, path: readonly string[] = spec.path): string | undefined {
   // SAFETY: AppConfig is a plain object literal built by `parseStoredConfig`,
   // and `spec.section` is a `keyof AppConfig` from the table above, so indexing
   // it by string reads a declared section and nothing else.
   let node: unknown = (cfg as Record<string, unknown>)[spec.section];
-  for (const key of spec.path) {
+  for (const key of path) {
     if (!node || typeof node !== "object") return undefined;
     // SAFETY: guarded on the line above — `node` is a non-null object here.
     node = (node as Record<string, unknown>)[key];

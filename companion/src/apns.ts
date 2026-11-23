@@ -123,6 +123,7 @@ export function resetApnsKeyCache(): void {
   vaultReadInFlight = null;
   vaultGeneration++;
   resolvedKeyName = SHARED_APNS_P8_NAME;
+  resolvedScopedKeyName = SHARED_APNS_P8_NAME;
   resetScopedApnsCache();
 }
 
@@ -155,35 +156,34 @@ export function apnsKeyReadReason(): string {
  * fleet Mac, and the ceiling above allows up to 49.8 s for a slower vault.
  * Run synchronously, that window is time the sidecar cannot answer a request,
  * fire a timer, or drain a push queue for — and the two reads a cold start
- * needs are sequential, so the worst case froze the event loop for ~100 s.
- * The read is async and the caller awaits it, and the same `timeout` still
- * bounds it:  the child is killed at the ceiling, and a killed read is still
- * a failed read, which is what turns APNs pushes off. */
-async function scopedVaultGet(name: string): Promise<string | null> {
+ * needs would have frozen the event loop for ~100 s.  The read is async and the
+ * caller awaits it, and the same `timeout` still bounds it:  the child is
+ * killed at the ceiling, and a killed read is still a failed read, which is
+ * what turns APNs pushes off.  The material and the key id are read side by
+ * side, so the wall time of a cold start is one round trip, not two. */
+async function scopedVaultGet(name: string): Promise<{ value: string | null; reason: string }> {
   const got = await readApnsScopedSecret(name, apnsSecretFolder(), apnsSecretAccount(), vaultReadTimeoutMs());
-  if (got.code === APNS_READ_OK) {
-    vaultReadReason = "";
-    return got.value;
-  }
+  if (got.code === APNS_READ_OK) return { value: got.value, reason: "" };
   const account = apnsSecretAccount();
   const grant = account ? `account ${account}` : "no account";
   if (got.reason === "no-account") {
-    vaultReadReason = "no scoped Infisical account is configured for the APNs read (APNS_INFISICAL_ACCOUNT)";
-  } else if (got.reason === "reader-missing") {
-    vaultReadReason = "the scoped Infisical reader is not installed";
-  } else if (got.reason === "absent") {
-    vaultReadReason = `the APNs name ${name} is absent from the scoped Infisical folder ${apnsSecretFolder()} for ${grant}`;
-  } else {
-    vaultReadReason = `the scoped Infisical read of ${name} was refused for ${grant}`;
+    return { value: null, reason: "no scoped Infisical account is configured for the APNs read (APNS_INFISICAL_ACCOUNT)" };
   }
-  return null;
+  if (got.reason === "reader-missing") {
+    return { value: null, reason: "the scoped Infisical reader is not installed" };
+  }
+  if (got.reason === "absent") {
+    return { value: null, reason: `the APNs name ${name} is absent from the scoped Infisical folder ${apnsSecretFolder()} for ${grant}` };
+  }
+  return { value: null, reason: `the scoped Infisical read of ${name} was refused for ${grant}` };
 }
 
 /** The key id the store names, or null when the read fails or the answer
  * does not look like an Apple key id. */
-async function sharedKeyId(): Promise<string | null> {
-  const id = (await scopedVaultGet(SHARED_APNS_KEY_ID_NAME))?.trim();
-  return id && KEY_ID_PATTERN.test(id) ? id : null;
+async function sharedKeyId(): Promise<{ id: string | null; reason: string }> {
+  const got = await scopedVaultGet(SHARED_APNS_KEY_ID_NAME);
+  const id = got.value?.trim();
+  return { id: id && KEY_ID_PATTERN.test(id) ? id : null, reason: got.reason };
 }
 
 /** The read itself, away from the cache check.
@@ -194,7 +194,17 @@ async function sharedKeyId(): Promise<string | null> {
  * from `AUTHKEY_<KEY_ID>`.  There is no environment copy of the material, of
  * the key id, and no path to a file that holds one. */
 async function readVaultFromVault(retryMs: number, generation: number): Promise<VaultKey> {
-  const p8 = await scopedVaultGet(SHARED_APNS_P8_NAME);
+  // The material and the key id are two names in the same folder, and the id
+  // does not depend on the material:  read them side by side, so a cold start
+  // pays one round trip instead of two.  Each read carries its own reason, so
+  // the reason that survives is the one for the read that failed and not the
+  // one that happened to finish last.
+  const [material, idRead] = await Promise.all([
+    scopedVaultGet(SHARED_APNS_P8_NAME),
+    sharedKeyId(),
+  ]);
+  const p8 = material.value;
+  const id = idRead.id;
   // The entry is stamped when the read FINISHED, not when it started.  A read
   // that runs longer than the retry window would otherwise leave an
   // already-expired entry behind, and the very next caller — `refreshConfig`
@@ -208,12 +218,18 @@ async function readVaultFromVault(retryMs: number, generation: number): Promise<
   if (p8 === null) {
     // The shared name is not in the store.  The store may still name a key of
     // its own, and the material then comes from `AUTHKEY_<KEY_ID>`.
-    const named = await sharedKeyId();
-    if (named) {
-      const pinned = await scopedVaultGet(apnsVaultName(named));
+    if (id) {
+      const pinned = await scopedVaultGet(apnsVaultName(id));
       // The read is not finished until the material read returns.
       completedAt = Date.now();
-      if (pinned !== null) return store({ name: apnsVaultName(named), keyId: named, p8: pinned, at: completedAt });
+      if (pinned.value !== null) {
+        // The key is there:  nothing is missing, so nothing is reported.
+        vaultReadReason = "";
+        return store({ name: apnsVaultName(id), keyId: id, p8: pinned.value, at: completedAt });
+      }
+      vaultReadReason = pinned.reason || material.reason || idRead.reason;
+    } else {
+      vaultReadReason = material.reason || idRead.reason;
     }
     // The read is not finished until the id read returns either.
     completedAt = Date.now();
@@ -224,13 +240,15 @@ async function readVaultFromVault(retryMs: number, generation: number): Promise<
     }
     return store({ name: SHARED_APNS_P8_NAME, keyId: SHARED_APNS_KEY_ID, p8: null, at: completedAt });
   }
-  const id = await sharedKeyId();
   // The read is not finished until the id read returns.  Stamping before it
   // left an entry that was already expired by the time it was stored, when the
   // id read took longer than the retry window — and the raised ceiling allows
   // exactly that — so the next caller ran a second full vault round trip
   // instead of taking the cached answer.
   completedAt = Date.now();
+  // The material is there.  The only read that can still have failed is the
+  // key id, and that is what the reason names.
+  vaultReadReason = idRead.reason;
   if (id) {
     return store({ name: SHARED_APNS_P8_NAME, keyId: id, p8, at: completedAt });
   }
@@ -258,16 +276,25 @@ async function readVault(now = Date.now()): Promise<VaultKey> {
   return vaultReadInFlight;
 }
 
-/** The store name the last read used.  The status line names the store, never
- * a value. */
+/** The store name the last direct read used.  The status line names the
+ * store, never a value. */
 let resolvedKeyName = SHARED_APNS_P8_NAME;
+
+/** The store name the last scoped-binding read used.
+ *
+ * A binding read and a direct read are two paths into two different stores,
+ * and one name for both would let the status line name the other path's
+ * grant after an interleaved read. */
+let resolvedScopedKeyName = SHARED_APNS_P8_NAME;
 
 /** Where the signing key comes from, as text for status lines.  Never the
  * contents.  The store is the only source:  `APNS_KEY_P8` for the shared
  * material, or `AUTHKEY_<KEY_ID>` for a key the store names.  An explicit
- * scoped binding labels the read as scoped. */
+ * scoped binding labels the read as scoped, and names the store that path
+ * read. */
 export function apnsKeySource(binding?: ApnsScopedBinding): string {
-  return binding ? `Infisical scoped ${resolvedKeyName}` : `Infisical ${resolvedKeyName}`;
+  const name = binding ? resolvedScopedKeyName : resolvedKeyName;
+  return binding ? `Infisical scoped ${name}` : `Infisical ${name}`;
 }
 
 /** The material the store holds, and the id it is signed with.
@@ -285,25 +312,35 @@ async function resolveStoreKey(binding?: ApnsScopedBinding): Promise<{ p8: strin
   if (binding) {
     const shared = await loadScopedApnsMaterial(binding, { ...timing, pin: "" });
     if (shared.p8) {
+      resolvedScopedKeyName = SHARED_APNS_P8_NAME;
       return { p8: shared.p8, keyId: shared.keyId || SHARED_APNS_KEY_ID, name: SHARED_APNS_P8_NAME };
     }
     // The store names the key even when the shared material is not there.
     const named = shared.storeKeyId;
     if (named) {
       const pinned = await loadScopedApnsMaterial(binding, { ...timing, pin: named });
+      // The name is the one this read used, whether or not it answered:  a
+      // failed read must not leave the previous key's name on the status line.
+      resolvedScopedKeyName = apnsVaultName(named);
       if (pinned.p8) return { p8: pinned.p8, keyId: named, name: apnsVaultName(named) };
+    } else {
+      resolvedScopedKeyName = SHARED_APNS_P8_NAME;
     }
     vaultReadReason = `the scoped APNs binding could not be read (project ${binding.projectId}, folder ${binding.folder})`;
     return null;
   }
   const got = await readVault();
+  // The name is the one this read used, whether or not it answered:  a failed
+  // read must not leave the previous key's name on the status line.
+  resolvedKeyName = got.name;
   return got.p8 ? { p8: got.p8, keyId: got.keyId, name: got.name } : null;
 }
 
 async function resolveP8(binding?: ApnsScopedBinding): Promise<{ p8: string; origin: string; keyId: string } | null> {
+  // The store name is recorded by the path that read it, so an interleaved
+  // read cannot leave the status line naming the other path's grant.
   const got = await resolveStoreKey(binding);
   if (!got) return null;
-  resolvedKeyName = got.name;
   return { p8: got.p8, origin: "vault", keyId: got.keyId };
 }
 
