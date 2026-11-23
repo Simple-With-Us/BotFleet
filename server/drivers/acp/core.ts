@@ -926,17 +926,47 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
        *  LastKnownAnswer's own ordering so a slow older probe cannot claim
        *  a newer probe's remembered version for a different binary. */
       let lastProbedOrder = 0;
+      /** Resolved binary path per cli string for the current augmented
+       *  PATH value.  Walking every PATH entry with synchronous stats on
+       *  every dispatch would stall the event loop in proportion to PATH
+       *  size; remembering where each name resolved leaves one stat per
+       *  dispatch (the mtime/size read that detects an in-place upgrade).
+       *  A remembered path that stops answering falls back to the walk. */
+      let identityPathCache = { pathValue: "", byCli: new Map<string, string>() };
       /** The identity above for one cli string, resolved the way the probe
        *  spawn resolves it (augmented PATH), or null when no file answers —
        *  an unresolvable binary is never answered from memory. */
       const cliIdentityKey = (cli: string): string | null => {
-        const candidates = isAbsolute(cli) || cli.includes("/")
-          ? [cli]
-          : augmentedPath().split(delimiter).filter(Boolean).map((dir) => join(dir, cli));
-        for (const candidate of candidates) {
+        if (isAbsolute(cli) || cli.includes("/")) {
+          try {
+            const stat = statSync(cli);
+            return stat.isFile() ? `${cli}:${stat.mtimeMs}:${stat.size}` : null;
+          } catch {
+            return null;
+          }
+        }
+        const pathValue = augmentedPath();
+        if (pathValue !== identityPathCache.pathValue) {
+          identityPathCache = { pathValue, byCli: new Map() };
+        }
+        const remembered = identityPathCache.byCli.get(cli);
+        if (remembered) {
+          try {
+            const stat = statSync(remembered);
+            if (stat.isFile()) return `${remembered}:${stat.mtimeMs}:${stat.size}`;
+          } catch {
+            // The remembered file is gone; walk again below.
+          }
+          identityPathCache.byCli.delete(cli);
+        }
+        for (const dir of pathValue.split(delimiter).filter(Boolean)) {
+          const candidate = join(dir, cli);
           try {
             const stat = statSync(candidate);
-            if (stat.isFile()) return `${candidate}:${stat.mtimeMs}:${stat.size}`;
+            if (stat.isFile()) {
+              identityPathCache.byCli.set(cli, candidate);
+              return `${candidate}:${stat.mtimeMs}:${stat.size}`;
+            }
           } catch {
             // Not in this directory; keep looking down the PATH.
           }
