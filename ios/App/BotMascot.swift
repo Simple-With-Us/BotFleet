@@ -37,39 +37,6 @@ enum BotPalette {
         Color(hex: hex[name] ?? "#8E8E93")
     }
 
-    /// The black or white that reads on this palette colour.
-    ///
-    /// The palette runs light — `#E8EAED` is a near-white, `#D8A729` a mid
-    /// amber — so white text on it is invisible or barely there, well under
-    /// WCAG AA. This picks whichever of the two has the higher contrast ratio
-    /// against the colour itself, so a label drawn on a bot's own colour is
-    /// always legible.
-    static func contrastingForeground(for name: String) -> Color {
-        let rgb = components(of: hex[name] ?? "#8E8E93")
-        let luminance = relativeLuminance(rgb)
-        let onWhite = 1.05 / (luminance + 0.05)
-        let onBlack = (luminance + 0.05) / 0.05
-        return onBlack >= onWhite ? .black : .white
-    }
-
-    /// The sRGB triple behind a palette hex, without the alpha.
-    private static func components(of hex: String) -> (r: Double, g: Double, b: Double) {
-        var value: UInt64 = 0
-        Scanner(string: hex.replacingOccurrences(of: "#", with: "")).scanHexInt64(&value)
-        return (
-            Double((value >> 16) & 0xFF) / 255,
-            Double((value >> 8) & 0xFF) / 255,
-            Double(value & 0xFF) / 255
-        )
-    }
-
-    /// WCAG relative luminance of an sRGB triple.
-    private static func relativeLuminance(_ rgb: (r: Double, g: Double, b: Double)) -> Double {
-        func channel(_ value: Double) -> Double {
-            value <= 0.03928 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4)
-        }
-        return 0.2126 * channel(rgb.r) + 0.7152 * channel(rgb.g) + 0.0722 * channel(rgb.b)
-    }
 }
 
 /// The mascot silhouette, as an SVG path. Absolute `M`, `C` and `Z` only —
@@ -732,7 +699,7 @@ struct ProfileAvatar: View {
             .overlay {
                 Text(initial)
                     .font(.system(size: size * 0.45, weight: .semibold))
-                    .foregroundStyle(BotPalette.contrastingForeground(for: "green"))
+                    .foregroundStyle(.white)
             }
     }
 

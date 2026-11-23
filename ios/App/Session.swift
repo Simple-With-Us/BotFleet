@@ -1460,7 +1460,7 @@ final class Session: ObservableObject {
             if message.contains("no route") {
                 // Packaged companion older than #224 deny-lists DELETE /queue/.
                 // Dropping the chip locally would hide a message that still sends.
-                actionError = "This Mac is running an older BotFleet.\u{00A0} Update BotFleet on your computer, then you can cancel a queued message."
+                actionError = "This Mac is running an older BotFleet.  Update BotFleet on your computer, then you can cancel a queued message."
                 return false
             }
             dropLocalChip()
@@ -3792,7 +3792,7 @@ final class Session: ObservableObject {
                 notificationChat = .room(room)
                 return
             }
-            guard var selected = bot else { throw APIError.status(code: 404, message: "That bot no longer exists.") }
+            guard var selected = bot else { throw APIError.status(code: 404, message: "That agent no longer exists.") }
             if target.requiresTaskSwitch(activeThreadId: selected.threadId) {
                 do {
                     selected = try await client.switchTask(botId: selected.id, threadId: target.threadId)

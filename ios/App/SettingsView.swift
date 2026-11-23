@@ -339,7 +339,7 @@ struct SettingsView: View {
                 } footer: {
                     Text(
                         settingsLoaded
-                            ? "Shown in the sidebar.\u{00A0} Saved when you leave a field."
+                            ? "Shown in the sidebar.  Saved when you leave a field."
                             : "Settings load from your computer before you can edit workspace, name, email, or the channel turn timeout."
                     )
                 }
@@ -353,7 +353,7 @@ struct SettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
                     } else if engines.isEmpty {
-                        Text("No engines yet.\u{00A0} Finish setup in the Mac app.")
+                        Text("No engines yet.  Finish setup in the Mac app.")
                             .foregroundStyle(.secondary)
                     } else {
                         ScrollView(.horizontal, showsIndicators: false) {
@@ -628,7 +628,7 @@ struct SettingsView: View {
         }
         return session.config?.isProjectsMode == true
             ? "Any number of threads under each bot and \(roomTermLowered).\u{00A0} A thread can be tied to one \(roomTermLowered) on your computer."
-            : "Simple is one conversation per bot.\u{00A0} That word is a group thread invited bots and you can all write in."
+            : "Simple is one conversation per bot.  That word is a group thread invited bots and you can all write in."
     }
 
     private var notificationsAreEnabled: Bool {
@@ -716,9 +716,9 @@ struct SettingsView: View {
     /// a software update rather than at a setting on their computer.
     private var pushHealthFooter: String {
         if session.pushSenderHealthNotReported {
-            return "This computer's BotFleet is older than the version that reports this row.\u{00A0} Update BotFleet on your computer to see it."
+            return "This computer's BotFleet is older than the version that reports this row.  Update BotFleet on your computer to see it."
         }
-        return "Pull down to refresh.\u{00A0} The status reflects what your computer last reported."
+        return "Pull down to refresh.  The status reflects what your computer last reported."
     }
 
     private var statusText: String { session.status.settingsText }
@@ -915,7 +915,7 @@ struct ConnectionSecurityView: View {
         case let .offline(reason):
             return reason
         case .macOffline:
-            return "Your Mac is not running BotFleet.\u{00A0} Open the app on your computer, then retry."
+            return "Your Mac is not running BotFleet.  Open the app on your computer, then retry."
         case .unauthorized:
             return "This phone was removed from the computer. Pair it again to reconnect."
         case .unpaired:
@@ -957,7 +957,7 @@ struct CustomRoomTermFields: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Enter both forms.\u{00A0} The plural is not always just an added \"s\", so it has its own box — Category and Categories.")
+            Text("Enter both forms.  The plural is not always just an added \"s\", so it has its own box — Category and Categories.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             HStack(spacing: 8) {

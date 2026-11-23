@@ -133,7 +133,7 @@ struct MacUpdateSection: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("The Mac app and its server restart during the update.\u{00A0} Continue?")
+            Text("The Mac app and its server restart during the update.  Continue?")
         }
     }
 
@@ -143,7 +143,7 @@ struct MacUpdateSection: View {
         VStack(alignment: .leading, spacing: 8) {
             Label("Mac Update not available", systemImage: "exclamationmark.triangle")
                 .foregroundStyle(.secondary)
-            Text("Could not reach this computer's update status.\u{00A0} It may be offline or running an older BotFleet.")
+            Text("Could not reach this computer's update status.  It may be offline or running an older BotFleet.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Button("Retry") {

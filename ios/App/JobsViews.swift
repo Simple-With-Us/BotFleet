@@ -59,10 +59,10 @@ struct JobsPill: View {
                     HStack(spacing: 6) {
                         JobStatusDot(tone: JobsDisplay.pillTone(shown, now: now))
                         Text(JobsDisplay.pillLabel(shown))
-                            .font(.scaled(13, weight: .medium, relativeTo: .footnote))
+                            .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(Color.primary)
                         Image(systemName: "chevron.right")
-                            .font(.scaled(10, weight: .semibold, relativeTo: .caption2))
+                            .font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(Color.secondary)
                             .accessibilityHidden(true)
                     }
@@ -70,10 +70,6 @@ struct JobsPill: View {
                     .frame(minHeight: 32)
                     .background(Capsule().fill(Color.secondary.opacity(0.14)))
                     .contentShape(Capsule())
-                    // The pill keeps its 32pt look, but the tap target reaches
-                    // the 44pt minimum.
-                    .frame(minHeight: 44)
-                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Background Jobs: \(description)")

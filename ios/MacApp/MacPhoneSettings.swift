@@ -28,7 +28,6 @@ struct MacPhoneSettings: View {
     @State private var errorMessage: String?
     @State private var renderedQR: NSImage? = nil
     @State private var renderedQRKey: String? = nil
-    @State private var revoking: PairedDevice? = nil
 
     var body: some View {
         ScrollView {
@@ -68,24 +67,9 @@ struct MacPhoneSettings: View {
                         .foregroundColor(.red)
                 }
             }
+            .padding(24)
         }
         .task(id: session.companionListenerEnabled) { await reload() }
-        .confirmationDialog("Revoke Phone?", isPresented: Binding(get: { revoking != nil }, set: { if !$0 { revoking = nil } })) {
-            if let device = revoking {
-                Button("Revoke Phone", role: .destructive) {
-                    Task {
-                        if await session.revokePairedPhone(id: device.id) {
-                            await reload()
-                        } else {
-                            errorMessage = "Could not revoke \(device.name).\u{00A0} Try again."
-                        }
-                        revoking = nil
-                    }
-                }
-            }
-        } message: {
-            Text("Revoking forgets this phone's pairing.\u{00A0} It has to pair again before it can send or receive messages.")
-        }
     }
 
     private var pairingCard: some View {
@@ -144,8 +128,14 @@ struct MacPhoneSettings: View {
                                     .foregroundColor(.secondary)
                             }
                             Spacer()
-                            Button("Revoke…", role: .destructive) {
-                                revoking = device
+                            Button("Revoke") {
+                                Task {
+                                    if await session.revokePairedPhone(id: device.id) {
+                                        await reload()
+                                    } else {
+                                        errorMessage = "Could not revoke \(device.name). Try again."
+                                    }
+                                }
                             }
                         }
                         Divider()

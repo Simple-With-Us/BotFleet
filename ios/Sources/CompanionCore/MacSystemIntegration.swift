@@ -216,7 +216,7 @@ public enum MacMenubarMenuItem: Equatable, Sendable {
 
 /// Pure, testable value model for the macOS menubar status item and menu.
 public struct MacMenubarState: Equatable, Sendable {
-    public static let connectionLostStatusCopy = "Connection lost.\u{00A0} Your bots will reconnect on their own"
+    public static let connectionLostStatusCopy = "Connection lost.  Your bots will reconnect on their own"
     public static let allBotsIdleStatusCopy = "All bots idle"
 
     public var isConnected: Bool
@@ -563,7 +563,7 @@ public enum MacCarbonRegistrationStatus: Equatable, Sendable {
 /// and drives the Settings shortcut recorder state machine.
 public final class MacGlobalHotkeyManager: @unchecked Sendable {
     /// Exact inline error copy when `RegisterEventHotKey` reports `eventHotKeyExistsErr`.
-    public static let shortcutCollisionCopy = "That shortcut is used by another app.\u{00A0} Choose a different one."
+    public static let shortcutCollisionCopy = "That shortcut is used by another app.  Choose a different one."
 
     /// Virtual key codes for Escape and Delete on macOS.
     public static let escapeKeyCode: UInt32 = 53
@@ -637,7 +637,7 @@ public final class MacGlobalHotkeyManager: @unchecked Sendable {
     /// - `Escape` cancels recording without modifying the current binding.
     /// - `Delete` (or Forward Delete) clears the shortcut back to off.
     /// - Any other key combo attempts registration; on collision (`eventHotKeyExistsErr`),
-    ///   surfaces `"That shortcut is used by another app.\u{00A0} Choose a different one."`.
+    ///   surfaces `"That shortcut is used by another app.  Choose a different one."`.
     @discardableResult
     public func handleRecordedKey(
         keyCode: UInt32,
@@ -1020,7 +1020,7 @@ public enum MacNotificationPermissionState: Equatable, Sendable {
 /// active-thread suppression, lazy permission prompting, and denied-permission
 /// Settings status copy.
 public final class MacNotificationCoordinator: @unchecked Sendable {
-    public static let notificationsOffStatusCopy = "Notifications are off.\u{00A0} Bots that need you will wait in the menubar"
+    public static let notificationsOffStatusCopy = "Notifications are off.  Bots that need you will wait in the menubar"
     public static let openSettingsActionTitle = "Open Settings"
 
     public private(set) var permissionState: MacNotificationPermissionState
@@ -1071,7 +1071,7 @@ public final class MacNotificationCoordinator: @unchecked Sendable {
     /// 3. If permission is `.notDetermined`, requests permission now (at the first
     ///    moment a bot actually needs the person).
     /// 4. If permission is `.denied`, suppresses delivery and surfaces
-    ///    `"Notifications are off.\u{00A0} Bots that need you will wait in the menubar"`
+    ///    `"Notifications are off.  Bots that need you will wait in the menubar"`
     ///    with action `"Open Settings"`.
     @discardableResult
     public func handleEvent(_ event: MacCandidateNotificationEvent) -> MacNotificationDecision {

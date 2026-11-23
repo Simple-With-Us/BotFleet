@@ -317,7 +317,7 @@ struct PairingView: View {
                     TextField("000000", text: $code)
                         .keyboardType(.numberPad)
                         .textContentType(.oneTimeCode)
-                        .font(.scaled(28, weight: .bold, design: .rounded, relativeTo: .title))
+                        .font(.system(size: 28, weight: .bold, design: .rounded))
                         .multilineTextAlignment(.center)
                         .padding(.vertical, 12)
                         .background(Color(uiColor: .tertiarySystemGroupedBackground))
