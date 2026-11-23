@@ -493,7 +493,25 @@ function ownCredentialStore(cfg: AppConfig, spec: SecretFieldSpec): boolean {
   // The marker sits beside the field in the same section, so the same safe
   // reader that walks a field's path reads it:  no dictionary access and no
   // runtime type check of its own.
+  //
+  // Only a secret answers to it.  The marker means the app's own credential
+  // store holds this field's secret, and the desktop relays secrets;  a
+  // section can hold a secret and a non-secret beside it -- a key and a base
+  // URL, a key and a region -- and one marker must not hand the non-secret
+  // one an environment copy of its own.
+  if (!spec.secret) return false;
   return readField(cfg, spec, OWN_STORE_MARKER_PATH) === "external";
+}
+
+/** The value each mapped field holds in the app's own file.
+ *
+ * The config overlay may put the app's own credential store's value in a
+ * field's place before the vault is consulted, so the copy that is really
+ * on disk has to be captured before that happens. */
+export function fileSecretValues(cfg: AppConfig): ReadonlyMap<string, string> {
+  const values = new Map<string, string>();
+  for (const spec of SECRET_FIELDS) values.set(spec.id, readField(cfg, spec) ?? "");
+  return values;
 }
 
 /** The environment names whose value the app's own credential store holds.
@@ -644,6 +662,7 @@ export function resolveSecretFields(
   cfg: AppConfig,
   env: NodeJS.ProcessEnv,
   snap: ReadonlyMap<string, string> | null,
+  fileValues?: ReadonlyMap<string, string>,
 ): SecretProvenance[] {
   const rows: SecretProvenance[] = [];
   // The store is the only source for a name it manages (owner ruling,
@@ -661,6 +680,11 @@ export function resolveSecretFields(
     //  no longer copies an environment value into it once a store is
     //  configured, so what is here came from the file.
     const local = readField(cfg, spec) ?? "";
+    //  The one exception is the app's own credential store, whose value the
+    //  overlay puts in the file's place:  the copy that is really on disk is
+    //  the one captured before the overlay ran, so a tombstoned file is not
+    //  reported as holding a copy the vault overrode.
+    const onDisk = fileValues?.get(spec.id) ?? local;
     //  The environment is not a source once a store is configured -- unless
     //  the app's own configuration says the value lives in the app's own
     //  credential store, which is the desktop's encrypted store handed to
@@ -677,7 +701,7 @@ export function resolveSecretFields(
     let resolved = local || fromEnv || "";
     if (typeof vaultValue === "string" && vaultValue.length > 0) {
       writeField(cfg, spec, vaultValue);
-      hasLocalCopy = local.length > 0;
+      hasLocalCopy = onDisk.length > 0;
       resolved = vaultValue;
       source = "infisical";
     }

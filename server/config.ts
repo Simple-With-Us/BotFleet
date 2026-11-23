@@ -13,6 +13,7 @@ import { dataDir } from "./data-dir.ts";
 import { clearDataFault, findSetAsideFiles, recordDataFault, type SetAsideFile } from "./data-faults.ts";
 import { isJsonObject, isJsonString, parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 import {
+  fileSecretValues,
   infisicalSnapshot,
   mappedEnvNames,
   ownCredentialStoreEnvNames,
@@ -2200,6 +2201,10 @@ export function loadConfig(): AppConfig {
   // fleet store still outranks it above, and an environment value with no
   // marker stays out of the way entirely.
   const ownStoreEnv = ownCredentialStoreEnvNames(cfg);
+  // The values the app's own file holds, captured before the overlay can put
+  // the app's own credential store's value in their place, so the provenance
+  // the vault check reports is about the file and not about the handoff.
+  const fileValues = fileSecretValues(cfg);
   const envCopy = (name: string): string | undefined => {
     if (storeConfigured && mappedEnv.has(name) && !ownStoreEnv.has(name)) return undefined;
     return process.env[name];
@@ -2287,7 +2292,7 @@ export function loadConfig(): AppConfig {
   // overwrites what env and file just agreed on, and the provenance of every
   // mapped field is recorded for the Secrets card.  With no store configured
   // the snapshot is null and this is a no-op.
-  resolveSecretFields(cfg, process.env, infisicalSnapshot());
+  resolveSecretFields(cfg, process.env, infisicalSnapshot(), fileValues);
   // The tunable-knob twin of the line above, from `server/knob-map.ts`: for
   // a knob name the vault holds, the vault wins over the file.  Runs after
   // the credential overlay so both layers read the same snapshot, and both

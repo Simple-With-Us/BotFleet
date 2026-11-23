@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR, loadConfig } from "./config.ts";
-import { setInfisicalSnapshot } from "./secret-map.ts";
+import { secretProvenance, setInfisicalSnapshot } from "./secret-map.ts";
 
 // The desktop shell keeps the operator's own keys OS-encrypted and hands them
 // to the server it spawns, so the app's own configuration marks the value
@@ -13,7 +13,7 @@ import { setInfisicalSnapshot } from "./secret-map.ts";
 // an ambient environment copy:  the fleet store still outranks it, and an
 // environment value with no marker is never a source once a store is
 // configured.
-const VARS = ["DEEPSEEK_API_KEY", "XAI_API_KEY"] as const;
+const VARS = ["DEEPSEEK_API_KEY", "DEEPSEEK_URL", "XAI_API_KEY"] as const;
 
 describe("the app's own credential store", () => {
   let saved: Record<string, string | undefined>;
@@ -51,6 +51,42 @@ describe("the app's own credential store", () => {
     // An ambient environment copy with no marker is not a source, and the
     // app's own configuration still applies for a name the store does not hold.
     expect(cfg.xai?.key).toBe("file-xai");
+  });
+
+  it("does not let an own-store marker make a non-secret alias a source", () => {
+    // The marker means the app's own credential store holds this section's
+    // secret.  A section can hold a secret and a non-secret beside it -- a
+    // key and a base URL -- and the marker must not hand the non-secret one
+    // an inherited environment copy of its own.
+    writeFileSync(
+      join(DATA_DIR, "config.json"),
+      JSON.stringify({
+        deepseek: { key: "", url: "https://file.example.test", credentialStorage: "external" },
+      }),
+    );
+    process.env.DEEPSEEK_API_KEY = "env-deepseek";
+    process.env.DEEPSEEK_URL = "https://env.example.test";
+    setInfisicalSnapshot(new Map([["COMPOSIO_API_KEY", "sentinel-vault-value-not-real"]]), ["COMPOSIO_API_KEY"]);
+    const cfg = loadConfig();
+    expect(cfg.deepseek?.key).toBe("env-deepseek");
+    expect(cfg.deepseek?.url).toBe("https://file.example.test");
+  });
+
+  it("reports no local copy when the file is tombstoned and the store holds the value", () => {
+    // The app's own credential store handed the value over, but the file is
+    // tombstoned, so there is no copy on disk for the vault to have
+    // overridden.
+    writeFileSync(
+      join(DATA_DIR, "config.json"),
+      JSON.stringify({ deepseek: { key: "", credentialStorage: "external" } }),
+    );
+    process.env.DEEPSEEK_API_KEY = "env-deepseek";
+    setInfisicalSnapshot(new Map([["DEEPSEEK_API_KEY", "sentinel-vault-value-not-real"]]), ["DEEPSEEK_API_KEY"]);
+    const cfg = loadConfig();
+    expect(cfg.deepseek?.key).toBe("sentinel-vault-value-not-real");
+    const row = secretProvenance().find((entry) => entry.id === "deepseek.key");
+    expect(row?.source).toBe("infisical");
+    expect(row?.hasLocalCopy).toBe(false);
   });
 
   it("ignores the same environment value with no marker on the field", () => {
