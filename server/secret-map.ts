@@ -12,10 +12,16 @@
 // resolves from the store, and the environment carries no copy of a value --
 // not as a first source and not as a second one.  So when a store is
 // configured, the store owns every name in the table below:  its answer is
-// the value, and a name it does not hold is absent, with the environment
-// copy and the file copy both out of the way.  When no store is configured
-// there is no store to own the name, and the app's own configuration still
-// applies.
+// the value for a name it holds, and for a name it does not hold the app's
+// own configuration still applies -- the file, which is the app's own store
+// and never a copy of a fleet grant.  When no store is configured there is
+// no store to own the name, and the environment and the file still apply.
+//
+// One narrow exception, and it is the app's own credential store:  the
+// desktop shell's OS-encrypted store, handed to the server it spawns and
+// marked in the app's own configuration with `credentialStorage: "external"`.
+// That value is the app's own store reaching its own server, never an
+// ambient environment copy, and the fleet store still outranks it.
 //
 // Three rules keep that layer safe:
 //   1. Only a name in this table is ever applied.  A vault row called `PATH`,
@@ -471,6 +477,35 @@ export const CLI_LOGIN_FIELDS: readonly CliLoginFieldSpec[] = [
   },
 ] as const;
 
+/** True when this field's value lives in the app's own credential store.
+ *
+ * The desktop shell keeps those values OS-encrypted (safeStorage) and hands
+ * them to the server it spawns, so the app's own configuration carries the
+ * durable marker `credentialStorage: "external"` and the value arrives out of
+ * the environment.  That is the app's own store, the same class as the file,
+ * and not an ambient environment copy:  the fleet store still outranks it,
+ * and an environment value with no marker stays out of the way entirely. */
+function ownCredentialStore(cfg: AppConfig, spec: SecretFieldSpec): boolean {
+  const section = (cfg as Record<string, unknown>)[spec.section];
+  if (!section || typeof section !== "object") return false;
+  return (section as Record<string, unknown>).credentialStorage === "external";
+}
+
+/** The environment names whose value the app's own credential store holds.
+ *
+ * The config overlay asks for these:  once a store is configured, an
+ * environment value is not a source unless the app's own configuration says
+ * the value lives in the app's own credential store (owner ruling, November
+ * 22, 2026:  the environment carries no copy of a value). */
+export function ownCredentialStoreEnvNames(cfg: AppConfig): ReadonlySet<string> {
+  const names = new Set<string>();
+  for (const spec of SECRET_FIELDS) {
+    if (!ownCredentialStore(cfg, spec)) continue;
+    for (const name of spec.env) names.add(name);
+  }
+  return names;
+}
+
 /** Every environment name a CLI login may use.  The allowlist: a row in the
  * seat's folder that is not one of these is ignored, and one of these the
  * folder does not hold is simply absent. */
@@ -621,7 +656,12 @@ export function resolveSecretFields(
     //  no longer copies an environment value into it once a store is
     //  configured, so what is here came from the file.
     const local = readField(cfg, spec) ?? "";
-    const fromEnv = storeOwns ? undefined : envValueFor(spec, env);
+    //  The environment is not a source once a store is configured -- unless
+    //  the app's own configuration says the value lives in the app's own
+    //  credential store, which is the desktop's encrypted store handed to
+    //  the server it spawns.  That is the app's own store, not an ambient
+    //  environment copy, and the store above still outranks it.
+    const fromEnv = storeOwns && !ownCredentialStore(cfg, spec) ? undefined : envValueFor(spec, env);
     const vaultValue = snap?.get(spec.infisicalName);
 
     let source: SecretSource;

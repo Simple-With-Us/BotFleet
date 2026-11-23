@@ -12,7 +12,13 @@ import type { InstanceConfig, InstanceConfigMap } from "./contracts.ts";
 import { dataDir } from "./data-dir.ts";
 import { clearDataFault, findSetAsideFiles, recordDataFault, type SetAsideFile } from "./data-faults.ts";
 import { isJsonObject, isJsonString, parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
-import { infisicalSnapshot, mappedEnvNames, resolveSecretFields, stripVaultManagedValues } from "./secret-map.ts";
+import {
+  infisicalSnapshot,
+  mappedEnvNames,
+  ownCredentialStoreEnvNames,
+  resolveSecretFields,
+  stripVaultManagedValues,
+} from "./secret-map.ts";
 import { resolveKnobFields, stripVaultManagedKnobs } from "./knob-map.ts";
 import { CONTROL_ACT_WITHIN_MS, CONTROL_WAIT_MS } from "./control-client.ts";
 import { describeDsn } from "./sentry.ts";
@@ -2175,11 +2181,27 @@ export function loadConfig(): AppConfig {
   // owns those names, and a hand-set value can never replace the reviewed
   // grant.  A host with no store configured has no store to own the name, so
   // the overlay still applies there.
+  //
+  // The one exception is the app's own credential store, marked in the app's
+  // own configuration:  the desktop shell's encrypted store, handed to the
+  // server it spawns.  The ruling preserves the app's own configuration for
+  // a name the fleet store does not hold, and the keychain value is exactly
+  // that -- the app's own store, never a copy of a fleet grant.  The fleet
+  // store still outranks it, and the environment copy of any other name
+  // stays out of the way.
   // The names the secret map manages, and the store that owns them.
   const mappedEnv = mappedEnvNames();
   const storeConfigured = infisicalSnapshot() !== null;
+  // The app's own credential store:  the desktop shell keeps those values
+  // OS-encrypted and hands them to the server it spawns, so they arrive out
+  // of the environment, and the app's own configuration says so with the
+  // `credentialStorage: "external"` marker.  That is the app's own store --
+  // the same class as the file -- and not an ambient environment copy:  the
+  // fleet store still outranks it above, and an environment value with no
+  // marker stays out of the way entirely.
+  const ownStoreEnv = ownCredentialStoreEnvNames(cfg);
   const envCopy = (name: string): string | undefined => {
-    if (storeConfigured && mappedEnv.has(name)) return undefined;
+    if (storeConfigured && mappedEnv.has(name) && !ownStoreEnv.has(name)) return undefined;
     return process.env[name];
   };
   cfg.githubRequestLog = { ...cfg.githubRequestLog };
