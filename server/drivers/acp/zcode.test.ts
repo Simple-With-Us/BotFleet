@@ -482,7 +482,7 @@ describe("ZCode ACP dispatch version gate (BF-2468)", () => {
         'const fs = require("node:fs");',
         `const countFile = ${JSON.stringify(countFile)};`,
         'let n = 0; try { n = Number(fs.readFileSync(countFile, "utf8")) || 0; } catch {}',
-        "fs.writeFileSync(countFile, String(n + 1));",
+        'if (process.argv.includes("--version")) fs.writeFileSync(countFile, String(n + 1));',
         'console.log("0.1.0");',
         "",
       ].join("\n"),
@@ -514,10 +514,33 @@ describe("ZCode ACP dispatch version gate (BF-2468)", () => {
       expect(second).toMatchObject({ ok: false });
       // The dispatch gate answered from the remembered version: no second spawn.
       expect(readFileSync(countFile, "utf8")).toBe("1");
+      // An in-place upgrade changes the binary identity (mtime/size), so the
+      // gate re-probes at once instead of refusing from cache for the window.
+      // The turn then refuses for sign-in, which is past the gate.
+      writeFileSync(
+        join(dir, "zcode-acp-server"),
+        [
+          "#!/usr/bin/env node",
+          'const fs = require("node:fs");',
+          `const countFile = ${JSON.stringify(countFile)};`,
+          'let n = 0; try { n = Number(fs.readFileSync(countFile, "utf8")) || 0; } catch {}',
+          'if (process.argv.includes("--version")) fs.writeFileSync(countFile, String(n + 1));',
+          'console.log("9.9.9");',
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      await instance!.adapter.sendTurn({ text: "run the check", threadId: "zcode-acp-ttl-3" });
+      await recorder!.until((event) => event.type === "turn.completed" && event.threadId === "zcode-acp-ttl-3");
+      expect(readFileSync(countFile, "utf8")).toBe("2");
+      await instance!.adapter.sendTurn({ text: "run the check", threadId: "zcode-acp-ttl-4" });
+      await recorder!.until((event) => event.type === "turn.completed" && event.threadId === "zcode-acp-ttl-4");
+      // The upgraded binary's answer is now the remembered one: cached again.
+      expect(readFileSync(countFile, "utf8")).toBe("2");
       // A snapshot is the freshness path: it probes again on purpose.
       const snap = await instance!.snapshot();
-      expect(snap.state).toBe("unavailable");
-      expect(readFileSync(countFile, "utf8")).toBe("2");
+      expect(snap.version).toBe("9.9.9");
+      expect(readFileSync(countFile, "utf8")).toBe("3");
     } finally {
       recorder?.stop();
       await instance?.dispose();
