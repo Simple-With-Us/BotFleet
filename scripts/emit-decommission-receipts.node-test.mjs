@@ -18,7 +18,7 @@ import test from "node:test";
 
 import { REQUIRED_CHECKS } from "./decommission-evidence-bundle.mjs";
 import { CHANGE_PLAN_CHECKS, emitChangePlanReceipt } from "./emit-change-plan-receipt.mjs";
-import { DAILY_DRIVER_OBSERVATIONS, emitDailyDriverReceipt } from "./emit-daily-driver-receipt.mjs";
+import { DAILY_DRIVER_OBSERVATIONS, emitDailyDriverReceipt, parseCliArgs } from "./emit-daily-driver-receipt.mjs";
 import { SIGNED_RELEASE_CHECKS, emitSignedReleaseReceipt } from "./emit-signed-release-receipt.mjs";
 
 /** A private-key header, assembled from parts, so the relay's secret scan reads
@@ -343,6 +343,56 @@ test("the daily-driver producer refuses a short interval, a gap, an interrupted 
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("the daily-driver producer refuses two segments citing the same log file", () => {
+  const root = capture(fixtureFiles([]));
+  try {
+    const observationPath = join(root, "observation.json");
+    const start = Date.parse("2026-11-01T00:00:00.000Z");
+    const mid = start + 4 * 24 * 60 * 60 * 1000;
+    const end = start + 7 * 24 * 60 * 60 * 1000;
+    const iso = (ms) => new Date(ms).toISOString();
+    const two = dailyDriverObservation();
+    two.segments = [
+      { ...two.segments[0], startedAt: iso(start), endedAt: iso(mid) },
+      { ...two.segments[0], startedAt: iso(mid), endedAt: iso(end) },
+    ];
+    // Both segments name the same capture file:  one log cannot stand in
+    // for two intervals.
+    writeFileSync(observationPath, JSON.stringify(two), { mode: 0o600 });
+    assert.throws(
+      () => emitDailyDriverReceipt({ captureDir: root, request: request(), observationPath, provenance: provenance() }),
+      /already cited by an earlier segment/,
+    );
+
+    // Distinct files validate.
+    const files = fixtureFiles([]);
+    files["segment-2.log"] = "second segment log line\n";
+    const other = capture(files);
+    try {
+      two.segments[1].logPath = "segment-2.log";
+      const observationPath2 = join(other, "observation.json");
+      writeFileSync(observationPath2, JSON.stringify(two), { mode: 0o600 });
+      const result = emitDailyDriverReceipt({ captureDir: other, request: request(), observationPath: observationPath2, provenance: provenance() });
+      assert.equal(result.segmentCount, 2);
+      assert.notEqual(result.receipt.data.segments[0].log.path, result.receipt.data.segments[1].log.path);
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("parseCliArgs refuses non-string entries with the documented error, not a TypeError", () => {
+  assert.throws(() => parseCliArgs([42, "x"]), /unknown argument: 42/);
+  // A number value coerces to its text and is accepted;  only a missing or
+  // empty value is the documented refusal.
+  assert.throws(() => parseCliArgs(["--capture", null]), /missing value for --capture/);
+  assert.throws(() => parseCliArgs(["--capture", "--request"]), /missing value for --capture/);
+  assert.throws(() => parseCliArgs([undefined, "x"]), /unknown argument: /);
+  assert.throws(() => parseCliArgs([{ flag: "--capture" }]), /unknown argument:/);
 });
 
 test("every producer refuses an artifact outside the capture directory and an unredacted one", () => {

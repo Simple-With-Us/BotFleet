@@ -391,6 +391,13 @@ export function emitDailyDriverReceipt({
 
     const logArtifact = readRedactedCaptureArtifact(reader, capture, span.logPath, `segment[${index}] log`);
 
+    // One log covers one segment.  The same file named twice would let one
+    // capture stand in for every interval, so a path that is already on a
+    // validated segment is a refusal rather than a second citation.
+    if (validatedSegments.some((segment) => segment.log.path === logArtifact.reference.path)) {
+      throw new Error(`segment[${index}] log "${printable(span.logPath)}" is already cited by an earlier segment`);
+    }
+
     for (const [field, expected] of Object.entries(DAILY_DRIVER_OBSERVATIONS)) {
       if (span[field] !== expected) {
         throw new Error(`segment[${index}] ${field} is "${span[field]}", expected "${expected}"`);
@@ -469,16 +476,20 @@ const KNOWN_FLAGS = new Set([
 export function parseCliArgs(args) {
   const values = new Map();
   for (let i = 0; i < args.length; i += 1) {
-    const flag = args[i];
+    // A programmatic caller can hand over anything;  a non-string entry is
+    // the documented refusal, not a TypeError from a method the value does
+    // not have.
+    const flag = String(args[i] ?? "");
     if (!KNOWN_FLAGS.has(flag)) {
-      throw new Error(`unknown argument: ${flag}`);
+      throw new Error(`unknown argument: ${printable(flag)}`);
     }
     if (values.has(flag)) {
-      throw new Error(`duplicate flag: ${flag}`);
+      throw new Error(`duplicate flag: ${printable(flag)}`);
     }
-    const next = args[i + 1];
-    if (next === undefined || next.startsWith("--")) {
-      throw new Error(`missing value for ${flag}`);
+    const rawNext = args[i + 1];
+    const next = rawNext === undefined || rawNext === null ? "" : String(rawNext);
+    if (next === "" || next.startsWith("--")) {
+      throw new Error(`missing value for ${printable(flag)}`);
     }
     values.set(flag, next);
     i += 1;

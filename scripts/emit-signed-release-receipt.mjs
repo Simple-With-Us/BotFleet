@@ -161,9 +161,15 @@ function readSafeJsonFile(filePath, label) {
     }
     const after = fstatSync(fd);
     const listedAfter = lstatSync(target);
+    // The path is bound to the descriptor as well as the descriptor to its
+    // first listing:  a rename-and-replace between the listing and the read
+    // would otherwise pass every check above while the bytes came from the
+    // replacement file.
     if (
       listedAfter.isSymbolicLink()
       || listedAfter.nlink !== 1
+      || listedAfter.dev !== after.dev
+      || listedAfter.ino !== after.ino
       || after.dev !== opened.dev
       || after.ino !== opened.ino
       || after.size !== opened.size
@@ -210,7 +216,14 @@ function readRedactedCaptureArtifact(reader, captureRoot, filePath, label) {
  * The printable text of a refusal, on one bounded line.
  */
 function printable(value) {
-  const text = String(value ?? "").replace(/[\r\n\t]+/g, " ").trim();
+  // Every control or separator character is written as a visible escape,
+  // the way `scripts/emit-daily-driver-receipt.mjs` prints the same text:
+  // a refusal stays one line for every parser, including the ones that
+  // split on NEL, LS and PS, and no ESC byte can forge a log line.
+  const text = String(value ?? "")
+    .replace(/\\/g, "\\\\")
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) => `\\u{${character.codePointAt(0).toString(16)}}`)
+    .trim();
   return text.length > 400 ? `${text.slice(0, 400)}…` : text;
 }
 
