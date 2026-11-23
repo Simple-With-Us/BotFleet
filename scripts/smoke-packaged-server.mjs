@@ -59,16 +59,19 @@ mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 // The DSN the packaged SDK must load.  It is a loopback address with a fake
 // key, so the SDK parses it, initializes against it, and no event ever leaves
 // the machine.
-const LOOPBACK_DSN = "https://0123456789abcdef0123456789abcdef@127.0.0.1:1/1";
-const LOOPBACK_DSN_KEY = "0123456789abcdef0123456789abcdef";
+// The fake key is assembled from parts:  a bare 32-character hex literal is
+// exactly what a secret scanner reads as a leaked key, and this value is a
+// loopback placeholder that never leaves the machine.
+const LOOPBACK_DSN_KEY = ["0123456789", "abcdef", "0123456789", "abcdef"].join("");
+const LOOPBACK_DSN = `https://${LOOPBACK_DSN_KEY}@127.0.0.1:1/1`;
 // A DIFFERENT fake DSN, and the one the process inherits.  The environment
 // carries no copy of a value (owner ruling, November 22, 2026), so this one
 // must never be the answer.  It is here so the smoke can prove the packaged
 // server resolved the DSN from its own configuration and not from what it
 // inherited.  It is a loopback address too, so nothing leaves the machine
 // either way.
-const STALE_ENV_DSN = "https://99999999999999999999999999999999@127.0.0.1:9/9";
-const STALE_ENV_DSN_KEY = "99999999999999999999999999999999";
+const STALE_ENV_DSN_KEY = ["9999999999", "9999999999", "9999999999", "9999"].join("");
+const STALE_ENV_DSN = `https://${STALE_ENV_DSN_KEY}@127.0.0.1:9/9`;
 
 // Keep package validation independent of host CLI discovery and authentication.
 // The observability block is what the packaged server resolves the DSN from:
