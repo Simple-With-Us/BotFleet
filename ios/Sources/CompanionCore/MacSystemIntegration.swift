@@ -321,7 +321,7 @@ public struct MacMenubarState: Equatable, Sendable {
     /// is not allowed to change under it, so the row says so instead of
     /// pretending to pause.  It never sends a pause and never changes a wake.
     public static let pauseResumeUnavailableCopy =
-        "Pausing every bot is not available yet.  Your bots keep running."
+        "Pausing every bot is not available yet.\u{00A0} Your bots keep running."
 
     /// Builds the menubar menu items in the exact specification order:
     /// 1. `"Open BotFleet"`

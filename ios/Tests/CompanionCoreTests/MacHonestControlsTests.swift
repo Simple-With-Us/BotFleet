@@ -27,16 +27,17 @@ final class MacHonestControlsTests: XCTestCase {
 
         let items = state.menuItems
         //  The row keeps its place:  the menubar order is a contract, and
-        //  removing a row moves every row under it.
-        XCTAssertEqual(items.count, 12)
-        XCTAssertEqual(items[8].title, "Pause All Bots")
-        XCTAssertEqual(items[9].title, "Settings")
+        //  removing a row moves every row under it.  With no bot waiting the
+        //  menu has eleven rows and the pause row is the eighth.
+        XCTAssertEqual(items.count, 11)
+        XCTAssertEqual(items[7].title, "Pause All Bots")
+        XCTAssertEqual(items[8].title, "Settings")
 
         //  It cannot act, and it says why:  pausing every bot is a
         //  fleet-wide behaviour change and the wake path is not allowed to
         //  change under it.
-        XCTAssertFalse(items[8].isActionable)
-        let reason = items[8].unavailableReason
+        XCTAssertFalse(items[7].isActionable)
+        let reason = items[7].unavailableReason
         XCTAssertNotNil(reason)
         XCTAssertEqual(reason, MacMenubarState.pauseResumeUnavailableCopy)
         XCTAssertTrue(reason?.contains("not available yet") == true, reason ?? "")
@@ -44,8 +45,34 @@ final class MacHonestControlsTests: XCTestCase {
 
         //  The rows around it still act:  only the pause row is unavailable.
         XCTAssertTrue(items[0].isActionable)
-        XCTAssertTrue(items[9].isActionable)
-        XCTAssertNil(items[9].unavailableReason)
+        XCTAssertTrue(items[8].isActionable)
+        XCTAssertNil(items[8].unavailableReason)
+    }
+
+    func testThePauseRowKeepsItsPlaceWhenABotIsWaiting() {
+        //  A waiting bot adds its own row, so the pause row moves down by
+        //  one.  It still cannot act and still says why.
+        let waiting = MacWaitingBotItem(
+            id: "bot-1",
+            botName: "Monet",
+            threadId: "thread-1",
+            needDescription: "Approve a change"
+        )
+        let state = MacMenubarState(
+            isConnected: true,
+            workingBotCount: 3,
+            waitingBots: [waiting],
+            allBotsPaused: false,
+            reduceMotion: false
+        )
+
+        let items = state.menuItems
+        XCTAssertEqual(items.count, 12)
+        XCTAssertEqual(items[6].title, "Monet — Approve a change")
+        XCTAssertEqual(items[8].title, "Pause All Bots")
+        XCTAssertEqual(items[9].title, "Settings")
+        XCTAssertFalse(items[8].isActionable)
+        XCTAssertEqual(items[8].unavailableReason, MacMenubarState.pauseResumeUnavailableCopy)
     }
 
     func testThePausedStateAlsoCannotAct() {
@@ -58,9 +85,9 @@ final class MacHonestControlsTests: XCTestCase {
             allBotsPaused: true,
             reduceMotion: false
         )
-        XCTAssertEqual(state.menuItems[8].title, "Resume All Bots")
-        XCTAssertFalse(state.menuItems[8].isActionable)
-        XCTAssertEqual(state.menuItems[8].unavailableReason, MacMenubarState.pauseResumeUnavailableCopy)
+        XCTAssertEqual(state.menuItems[7].title, "Resume All Bots")
+        XCTAssertFalse(state.menuItems[7].isActionable)
+        XCTAssertEqual(state.menuItems[7].unavailableReason, MacMenubarState.pauseResumeUnavailableCopy)
     }
 
     // MARK: - The Settings sections with no screen behind them
