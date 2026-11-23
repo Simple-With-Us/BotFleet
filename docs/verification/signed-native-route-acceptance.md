@@ -64,6 +64,13 @@ later:
   ID and for optional Sentry.  The candidate therefore does **not** establish
   current Infisical-only acceptance.  A future candidate built with the
   store-only path is a separate item and needs its own run.
+- The candidate **predates the merged Open-on-Mac action** (BF-2690, PR
+  #2189):  the native app in this build answers the phone's "Open on Mac"
+  with `501`, because no launch action is installed in it.  The artifact is
+  preserved as historical packaging evidence and nothing more;  Profile A's
+  Open-on-Mac row is blocked on a **verified Infisical-only signed candidate
+  that contains the merged callback**, and both the eventual test and the
+  `signed-release` receipt are pinned to that candidate, not to this one.
 
 ## Profile A:  Mac-Only, No Server Configured
 
@@ -81,13 +88,13 @@ Preconditions, all owner-side and none of them implied by this document:
 | # | Observe | Expected | Where |
 | --- | --- | --- | --- |
 | A1 | Launch the native app with the harness down | the app starts; it does not require a Node harness | app launch, `~/Library/Logs` or the journal |
-| A2 | The launch starts the launchd harness when it is down, and clears `~/.botfleet/stopped.marker` | the harness comes up; the marker is gone | `launchctl print gui/$(id -u)/app.botfleet.server`, `~/.botfleet/stopped.marker` |
+| A2 | Optional, separate from A1:  the launch starts the launchd harness when it is down, and clears `~/.botfleet/stopped.marker` | the harness comes up; the marker is gone | `launchctl print gui/$(id -u)/app.botfleet.server`, `~/.botfleet/stopped.marker` |
 | A3 | **Settings → Servers** holds no server row | the app is Mac-only and says so | the Settings window |
 | A4 | The companion listener is on and the LAN opt-in is off | the listener binds loopback and advertises no LAN route | the listener state line under the toggle |
 | A5 | The phone pairs with the Mac over Tailscale | the pairing window opens, the code or QR shows, the phone appears in **Settings → Phone → Paired Phones** | Settings → Phone |
 | A6 | A chat turn runs on the Mac with no server configured | the turn runs natively and the transcript updates | the transcript |
 | A7 | The phone receives a push while the app is in the background | the alert arrives with the native payload shape | the phone |
-| A8 | The phone sends **Open on Mac** | the Mac app comes forward | the Mac screen |
+| A8 | **Blocked on the future candidate.**  The phone sends **Open on Mac** | the Mac app comes forward | the Mac screen |
 | A9 | Open on Mac with **Settings → General → Allow iOS Remote Desktop Launch** off | `403`, and the message says the setting is off | the phone's error |
 | A10 | The phone tries to open the gate itself through `PUT /api/config` | `403` | the phone's request |
 | A11 | Open on Mac over a non-loopback caller | `403` | the listener's log |
@@ -152,10 +159,10 @@ record, not in a later summary.
 | --- | --- | --- | --- |
 | Every inventory row has a named owner | neither | the Electron decommission map | in progress, separate document |
 | The iOS companion works with Electron not running | A | A5, A6, A7 | not run |
-| Open on Mac opens the native app | A | A8, with A9 to A11 as the refusals | not run |
+| Open on Mac opens the native app | A | A8, with A9 to A11 as the refusals | **blocked**:  the recorded candidate predates the merged launch action, so this row is pinned to a verified Infisical-only signed candidate that contains it |
 | One installed native copy at `~/Applications/BotFleet.app` | A | the install itself | not done:  no install is authorized here |
 | The companion without Electron | A | A5 to A7 | not run |
-| The signed build is the one that is installed | A | the install receipt for artifact `14735666706` | not done; the artifact expires Fri, Dec 5, 8:27 PM |
+| The signed build is the one that is installed | A | the install receipt for the candidate | not done; the recorded artifact expires Fri, Dec 5, 8:27 PM and predates the merged launch action, so the eventual install receipt is pinned to the future verified store-only candidate |
 | An installed previous build updates through the native feed | A | the `signed-release` receipt's `installed-previous-build-update` check | blocked:  no verified prior baseline exists |
 | The phone keeps working while the Mac is asleep | B | B1 to B6 | not run; blocked on the APNs grant and the bridge route |
 | Jay signs off a 7-day soak | A and B | the `daily-driver` receipt and the owner's acceptance | not started; the owner signs it |
