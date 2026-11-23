@@ -429,6 +429,26 @@ export class BridgeDeviceRegistry {
   }
 
   /**
+   * Remove one device row outright.
+   *
+   * This is the rollback a pairing whose durable save failed needs:  the
+   * row this redeem just minted must not stay reserved in memory when the
+   * caller refused it, or the retry would answer as a replay with no
+   * credential.  It is not a revocation:  nothing is remembered, because
+   * the point is that the pairing never happened.
+   *
+   * @param {string} id
+   * @returns {boolean}
+   */
+  removeDevice(id) {
+    const wanted = String(id ?? '');
+    const index = this.devices.findIndex((entry) => entry.id === wanted);
+    if (index === -1) return false;
+    this.devices.splice(index, 1);
+    return true;
+  }
+
+  /**
    * Revoke a device.  A revoked device keeps its row so a replayed redeem
    * cannot mint a fresh credential for it.
    *
@@ -512,6 +532,11 @@ export function boundedWindowMetadata(metadata) {
   for (const [key, value] of Object.entries(metadata ?? {})) {
     if (Object.keys(carried).length >= BRIDGE_WINDOW_METADATA_MAX_KEYS) break;
     if (RESERVED_WINDOW_KEYS.has(key)) continue;
+    // A key named like the prototype accessor would mutate the shared
+    // prototype through the assignment below, so it is dropped with the
+    // reserved keys:  a JSON body that carries one is not metadata, it is
+    // an attempt.
+    if (key === '__proto__') continue;
     let serialized;
     try {
       serialized = JSON.stringify(value);
@@ -937,6 +962,7 @@ async function handleLocalRoute({ req, res, method, url, state, logger, now, per
       respondJson(res, 400, { error: 'a pairing code or token is required' });
       return;
     }
+    const windowBefore = state.window;
     const redeemed = bridgeRedeemPairing({
       state,
       presented,
@@ -956,10 +982,13 @@ async function handleLocalRoute({ req, res, method, url, state, logger, now, per
     }
     if (!persist(state)) {
       // A pairing the durable state cannot hold is not confirmed to the
-      // phone:  the minted credential never leaves the bridge, and a retry
-      // after a save succeeds would answer as a replay with no credential,
-      // so the operator opens a fresh window and pairs again.
-      logger('[companion-bridge] the durable state refused a save; the redeem is not confirmed');
+      // phone, and it does not stay half-done in memory either:  the spend
+      // and the just-minted device row are rolled back, so once a save
+      // succeeds the same redeem can run again for real instead of
+      // answering as a replay with no credential.
+      state.window = windowBefore;
+      if (!redeemed.replayed) state.registry.removeDevice(redeemed.deviceId);
+      logger('[companion-bridge] the durable state refused a save; the redeem was rolled back and is not confirmed');
       unsaved();
       return;
     }

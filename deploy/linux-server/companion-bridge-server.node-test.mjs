@@ -1071,7 +1071,7 @@ test('a failing durable save pauses the trust-extending routes and a working sav
   }
 });
 
-test('a redeem whose save fails is not confirmed to the phone', async () => {
+test('a redeem whose save fails is rolled back, then works when saves recover', async () => {
   let savesWork = true;
   const bridge = await startBridge({
     bridgeOptions: {
@@ -1093,12 +1093,37 @@ test('a redeem whose save fails is not confirmed to the phone', async () => {
       headers: ownerHeaders({ 'content-type': 'application/json' }),
       body: JSON.stringify({ code: opened.json.code, deviceId: 'phone-unconfirmed' }),
     });
-    // The window was spent and the device added in memory, but the phone is
-    // not told a pairing happened, so no credential leaves the bridge.
+    // The phone is not told a pairing happened, no credential leaves the
+    // bridge, and the in-memory spend is rolled back:  the window is
+    // unspent again and the device row is gone, so the pairing never
+    // half-happened.
     assert.equal(redeemed.status, 503);
     assert.equal(redeemed.json.credential, undefined);
+    assert.equal(bridge.state.registry.activeIds().includes('phone-unconfirmed'), false);
+    assert.equal(bridge.state.window.spent, false);
+
+    // Saves recover, and the SAME code redeems for real.
+    savesWork = true;
+    const retried = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/redeem',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ code: opened.json.code, deviceId: 'phone-unconfirmed' }),
+    });
+    assert.equal(retried.status, 200);
+    assert.ok(retried.json.credential);
     assert.equal(bridge.state.registry.activeIds().includes('phone-unconfirmed'), true);
   } finally {
     await bridge.close();
   }
+});
+
+test('a metadata key named like the prototype accessor is dropped, not applied', () => {
+  // JSON.parse makes __proto__ an own property, which is exactly how a
+  // pairing-open body would carry it.
+  const body = JSON.parse('{"__proto__": {"polluted": true}, "note": "kept"}');
+  const carried = boundedWindowMetadata(body);
+  assert.deepEqual(carried, { note: 'kept' });
+  assert.equal({}.polluted, undefined);
+  assert.equal(Object.keys(carried).includes('__proto__'), false);
 });
