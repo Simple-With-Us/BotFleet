@@ -526,6 +526,8 @@ describe("ZCode ACP dispatch version gate (BF-2468)", () => {
           'let n = 0; try { n = Number(fs.readFileSync(countFile, "utf8")) || 0; } catch {}',
           'if (process.argv.includes("--version")) fs.writeFileSync(countFile, String(n + 1));',
           'console.log("9.9.9");',
+          "// upgraded fixture: this line also changes the file size, so the",
+          "// binary identity differs even where mtime granularity is coarse",
           "",
         ].join("\n"),
         { mode: 0o755 },
