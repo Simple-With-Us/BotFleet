@@ -72,6 +72,37 @@ later:
   that contains the merged callback**, and both the eventual test and the
   `signed-release` receipt are pinned to that candidate, not to this one.
 
+## The Two Prerequisites
+
+Two things stand before a Profile A run, and neither exists yet.  They are
+named here so the wait is for something specific.
+
+**1.  A freshly signed Infisical-only candidate that contains the merged
+Open-on-Mac action.**  BF-2690 (#2189) installs the real launch callback, and
+the recorded candidate predates that merge:  its app answers `501`, so the
+whole A8 to A11 row waits.  The prerequisite is one `native-mac-release.yml`
+run whose source contains #2189, built through the store-only path with no
+Developer-ID or Sentry secret fallback, passing signing, notarization,
+stapling and the appcast verification.  The A8 to A11 rows and the
+`signed-release` receipt all pin to that run and to no other.
+
+**2.  The redacted read-only hosted-planner receipts (OPS-1108).**  Both
+hosted release planners still take the scoped Infisical read from a
+composite fetch whose binding ends at its own step, so the iOS
+`plan-build` and `ship` consumers and the Mac `prepare` consumer have no
+scoped read of their own, and the pinned workflows keep Developer-ID and
+Sentry secret fallbacks.  The prerequisite is the review-only workflow diff
+that closes that gap, and with it one receipt per planner run that records,
+in redacted form:  the run id and head SHA, which steps consumed the scoped
+fetch, the secret NAMES the fetch asked for and never their values, and
+that no signing or Sentry fallback ran.  A candidate without those receipts
+is not an Infisical-only candidate, whatever its appcast says, and the
+`signed-release` receipt refuses to cite one.
+
+Neither prerequisite dispatches a run, mints a key, changes a credential,
+publishes a route or tests a phone.  This document names them;  producing
+them is the workflow lane's work (OPS-1108) and the owner's dispatch.
+
 ## Profile A:  Mac-Only, No Server Configured
 
 Preconditions, all owner-side and none of them implied by this document:
@@ -94,19 +125,21 @@ Preconditions, all owner-side and none of them implied by this document:
 | A5 | The phone pairs with the Mac over Tailscale | the pairing window opens, the code or QR shows, the phone appears in **Settings → Phone → Paired Phones** | Settings → Phone |
 | A6 | A chat turn runs on the Mac with no server configured | the turn runs natively and the transcript updates | the transcript |
 | A7 | The phone receives a push while the app is in the background | the alert arrives with the native payload shape | the phone |
-| A8 | **Blocked on the future candidate.**  The phone sends **Open on Mac** | the Mac app comes forward | the Mac screen |
-| A9 | Open on Mac with **Settings → General → Allow iOS Remote Desktop Launch** off | `403`, and the message says the setting is off | the phone's error |
-| A10 | The phone tries to open the gate itself through `PUT /api/config` | `403` | the phone's request |
-| A11 | Open on Mac over a non-loopback caller | `403` | the listener's log |
+| A8 | **Blocked on the future candidate.**  The phone sends **Open on Mac** | the Mac app comes forward | the Mac screen |
+| A9 | **Blocked on the future candidate.**  Open on Mac with **Settings → General → Allow iOS Remote Desktop Launch** off | `403`, and the message says the setting is off | the phone's error |
+| A10 | **Blocked on the future candidate.**  The phone tries to open the gate itself through `PUT /api/config` | `403` | the phone's request |
+| A11 | **Blocked on the future candidate.**  Open on Mac over a non-loopback caller | `403` | the listener's log |
 | A12 | Quit the app, then launch it again | the listener is gone after the quit and back after the launch | `launchctl`, Settings → General |
 | A13 | Close the last window with **Keep Server Running When Window Closes** on | the app stays in the menubar and the listener stays up | the menubar |
 | A14 | Close the last window with that setting off | the listener stops with the window | the menubar |
 
-A8 to A11 are the Open-on-Mac row, and they are the ones that changed most
-recently:  the native app now installs a real launch action, so the route can
-bring the window forward instead of answering that the feature is not
-available.  The setting gate is still the owner's, and a grant that has not
-been read stays closed.
+A8 to A11 are the Open-on-Mac row, and all four are pinned to the future
+candidate, not only A8.  The refusal rows are not runnable against the
+recorded artifact either:  a build with no launch action answers `501`
+before any of the three gates can answer `403`, so running A9 to A11
+there produces false failures rather than evidence.  On the future
+candidate the route brings the window forward,  and the setting gate is
+still the owner's:  a grant that has not been read stays closed.
 
 ## Profile B:  Server-First With The Mac Asleep
 
@@ -159,7 +192,7 @@ record, not in a later summary.
 | --- | --- | --- | --- |
 | Every inventory row has a named owner | neither | the Electron decommission map | in progress, separate document |
 | The iOS companion works with Electron not running | A | A5, A6, A7 | not run |
-| Open on Mac opens the native app | A | A8, with A9 to A11 as the refusals | **blocked**:  the recorded candidate predates the merged launch action, so this row is pinned to a verified Infisical-only signed candidate that contains it |
+| Open on Mac opens the native app | A | A8, with A9 to A11 as the refusals | **blocked**:  the whole A8 to A11 row is pinned to a verified Infisical-only signed candidate that contains the merged launch action;  the recorded artifact predates it and answers `501`, so no row of the four is runnable against it |
 | One installed native copy at `~/Applications/BotFleet.app` | A | the install itself | not done:  no install is authorized here |
 | The companion without Electron | A | A5 to A7 | not run |
 | The signed build is the one that is installed | A | the install receipt for the candidate | not done; the recorded artifact expires Fri, Dec 5, 8:27 PM and predates the merged launch action, so the eventual install receipt is pinned to the future verified store-only candidate |
