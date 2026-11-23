@@ -86,6 +86,30 @@ Capture instants must follow their observations, cannot be in the future, and ow
 
 Machine receipt instants use ISO 8601; human-facing timestamps and the existing placement hand-run display fields retain the owner's America/Chicago 12-hour AM/PM convention without zone labels.
 
+## The Three Receipts That Had No Producer
+
+`signed-release`, `change-plan` and `daily-driver` had no producer anywhere in the tree, so the packet could only be assembled by hand.  Each one now has one, and each one reads an operator-supplied record rather than asserting a result of its own.
+
+### `signed-release`
+
+`scripts/emit-signed-release-receipt.mjs` reads a verification record and the artifacts it names, and writes `signed-release.receipt.json`.  The record carries the bundle id, the team id, the designated requirement, the previous build and one entry per check; the producer refuses a record that does not carry every check `REQUIRED_CHECKS` names for this kind, a record that names one check twice, a bundle id that is not `app.botfleet.macos`, and a previous build that is the candidate's own build, because an update from a build to itself evidences nothing.  Each exit code is read out of the record, so a failed signing run earns a failing code and this bundle refuses the packet.  The producer does not sign, notarize, staple, install or update anything, and it cannot authenticate that the captured bytes came from a real install.
+
+### `change-plan`
+
+`scripts/emit-change-plan-receipt.mjs` reads a plan record and the artifacts it names, and writes `change-plan.receipt.json`.  The record carries the jobs, files and app copies that will change, and one entry per check; the producer refuses a record that is missing a check `REQUIRED_CHECKS` names for this kind, one that names a check twice, and one with an empty job, file or app-copy list.  The lists are carried as the plan wrote them, because a receipt that trimmed them would be a different plan from the one that was reviewed.
+
+### `daily-driver`
+
+`scripts/emit-daily-driver-receipt.mjs` reads a seven-day observation and the segment logs it names, and writes `daily-driver.receipt.json`.  It requires contiguous segments with no gap or overlap, an uninterrupted continuity on each, at least seven days of coverage, a host the packet names, a controller-epoch fence that never regresses, and the four observations a segment has to record:  `nativeApp:  "signed-native-daily-driver"`, `iosSession:  "passed"`, `openOnMac:  "passed"` and `processInventory:  "recorded"`.  A local-only native Mac controller does not need server traffic or a routine-run count to satisfy daily use, so none of the soak producer's writer bounds are read here.  The seven-day sign-off itself stays the owner's.
+
+### What The Three Producers Do Not Do
+
+None of them contacts a live daemon, host or launch agent, and none of them can authenticate that the bytes they read came from production rather than a fixture.  They verify structural binding, redaction cleanliness, hashes and the check lists the bundle itself requires, which is the same line the rest of this bundle holds.  The `owner-acceptance` receipt still has no producer on purpose: the collector refuses to synthesize an owner's assertion.
+
+### The Packet Shape, Proved In A Fixture
+
+`scripts/decommission-packet-fixture.node-test.mjs` assembles a complete thirteen-receipt packet in a temporary private directory, from synthetic artifacts and synthetic receipts, and runs this bundle's own validator over it.  It proves that the packet the final CLI wants is reachable, and that the validator accepts a complete one and refuses an incomplete one.  It proves nothing about a real install: every artifact in it is a fixture, and the directory is removed when the test ends.
+
 ## The Process Inventory Receipt Producer
 
 The `process-inventory` receipt has a producer.  `scripts/check-post-reboot-node.mjs --json` is the measurement: it inspects the Mac's processes, launchd jobs and listeners and prints a verdict.  `scripts/emit-process-inventory-receipt.mjs` is the receipt: it reads a saved verdict and the rows captured out of the Mac's process inventory, and emits `process-inventory.receipt.json` in the shape this bundle validates.
