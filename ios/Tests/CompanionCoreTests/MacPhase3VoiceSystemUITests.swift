@@ -337,7 +337,7 @@ final class MacPhase3VoiceSystemUITests: XCTestCase {
         XCTAssertEqual(disconnected.iconState, .connectionLost)
         XCTAssertEqual(
             disconnected.statusLine,
-            "Connection lost.\u{00A0} Your bots will reconnect on their own"
+            "Connection lost.  Your bots will reconnect on their own"
         )
     }
 
@@ -366,7 +366,7 @@ final class MacPhase3VoiceSystemUITests: XCTestCase {
         XCTAssertFalse(manager.handleRecordedKey(keyCode: 49, carbonModifiers: 256))
         XCTAssertEqual(
             manager.inlineCollisionError,
-            "That shortcut is used by another app.\u{00A0} Choose a different one."
+            "That shortcut is used by another app.  Choose a different one."
         )
         XCTAssertFalse(manager.binding(for: .showOrHideBotFleet).isEnabled)
 
@@ -517,13 +517,13 @@ final class MacPhase3VoiceSystemUITests: XCTestCase {
         XCTAssertEqual(
             deniedDecision,
             .suppressedPermissionDenied(
-                statusBanner: "Notifications are off.\u{00A0} Bots that need you will wait in the menubar",
+                statusBanner: "Notifications are off.  Bots that need you will wait in the menubar",
                 actionTitle: "Open Settings"
             )
         )
         XCTAssertEqual(
             deniedCoordinator.settingsStatusBanner,
-            "Notifications are off.\u{00A0} Bots that need you will wait in the menubar"
+            "Notifications are off.  Bots that need you will wait in the menubar"
         )
         XCTAssertEqual(deniedCoordinator.settingsActionTitle, "Open Settings")
     }
