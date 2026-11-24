@@ -164,8 +164,38 @@ struct NativeMacServicesParityTests {
         #expect(reloadedTotals.entryCount == 2)
         #expect(abs(reloadedTotals.totalCostUSD - 5.0) < 0.0001)
 
-        // Future-dated entry still counts in rollingSpend checked at t0.
+        // Overflow-safe init accepts Int.max without trapping.
+        let unboundedLedger = CostLedgerService(maxEntries: .max)
+        try await unboundedLedger.record(CostLedgerEntry(
+            id: "max-bound-1",
+            botId: "bot-a",
+            threadId: "thread-a",
+            provider: "anthropic",
+            model: "claude-sonnet",
+            inputTokens: 10,
+            outputTokens: 5,
+            estimatedCostUSD: 0.25,
+            isPriced: true,
+            recordedAt: t0.timeIntervalSince1970
+        ), now: t0)
+        #expect(await unboundedLedger.totals().entryCount == 1)
+
+        // Small forward clock skew (<= 300 s) counts immediately and still ages out once now advances past window.
         let skewLedger = CostLedgerService(maxEntries: 10)
+        await #expect(throws: CostLedgerError.self) {
+            try await skewLedger.record(CostLedgerEntry(
+                id: "skew-too-far",
+                botId: "bot-a",
+                threadId: "thread-a",
+                provider: "anthropic",
+                model: "claude-sonnet",
+                inputTokens: 10,
+                outputTokens: 5,
+                estimatedCostUSD: 9.0,
+                isPriced: true,
+                recordedAt: t0.addingTimeInterval(CostLedgerService.defaultMaxFutureSkewSeconds + 1).timeIntervalSince1970
+            ), now: t0)
+        }
         try await skewLedger.record(CostLedgerEntry(
             id: "skew-1",
             botId: "bot-a",
@@ -177,9 +207,11 @@ struct NativeMacServicesParityTests {
             estimatedCostUSD: 4.0,
             isPriced: true,
             recordedAt: t0.addingTimeInterval(300).timeIntervalSince1970
-        ))
+        ), now: t0)
         let skewSpend = await skewLedger.rollingSpend(windowSeconds: 60, now: t0)
         #expect(abs(skewSpend - 4.0) < 0.0001)
+        let expiredSkewSpend = await skewLedger.rollingSpend(windowSeconds: 60, now: t0.addingTimeInterval(361))
+        #expect(abs(expiredSkewSpend - 0.0) < 0.0001)
 
         // Low priced share fails open (mirroring server/rolling-spend.ts spendCeilingDecision).
         try await skewLedger.record(CostLedgerEntry(
