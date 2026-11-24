@@ -548,6 +548,30 @@ export function cliLoginSecretPath(seat: string): string | null {
   return `/cli-logins/${seat}`;
 }
 
+/** The environment name the fleet's own tools read a bearer out of.
+ *
+ * The fleet's tools resolve their own bearer from this name first and from
+ * the seat's private file second (`scripts/simple_tools/fleet_bearer.py`), so
+ * a child that carries this name presents the bearer it was given and
+ * nothing else. */
+export const FLEET_BEARER_ENV_NAME = "SIMPLE_TOOLS_BEARER";
+
+/** The seat names a fleet-bearer folder may have.
+ *
+ * The same shape the fleet's writer accepts for a CLI-login path, so a
+ * folder BotFleet reads is a folder the fleet can write. */
+export const FLEET_BEARER_SEAT_PATTERN = /^[A-Z][A-Z0-9-]{0,15}$/;
+
+/** The folder a seat's fleet bearer lives in: `/fleet-bearers/<SEAT>`.
+ *
+ * One folder per seat, exactly like the CLI logins, so a read for one bot
+ * never carries another bot's bearer.  A seat the fleet's writer could not
+ * have produced has no folder, and no folder is invented for it. */
+export function fleetBearerSecretPath(seat: string): string | null {
+  if (!FLEET_BEARER_SEAT_PATTERN.test(seat)) return null;
+  return `/fleet-bearers/${seat}`;
+}
+
 export type SecretSource = "infisical" | "env" | "file" | "none";
 
 export interface SecretProvenance {
