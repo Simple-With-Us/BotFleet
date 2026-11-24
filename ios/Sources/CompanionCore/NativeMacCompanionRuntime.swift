@@ -118,6 +118,9 @@ public struct NativeMacCompanionRuntime: Sendable {
     /// Nil off macOS, where no owned process can run.
     private let processSupervisor: ProcessSupervisorActor?
 
+    /// Creates the Mac companion runtime graph.
+    /// When `executionContext` is supplied, it takes precedence over `credentials`
+    /// (which configures the default `MacExecutionContext` only when `executionContext` is `nil`).
     public init(
         database: DatabaseService,
         workspacesRoot: URL,
@@ -138,7 +141,7 @@ public struct NativeMacCompanionRuntime: Sendable {
         )
         let engineSwitch = engineSwitch ?? BotNativeEngineSwitchActor(database: database)
         let workspaceSource = DatabaseBotWorkspaceSource(database: database, workspacesRoot: workspacesRoot)
-        precondition(
+        assert(
             executionContext == nil || credentials == nil,
             "credentials cannot be combined with an injected executionContext; supply credentials directly to the injected context."
         )
