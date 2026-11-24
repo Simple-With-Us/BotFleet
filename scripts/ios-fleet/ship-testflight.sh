@@ -505,6 +505,12 @@ sentry_project_for_app() {
 
 # Pull SENTRY_AUTH_TOKEN from the environment, else from the shared scoped
 # reader (Mac).  Extract into a var, never echo.
+#
+# PAIRED, NOT REMOVED (OPS-1108).  The environment copy is still read
+# first, and it stays until the hosted ship job binds the store instead of
+# exporting a copy:  the runner has no scoped reader, so removing this
+# read on its own would take the dSYM upload with it.  The workflow-side
+# change is filed and blocked, so the read stays and this note names why.
 load_sentry_auth() {
   if [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
     return 0
@@ -827,18 +833,28 @@ PY
     fi
     floor="$max"
   fi
+  # The platform this plan belongs to.  The shared planner takes it
+  # so the two platforms of ONE commit carry the same build number:  a
+  # build equal to the merge stamp is that commit's own build on the OTHER
+  # platform, so it must not push this platform's plan up.  Without it
+  # the plan falls back to the legacy max + 1 rule, and the iOS and the Mac
+  # build of one commit can differ by one.
+  local plan_platform="ios"
+  case "${PLATFORM:-}" in
+    macOS|macos|MacOS|MAC_OS) plan_platform="macos" ;;
+  esac
   set +e
   if [[ -n "$paired_id" && -n "$floor" ]]; then
-    out=$(asc_client plan-release-build "$BUNDLE_ID" "$paired_id" "$floor" --merge-stamp "$stamp")
+    out=$(asc_client plan-release-build "$BUNDLE_ID" "$paired_id" "$floor" --merge-stamp "$stamp" --platform "$plan_platform")
     rc=$?
   elif [[ -n "$paired_id" ]]; then
-    out=$(asc_client plan-release-build "$BUNDLE_ID" "$paired_id" --merge-stamp "$stamp")
+    out=$(asc_client plan-release-build "$BUNDLE_ID" "$paired_id" --merge-stamp "$stamp" --platform "$plan_platform")
     rc=$?
   elif [[ -n "$floor" ]]; then
-    out=$(asc_client plan-release-build "$BUNDLE_ID" "$floor" --merge-stamp "$stamp")
+    out=$(asc_client plan-release-build "$BUNDLE_ID" "$floor" --merge-stamp "$stamp" --platform "$plan_platform")
     rc=$?
   else
-    out=$(asc_client plan-release-build "$BUNDLE_ID" --merge-stamp "$stamp")
+    out=$(asc_client plan-release-build "$BUNDLE_ID" --merge-stamp "$stamp" --platform "$plan_platform")
     rc=$?
   fi
   set -e
@@ -1961,6 +1977,11 @@ else
   ARCHIVE_PLATFORM_FLAGS=(-destination "generic/platform=iOS")
 fi
 
+# PAIRED, NOT REMOVED (OPS-1108).  The DSN is still taken from the
+# environment here, and it stays until the hosted ship job reads it from the
+# store:  the runner has no scoped reader, so removing this read on its
+# own would ship the archive with an inert Sentry.  The workflow-side
+# change is filed and blocked, so the read stays and this note names why.
 SENTRY_DSN_FLAGS=()
 if [[ -n "${SENTRY_DSN:-}" ]]; then
   SENTRY_DSN_FLAGS+=(SENTRY_DSN="$SENTRY_DSN")
