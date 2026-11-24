@@ -9,6 +9,7 @@
 import { describe, expect, it } from "vitest";
 
 import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
+import type { StoredMcpServer } from "./mcp-registry.ts";
 
 describe("parseBotProfilePatch (strict — the paired boundary)", () => {
   it("refuses unknown keys — strict means the allowlist IS the contract", () => {
@@ -354,4 +355,77 @@ describe("resolveMaxToolRounds", () => {
       expect(resolveMaxToolRounds(bad), String(bad)).toBeUndefined();
     }
   });
+
+describe("the bot's own MCP servers", () => {
+  // A stored server of the bot's own, in the shape the record holds:  a
+  // command, its arguments, its credential and its switch.
+  const stored = {
+    mine: { command: "npx", args: ["-y", "old"], env: { TOKEN: "the-secret" }, enabled: true },
+  } satisfies Record<string, StoredMcpServer>;
+
+  it("keeps a credential the patch does not carry", () => {
+    // The panel never learns a server's env values, so a save that re-sends
+    // the server's command must not erase the credential it cannot see.
+    const parsed = parseBotProfilePatch(
+      { ownMcpServers: { mine: { command: "npx", args: ["-y", "new"] } } },
+      true,
+      { ownMcpServers: stored },
+    );
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const mine = parsed.patch.ownMcpServers?.mine;
+    expect(mine && "env" in mine ? mine.env : undefined).toEqual({ TOKEN: "the-secret" });
+    expect(mine && "args" in mine ? mine.args : undefined).toEqual(["-y", "new"]);
+  });
+
+  it("replaces a credential the patch does carry", () => {
+    const parsed = parseBotProfilePatch(
+      { ownMcpServers: { mine: { command: "npx", env: { TOKEN: "a-new-one" } } } },
+      true,
+      { ownMcpServers: stored },
+    );
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const mine = parsed.patch.ownMcpServers?.mine;
+    expect(mine && "env" in mine ? mine.env : undefined).toEqual({ TOKEN: "a-new-one" });
+  });
+
+  it("refuses an unknown field in a server", () => {
+    const parsed = parseBotProfilePatch(
+      { ownMcpServers: { mine: { command: "npx", enve: {} } } },
+      true,
+      { ownMcpServers: stored },
+    );
+    expect(parsed.ok).toBe(false);
+  });
+
+  it("refuses a server that carries both a command and an address", () => {
+    const parsed = parseBotProfilePatch(
+      { ownMcpServers: { mine: { command: "npx", url: "https://example.com/mcp" } } },
+      true,
+      { ownMcpServers: stored },
+    );
+    expect(parsed.ok).toBe(false);
+  });
+
+  it("refuses more servers than a bot may hold", () => {
+    const many: Record<string, { command: string }> = {};
+    for (let index = 0; index < 21; index += 1) many[`s${index}`] = { command: "npx" };
+    const parsed = parseBotProfilePatch({ ownMcpServers: many }, true, null);
+    expect(parsed.ok).toBe(false);
+  });
+
+  it("clears the shared narrowing with null and leaves it alone when absent", () => {
+    const cleared = parseBotProfilePatch({ mcpServers: null }, true, null);
+    expect(cleared.ok).toBe(true);
+    if (!cleared.ok) return;
+    expect(cleared.patch.mcpServers).toBeUndefined();
+
+    const absent = parseBotProfilePatch({ name: "x" }, true, null);
+    expect(absent.ok).toBe(true);
+    if (!absent.ok) return;
+    expect(absent.patch.mcpServers).toBeUndefined();
+    expect(Object.hasOwn(absent.patch, "mcpServers")).toBe(false);
+  });
+});
 });

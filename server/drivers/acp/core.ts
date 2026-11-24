@@ -2986,6 +2986,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             composioMcp: mountsMcpServers,
             phoneMcp: mountsMcpServers,
             qdrantMcp: mountsMcpServers,
+            customMcp: mountsMcpServers,
             images: acceptsImages,
             effortLevels: support.effortLevels,
             localComputerMcp: mountsMcpServers,

@@ -10,6 +10,7 @@ import {
   CONNECTOR_TOOL_NAME_PATTERN,
 } from "../shared/connector-tools.ts";
 
+import { isRemoteMcpServer, type StoredMcpServer } from "./mcp-registry.ts";
 import type { BotRecord } from "./store.ts";
 
 export const BOT_PROFILE_PATCH_FIELDS = [
@@ -44,6 +45,8 @@ export const BOT_PROFILE_PATCH_FIELDS = [
   "maxToolRounds",
   "maxHistoryTurns",
   "historySummaryModel",
+  "ownMcpServers",
+  "mcpServers",
 ] as const;
 
 /** One service's grant, `{ tools: "*" }` for every tool Composio offers on
@@ -119,6 +122,49 @@ export function resolveMaxHistoryTurns(
   return parsed.success ? parsed.data : undefined;
 }
 
+/** How many environment variables one MCP server may carry. */
+const MAX_MCP_ENV_FIELDS = 64;
+
+/** How many headers one MCP server may carry. */
+const MAX_MCP_HEADER_FIELDS = 32;
+
+/** How many MCP servers one bot may hold. */
+const MAX_MCP_SERVERS_PER_BOT = 20;
+
+/** One MCP server as a patch carries it:  a command or a url, with the
+ * fields that kind of server has, and the switch that says whether it is
+ * on.  The stored form fills in the fields a kind does not carry.
+ *
+ * The schema is strict, so a typo in a field name is a refusal rather than
+ * a silently dropped key, and both the field count and each field's name
+ * are bounded — a server's env and headers reach the engine's environment
+ * and its outgoing requests, so neither the number of them nor the length
+ * of a name is unbounded. */
+const mcpCredentialFieldSchema = z
+  .record(
+    z.string().min(1).max(128),
+    z.string().max(16384),
+  );
+
+const mcpServerEntrySchema = z
+  .object({
+    command: z.string().trim().min(1).max(1024).optional(),
+    args: z.array(z.string().max(4096)).max(64).optional(),
+    env: mcpCredentialFieldSchema.refine((value) => Object.keys(value).length <= MAX_MCP_ENV_FIELDS, {
+      error: `an MCP server takes at most ${MAX_MCP_ENV_FIELDS} environment variables`,
+    }).optional(),
+    type: z.enum(["http", "sse"]).optional(),
+    url: z.string().trim().min(1).max(2048).optional(),
+    headers: mcpCredentialFieldSchema.refine((value) => Object.keys(value).length <= MAX_MCP_HEADER_FIELDS, {
+      error: `an MCP server takes at most ${MAX_MCP_HEADER_FIELDS} headers`,
+    }).optional(),
+    enabled: z.boolean().optional(),
+  })
+  .strict()
+  .refine((entry) => Boolean(entry.command) !== Boolean(entry.url), {
+    error: "an MCP server needs a command or a url, not both and not neither",
+  });
+
 const profilePatchSchema = z.object({
   name: z
     .string({ error: "name must be a string" })
@@ -181,7 +227,62 @@ const profilePatchSchema = z.object({
   // path instead of being accepted and silently clearing the setting.
   maxHistoryTurns: z.union([z.string().max(64), z.number(), z.boolean(), z.null()]).optional(),
   historySummaryModel: z.boolean({ error: "historySummaryModel must be true or false" }).optional(),
+  // The workspace's shared MCP servers this bot may mount.  Absent means
+  // every enabled shared server;  a list narrows it to those names.
+  mcpServers: z.union([z.array(z.string().min(1).max(64)).max(20), z.null()]).optional(),
+  // The bot's own MCP servers, by name.  A name here mounts for this bot
+  // only, and a name here wins over a shared server of the same name.
+  // The values are the server's own credentials, so they are never
+  // returned by a listing and never logged.
+  ownMcpServers: z
+    .record(z.string().min(1).max(64), mcpServerEntrySchema)
+    .refine((value) => Object.keys(value).length <= MAX_MCP_SERVERS_PER_BOT, {
+      error: `a bot may hold at most ${MAX_MCP_SERVERS_PER_BOT} MCP servers`,
+    })
+    .optional(),
 });
+
+/** The stored form of a bot's own MCP servers.
+ *
+ * A patch carries a remote server without `args` and a local one without
+ * `headers`;  the stored form carries exactly the fields that kind of
+ * server has, so a reader never has to guess which half is present.
+ */
+function normalizeOwnMcpServers(
+  entries: Record<string, z.infer<typeof mcpServerEntrySchema>>,
+  stored: Record<string, StoredMcpServer> | undefined,
+) {
+  const out: Record<string, StoredMcpServer> = {};
+  for (const [name, entry] of Object.entries(entries)) {
+    // A credential the patch does not carry is the credential that is
+    // already stored.  The panel never learns a server's env or header
+    // VALUES — the listing reports the field names only — so a patch that
+    // re-saves a server would otherwise erase the very credentials it
+    // cannot see.  The stored value is kept for every field the patch
+    // leaves out, and a field the patch does carry replaces it.
+    const existing = stored?.[name];
+    // A stored server is one kind or the other, so the credentials it
+    // keeps are read from the kind it is.
+    const keptHeaders = existing && isRemoteMcpServer(existing) ? existing.headers : undefined;
+    const keptEnv = existing && !isRemoteMcpServer(existing) ? existing.env : undefined;
+    if (entry.url !== undefined) {
+      out[name] = {
+        type: entry.type ?? "http",
+        url: entry.url,
+        headers: entry.headers ?? keptHeaders ?? {},
+        enabled: entry.enabled ?? true,
+      };
+      continue;
+    }
+    out[name] = {
+      command: entry.command ?? "",
+      args: entry.args ?? [],
+      env: entry.env ?? keptEnv ?? {},
+      enabled: entry.enabled ?? true,
+    };
+  }
+  return out;
+}
 
 export type BotProfilePatchInput = z.input<typeof profilePatchSchema>;
 
@@ -218,6 +319,8 @@ export type BotProfilePatch = Partial<
     | "maxToolRounds"
     | "maxHistoryTurns"
     | "historySummaryModel"
+    | "ownMcpServers"
+    | "mcpServers"
   >
 > & { effort?: string };
 
@@ -251,7 +354,7 @@ export function parseBotProfilePatch(
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- validation boundary: the wire patch is untrusted and safeParse-checked before any field is read
   input: unknown,
   strict = false,
-  current?: { voices?: BotVoices } | null,
+  current?: { voices?: BotVoices; ownMcpServers?: Record<string, StoredMcpServer> } | null,
 ): BotProfilePatchResult {
   const parsed = (strict ? profilePatchSchema.strict() : profilePatchSchema).safeParse(input);
   if (!parsed.success) {
@@ -283,6 +386,8 @@ export function parseBotProfilePatch(
     voices,
     maxToolRounds: _maxToolRounds,
     maxHistoryTurns: _maxHistoryTurns,
+    ownMcpServers: _ownMcpServers,
+    mcpServers: _mcpServers,
     ...fields
   } = parsed.data;
   const patch: BotProfilePatch = fields;
@@ -303,6 +408,17 @@ export function parseBotProfilePatch(
   // clear), key absent leaves the stored cap alone.
   if (Object.prototype.hasOwnProperty.call(parsed.data, "maxHistoryTurns")) {
     patch.maxHistoryTurns = resolveMaxHistoryTurns(parsed.data.maxHistoryTurns);
+  }
+  // The stored form carries exactly the fields a kind of server has, so a
+  // reader never has to guess which half of the entry is present.
+  // null is the API-edge clear:  it returns the bot to every enabled
+  // shared server.  undefined (the key was absent) leaves the stored list
+  // alone.
+  if (parsed.data.mcpServers !== undefined) {
+    patch.mcpServers = parsed.data.mcpServers ?? undefined;
+  }
+  if (parsed.data.ownMcpServers !== undefined) {
+    patch.ownMcpServers = normalizeOwnMcpServers(parsed.data.ownMcpServers, current?.ownMcpServers);
   }
   return { ok: true, patch };
 }
