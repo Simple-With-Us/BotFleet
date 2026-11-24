@@ -16,6 +16,7 @@ import type { JsonValue } from "./schema.ts";
 import { interpretRecordList, loadGuarded, logRefusedSave } from "./store-guard.ts";
 import { workspaceDir } from "./workspace.ts";
 import { newId, type CloudBackend, type ModelSelection, type ThreadId, type TurnBillingMode } from "./contracts.ts";
+import type { StoredMcpServer } from "./mcp-registry.ts";
 import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { botAvatarProfile, type BotAvatarCrop, type BotAvatarRecolorable } from "../shared/bot-avatar.ts";
@@ -744,8 +745,17 @@ export interface BotRecord {
   /** Tools this bot may always use without asking, even outside auto mode
    * (set by "Always allow" on an approval card). */
   alwaysAllow?: string[];
-  /** Optional subset of config `mcpServers` this bot may mount; absent = all enabled. */
+  /** Optional subset of the workspace's shared `mcpServers` this bot may
+   * mount; absent = all enabled. */
   mcpServers?: string[];
+  /** MCP servers that belong to this bot alone, by name.  A name here
+   * mounts for this bot and for no other, and a name here wins over a
+   * shared server of the same name.
+   *
+   * The shape is the registry's own, so the writer and the reader agree
+   * on one definition of a server:  a command with its args and env, or
+   * a url with its headers, and the switch that says whether it is on. */
+  ownMcpServers?: Record<string, StoredMcpServer>;
   /** Ceiling on model→tool rounds for HTTP toolLoop engines (MiniMax / Grok
    * HTTP / openai-compat). Unset = DEFAULT_MAX_TOOL_ROUNDS (shared/bot-profile.ts),
    * which DEFAULT_TURN_LOOP_BUDGET.maxRounds is derived from.

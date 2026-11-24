@@ -10,6 +10,7 @@ import {
   CONNECTOR_TOOL_NAME_PATTERN,
 } from "../shared/connector-tools.ts";
 
+import type { StoredMcpServer } from "./mcp-registry.ts";
 import type { BotRecord } from "./store.ts";
 
 export const BOT_PROFILE_PATCH_FIELDS = [
@@ -44,6 +45,8 @@ export const BOT_PROFILE_PATCH_FIELDS = [
   "maxToolRounds",
   "maxHistoryTurns",
   "historySummaryModel",
+  "ownMcpServers",
+  "mcpServers",
 ] as const;
 
 /** One service's grant, `{ tools: "*" }` for every tool Composio offers on
@@ -119,6 +122,23 @@ export function resolveMaxHistoryTurns(
   return parsed.success ? parsed.data : undefined;
 }
 
+/** One MCP server as a patch carries it:  a command or a url, with the
+ * fields that kind of server has, and the switch that says whether it is
+ * on.  The stored form fills in the fields a kind does not carry. */
+const mcpServerEntrySchema = z
+  .object({
+    command: z.string().trim().min(1).max(1024).optional(),
+    args: z.array(z.string().max(4096)).max(64).optional(),
+    env: z.record(z.string(), z.string().max(16384)).optional(),
+    type: z.enum(["http", "sse"]).optional(),
+    url: z.string().trim().min(1).max(2048).optional(),
+    headers: z.record(z.string(), z.string().max(16384)).optional(),
+    enabled: z.boolean().optional(),
+  })
+  .refine((entry) => Boolean(entry.command) !== Boolean(entry.url), {
+    error: "an MCP server needs a command or a url, not both and not neither",
+  });
+
 const profilePatchSchema = z.object({
   name: z
     .string({ error: "name must be a string" })
@@ -181,7 +201,47 @@ const profilePatchSchema = z.object({
   // path instead of being accepted and silently clearing the setting.
   maxHistoryTurns: z.union([z.string().max(64), z.number(), z.boolean(), z.null()]).optional(),
   historySummaryModel: z.boolean({ error: "historySummaryModel must be true or false" }).optional(),
+  // The workspace's shared MCP servers this bot may mount.  Absent means
+  // every enabled shared server;  a list narrows it to those names.
+  mcpServers: z.array(z.string().min(1).max(64)).max(20).optional(),
+  // The bot's own MCP servers, by name.  A name here mounts for this bot
+  // only, and a name here wins over a shared server of the same name.
+  // The values are the server's own credentials, so they are never
+  // returned by a listing and never logged.
+  ownMcpServers: z
+    .record(z.string().min(1).max(64), mcpServerEntrySchema)
+    .optional(),
 });
+
+/** The stored form of a bot's own MCP servers.
+ *
+ * A patch carries a remote server without `args` and a local one without
+ * `headers`;  the stored form carries exactly the fields that kind of
+ * server has, so a reader never has to guess which half is present.
+ */
+function normalizeOwnMcpServers(
+  entries: Record<string, z.infer<typeof mcpServerEntrySchema>>,
+) {
+  const out: Record<string, StoredMcpServer> = {};
+  for (const [name, entry] of Object.entries(entries)) {
+    if (entry.url !== undefined) {
+      out[name] = {
+        type: entry.type ?? "http",
+        url: entry.url,
+        headers: entry.headers ?? {},
+        enabled: entry.enabled ?? true,
+      };
+      continue;
+    }
+    out[name] = {
+      command: entry.command ?? "",
+      args: entry.args ?? [],
+      env: entry.env ?? {},
+      enabled: entry.enabled ?? true,
+    };
+  }
+  return out;
+}
 
 export type BotProfilePatchInput = z.input<typeof profilePatchSchema>;
 
@@ -218,6 +278,8 @@ export type BotProfilePatch = Partial<
     | "maxToolRounds"
     | "maxHistoryTurns"
     | "historySummaryModel"
+    | "ownMcpServers"
+    | "mcpServers"
   >
 > & { effort?: string };
 
@@ -283,6 +345,7 @@ export function parseBotProfilePatch(
     voices,
     maxToolRounds: _maxToolRounds,
     maxHistoryTurns: _maxHistoryTurns,
+    ownMcpServers: _ownMcpServers,
     ...fields
   } = parsed.data;
   const patch: BotProfilePatch = fields;
@@ -303,6 +366,11 @@ export function parseBotProfilePatch(
   // clear), key absent leaves the stored cap alone.
   if (Object.prototype.hasOwnProperty.call(parsed.data, "maxHistoryTurns")) {
     patch.maxHistoryTurns = resolveMaxHistoryTurns(parsed.data.maxHistoryTurns);
+  }
+  // The stored form carries exactly the fields a kind of server has, so a
+  // reader never has to guess which half of the entry is present.
+  if (parsed.data.ownMcpServers !== undefined) {
+    patch.ownMcpServers = normalizeOwnMcpServers(parsed.data.ownMcpServers);
   }
   return { ok: true, patch };
 }

@@ -74,6 +74,7 @@ import {
   type PromptSplitReceipt,
 } from "./prompt-split.ts";
 import type { ReviewPrompt } from "../../shared/auto-review.ts";
+import { mcpStdioServer } from "../mcp-gate-config.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 
 /** How the volatile half of the system prompt (memory, mentions) reaches a
@@ -1332,6 +1333,17 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         };
         allowed.push("mcp__dweb");
       }
+      // The person's own MCP servers:  the ones the workspace shares and
+      // the ones this bot owns.  A URL server rides BotFleet's remote
+      // proxy (mcpStdioServer), so it reaches the engine over stdio with
+      // the same handshake the harness uses, and a credential in its
+      // headers travels in the 0600 config file below rather than on argv.
+      for (const [name, server] of Object.entries(turn.integrations?.custom ?? {})) {
+        if (mcpServers[name]) continue;
+        const stdio = mcpStdioServer(server, { nodeEnv: { ELECTRON_RUN_AS_NODE: "1" } });
+        if (!stdio) continue;
+        mcpServers[name] = { command: stdio.command, args: stdio.args ?? [], env: stdio.env ?? {} };
+      }
       // permission broker: anything acceptEdits would silently deny becomes
       // an Allow/Deny card in chat, and the agent gets ask_user. Skipped in
       // bypassPermissions (fullAuto) — nothing would ever ask.
@@ -2441,6 +2453,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           effortLevels: ["low", "medium", "high", "xhigh", "max"],
           queueing: true,
           qdrantMcp: true,
+          customMcp: true,
           // Offered in every mode: a bypass instance runs a host-control turn
           // through the broker (see sendTurn), so the asks still reach a person.
           localComputerMcp: true,

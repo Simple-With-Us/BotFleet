@@ -25,6 +25,7 @@ import {
   logProbeFailure,
   spawnCli,
 } from "../procs.ts";
+import { mcpStdioServer } from "../mcp-gate-config.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 
 import type {
@@ -370,6 +371,20 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         }
         if (turn.integrations?.qdrant) {
           mountMcpServer(appServerArgs, env, "qdrant", turn.integrations.qdrant);
+        }
+        // The person's own MCP servers:  the ones the workspace shares and
+        // the ones this bot owns.  A URL server rides BotFleet's remote
+        // proxy, so it reaches the engine over stdio the same way every
+        // other server here does, and a credential in its headers stays in
+        // the child environment rather than on argv.
+        for (const [name, server] of Object.entries(turn.integrations?.custom ?? {})) {
+          const stdio = mcpStdioServer(server, { nodeEnv: { ELECTRON_RUN_AS_NODE: "1" } });
+          if (!stdio) continue;
+          mountMcpServer(appServerArgs, env, name, {
+            command: stdio.command,
+            args: stdio.args ?? [],
+            env: stdio.env ?? {},
+          });
         }
 
         const child = spawnCli(config.cli, appServerArgs, {
@@ -1060,6 +1075,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         agentsMcp: true,
         phoneMcp: true,
         qdrantMcp: true,
+        customMcp: true,
         images: true,
         effortLevels: ["low", "medium", "high", "xhigh", "max"],
         // Jobs matrix (docs/plans/2026-10-01-background-jobs-and-subagents-decision.md):

@@ -1,5 +1,5 @@
 import { AlertTriangle, Bug, ChevronDown, ChevronLeft, Crown, FolderOpen, X } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, useStore, type Bot } from "@/state/store";
 import type { BotUpdatePatch } from "@/state/bot-patch-queue";
 import { stateForBot } from "@/lib/mascot";
@@ -37,6 +37,7 @@ import {
 } from "../../shared/bot-power";
 import { BotSkillsPanel } from "./BotSkillsPanel";
 import { ConnectorToolsSettings } from "./ConnectorToolsSettings";
+import { McpServersSettings, type McpServerView } from "./McpServersSettings";
 import { LocalComputerAutoWarning, shouldWarnBeforeAddingLocalAuto } from "./LocalComputerAutoWarning";
 import { BypassPermissionsWarning } from "./BypassPermissionsWarning";
 import {
@@ -411,6 +412,25 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
     cloudNote,
     cloudPickerVisible,
   );
+  // The MCP servers this bot may mount:  the workspace's shared ones and
+  // this bot's own.  The listing names a server's credential FIELDS and
+  // never their values, so nothing secret reaches the panel.
+  const [mcpServers, setMcpServers] = useState<McpServerView[]>([]);
+  const [mcpError, setMcpError] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    void api(`/api/bots/${bot.id}/mcp-servers`)
+      .then((result: { servers?: McpServerView[] }) => {
+        if (live) setMcpServers(result.servers ?? []);
+      })
+      .catch(() => {
+        if (live) setMcpServers([]);
+      });
+    return () => {
+      live = false;
+    };
+  }, [bot.id]);
+
   const patch = (
     p: Partial<BotUpdatePatch> & {
       // Panel-only fields the broad PATCH boundary (BotUpdatePatch) does not
@@ -421,6 +441,8 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
       bypassLocalComputer?: Bot["bypassLocalComputer"];
       alwaysAllow?: Bot["alwaysAllow"];
       connectorTools?: Bot["connectorTools"];
+      mcpServers?: Bot["mcpServers"];
+      ownMcpServers?: Bot["ownMcpServers"];
     },
   ) => dispatch({ type: "updateBot", botId: bot.id, patch: p });
   const alwaysAllow = bot.alwaysAllow ?? [];
@@ -433,7 +455,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   // lib/bot-settings-gates.ts.
   const gates = botCapabilityGates(state.instances, bot);
   const engine = gates.engine;
-  const { canCoordinate, canUseConnectedApps } = gates;
+  const { canCoordinate, canUseConnectedApps, canUseMcpServers } = gates;
   const roundsGate = toolRoundsGate(state.instances, bot);
   const historyGate = historySummaryGate(state.instances, bot);
   // Null when the engine asks and the broker answers, which is the common case.
@@ -654,6 +676,20 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
 
           {connectedAppsConfigured && canUseConnectedApps && connectedAppsEnabled && (
             <ConnectorToolsSettings bot={bot} onPatch={patch} />
+          )}
+
+          {canUseMcpServers && (
+            <McpServersSettings
+              bot={bot}
+              servers={mcpServers}
+              onPatch={patch}
+              onError={setMcpError}
+            />
+          )}
+          {mcpError && (
+            <div className="rounded-xl border border-danger/40 bg-inset px-4 py-3 text-[13px] text-danger">
+              {mcpError}
+            </div>
           )}
 
           <div className="rounded-xl bg-card p-4 flex flex-col gap-4">
