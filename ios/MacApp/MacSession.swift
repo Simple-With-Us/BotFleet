@@ -974,11 +974,15 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
                     refreshLifecycleSettings: { [weak self] in
                         guard let self, self.connectionGeneration == generation, !Task.isCancelled else { return }
                         await self.refreshLifecycleSettings()
-                        // The status read and the policy read ride the same
-                        // per-connection refresh, so a section that opened
-                        // before the harness answered still fills in.
+                        // The policy read is a couple of file stats and
+                        // rides here;  the status read can take the harness
+                        // tens of seconds, so it runs detached rather than
+                        // holding the connection's hydration for it.
                         self.refreshStartupPolicy()
-                        await self.refreshControlStatus()
+                        Task { [weak self, generation] in
+                            guard let self, self.connectionGeneration == generation, !Task.isCancelled else { return }
+                            await self.refreshControlStatus()
+                        }
                     }
                 )
                 guard connectionGeneration == generation, !Task.isCancelled else { return }
@@ -1111,21 +1115,45 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
 
     // MARK: - Server Status & Local VM Controls (BF-2688, Decision 1 Option C)
 
-    private func makeControlStatusClient() -> MacControlStatusClient {
-        MacControlStatusClient(baseURL: URL(string: "http://\(host):\(port)")!)
+    /// The message when the control routes must not be asked at all.
+    private static let controlClientUnavailableMessage =
+        "The server controls answer only to the harness on this Mac."
+
+    /// The control-status client — and only for this Mac's loopback harness.
+    ///
+    /// The routes it calls answer only to the loopback and carry no token, so
+    /// a remote server must never be asked them:  an unauthenticated start or
+    /// stop POST sent to a remote address would be both refused and wrong.
+    /// `nil` means the connection is not loopback, or the endpoint is
+    /// malformed, and the caller says so instead of guessing.
+    private func makeControlStatusClient() -> MacControlStatusClient? {
+        let normalized = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let isLoopback = normalized == "localhost"
+            || normalized == "::1"
+            || normalized == "[::1]"
+            || normalized.hasPrefix("127.")
+        guard isLoopback else { return nil }
+        guard let baseURL = URL(string: "http://\(host):\(port)") else { return nil }
+        return MacControlStatusClient(baseURL: baseURL)
     }
 
     /// Reads the harness status once per connection, the same cadence the
-    /// lifecycle settings keep.  A failed read keeps the last known state
-    /// beside the reason, so a section that answered a moment ago does not
-    /// blank out because one request did.
+    /// other lifecycle reads keep — but detached from them, because the
+    /// harness asks its container runtime about every VM before it answers,
+    /// and a slow answer must not hold up the event stream.  A failed read
+    /// keeps the last known state beside the reason, so a section that
+    /// answered a moment ago does not blank out because one request did.
     public func refreshControlStatus() async {
         guard !isRefreshingControlStatus else { return }
         isRefreshingControlStatus = true
         defer { isRefreshingControlStatus = false }
+        guard let client = makeControlStatusClient() else {
+            controlStatusError = Self.controlClientUnavailableMessage
+            return
+        }
         let generation = connectionGeneration
         do {
-            let status = try await makeControlStatusClient().fetchStatus()
+            let status = try await client.fetchStatus()
             guard connectionGeneration == generation, !Task.isCancelled else { return }
             controlStatus = status
             controlStatusError = nil
@@ -1149,9 +1177,13 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         guard !isControllingVM else { return }
         isControllingVM = true
         defer { isControllingVM = false }
+        guard let client = makeControlStatusClient() else {
+            controlStatusError = Self.controlClientUnavailableMessage
+            return
+        }
         let generation = connectionGeneration
         do {
-            let note = try await action(makeControlStatusClient())
+            let note = try await action(client)
             guard connectionGeneration == generation, !Task.isCancelled else { return }
             vmActionMessage = note
             controlStatusError = nil

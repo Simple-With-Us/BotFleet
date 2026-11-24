@@ -158,7 +158,9 @@ struct BotFleetMacApp: App {
                 Button("Stop Local VMs") {
                     Task { await session.stopLocalVMs() }
                 }
-                .disabled(!(session.controlStatus?.canStopSharedVM ?? false) || session.isControllingVM)
+                //  The stop route stops every VM the harness manages, so the
+                //  row is gated on any of them running, not on the shared one.
+                .disabled((session.controlStatus?.runningVMCount ?? 0) == 0 || session.isControllingVM)
 
                 Divider()
 

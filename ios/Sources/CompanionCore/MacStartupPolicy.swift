@@ -238,10 +238,7 @@ public final class MacStartupPolicyStore: @unchecked Sendable {
     /// because a marker is not a secret;  these are still not secrets, but a
     /// policy file reads better beside files that are.
     private func setOwnerOnlyPermissions(_ url: URL) throws {
-        try files.setAttributes(
-            ofItemAtPath: url.path,
-            posixPermissions: 0o600
-        )
+        try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 }
 

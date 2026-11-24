@@ -75,7 +75,10 @@ struct MacLifecycleSettingsView: View {
             VStack(alignment: .leading, spacing: 8) {
                 let status = session.controlStatus
                 let canStart = status?.canStartSharedVM == true
-                let canStop = status?.canStopSharedVM == true
+                //  The stop route stops every VM the harness manages, so the
+                //  button follows that:  any running VM makes it available,
+                //  shared or not.
+                let canStop = (status?.runningVMCount ?? 0) > 0
                 HStack {
                     Button("Start Shared VM") {
                         Task { await session.startSharedVM() }
@@ -91,9 +94,9 @@ struct MacLifecycleSettingsView: View {
                     Spacer()
                 }
                 Text(
-                    status?.canStartSharedVM == false && !canStop
-                        ? "The shared VM is not in a state this Mac can start."
-                        : "The shared VM runs this Mac's bots when Computer settings allow it."
+                    (status?.runningVMCount ?? 0) > 0
+                        ? "A stop reaches every VM this harness manages, not only the shared one."
+                        : "No local VM is running."
                 )
                 .font(.caption)
                 .foregroundColor(.secondary)
