@@ -3416,13 +3416,29 @@ const botMcpServersBodySchema = z
           .object({
             command: z.string().trim().min(1).max(1024).optional(),
             args: z.array(z.string().max(4096)).max(64).optional(),
-            env: z.record(z.string().max(128), z.string().max(16384)).optional(),
+            env: z
+              .record(z.string().max(128), z.string().max(16384))
+              .refine((value) => Object.keys(value).length <= 64, {
+                error: "an MCP server takes at most 64 environment variables",
+              })
+              .optional(),
             type: z.enum(["http", "sse"]).optional(),
             url: z.string().trim().min(1).max(2048).optional(),
-            headers: z.record(z.string().max(128), z.string().max(16384)).optional(),
+            headers: z
+              .record(z.string().max(128), z.string().max(16384))
+              .refine((value) => Object.keys(value).length <= 32, {
+                error: "an MCP server takes at most 32 headers",
+              })
+              .optional(),
             enabled: z.boolean().optional(),
           })
-          .strict(),
+          .strict()
+          // A server has either a command to run or an address to connect
+          // to:  both would let the remote shape win and drop the command,
+          // and neither is not a server at all.
+          .refine((entry) => Boolean(entry.command) !== Boolean(entry.url), {
+            error: "an MCP server needs a command or a url, not both and not neither",
+          }),
       )
       .refine((value) => Object.keys(value).length <= 20, {
         error: "a bot may hold at most 20 MCP servers",
