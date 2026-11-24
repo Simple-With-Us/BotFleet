@@ -138,6 +138,10 @@ public struct NativeMacCompanionRuntime: Sendable {
         )
         let engineSwitch = engineSwitch ?? BotNativeEngineSwitchActor(database: database)
         let workspaceSource = DatabaseBotWorkspaceSource(database: database, workspacesRoot: workspacesRoot)
+        precondition(
+            executionContext == nil || credentials == nil,
+            "credentials cannot be combined with an injected executionContext; supply credentials directly to the injected context."
+        )
         if let injectedMacContext = executionContext as? MacExecutionContext {
             self.macExecutionContext = injectedMacContext
             self.usesExternalExecutionContext = false
