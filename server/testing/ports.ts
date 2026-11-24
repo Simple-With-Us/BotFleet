@@ -18,6 +18,45 @@ const isFree = (port: number): Promise<boolean> =>
   });
 
 /**
+ * The pool the suite takes its ports from.
+ *
+ * It sits below the kernel's ephemeral range, so the OS never hands one of
+ * these ports to an outgoing connection: a port inside that range can be
+ * taken between the pick and the bind, and the suite then fails on
+ * EADDRINUSE instead of on anything it asserts.
+ */
+export const PORT_POOL_START = 19_600;
+
+/**
+ * How many bands the pool is cut into, and how wide a band is.
+ *
+ * A band is one process's share of the pool.  Two suites that run at the
+ * same time are two processes, so two bands, so they cannot pick the same
+ * base — which a single shared range could not promise, because the probe
+ * releases the port before the caller binds it.
+ */
+export const PORT_POOL_BANDS = 128;
+export const PORT_POOL_BAND_WIDTH = 24;
+
+/** The last port of the pool, exclusive. */
+export const PORT_POOL_END = PORT_POOL_START + PORT_POOL_BANDS * PORT_POOL_BAND_WIDTH;
+
+/**
+ * The band of the pool a process may take ports from.
+ *
+ * The process id picks the band.  Workers are spawned in a burst, so the
+ * workers running at the same moment have neighbouring ids and therefore
+ * neighbouring bands; a band is far wider than the two or three ports one
+ * suite asks for, and two suites in the same worker run one after the
+ * other, where the probe alone is enough.
+ */
+export function portBand(pid: number = process.pid): { start: number; end: number } {
+  const band = ((pid % PORT_POOL_BANDS) + PORT_POOL_BANDS) % PORT_POOL_BANDS;
+  const start = PORT_POOL_START + band * PORT_POOL_BAND_WIDTH;
+  return { start, end: start + PORT_POOL_BAND_WIDTH };
+}
+
+/**
  * Find a base port where every `base + offset` is free.
  *
  * Offsets rather than a count because the ports a suite needs are rarely
@@ -26,17 +65,20 @@ const isFree = (port: number): Promise<boolean> =>
  * way to know the whole layout is clear.
  *
  * This is a probe, not a reservation — the ports are released before they are
- * returned, so a sufficiently unlucky third party can still take one in the
- * gap. It closes the window that concurrent suites in the same checkout
- * actually hit, which is the one that matters here.
+ * returned, so a third party can still take one in the gap.  The band keeps
+ * that gap away from the suites running at the same time, and the probe
+ * covers everything else.
  */
-export async function freePortBlock(offsets: number[], from = 19_600, span = 3_000): Promise<number> {
+export async function freePortBlock(offsets: number[]): Promise<number> {
+  const band = portBand();
   for (let attempt = 0; attempt < 40; attempt++) {
-    const base = from + Math.floor(Math.random() * span);
+    const base = band.start + Math.floor(Math.random() * PORT_POOL_BAND_WIDTH);
     const checks = await Promise.all(offsets.map((offset) => isFree(base + offset)));
     if (checks.every(Boolean)) return base;
   }
-  throw new Error(`no free port block for offsets ${offsets.join(",")} in ${from}..${from + span}`);
+  throw new Error(
+    `no free port block for offsets ${offsets.join(",")} in ${band.start}..${band.end}`,
+  );
 }
 
 function ephemeralFloor(): number {
