@@ -148,10 +148,14 @@ private struct PersistedCostLedgerState: Codable {
 /// Swift spend and quota ledger actor replacing the Node harness cost tracking
 /// (`server/gen-ai-cost.ts`, `server/rolling-spend.ts`, `BF-2619`).
 public actor CostLedgerService {
+    /// Maximum allowed forward clock skew on `recordedAt` (`5 minutes`).
+    public static let defaultMaxFutureSkewSeconds: TimeInterval = 300
+
     private let storageURL: URL?
     private let maxEntries: Int
     private let maxSeenIds: Int
     private var entriesStorage: [CostLedgerEntry]
+    private var retainedEntryIds: Set<String>
     private var seenIdOrder: [String]
     private var seenEntryIds: Set<String>
 
@@ -160,8 +164,9 @@ public actor CostLedgerService {
         let resolvedEntries = max(1, maxEntries)
         self.storageURL = nil
         self.maxEntries = resolvedEntries
-        self.maxSeenIds = max(resolvedEntries, maxSeenIds ?? max(resolvedEntries * 10, 100_000))
+        self.maxSeenIds = Self.resolveSeenHistoryLimit(maxEntries: resolvedEntries, maxSeenIds: maxSeenIds)
         self.entriesStorage = []
+        self.retainedEntryIds = []
         self.seenIdOrder = []
         self.seenEntryIds = []
     }
@@ -173,7 +178,7 @@ public actor CostLedgerService {
             throw CostLedgerError.persistenceFailed("storageURL must be an absolute non-root file URL.")
         }
         let resolvedEntries = max(1, maxEntries)
-        let resolvedSeen = max(resolvedEntries, maxSeenIds ?? max(resolvedEntries * 10, 100_000))
+        let resolvedSeen = Self.resolveSeenHistoryLimit(maxEntries: resolvedEntries, maxSeenIds: maxSeenIds)
         self.storageURL = storageURL
         self.maxEntries = resolvedEntries
         self.maxSeenIds = resolvedSeen
@@ -182,6 +187,7 @@ public actor CostLedgerService {
             let decoder = JSONDecoder()
             if let envelope = try? decoder.decode(PersistedCostLedgerState.self, from: data) {
                 let clamped = Array(envelope.entries.suffix(resolvedEntries))
+                let retained = Set(clamped.map(\.id))
                 var combinedOrder = envelope.seenEntryIds
                 var combinedSet = Set(combinedOrder)
                 for item in clamped where !combinedSet.contains(item.id) {
@@ -189,29 +195,45 @@ public actor CostLedgerService {
                     combinedSet.insert(item.id)
                 }
                 if combinedOrder.count > resolvedSeen {
-                    combinedOrder = Array(combinedOrder.suffix(resolvedSeen))
-                    combinedSet = Set(combinedOrder)
+                    let overflow = combinedOrder.count - resolvedSeen
+                    for evictedId in combinedOrder.prefix(overflow) where !retained.contains(evictedId) {
+                        combinedSet.remove(evictedId)
+                    }
+                    combinedOrder.removeFirst(overflow)
                 }
                 self.entriesStorage = clamped
+                self.retainedEntryIds = retained
                 self.seenIdOrder = combinedOrder
                 self.seenEntryIds = combinedSet
             } else {
                 let decoded = try decoder.decode([CostLedgerEntry].self, from: data)
                 let clamped = Array(decoded.suffix(resolvedEntries))
                 let order = clamped.map(\.id)
+                let retained = Set(order)
                 self.entriesStorage = clamped
+                self.retainedEntryIds = retained
                 self.seenIdOrder = order
-                self.seenEntryIds = Set(order)
+                self.seenEntryIds = retained
             }
         } else {
             self.entriesStorage = []
+            self.retainedEntryIds = []
             self.seenIdOrder = []
             self.seenEntryIds = []
         }
     }
 
+    private static func resolveSeenHistoryLimit(maxEntries: Int, maxSeenIds: Int?) -> Int {
+        if let maxSeenIds {
+            return max(maxEntries, maxSeenIds)
+        }
+        let scaled = maxEntries.multipliedReportingOverflow(by: 10)
+        let tenX = scaled.overflow ? Int.max : scaled.partialValue
+        return max(maxEntries, max(tenX, 100_000))
+    }
+
     /// Records a single metered call idempotently by `entry.id`.
-    public func record(_ entry: CostLedgerEntry) throws {
+    public func record(_ entry: CostLedgerEntry, now: Date = Date()) throws {
         guard !entry.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw CostLedgerError.invalidEntry("entry.id must not be empty.")
         }
@@ -230,29 +252,41 @@ public actor CostLedgerService {
         guard entry.recordedAt.isFinite else {
             throw CostLedgerError.invalidEntry("recordedAt must be finite.")
         }
+        guard entry.recordedAt <= now.timeIntervalSince1970 + Self.defaultMaxFutureSkewSeconds else {
+            throw CostLedgerError.invalidEntry("recordedAt exceeds maximum allowed future clock skew.")
+        }
         if seenEntryIds.contains(entry.id) {
             return
         }
 
         var nextEntries = entriesStorage
         nextEntries.append(entry)
+        var nextRetainedIds = retainedEntryIds
+        nextRetainedIds.insert(entry.id)
         if nextEntries.count > maxEntries {
-            nextEntries.removeFirst(nextEntries.count - maxEntries)
+            let overflow = nextEntries.count - maxEntries
+            for dropped in nextEntries.prefix(overflow) {
+                nextRetainedIds.remove(dropped.id)
+            }
+            nextEntries.removeFirst(overflow)
         }
 
         var nextSeenOrder = seenIdOrder
         nextSeenOrder.append(entry.id)
+        var nextSeenSet = seenEntryIds
+        nextSeenSet.insert(entry.id)
         if nextSeenOrder.count > maxSeenIds {
-            nextSeenOrder.removeFirst(nextSeenOrder.count - maxSeenIds)
-        }
-        var nextSeenSet = Set(nextSeenOrder)
-        for item in nextEntries {
-            nextSeenSet.insert(item.id)
+            let overflow = nextSeenOrder.count - maxSeenIds
+            for evictedId in nextSeenOrder.prefix(overflow) where !nextRetainedIds.contains(evictedId) {
+                nextSeenSet.remove(evictedId)
+            }
+            nextSeenOrder.removeFirst(overflow)
         }
 
         try persistIfConfigured(entries: nextEntries, seenIds: nextSeenOrder)
 
         entriesStorage = nextEntries
+        retainedEntryIds = nextRetainedIds
         seenIdOrder = nextSeenOrder
         seenEntryIds = nextSeenSet
     }
@@ -290,8 +324,8 @@ public actor CostLedgerService {
         )
     }
 
-    /// Computes spend inside `[now - windowSeconds, +inf)` for rolling budget checks.
-    /// Future-dated timestamps remain included so clock skew cannot bypass admission ceilings.
+    /// Computes spend inside `[now - windowSeconds, now + defaultMaxFutureSkewSeconds]` for rolling budget checks.
+    /// Small forward clock skew counts immediately without letting far-future timestamps stay in the window forever.
     public func rollingSpend(
         windowSeconds: TimeInterval,
         now: Date = Date(),
@@ -350,8 +384,10 @@ public actor CostLedgerService {
         forBotId botId: String?
     ) -> [CostLedgerEntry] {
         guard windowSeconds.isFinite, windowSeconds > 0 else { return [] }
-        let cutoff = now.timeIntervalSince1970 - windowSeconds
-        return entries(forBotId: botId).filter { $0.recordedAt >= cutoff }
+        let nowEpoch = now.timeIntervalSince1970
+        let cutoff = nowEpoch - windowSeconds
+        let upperBound = nowEpoch + Self.defaultMaxFutureSkewSeconds
+        return entries(forBotId: botId).filter { $0.recordedAt >= cutoff && $0.recordedAt <= upperBound }
     }
 
     private func persistIfConfigured(entries: [CostLedgerEntry], seenIds: [String]) throws {
