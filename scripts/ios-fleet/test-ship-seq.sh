@@ -45,8 +45,16 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Sections 1-12 test the unchanged next-patch behaviour, so they run a copy of
 # the fleet dir whose apps.json carries no fixed-version keys.  Section 13 tests
 # the keys on their own copy.
-LEGACY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ios-fleet-legacy.XXXXXX")"
-cp -R "$SCRIPT_DIR/." "$LEGACY_DIR/"
+# The client reads the store through two siblings of scripts/ios-fleet, so
+# the copy keeps the checkout's layout:  a missing sibling is
+# ERR_MODULE_NOT_FOUND.
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+LEGACY_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ios-fleet-legacy.XXXXXX")"
+mkdir -p "${LEGACY_ROOT}/scripts"
+cp -R "$SCRIPT_DIR" "${LEGACY_ROOT}/scripts/ios-fleet"
+cp "${REPO_ROOT}/scripts/infisical-fetch.mjs" "${LEGACY_ROOT}/scripts/infisical-fetch.mjs"
+cp -R "${REPO_ROOT}/scripts/lib" "${LEGACY_ROOT}/scripts/lib"
+LEGACY_DIR="${LEGACY_ROOT}/scripts/ios-fleet"
 python3 - "$LEGACY_DIR/apps.json" <<'PY'
 import json, sys
 p = sys.argv[1]
@@ -63,7 +71,7 @@ SHIP="${LEGACY_DIR}/ship-testflight.sh"
 [[ -f "$SHIP" ]] || { echo "missing $SHIP"; exit 1; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ios-fleet-seq-test.XXXXXX")"
-trap 'rm -rf "$WORK" "$LEGACY_DIR"' EXIT
+trap 'rm -rf "$WORK" "$LEGACY_ROOT"' EXIT
 
 FAKE_HOME="${WORK}/home"
 FAKE_BIN="${WORK}/bin"
@@ -152,6 +160,15 @@ case "\$cmd" in
     ;;
 esac
 # The key validator is the real one.  The staged WRITE stays refused, exactly
+# The CREDENTIAL commands are the real client's:  the store seam is the fake
+# reader, so the client resolves the credential and stages the key itself,
+# exactly as a run does.  A stub that answered them would hide the store
+# contract the run is built on.
+if [[ "\${1:-}" == *asc-api.mjs ]]; then
+  case "\${2:-}" in
+    stage-key|credential-labels) exec "$real_node" "\$@" ;;
+  esac
+fi
 # as it was before the stub delegated.
 if [[ "\${1:-}" == *asc-key.mjs ]]; then
   if [[ "\${2:-}" == "write" ]]; then exit 2; fi
@@ -161,13 +178,46 @@ exit 2
 FAKE
 chmod +x "${FAKE_BIN}/node"
 
-# A stub reader that always reports "absent", so ASC credentials stay
-# unset and no test can reach the real Infisical (the helper reads the reader
-# the environment names).  The reader is a Python program, because the helper
-# runs it with `python3 -I`.
-printf 'import sys\nsys.exit(3)\n' >"${FAKE_BIN}/infisical-scoped.py"
+# A stub reader that stands in for the STORE:  it answers the names the case
+# configured and reports every read it was asked for, so a test can prove
+# where the credential came from.  Nothing here reaches the real Infisical
+# (the helper reads the reader the environment names).  The reader is a
+# Python program, because the helper runs it with `python3 -I`.
+#
+# The credential comes from the store and from nowhere else, so the reader is
+# the only source in this harness:  the environment of a run holds no copy of
+# the credential, and a case that wants one configures the store instead.
+cat >"${FAKE_BIN}/infisical-scoped.py" <<'FAKE'
+import os, sys
+args = sys.argv[1:]
+if not args or args[0] != "get":
+    sys.exit(2)
+name = args[1]
+folder = args[args.index("--folder") + 1]
+with open(os.environ["FAKE_STORE_LOG"], "a") as fh:
+    fh.write(name + " " + folder + "\n")
+if folder != "/asc":
+    sys.exit(3)
+if name == "ASC_KEY_P8":
+    path = os.environ.get("FAKE_STORE_PEM_FILE", "")
+    if not path:
+        sys.exit(3)
+    with open(path) as fh:
+        sys.stdout.write(fh.read())
+    sys.exit(0)
+value = os.environ.get("FAKE_STORE_KEY_ID" if name == "ASC_KEY_ID" else "FAKE_STORE_ISSUER_ID", "")
+if not value:
+    sys.exit(3)
+sys.stdout.write(value + "\n")
+FAKE
 chmod +x "${FAKE_BIN}/infisical-scoped.py"
 export FLEET_INFISICAL_READER="${FAKE_BIN}/infisical-scoped.py"
+# The store a case configures.  Empty means the store holds nothing.
+FAKE_STORE_KEY_ID=""
+FAKE_STORE_ISSUER_ID=""
+FAKE_STORE_PEM_FILE=""
+FAKE_STORE_LOG="${WORK}/store.log"
+: > "$FAKE_STORE_LOG"
 
 # A tiny clean git repo so repo_head_sha() has a real, stable SHA.
 git -C "$REPO" init -q 2>/dev/null || git -C "$REPO" init >/dev/null
@@ -210,23 +260,13 @@ RC=0
 # SHIP_TMPDIR overrides the TMPDIR the sandboxed run sees, so a test can
 # drive the root-TMPDIR path.  It defaults to a scratch directory under the
 # sandbox, which is what every other case wants.
-# The synthetic credential is handed to the sandboxed run through an
-# INHERITED DESCRIPTOR, never through a command argument:  an argument is
-# readable by every process on the machine through ps.  The here-string that
-# carries it is a temporary file that bash unlinks as soon as it is open, so
-# nothing is left on disk either.  The key id and the issuer are public
-# labels, so they stay in the environment where the run expects them.
+# The credential comes from the STORE and from nowhere else, so the
+# environment of a run carries no copy of it:  the store is the fake
+# reader the harness installs, and a case that wants a credential
+# configures the store.  Nothing here is handed over through an
+# inherited descriptor or through a command argument either.
 run_ship() {
-  # A credential is EXPECTED whenever the case put one in TEST_ASC_KEY_P8:
-  # the descriptor handoff must then be proven to have delivered it.
-  local expect_key=0
-  [[ -n "${TEST_ASC_KEY_P8:-}" ]] && expect_key=1
-  case "${EXPECT_ASC_KEY:-}" in
-    0) expect_key=0 ;;
-    1) expect_key=1 ;;
-  esac
   OUT="$(
-    exec 3<<<"${TEST_ASC_KEY_P8:-}"
     env -i \
     HOME="$FAKE_HOME" \
     PATH="${FAKE_BIN}:/usr/bin:/bin:/usr/sbin:/sbin" \
@@ -234,8 +274,11 @@ run_ship() {
     IOS_FLEET_STATE_DIR="$STATE" \
     FLEET_INFISICAL_READER="${FAKE_BIN}/infisical-scoped.py" \
     IOS_FLEET_NODE="${FAKE_BIN}/node" \
-    ASC_KEY_ID="${TEST_ASC_KEY_ID:-}" \
-    ASC_ISSUER_ID="${TEST_ASC_ISSUER_ID:-}" \
+    FLEET_INFISICAL_ASC_ACCOUNT="fixture-asc-ro" \
+    FAKE_STORE_KEY_ID="$FAKE_STORE_KEY_ID" \
+    FAKE_STORE_ISSUER_ID="$FAKE_STORE_ISSUER_ID" \
+    FAKE_STORE_PEM_FILE="$FAKE_STORE_PEM_FILE" \
+    FAKE_STORE_LOG="$FAKE_STORE_LOG" \
     FAKE_ASC_PATCH="$FAKE_ASC_PATCH" \
     FAKE_ASC_FLOOR="$FAKE_ASC_FLOOR" \
     FAKE_RELEASED="${FAKE_RELEASED:-}" \
@@ -246,49 +289,9 @@ run_ship() {
     FAKE_CURL_ERR="${FAKE_CURL_ERR:-}" \
     FAKE_CURL_LOG="${FAKE_CURL_LOG:-}" \
     FAKE_ARGV_LOG="${FAKE_ARGV_LOG:-}" \
-    EXPECT_ASC_KEY="$expect_key" \
-    bash -c '
-      if [[ "${EXPECT_ASC_KEY:-0}" == "1" ]]; then
-        # The credential is EXPECTED here.  An unreadable or empty descriptor
-        # is a FAILURE of this harness, not a missing credential:  it has to
-        # be loud, or every case would report "missing credentials" and pass
-        # vacuously.
-        if [[ ! -r /dev/fd/3 ]]; then
-          echo "FLEET-TEST: the inherited credential descriptor was not readable" >&2
-          exit 90
-        fi
-        _pem="$(cat <&3)"
-        if [[ -z "$_pem" ]]; then
-          echo "FLEET-TEST: the inherited credential descriptor was empty" >&2
-          exit 91
-        fi
-        export ASC_KEY_P8="$_pem"
-        unset _pem
-        echo "FLEET-TEST-CREDENTIAL-ARRIVED"
-      elif [[ -r /dev/fd/3 ]]; then
-        _pem="$(cat <&3)"
-        if [[ -n "$_pem" ]]; then export ASC_KEY_P8="$_pem"; fi
-        unset _pem
-      fi
-      exec bash "$1" "${@:2}"
-    ' _ "$SHIP" "$@" 2>&1
+    bash -c 'exec bash "$1" "${@:2}"' _ "$SHIP" "$@" 2>&1
   )"
   RC=$?
-  # The marker is matched and stripped with BASH pattern removal, never with
-  # grep:  the captured output carries a UTF-8 em-dash (ship-testflight.sh
-  # logs "ship-gate: skip - ..."), and under a C/POSIX locale grep treats
-  # that stream as BINARY and replaces the whole capture with a binary-file
-  # message, which would make every later assertion fail misleadingly.
-  if [[ "$expect_key" == "1" && "$OUT" != *"FLEET-TEST-CREDENTIAL-ARRIVED"* ]]; then
-    bad "the credential never reached the sandboxed run (rc=${RC})"
-  fi
-  # The marker is the harness's own line, and the cases match on the ship
-  # script's output, so it is stripped before they look.
-  OUT="$(
-    while IFS= read -r _line; do
-      [[ "$_line" == "FLEET-TEST-CREDENTIAL-ARRIVED" ]] || printf '%s\n' "$_line"
-    done <<< "$OUT"
-  )"
   return 0
 }
 
@@ -645,14 +648,16 @@ check "plans no version around it" "$(contains 'UNVERIFIED patch' && echo 1 || e
 # the key is printed:  every byte of a private-key body is secret, and a
 # first-eight/last-four slice of it could not even identify the credential,
 # because two different keys share one.
-# A REAL key pair, generated here and never committed:  the diagnostic
-# resolves the credential the way the client does, and a value that is not a
-# usable PEM is skipped by both.
+# The credential comes from the STORE:  a REAL key pair, generated here and
+# never committed, is what the fake reader holds, and the diagnostic reads
+# the two labels the store holds beside it.
 syn_pem="$(node -e 'process.stdout.write(require("crypto").generateKeyPairSync("ec", { namedCurve: "prime256v1" }).privateKey.export({ type: "pkcs8", format: "pem" }))')"
 syn_body="$(printf '%s\n' "$syn_pem" | sed '1d;$d' | tr -d ' \n')"
-TEST_ASC_KEY_ID="ABCDE12345"
-TEST_ASC_ISSUER_ID="issuer-synthetic"
-TEST_ASC_KEY_P8="$syn_pem"
+printf '%s' "$syn_pem" > "${WORK}/store-key.p8"
+chmod 600 "${WORK}/store-key.p8"
+FAKE_STORE_KEY_ID="ABCDE12345"
+FAKE_STORE_ISSUER_ID="issuer-synthetic"
+FAKE_STORE_PEM_FILE="${WORK}/store-key.p8"
 run_ship botfleet --repo-root "$REPO" --allow-unverified-seq --dry-run
 check "names the rejected key by its key id" \
   "$(contains 'key id ABCDE12345' && echo 0 || echo 1)"
@@ -660,9 +665,10 @@ check "names the rejected key by its issuer id" \
   "$(contains 'issuer id issuer-synthetic' && echo 0 || echo 1)"
 check "does not print the key or any masked slice of it" \
   "$([[ "$OUT" != *"$syn_body"* && "$OUT" != *"${syn_body:0:8}...${syn_body:$((${#syn_body}-4))}"* ]] && echo 0 || echo 1)"
-TEST_ASC_KEY_ID=""
-TEST_ASC_ISSUER_ID=""
-TEST_ASC_KEY_P8=""
+FAKE_STORE_KEY_ID=""
+FAKE_STORE_ISSUER_ID=""
+FAKE_STORE_PEM_FILE=""
+rm -f "${WORK}/store-key.p8"
 unset syn_body syn_pem
 FAKE_ASC_PATCH=236
 echo

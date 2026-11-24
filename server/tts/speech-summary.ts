@@ -31,14 +31,16 @@ export type DeepSeekChatResponse = z.infer<typeof DeepSeekChatResponseSchema>;
 const DEFAULT_DEEPSEEK_BASE = "https://api.deepseek.com";
 const DEFAULT_TIMEOUT_MS = 15_000;
 
-/** Explicit config key first, then DEEPSEEK_VOICE_API_KEY, then DEEPSEEK_API_KEY. */
+/** The key the caller resolved from the store, or nothing.
+ *
+ * The environment carries no copy of a value (owner ruling, November 22,
+ * 2026):  DEEPSEEK_VOICE_API_KEY and DEEPSEEK_API_KEY are not sources, and
+ * a hand-set one never becomes the credential.  The key comes from the
+ * store through the resolved config (`deepseek.key` and `tts.key` in the
+ * secret map), and without one the optional summary stays off. */
 export function resolveDeepSeekKey(providedKey?: string): string {
   const explicit = providedKey?.trim();
   if (explicit && explicit !== "undefined") return explicit;
-  const voice = process.env.DEEPSEEK_VOICE_API_KEY?.trim();
-  if (voice && voice !== "undefined") return voice;
-  const general = process.env.DEEPSEEK_API_KEY?.trim();
-  if (general && general !== "undefined") return general;
   return "";
 }
 

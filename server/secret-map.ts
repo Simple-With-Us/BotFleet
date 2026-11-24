@@ -8,6 +8,21 @@
 // table and one layer above all of them: for a name the vault holds, the vault
 // wins; underneath, the existing env-versus-file ordering is untouched.
 //
+// The owner's ruling of November 22, 2026 is the rule here:  every secret
+// resolves from the store, and the environment carries no copy of a value --
+// not as a first source and not as a second one.  So when a store is
+// configured, the store owns every name in the table below:  its answer is
+// the value for a name it holds, and for a name it does not hold the app's
+// own configuration still applies -- the file, which is the app's own store
+// and never a copy of a fleet grant.  When no store is configured there is
+// no store to own the name, and the environment and the file still apply.
+//
+// One narrow exception, and it is the app's own credential store:  the
+// desktop shell's OS-encrypted store, handed to the server it spawns and
+// marked in the app's own configuration with `credentialStorage: "external"`.
+// That value is the app's own store reaching its own server, never an
+// ambient environment copy, and the fleet store still outranks it.
+//
 // Three rules keep that layer safe:
 //   1. Only a name in this table is ever applied.  A vault row called `PATH`,
 //      `NODE_ENV` or `INFISICAL_CLIENT_SECRET` cannot reach this process.
@@ -375,6 +390,17 @@ export const SECRET_FIELDS: readonly SecretFieldSpec[] = [
   },
 ] as const;
 
+/** The environment names this table manages.
+ *
+ * The config overlay asks for these:  once a store is configured, a value
+ * the environment carries for one of them is not a source, because the
+ * store owns the name (owner ruling, November 22, 2026). */
+export function mappedEnvNames(): ReadonlySet<string> {
+  const names = new Set<string>();
+  for (const spec of SECRET_FIELDS) for (const name of spec.env) names.add(name);
+  return names;
+}
+
 /** Every Infisical name this process will accept, built once from the table.
  * Knob names ride along: the snapshot is the one listing for both layers,
  * and `knob-map.ts` resolves its own rows off it. */
@@ -451,6 +477,58 @@ export const CLI_LOGIN_FIELDS: readonly CliLoginFieldSpec[] = [
   },
 ] as const;
 
+/** The marker the desktop shell writes beside a field whose value lives in
+ * the app's own credential store. */
+const OWN_STORE_MARKER_PATH = ["credentialStorage"] as const;
+
+/** True when this field's value lives in the app's own credential store.
+ *
+ * The desktop shell keeps those values OS-encrypted (safeStorage) and hands
+ * them to the server it spawns, so the app's own configuration carries the
+ * durable marker `credentialStorage: "external"` and the value arrives out of
+ * the environment.  That is the app's own store, the same class as the file,
+ * and not an ambient environment copy:  the fleet store still outranks it,
+ * and an environment value with no marker stays out of the way entirely. */
+function ownCredentialStore(cfg: AppConfig, spec: SecretFieldSpec): boolean {
+  // The marker sits beside the field in the same section, so the same safe
+  // reader that walks a field's path reads it:  no dictionary access and no
+  // runtime type check of its own.
+  //
+  // Only a secret answers to it.  The marker means the app's own credential
+  // store holds this field's secret, and the desktop relays secrets;  a
+  // section can hold a secret and a non-secret beside it -- a key and a base
+  // URL, a key and a region -- and one marker must not hand the non-secret
+  // one an environment copy of its own.
+  if (!spec.secret) return false;
+  return readField(cfg, spec, OWN_STORE_MARKER_PATH) === "external";
+}
+
+/** The value each mapped field holds in the app's own file.
+ *
+ * The config overlay may put the app's own credential store's value in a
+ * field's place before the vault is consulted, so the copy that is really
+ * on disk has to be captured before that happens. */
+export function fileSecretValues(cfg: AppConfig): ReadonlyMap<string, string> {
+  const values = new Map<string, string>();
+  for (const spec of SECRET_FIELDS) values.set(spec.id, readField(cfg, spec) ?? "");
+  return values;
+}
+
+/** The environment names whose value the app's own credential store holds.
+ *
+ * The config overlay asks for these:  once a store is configured, an
+ * environment value is not a source unless the app's own configuration says
+ * the value lives in the app's own credential store (owner ruling, November
+ * 22, 2026:  the environment carries no copy of a value). */
+export function ownCredentialStoreEnvNames(cfg: AppConfig): ReadonlySet<string> {
+  const names = new Set<string>();
+  for (const spec of SECRET_FIELDS) {
+    if (!ownCredentialStore(cfg, spec)) continue;
+    for (const name of spec.env) names.add(name);
+  }
+  return names;
+}
+
 /** Every environment name a CLI login may use.  The allowlist: a row in the
  * seat's folder that is not one of these is ignored, and one of these the
  * folder does not hold is simply absent. */
@@ -519,12 +597,12 @@ export function vaultNames(): readonly string[] {
   return snapshotNames;
 }
 
-function readField(cfg: AppConfig, spec: SecretFieldSpec): string | undefined {
+function readField(cfg: AppConfig, spec: SecretFieldSpec, path: readonly string[] = spec.path): string | undefined {
   // SAFETY: AppConfig is a plain object literal built by `parseStoredConfig`,
   // and `spec.section` is a `keyof AppConfig` from the table above, so indexing
   // it by string reads a declared section and nothing else.
   let node: unknown = (cfg as Record<string, unknown>)[spec.section];
-  for (const key of spec.path) {
+  for (const key of path) {
     if (!node || typeof node !== "object") return undefined;
     // SAFETY: guarded on the line above — `node` is a non-null object here.
     node = (node as Record<string, unknown>)[key];
@@ -584,11 +662,35 @@ export function resolveSecretFields(
   cfg: AppConfig,
   env: NodeJS.ProcessEnv,
   snap: ReadonlyMap<string, string> | null,
+  fileValues?: ReadonlyMap<string, string>,
 ): SecretProvenance[] {
   const rows: SecretProvenance[] = [];
+  // The store is the only source for a name it manages (owner ruling,
+  // November 22, 2026:  every secret resolves from Infisical, and the
+  // environment carries no copy of a value).  When a store is configured,
+  // an environment copy is neither a first source nor a second one:  the
+  // store's answer is the value for a name it holds, and a name it does
+  // not hold keeps the app's own configuration -- the file, which is the
+  // app's own store and never a copy of a vault value.  A host with no
+  // store configured has no store to own the name, so the environment
+  // still applies there.
+  const storeOwns = snap !== null;
   for (const spec of SECRET_FIELDS) {
+    //  The file value is the app's own store, and the config overlay above
+    //  no longer copies an environment value into it once a store is
+    //  configured, so what is here came from the file.
     const local = readField(cfg, spec) ?? "";
-    const fromEnv = envValueFor(spec, env);
+    //  The one exception is the app's own credential store, whose value the
+    //  overlay puts in the file's place:  the copy that is really on disk is
+    //  the one captured before the overlay ran, so a tombstoned file is not
+    //  reported as holding a copy the vault overrode.
+    const onDisk = fileValues?.get(spec.id) ?? local;
+    //  The environment is not a source once a store is configured -- unless
+    //  the app's own configuration says the value lives in the app's own
+    //  credential store, which is the desktop's encrypted store handed to
+    //  the server it spawns.  That is the app's own store, not an ambient
+    //  environment copy, and the store above still outranks it.
+    const fromEnv = storeOwns && !ownCredentialStore(cfg, spec) ? undefined : envValueFor(spec, env);
     const vaultValue = snap?.get(spec.infisicalName);
 
     let source: SecretSource;
@@ -599,7 +701,7 @@ export function resolveSecretFields(
     let resolved = local || fromEnv || "";
     if (typeof vaultValue === "string" && vaultValue.length > 0) {
       writeField(cfg, spec, vaultValue);
-      hasLocalCopy = local.length > 0;
+      hasLocalCopy = onDisk.length > 0;
       resolved = vaultValue;
       source = "infisical";
     }

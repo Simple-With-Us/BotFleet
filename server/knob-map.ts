@@ -620,6 +620,10 @@ export function resolveKnobFields(
   snap: ReadonlyMap<string, string> | null,
 ): KnobProvenance[] {
   const rows: KnobProvenance[] = [];
+  // The store owns a knob it holds (owner ruling, November 22, 2026:  every
+  // variable resolves from Infisical too).  A knob is never read from the
+  // environment here:  the two sources are the store and the app's own
+  // configuration, and the store's answer wins for a name it holds.
   for (const spec of KNOB_FIELDS) {
     const local = readKnobField(cfg, spec);
     const vaultRaw = snap?.get(spec.infisicalName);

@@ -124,14 +124,28 @@ describe("observability status resolution", () => {
     );
   });
 
-  it("lets an environment DSN win over the stored one and says so", async () => {
+  it("never reads the DSN from the environment", async () => {
+    //  The environment carries no copy of a value (owner ruling, November
+    //  22, 2026):  a stale DSN in the process environment is not a source,
+    //  and the stored one is the only answer.
     process.env.SENTRY_DSN = ENV_DSN;
     useConfig({ observability: { sentryDsn: CONFIG_DSN } });
     const status = observability.getStatus();
-    expect(status.source).toBe("env");
-    expect(status.host).toBe("o9.ingest.sentry.io");
-    expect(status.projectId).toBe("2");
-    expect(observability.effectiveDsn()).toBe(ENV_DSN);
+    expect(status.source).toBe("config");
+    expect(status.host).toBe("o0.ingest.sentry.io");
+    expect(status.projectId).toBe("1");
+    expect(observability.effectiveDsn()).toBe(CONFIG_DSN);
+  });
+
+  it("has no DSN at all when only the environment carries one", async () => {
+    //  Without a stored DSN the optional reporting stays off, and the
+    //  environment value is never read.
+    process.env.SENTRY_DSN = ENV_DSN;
+    useConfig({});
+    const status = observability.getStatus();
+    expect(status.source).toBe("none");
+    expect(status.configured).toBe(false);
+    expect(observability.effectiveDsn()).toBeNull();
   });
 
   it("keeps enabled as configuration while delivering stays false before apply", () => {
@@ -415,9 +429,8 @@ describe("observability malformed DSN", () => {
   // The boot line is what an operator (and this plan's own verification
   // steps) greps for the word "enabled".  A DSN that never started the SDK
   // must not produce a line that opens with it, however honest the suffix.
-  it("names the problem when the environment pins a non-DSN", async () => {
-    process.env.SENTRY_DSN = "http://key@o0.ingest.sentry.io/1";
-    useConfig({});
+  it("names the problem when the store holds a non-DSN", async () => {
+    useConfig({ observability: { sentryDsn: "http://key@o0.ingest.sentry.io/1" } });
     const status = await observability.apply();
     expect(status.configured).toBe(true);
     expect(status.enabled).toBe(false);
@@ -425,13 +438,12 @@ describe("observability malformed DSN", () => {
     expect(status.lastError).toBe("The stored DSN is not a Sentry https:// DSN.");
 
     const line = observabilityBootLine(status);
-    expect(line).toBe("[sentry] misconfigured (env): The stored DSN is not a Sentry https:// DSN.");
+    expect(line).toBe("[sentry] misconfigured (config): The stored DSN is not a Sentry https:// DSN.");
     expect(line).not.toContain("enabled");
   });
 
   it("says the same thing before any apply() has run", async () => {
-    process.env.SENTRY_DSN = "http://key@o0.ingest.sentry.io/1";
-    useConfig({});
+    useConfig({ observability: { sentryDsn: "http://key@o0.ingest.sentry.io/1" } });
     const status = observability.getStatus();
     expect(status.enabled).toBe(false);
     expect(status.lastError).toBe("The stored DSN is not a Sentry https:// DSN.");
@@ -447,8 +459,7 @@ describe("observability malformed DSN", () => {
   it("refuses a DSN the SDK itself would reject, before init can print it", async () => {
     const { record, loader } = fakeSentry();
     setSentryLoaderForTests(loader);
-    process.env.SENTRY_DSN = UUID_KEY_DSN;
-    useConfig({});
+    useConfig({ observability: { sentryDsn: UUID_KEY_DSN } });
 
     const logged: string[] = [];
     const spies = (["log", "warn", "error"] as const).map((level) =>
@@ -468,7 +479,7 @@ describe("observability malformed DSN", () => {
       expect(status.projectId).toBeNull();
       expect(status.lastError).toBe("The stored DSN is not a Sentry https:// DSN.");
       expect(observabilityBootLine(status)).toBe(
-        "[sentry] misconfigured (env): The stored DSN is not a Sentry https:// DSN.",
+        "[sentry] misconfigured (config): The stored DSN is not a Sentry https:// DSN.",
       );
 
       const transcript = `${logged.join("\n")}\n${JSON.stringify(status)}`;

@@ -86,6 +86,9 @@ struct MacResourcesSettings: View {
                         }
                     }
                 }
+            } else {
+                Text("No resources yet.\u{00A0} Refresh to read the selected host's capacity.")
+                    .font(.callout).foregroundStyle(.secondary)
             }
         }
         .task {
@@ -302,7 +305,7 @@ private struct HeadroomCard: View {
                             ProgressView()
                                 .controlSize(.small)
                         }
-                        Text(saving ? "Saving…" : "Save headroom")
+                        Text(saving ? "Saving…" : "Save Headroom")
                     }
                 }
                 .disabled(!isValid || saving)

@@ -104,8 +104,9 @@
     "test:work-labels": "node --test scripts/blocking-work-labels.node-test.mjs",
     "test:smoke-runtime-mode": "node --test scripts/smoke-runtime-mode.node-test.mjs",
     "smoke:native-host-package": "node scripts/native-host-package-smoke.mjs",
-    "test:native-release": "node --test scripts/native-appcast.node-test.mjs scripts/native-release-workflow.node-test.mjs scripts/native-update-release-config.node-test.mjs scripts/native-release-signature.node-test.mjs scripts/native-host-artifact.node-test.mjs scripts/native-host-package-smoke.node-test.mjs scripts/native-host-independent-path.node-test.mjs scripts/decommission-gates.node-test.mjs scripts/decommission-gate-state.node-test.mjs scripts/placement-evidence.node-test.mjs scripts/placement-rollback-probe.node-test.mjs scripts/mac-release-version.node-test.mjs scripts/check-post-reboot-node.node-test.mjs scripts/check-decommission-tree.node-test.mjs scripts/check-node-ci-jobs.node-test.mjs scripts/check-soak-24h.node-test.mjs scripts/emit-soak-receipt.node-test.mjs scripts/archive-node-store.node-test.mjs scripts/import-parity-report-contract.node-test.mjs scripts/emit-replay-receipt.node-test.mjs scripts/archive-node-store.synthetic.node-test.mjs scripts/archive-node-store-verify.node-test.mjs",
-    "test:electron-release": "node --test scripts/electron-release-version.node-test.mjs",    "test:linux-server-install": "node --test deploy/linux-server/dependency-install.node-test.mjs deploy/linux-server/start.node-test.mjs deploy/linux-server/start-token.node-test.mjs deploy/linux-server/companion-bridge.node-test.mjs deploy/linux-server/retained-source.node-test.mjs deploy/linux-server/retained-actual-adapters.node-test.mjs scripts/emit-linux-retention-receipt.node-test.mjs",
+    "test:native-release": "node --test scripts/emit-decommission-receipts.node-test.mjs scripts/decommission-packet-fixture.node-test.mjs scripts/native-appcast.node-test.mjs scripts/native-release-workflow.node-test.mjs scripts/native-update-release-config.node-test.mjs scripts/native-release-signature.node-test.mjs scripts/native-host-artifact.node-test.mjs scripts/native-host-package-smoke.node-test.mjs scripts/native-host-independent-path.node-test.mjs scripts/decommission-gates.node-test.mjs scripts/decommission-gate-state.node-test.mjs scripts/placement-evidence.node-test.mjs scripts/placement-rollback-probe.node-test.mjs scripts/mac-release-version.node-test.mjs scripts/check-post-reboot-node.node-test.mjs scripts/check-decommission-tree.node-test.mjs scripts/check-node-ci-jobs.node-test.mjs scripts/check-soak-24h.node-test.mjs scripts/emit-soak-receipt.node-test.mjs scripts/archive-node-store.node-test.mjs scripts/import-parity-report-contract.node-test.mjs scripts/emit-replay-receipt.node-test.mjs scripts/archive-node-store.synthetic.node-test.mjs scripts/archive-node-store-verify.node-test.mjs",
+    "test:electron-release": "node --test scripts/electron-release-version.node-test.mjs",
+    "test:linux-server-install": "node --test deploy/linux-server/dependency-install.node-test.mjs deploy/linux-server/start.node-test.mjs deploy/linux-server/start-token.node-test.mjs deploy/linux-server/companion-bridge.node-test.mjs deploy/linux-server/retained-source.node-test.mjs deploy/linux-server/retained-actual-adapters.node-test.mjs scripts/emit-linux-retention-receipt.node-test.mjs deploy/linux-server/companion-bridge-server.node-test.mjs",
     "test:scoped-read": "node --test scripts/lib/fleet-infisical-read.node-test.mjs"
   },
   "dependencies": {
@@ -137,7 +138,7 @@
     "@assistant-ui/react-markdown": "^0.14.20",
     "@assistant-ui/react-ui": "^0.2.1",
     "@assistant-ui/store": "^0.3.21",
-    "@oxlint/plugins": "1.93.0",
+    "@oxlint/plugins": "1.94.0",
     "@playwright/test": "^1.62.0",
     "@sentry/vite-plugin": "^11.0.0",
     "@tailwindcss/vite": "^4.1.11",
@@ -153,12 +154,12 @@
     "esbuild": "^0.28.2",
     "gifuct-js": "2.1.2",
     "happy-dom": "^21.0.0",
-    "oxlint": "1.93.0",
+    "oxlint": "1.94.0",
     "tailwindcss": "^4.1.11",
     "typebox": "1.4.7",
     "typescript": "^7.0.0",
     "vite": "^8.0.0",
     "vitest": "^5.0.0",
-    "wrangler": "4.162.0"
+    "wrangler": "4.164.0"
   }
 }

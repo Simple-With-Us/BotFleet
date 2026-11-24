@@ -411,9 +411,10 @@ test("one key file serves every notarization, and it leaves no copy behind", () 
   }
 });
 
-// The fleet's approved order: the environment first, then Infisical, and
-// the keychain profile only as this machine's bootstrap identity.
-test("the notarization credentials are resolved in the approved order", () => {
+// The store is the only source (owner ruling, November 22, 2026):  the
+// notarization credentials and the keychain profile are the store's
+// answers, and an inherited value is cleared before the read.
+test("the notarization credentials are resolved from the store only", () => {
   // The Infisical leg reads through the shared scoped reader, with the
   // folder the names live in and the consumer's own account.  The retired
   // command must not come back.
@@ -426,8 +427,16 @@ test("the notarization credentials are resolved in the approved order", () => {
   const resolver = localScript.indexOf("resolve_notary_credentials");
   const call = localScript.indexOf("resolve_notary_credentials\n");
   assert.ok(resolver !== -1 && call !== -1, "the resolver must run before notarization");
-  // The keychain profile is the fallback, never the first choice.
+  // The keychain profile is named by the store:  there is no default
+  // profile and no ambient fallback.
   assert.match(localScript, /--keychain-profile/);
+  assert.match(localScript, /fleet_secret_get NOTARY_PROFILE/);
+  assert.doesNotMatch(localScript, /NOTARY_PROFILE:-AC_PASSWORD/);
+  // An inherited copy of any of these names is cleared before the read.
+  assert.match(localScript, /unset NOTARY_PROFILE/);
+  assert.match(localScript, /unset APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER_ID/);
+  // The Sentry DSN is the store's answer as well.
+  assert.match(localScript, /unset SENTRY_DSN/);
 });
 
 // XcodeGen REWRITES the Mac Info.plist and the Mac entitlements file from
