@@ -9,7 +9,7 @@
 // panel shows a server's field names and never their contents, and a save
 // carries the fields it knows while the server keeps the credentials it
 // already has for the fields the panel cannot see.
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { cn } from "@/lib/cn";
 import type { Bot } from "@/state/store";
@@ -135,8 +135,15 @@ export function McpServersSettings({
   const [url, setUrl] = useState("");
   const [credential, setCredential] = useState("");
 
-  const shared = servers.filter((server) => server.scope === "shared");
-  const own = servers.filter((server) => server.scope === "bot");
+  // The two scopes, memoized on the listing:  a fresh array on every
+  // render would make the effect below run on every render, and the state
+  // it sets would render again — a loop that also threw away an
+  // in-progress credential edit.
+  const { shared, own } = useMemo(() => {
+    const scoped = servers.filter((server) => server.scope === "shared");
+    const ownScoped = servers.filter((server) => server.scope === "bot");
+    return { shared: scoped, own: ownScoped };
+  }, [servers]);
 
   // The bot's own servers, as the panel knows them.  The bot record does
   // not carry them —  their credentials never leave the server — so this

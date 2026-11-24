@@ -10,7 +10,7 @@ import {
   CONNECTOR_TOOL_NAME_PATTERN,
 } from "../shared/connector-tools.ts";
 
-import type { StoredMcpServer } from "./mcp-registry.ts";
+import { isRemoteMcpServer, type StoredMcpServer } from "./mcp-registry.ts";
 import type { BotRecord } from "./store.ts";
 
 export const BOT_PROFILE_PATCH_FIELDS = [
@@ -261,11 +261,15 @@ function normalizeOwnMcpServers(
     // cannot see.  The stored value is kept for every field the patch
     // leaves out, and a field the patch does carry replaces it.
     const existing = stored?.[name];
+    // A stored server is one kind or the other, so the credentials it
+    // keeps are read from the kind it is.
+    const keptHeaders = existing && isRemoteMcpServer(existing) ? existing.headers : undefined;
+    const keptEnv = existing && !isRemoteMcpServer(existing) ? existing.env : undefined;
     if (entry.url !== undefined) {
       out[name] = {
         type: entry.type ?? "http",
         url: entry.url,
-        headers: entry.headers ?? existing?.headers ?? {},
+        headers: entry.headers ?? keptHeaders ?? {},
         enabled: entry.enabled ?? true,
       };
       continue;
@@ -273,7 +277,7 @@ function normalizeOwnMcpServers(
     out[name] = {
       command: entry.command ?? "",
       args: entry.args ?? [],
-      env: entry.env ?? existing?.env ?? {},
+      env: entry.env ?? keptEnv ?? {},
       enabled: entry.enabled ?? true,
     };
   }

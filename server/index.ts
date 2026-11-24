@@ -3409,7 +3409,25 @@ const wireGroupTask = (task: GroupTaskRecord) => {
 const botMcpServersBodySchema = z
   .object({
     shared: z.array(z.string().min(1).max(64)).max(20).optional(),
-    servers: z.record(z.string().min(1).max(64), z.json()).optional(),
+    servers: z
+      .record(
+        z.string().min(1).max(64),
+        z
+          .object({
+            command: z.string().trim().min(1).max(1024).optional(),
+            args: z.array(z.string().max(4096)).max(64).optional(),
+            env: z.record(z.string().max(128), z.string().max(16384)).optional(),
+            type: z.enum(["http", "sse"]).optional(),
+            url: z.string().trim().min(1).max(2048).optional(),
+            headers: z.record(z.string().max(128), z.string().max(16384)).optional(),
+            enabled: z.boolean().optional(),
+          })
+          .strict(),
+      )
+      .refine((value) => Object.keys(value).length <= 20, {
+        error: "a bot may hold at most 20 MCP servers",
+      })
+      .optional(),
   })
   .strict();
 

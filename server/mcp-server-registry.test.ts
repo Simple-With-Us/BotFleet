@@ -40,7 +40,9 @@ function bot(overrides: Partial<Pick<BotRecord, "mcpServers" | "ownMcpServers">>
  * defaults fill in the fields a KIND of server carries and no other:  a
  * server has either a command or an address, never both, so the fixture
  * must not put a command on a remote one. */
-function ownServer(server: Partial<StoredMcpServer>): BotRecord["ownMcpServers"] {
+function ownServer(server: OwnServerFields): BotRecord["ownMcpServers"] {
+  // A stored server is one kind or the other, so the fixture names the
+  // kind it builds rather than asserting a union.
   const remote = server.url !== undefined;
   const base = remote
     ? { type: "http" as const, url: "", headers: {}, enabled: true }
@@ -50,6 +52,17 @@ function ownServer(server: Partial<StoredMcpServer>): BotRecord["ownMcpServers"]
 
 // The stored shapes, typed as the config's own JSON value so a fixture
 // never has to assert an unrelated object into the parser's boundary.
+/** The fields a fixture may name for a stored server of the bot's own. */
+interface OwnServerFields {
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  type?: "http" | "sse";
+  url?: string;
+  headers?: Record<string, string>;
+  enabled?: boolean;
+}
+
 const LOCAL: JsonValue = { command: "npx", args: ["-y", "my-mcp"], env: { TOKEN: "secret-value" } };
 const REMOTE: JsonValue = { type: "http", url: "https://example.com/mcp", headers: { Authorization: "Bearer x" } };
 
