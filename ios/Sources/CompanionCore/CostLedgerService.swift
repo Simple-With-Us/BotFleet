@@ -237,6 +237,11 @@ public actor CostLedgerService {
         return overflow ? Int.max : sum
     }
 
+    private static func saturatingAdd(_ lhs: Double, _ rhs: Double) -> Double {
+        let sum = lhs + rhs
+        return sum.isFinite ? sum : Double.greatestFiniteMagnitude
+    }
+
     /// Records a single metered call idempotently by `entry.id`.
     public func record(_ entry: CostLedgerEntry, now: Date = Date()) throws {
         guard !entry.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -317,7 +322,7 @@ public actor CostLedgerService {
             input = Self.saturatingAdd(input, item.inputTokens)
             output = Self.saturatingAdd(output, item.outputTokens)
             cached = Self.saturatingAdd(cached, item.cachedInputTokens)
-            cost += item.estimatedCostUSD
+            cost = Self.saturatingAdd(cost, item.estimatedCostUSD)
         }
         return CostLedgerTotals(
             entryCount: filtered.count,
@@ -338,7 +343,7 @@ public actor CostLedgerService {
         forBotId botId: String? = nil
     ) -> Double {
         let windowEntries = rollingWindowEntries(windowSeconds: windowSeconds, now: now, forBotId: botId)
-        return windowEntries.reduce(0.0) { $0 + $1.estimatedCostUSD }
+        return windowEntries.reduce(0.0) { Self.saturatingAdd($0, $1.estimatedCostUSD) }
     }
 
     /// Checks whether current rolling spend stays strictly below `ceiling.maxSpendUSD`,
@@ -356,7 +361,7 @@ public actor CostLedgerService {
             return .allowed(remainingUSD: .infinity)
         }
         let windowEntries = rollingWindowEntries(windowSeconds: ceiling.windowSeconds, now: now, forBotId: botId)
-        let spent = windowEntries.reduce(0.0) { $0 + $1.estimatedCostUSD }
+        let spent = windowEntries.reduce(0.0) { Self.saturatingAdd($0, $1.estimatedCostUSD) }
         guard ceiling.windowSeconds.isFinite,
               ceiling.windowSeconds > 0,
               ceiling.minPricedShare.isFinite,
