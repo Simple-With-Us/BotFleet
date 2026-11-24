@@ -41,6 +41,8 @@ export type BotUpdatePatch = Partial<
     | "composio"
     | "modelSelection"
     | "unread"
+    | "mcpServers"
+    | "ownMcpServers"
   >
 > & {
   /** Per-device voice overrides.  Merged per device on every path, never

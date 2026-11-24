@@ -177,6 +177,8 @@ import {
   snapshotAvatarGenerationState,
 } from "./avatar-image.ts";
 import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
+import { listMcpServersForBot, mcpServersForTurn, resolveMcpServers } from "./mcp-server-registry.ts";
+import type { JsonValue } from "./schema.ts";
 import { checkBotOrganizeBody, parseAutoUpdateBody } from "./companion-writes.ts";
 import { doomedDispatches, enableDoomedDispatchPersist, DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
 import { isMcodeLockContentionMessage } from "./mcode-lock-contention.ts";
@@ -3398,8 +3400,59 @@ const wireGroupTask = (task: GroupTaskRecord) => {
   return { ...task, lastActivity: last?.at ?? task.createdAt, lastMessage: last };
 };
 
+/** The body the MCP server route accepts.
+ *
+ * `shared` narrows the workspace's shared servers for this bot;  `servers`
+ * is the bot's own set, and it is the COMPLETE set:  a name that is not in
+ * it is gone, and a name that is in it keeps the credential it already has
+ * unless the request carries a new one. */
+const botMcpServersBodySchema = z
+  .object({
+    shared: z.array(z.string().min(1).max(64)).max(20).optional(),
+    servers: z
+      .record(
+        z.string().min(1).max(64),
+        z
+          .object({
+            command: z.string().trim().min(1).max(1024).optional(),
+            args: z.array(z.string().max(4096)).max(64).optional(),
+            env: z
+              .record(z.string().max(128), z.string().max(16384))
+              .refine((value) => Object.keys(value).length <= 64, {
+                error: "an MCP server takes at most 64 environment variables",
+              })
+              .optional(),
+            type: z.enum(["http", "sse"]).optional(),
+            url: z.string().trim().min(1).max(2048).optional(),
+            headers: z
+              .record(z.string().max(128), z.string().max(16384))
+              .refine((value) => Object.keys(value).length <= 32, {
+                error: "an MCP server takes at most 32 headers",
+              })
+              .optional(),
+            enabled: z.boolean().optional(),
+          })
+          .strict()
+          // A server has either a command to run or an address to connect
+          // to:  both would let the remote shape win and drop the command,
+          // and neither is not a server at all.
+          .refine((entry) => Boolean(entry.command) !== Boolean(entry.url), {
+            error: "an MCP server needs a command or a url, not both and not neither",
+          }),
+      )
+      .refine((value) => Object.keys(value).length <= 20, {
+        error: "a bot may hold at most 20 MCP servers",
+      })
+      .optional(),
+  })
+  .strict();
+
 const wireBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
-  const { resumeCursors, tasks, ...rest } = bot;
+  // `ownMcpServers` never goes out on the wire:  a server's env and header
+  // values are its credentials, and a bot frame reaches every client and
+  // every SSE broadcast.  The panel reads what it needs from the bot's own
+  // listing route, which reports the field NAMES and never the values.
+  const { resumeCursors, tasks, ownMcpServers: _ownMcpServers, ...rest } = bot;
   // avatarUrl and voices go out as null when unset, so a client that merges
   // bot frames into what it holds (object spread, Codable defaults) clears a
   // value another device removed instead of keeping the stale one.
@@ -7769,6 +7822,14 @@ async function startTurn(
         if (providerReloadInProgress) await waitForProviderReloads();
         if (!dispatchStillCurrent()) return;
         if (connection) integrations.composio = connection;
+      }
+      // The user's own MCP servers:  the ones the workspace shares, narrowed
+      // by this bot's list, plus the ones that belong to this bot alone.
+      // This is the field the mount point reads, so a configured server
+      // finally mounts instead of only being stored.
+      if (instance.adapter.capabilities.customMcp === true) {
+        const custom = mcpServersForTurn(resolveMcpServers(cfg, bot).servers);
+        if (Object.keys(custom).length > 0) integrations.custom = custom;
       }
       if (cfg.qdrant?.enabled !== false && instance.adapter.capabilities.qdrantMcp === true) {
         integrations.qdrant = qdrantIntegration(bot.id, threadId);
@@ -16176,6 +16237,49 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const visible = wireBot(bot);
       broadcast({ kind: "bot", bot: visible });
       return json(res, 200, { bot: visible });
+    }
+    // The MCP servers this bot may mount:  the ones the workspace shares
+    // and the ones that belong to this bot alone.  The listing reports the
+    // NAMES of a server's env and header fields and never their values, so
+    // a credential in a server never reaches the renderer.
+    m = path.match(/^\/api\/bots\/([\w-]+)\/mcp-servers$/);
+    if (m && method === "GET") {
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      return json(res, 200, { servers: listMcpServersForBot(cfg, bot) });
+    }
+    if (m && method === "PATCH") {
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+
+      // The body's own servers are this bot's alone, and the body's
+      // `shared` list narrows the workspace's shared set for this bot.
+      // Both go through the profile patch, so the validation, the naming
+      // rules and the reserved-name refusal are the ones every other bot
+      // field already uses.
+      const body = await readBody(req);
+      // The body is parsed before anything is read off it, so a shape the
+      // route did not expect is a refusal rather than a surprise.
+      const parsedBody = botMcpServersBodySchema.safeParse(body);
+      if (!parsedBody.success) {
+        return json(res, 400, { error: parsedBody.error.issues[0]?.message ?? "invalid MCP server request" });
+      }
+      const requested: Record<string, JsonValue> = {};
+      if (parsedBody.data.shared !== undefined) requested.mcpServers = parsedBody.data.shared;
+      if (parsedBody.data.servers !== undefined) requested.ownMcpServers = parsedBody.data.servers;
+      const parsed = parseBotProfilePatch(requested, true, bot);
+      if (!parsed.ok) return json(res, 400, { error: parsed.error });
+      if (parsed.patch.mcpServers === undefined && parsed.patch.ownMcpServers === undefined) {
+        return json(res, 400, { error: "nothing to save" });
+      }
+      const changes: Partial<typeof bot> = {};
+      if (parsed.patch.mcpServers !== undefined) changes.mcpServers = parsed.patch.mcpServers;
+      if (parsed.patch.ownMcpServers !== undefined) changes.ownMcpServers = parsed.patch.ownMcpServers;
+      const patched = store.patchBot(bot.id, changes);
+      if (!patched) return json(res, 404, { error: "no such bot" });
+      const visible = wireBot(patched);
+      broadcast({ kind: "bot", bot: visible });
+      return json(res, 200, { bot: visible, servers: listMcpServersForBot(cfg, patched) });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/read$/);
     if (m && method === "POST") {

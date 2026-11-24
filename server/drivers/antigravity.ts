@@ -61,6 +61,7 @@ import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
 import { captureInput, captureOutput } from "../../shared/item-io.ts";
+import { mcpStdioServer } from "../mcp-gate-config.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { injectedApiModel, mergeLocalInject } from "./local-inject.ts";
 
@@ -384,6 +385,17 @@ export function antigravityMcpServers(
       continue;
     }
     servers[`botfleet-${name}`] = { command: (def as any).command, args: (def as any).args, env: { ...(def as any).env } };
+  }
+  // The person's own MCP servers ride the same path, under their own
+  // names.  A URL server becomes BotFleet's remote proxy here too, so it
+  // reaches the engine over stdio the same way every other server does,
+  // and a credential in its headers stays in the config file's env rather
+  // than on argv.
+  for (const [name, server] of Object.entries(integrations.custom ?? {})) {
+    if (servers[name]) continue;
+    const stdio = mcpStdioServer(server, { nodeEnv: { ELECTRON_RUN_AS_NODE: "1" } });
+    if (!stdio) continue;
+    servers[name] = { command: stdio.command, args: stdio.args ?? [], env: { ...stdio.env } };
   }
   return servers;
 }
@@ -746,7 +758,17 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       // still be in flight here.  Waiting for it after the registration —
       // which must stay synchronous with the guard — means the child is
       // spawned with the credential rather than without it.
-      if (!seatCredentialsReady(turn.launchIdentity?.seat)) await awaitSeatCredentials(turn.launchIdentity?.seat);
+      if (!seatCredentialsReady(turn.launchIdentity?.seat)) {
+        try {
+          await awaitSeatCredentials(turn.launchIdentity?.seat);
+        } catch (error) {
+          // Release the pending claim before the failure propagates:  no
+          // child exists yet, and a stale entry would refuse every later
+          // turn on this thread as already running.
+          pending.delete(threadId);
+          throw error;
+        }
+      }
       const turnId = newId();
       // Carried across a relaunch (see maybeRetry): `attempt` counts the
       // transient failures this logical turn has already absorbed, and
@@ -1601,6 +1623,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           composioMcp: true,
           phoneMcp: true,
           qdrantMcp: true,
+          customMcp: true,
           // Jobs matrix: BotFleet jobs are gated until their fixtures pass
           // (P2b).  `invoke_subagent` is the tool name on the row, and the
           // chat draws that row as a named helper card (jobs P3).

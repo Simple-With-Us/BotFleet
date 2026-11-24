@@ -68,11 +68,17 @@ function sameReport(a: ReportMessage, b: ReportMessage): boolean {
 export class PlacementReportSpool {
   readonly directory: string;
   private damagedRows = 0;
+  /** The directory reader, kept injectable for the tests.  It is a plain
+   *  field and not a constructor parameter property, so this module loads
+   *  under Node's type stripping:  a child process that runs the placement
+   *  worker outside a test runner needs that. */
+  private readonly readDirectory: (directory: string) => string[];
 
   constructor(
     dataDir: string,
-    private readonly readDirectory: (directory: string) => string[] = (directory) => readdirSync(directory),
+    readDirectory: (directory: string) => string[] = (directory) => readdirSync(directory),
   ) {
+    this.readDirectory = readDirectory;
     this.directory = join(dataDir, "placement", "reports");
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
     if (process.platform !== "win32") chmodSync(this.directory, 0o700);
