@@ -92,7 +92,11 @@ export function closeWorkerServer(server: Server): Promise<void> {
   server.closeAllConnections();
   return new Promise<void>((resolve, reject) =>
     server.close((error?: Error) => {
-      if (error) {
+      // A close error is a teardown failure the caller has to see —
+      // except "not running":  the server is already closed, which is
+      // the state the caller wants, so a second close from a caller's
+      // finally block stays a success instead of masking the test result.
+      if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
         reject(error);
       } else {
         resolve();
