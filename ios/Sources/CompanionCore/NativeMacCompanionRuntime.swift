@@ -98,6 +98,7 @@ public struct NativeMacCompanionRuntime: Sendable {
     /// Interactive Mac execution context resolving ready turns when profiles,
     /// workspaces, and credentials are registered (`BF-2689`).
     public let macExecutionContext: MacExecutionContext
+    private let usesExternalExecutionContext: Bool
     /// Spend and quota ledger (`BF-2619`).
     public let costLedger: CostLedgerService
     /// Redacted runtime fault banner store (`BF-2618`).
@@ -137,11 +138,16 @@ public struct NativeMacCompanionRuntime: Sendable {
         )
         let engineSwitch = engineSwitch ?? BotNativeEngineSwitchActor(database: database)
         let workspaceSource = DatabaseBotWorkspaceSource(database: database, workspacesRoot: workspacesRoot)
-        let resolvedMacContext = MacExecutionContext(
-            workspaceSource: workspaceSource,
-            credentials: credentials ?? UnavailableNativeServiceCredentials()
-        )
-        self.macExecutionContext = resolvedMacContext
+        if let injectedMacContext = executionContext as? MacExecutionContext {
+            self.macExecutionContext = injectedMacContext
+            self.usesExternalExecutionContext = false
+        } else {
+            self.macExecutionContext = MacExecutionContext(
+                workspaceSource: workspaceSource,
+                credentials: credentials ?? UnavailableNativeServiceCredentials()
+            )
+            self.usesExternalExecutionContext = (executionContext != nil)
+        }
         self.costLedger = costLedger ?? CostLedgerService()
         self.faultBanners = faultBanners ?? NativeFaultBannerStore()
         let defaultPluginRoot = workspacesRoot.deletingLastPathComponent().appendingPathComponent("plugins", isDirectory: true)
@@ -165,7 +171,7 @@ public struct NativeMacCompanionRuntime: Sendable {
         let processSource: any NativeEventWaitProcessOwnershipSource = NoOwnedProcessSource()
         #endif
         let resolvedExecutionContext: any NativeExecutionContextSource =
-            executionContext ?? resolvedMacContext
+            executionContext ?? self.macExecutionContext
         self.runtime = NativeRuntimeServices(
             database: database,
             engineCoordinator: coordinator,
@@ -178,10 +184,15 @@ public struct NativeMacCompanionRuntime: Sendable {
 
     /// Registers an interactive Mac bot profile and optional engine driver on
     /// the runtime's execution context and engine coordinator (`BF-2689`).
+    /// Fails closed with `MacExecutionContextError.externalExecutionContextActive`
+    /// if the runtime was constructed with a non-`MacExecutionContext` override.
     public func registerBot(
         _ profile: MacBotExecutionProfile,
         driver: (any EngineDriver)? = nil
     ) async throws {
+        guard !usesExternalExecutionContext else {
+            throw MacExecutionContextError.externalExecutionContextActive
+        }
         try await macExecutionContext.register(profile)
         if let driver {
             await runtime.engineCoordinator.registerDriver(driver)
