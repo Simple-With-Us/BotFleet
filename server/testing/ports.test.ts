@@ -15,6 +15,7 @@ import {
   PORT_POOL_END,
   PORT_POOL_START,
   portBand,
+  portBlockBases,
 } from "./ports.ts";
 
 /** The lowest ephemeral port the kernel hands out on the CI runners. */
@@ -58,5 +59,24 @@ describe("the free-port pool", () => {
     const band = portBand(-1);
     expect(band.start).toBeGreaterThanOrEqual(PORT_POOL_START);
     expect(band.end).toBeLessThanOrEqual(PORT_POOL_END);
+  });
+
+  it("keeps every port of a block inside the band that owns it", () => {
+    // The band is the reservation.  A base at the very end of the band
+    // would put the port one above it into the next band, and the next
+    // band belongs to another suite — the partition undone by one port.
+    for (let pid = 0; pid < PORT_POOL_BANDS; pid += 1) {
+      const band = portBand(pid);
+      const bases = portBlockBases(band, [0, 1]);
+      expect(bases.first).toBeGreaterThanOrEqual(band.start);
+      expect(bases.last).toBeLessThan(band.end - 1);
+      expect(bases.last + 1).toBeLessThan(band.end);
+    }
+  });
+
+  it("refuses a block that cannot fit the band instead of spilling", () => {
+    const band = portBand(1);
+    const bases = portBlockBases(band, [0, PORT_POOL_BAND_WIDTH]);
+    expect(bases.last).toBeLessThan(bases.first);
   });
 });

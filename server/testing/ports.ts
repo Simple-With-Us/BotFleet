@@ -64,6 +64,35 @@ export function portBand(pid: number = process.pid): PortBand {
   return { start, end: start + PORT_POOL_BAND_WIDTH };
 }
 
+/** The bases a block of offsets may take inside a band. */
+export type PortBlockBases = {
+  /** The first base the block may take. */
+  first: number;
+  /** The last base the block may take. */
+  last: number;
+};
+
+/**
+ * The bases a block of these offsets may take inside the band.
+ *
+ * The block has to fit WHOLE:  a base near the end of the band would put
+ * `base + offset` into the next band, which belongs to another suite, and
+ * the partition that keeps two suites apart would be undone by one port.
+ * So the base is bounded by the widest offset on both sides, and a block
+ * that does not fit the band is refused rather than spilling.
+ */
+export function portBlockBases(
+  band: PortBand,
+  offsets: number[],
+): PortBlockBases {
+  const lowest = offsets.length === 0 ? 0 : Math.min(...offsets);
+  const highest = offsets.length === 0 ? 0 : Math.max(...offsets);
+  return {
+    first: band.start - lowest,
+    last: band.end - 1 - highest,
+  };
+}
+
 /**
  * Find a base port where every `base + offset` is free.
  *
@@ -79,8 +108,15 @@ export function portBand(pid: number = process.pid): PortBand {
  */
 export async function freePortBlock(offsets: number[]): Promise<number> {
   const band = portBand();
+  const bases = portBlockBases(band, offsets);
+  if (bases.last < bases.first) {
+    throw new Error(
+      `a block of offsets ${offsets.join(",")} does not fit in a band of ${PORT_POOL_BAND_WIDTH} ports`,
+    );
+  }
+  const width = bases.last - bases.first + 1;
   for (let attempt = 0; attempt < 40; attempt++) {
-    const base = band.start + Math.floor(Math.random() * PORT_POOL_BAND_WIDTH);
+    const base = bases.first + Math.floor(Math.random() * width);
     const checks = await Promise.all(offsets.map((offset) => isFree(base + offset)));
     if (checks.every(Boolean)) return base;
   }
