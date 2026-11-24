@@ -41,7 +41,7 @@ public struct MacRootView: View {
                 }) {
                     Image(systemName: session.showCuaViewer ? "display.fill" : "display")
                 }
-                .help("Toggle Computer Use Agent (CUA) live viewer")
+                .help("Toggle the Computer Use live viewer")
             }
             ToolbarItem(placement: .automatic) {
                 MacStatusPillView(
@@ -162,6 +162,9 @@ struct MacSidebarView: View {
             HStack {
                 Button(action: {
                     session.activeSettingsSection = .general
+                    //  Choosing the section is not enough:  the Settings
+                    //  window has to open, or the button does nothing.
+                    session.presentSettingsScene()
                 }) {
                     Label("Settings", systemImage: "gearshape")
                 }
@@ -180,12 +183,16 @@ struct MacSidebarView: View {
                         .clipShape(Capsule())
                 }
 
-                Button(action: {
-                    // Quick add bot
-                }) {
+                //  A button that does nothing still reads as a live
+                //  control, so this one says it is not available yet
+                //  instead of taking a click.
+                Button(action: {}) {
                     Image(systemName: "plus")
                 }
                 .buttonStyle(.plain)
+                .disabled(true)
+                .help("Adding a bot from here is not available yet.")
+                .accessibilityLabel("Adding a bot is not available yet")
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
             }
@@ -317,8 +324,16 @@ struct MacThreadListView: View {
 
                 List {
                     Section("Conversations") {
-                        NavigationLink(destination: EmptyView()) {
+                        //  This row used to be a link to an empty view, which
+                        //  cannot push anything because the app has no
+                        //  navigation stack.  It says plainly that it is not
+                        //  available yet.
+                        HStack {
                             Label("Main Thread", systemImage: "bubble.left.and.bubble.right.fill")
+                            Spacer()
+                            Text("Not available yet")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
                         }
                     }
 

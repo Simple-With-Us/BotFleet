@@ -553,6 +553,35 @@ public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identif
 
     public var id: String { rawValue }
 
+    /// Whether this section has a screen behind it today.
+    ///
+    /// A section that renders nothing but the version stamp reads as a live
+    /// control and is not one, so the app says plainly that it is not
+    /// available yet instead of showing a stamp in its place.
+    public var isImplemented: Bool {
+        switch self {
+        case .general, .servers, .resources, .secrets, .permissions, .phone:
+            return true
+        case .models, .voice, .shortcuts, .lifecycle:
+            return false
+        }
+    }
+
+    /// The honest copy for a section with no screen behind it yet.
+    ///
+    /// It names the section and says the truth.  It is not placeholder
+    /// content and it does not promise a date.
+    public var unavailableCopy: String {
+        switch self {
+        case .models: return "Model settings are not available yet."
+        case .voice: return "Voice settings are not available yet."
+        case .shortcuts: return "Shortcuts are not available yet."
+        case .lifecycle: return "Lifecycle settings are not available yet."
+        case .general, .servers, .resources, .secrets, .permissions, .phone:
+            return ""
+        }
+    }
+
     public var displayTitle: String {
         switch self {
         case .general: return "General"
