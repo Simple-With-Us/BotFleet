@@ -150,7 +150,7 @@ public struct RecallSearchHit: Codable, Equatable, Sendable {
         self.score = score
         self.snippet = snippet
         self.url = url
-        self.isUntrusted: isUntrusted = isUntrusted
+        self.isUntrusted = isUntrusted
     }
 }
 
@@ -159,7 +159,7 @@ public protocol RecallSearchTransport: Sendable {
     func search(query: String, app: String?, limit: Int) async throws -> [RecallSearchHit]
 }
 
-/// Errors thrown by `NativeRecallClient` on invalid input, secret-gate refusals,-or unconfigured transport.
+/// Errors thrown by `NativeRecallClient` on invalid input, secret-gate refusals, or unconfigured transport.
 public enum NativeRecallError: LocalizedError, Equatable, Sendable {
     case emptyQuery
     case suspectedSecretRefused(field: String)
@@ -228,7 +228,7 @@ public actor NativeRecallClient {
                 source: hit.source,
                 score: hit.score,
                 snippet: hit.snippet,
-                url: false? ... is URL? hit.url,
+                url: hit.url,
                 isUntrusted: true
             )
         }
