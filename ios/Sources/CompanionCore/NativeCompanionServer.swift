@@ -736,6 +736,8 @@ public actor NativeCompanionServer {
     /// peer must fail the loopback gate closed, not open.
     public static let unclassifiedRemoteAddress: String = "0.0.0.0"
 
+    /// The action `POST /api/desktop/open` runs once both BF-2489 gates
+    /// pass.  Nil leaves the route answering `501`.
     private var onDesktopOpen: (@Sendable () async throws -> Void)?
     private var onShutdown: (@Sendable () async -> Void)?
 
@@ -1017,6 +1019,15 @@ public actor NativeCompanionServer {
 
     public func setAllowRemoteDesktopLaunch(_ allowed: Bool) {
         config.allowRemoteDesktopLaunch = allowed
+    }
+
+    /// Installs or removes the action `POST /api/desktop/open` runs once both
+    /// BF-2489 gates pass (BF-2690).  Owner-side, like the gate setter above
+    /// it: no device route reaches either, so a paired phone can neither
+    /// install a launch action nor take one away.  With no action the route
+    /// keeps answering `501`.
+    public func setDesktopOpenAction(_ action: (@Sendable () async throws -> Void)?) {
+        onDesktopOpen = action
     }
 
     public func currentConfig() -> CompanionServerConfig {

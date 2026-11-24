@@ -27,8 +27,8 @@ Usage: $(basename "$0") [--dry-run]
 
   --dry-run  Print every action instead of running it.
 
-Environment overrides: BF_USER, BF_GROUP, BF_ROOT, BF_CODE, BF_REPO, BF_REF,
-NODE_VERSION, TS_HTTPS_PORT.
+Environment overrides: BF_USER, BF, BF_GROUP, BF_ROOT, BF_CODE, BF_REPO, BF_REF,
+NODE_VERSION, TS_HTTPS_PORT, BF_COMPANION_BRIDGE.
 EOF
 }
 
@@ -241,6 +241,23 @@ render_unit "$SCRIPT_DIR/botfleet-owner-gate.service.in" "/etc/systemd/system/$G
 run systemctl daemon-reload
 run systemctl enable --now "$SERVER_UNIT" "$GATE_UNIT"
 
+# The companion bridge is default-off.  Without BF_COMPANION_BRIDGE=1 nothing
+# below runs: the unit is not written, not enabled and not started, and the
+# tailnet route for it is not published.
+if [ "$BF_COMPANION_BRIDGE" = "1" ]; then
+  say "installing the companion bridge unit (BF_COMPANION_BRIDGE=1)"
+  render_unit "$SCRIPT_DIR/botfleet-companion-bridge.service.in" "/etc/systemd/system/$BRIDGE_UNIT"
+  run install -d -m 0700 -o "$BF_USER" -g "$BF_GROUP" "$BF_ROOT/data/companion-bridge"
+  run systemctl daemon-reload
+  run systemctl enable --now "$BRIDGE_UNIT"
+  note "the bridge listens on 127.0.0.1:${BRIDGE_PORT} and reaches the harness on 127.0.0.1:${HARNESS_PORT}"
+  note "publish its tailnet route by hand, one command, never Funnel:"
+  note "  tailscale serve --bg --https=${TS_BRIDGE_HTTPS_PORT} http://127.0.0.1:${BRIDGE_PORT}"
+  note "Tailscale Serve stays inside the tailnet.  Never enable Funnel."
+else
+  note "the companion bridge is not installed: set BF_COMPANION_BRIDGE=1 to install it"
+fi
+
 # --------------------------------------------------------------------------
 # (h) The tailnet URL.  Serve is tailnet only.  Never Funnel: Funnel is
 # public and adds no identity header, which would leave the gate without an
@@ -274,6 +291,9 @@ else
 fi
 note "$SERVER_UNIT: $(systemctl is-active "$SERVER_UNIT" || true)"
 note "$GATE_UNIT: $(systemctl is-active "$GATE_UNIT" || true)"
+if [ "$BF_COMPANION_BRIDGE" = "1" ]; then
+  note "$BRIDGE_UNIT: $(systemctl is-active "$BRIDGE_UNIT" || true)"
+fi
 say "the owner gate reads its configuration from Infisical"
 note "BotFleet, prod, /botfleet-server: BOTFLEET_OWNER_LOGINS, BOTFLEET_PUBLIC_ORIGIN, BOTFLEET_SERVER_GATE_TOKEN"
 note "the desktop app reads BOTFLEET_SERVER_MODE, BOTFLEET_SERVER_URL and BOTFLEET_SERVER_GATE_TOKEN from the same place"
