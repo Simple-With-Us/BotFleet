@@ -995,6 +995,56 @@ export function restoreArchive({ archiveDir, intoDir, restoredAt = new Date().to
 }
 
 /**
+ * Check a capture where it lies, without restoring it.
+ *
+ * The manifest comparison lived inside the restore, so the only way to ask
+ * whether a capture was intact was to write a copy of it out first.  This
+ * reads the manifest and the tree and writes nothing:  a check that is not a
+ * restore cannot become one, and a capture is never disturbed to be judged.
+ */
+export function verifyArchive({ captureDir }) {
+  const archive = resolve(captureDir);
+  const manifest = JSON.parse(readFileSync(join(archive, "manifest.json"), "utf8"));
+  if (manifest.marker !== ARCHIVE_MARKER) throw new Error("not an archive manifest");
+  const tree = join(archive, "tree");
+
+  const mismatches = [];
+  if (manifest.totals && manifest.totals.files !== manifest.files.length) {
+    mismatches.push({ path: "manifest.json", reason: "totals-mismatch" });
+  }
+  for (const row of manifest.files) {
+    // A manifest names paths, and a tampered one names a path that leaves the
+    // tree, so every path is resolved and refused when it escapes.
+    const from = resolveInside(tree, row.path);
+    if (!from) {
+      mismatches.push({ path: row.path, reason: "unsafe-manifest-path" });
+      continue;
+    }
+    let archivedHash;
+    try {
+      archivedHash = hashFile(from);
+    } catch (error) {
+      // A missing or unreadable file is a mismatch, not a crash:  the check
+      // has to finish and say so.
+      mismatches.push({ path: row.path, reason: "archive-hash-mismatch", detail: error.code ?? "unreadable" });
+      continue;
+    }
+    if (archivedHash !== row.sha256) {
+      mismatches.push({ path: row.path, reason: "archive-hash-mismatch" });
+    }
+  }
+  return {
+    marker: "botfleet-node-store-verify-report",
+    version: ARCHIVE_VERSION,
+    capture: archive,
+    expectedFiles: manifest.files.length,
+    verifiedFiles: manifest.files.length - mismatches.length,
+    mismatches,
+    ok: mismatches.length === 0,
+  };
+}
+
+/**
  * The structural health of a restored store.
  *
  * This is a statement about the RESTORE, not about the store:  a file that
@@ -1543,6 +1593,17 @@ if (isEntry) {
         healthOk: health.ok,
       }));
       if (!rehearsal.ok || !health.ok) process.exitCode = 1;
+    } else if (command === "verify") {
+      const captureDir = flagValue(args, "--capture");
+      if (!captureDir) throw new Error("--capture <capture-directory> is required");
+      const verdict = verifyArchive({ captureDir });
+      console.log(JSON.stringify({
+        verified: verdict.ok,
+        expectedFiles: verdict.expectedFiles,
+        verifiedFiles: verdict.verifiedFiles,
+        mismatches: verdict.mismatches.length,
+      }));
+      if (!verdict.ok) process.exitCode = 1;
     } else if (command === "receipt") {
       const captureDir = flagValue(args, "--capture");
       const requestPath = flagValue(args, "--request");
@@ -1569,6 +1630,7 @@ if (isEntry) {
     } else {
       console.error(`usage: node scripts/archive-node-store.mjs archive --store <root> --out <dir> [--max-files <count, at most ${ABSOLUTE_MAX_FILES}>] [--max-bytes <bytes, at most ${ABSOLUTE_MAX_BYTES}>]`);
       console.error("       node scripts/archive-node-store.mjs restore --archive <dir> --into <scratch-root>");
+      console.error("       node scripts/archive-node-store.mjs verify --capture <dir>");
       console.error("       node scripts/archive-node-store.mjs receipt --capture <dir> --request <request.json> --provenance-record <file> --provenance-source <https-url> --provenance-by <who> [--parity-report <file>]");
       process.exitCode = 2;
     }

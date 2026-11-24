@@ -10,10 +10,11 @@ export const REQUIRED_PLACEMENT_EVIDENCE = [
   "mode-change-fence", "forced-takeover-and-return", "settings-saved-vs-applied",
   "headroom-enforced-mac", "headroom-enforced-server", "mount-loss-root-fallback",
   "other-apps-unchanged", "inventory-recorded", "rollback-keeps-epoch", "connect-and-revert-clean",
+  "server-first-mac-asleep-iphone",
 ];
 export const HAND_RUN_PLACEMENT_EVIDENCE = [
   "mac-high-cpu-accepted", "headroom-enforced-mac", "headroom-enforced-server",
-  "mount-loss-root-fallback", "other-apps-unchanged",
+  "mount-loss-root-fallback", "other-apps-unchanged", "server-first-mac-asleep-iphone",
 ];
 const nonempty = z.string().trim().min(1);
 const handRun = z.strictObject({
