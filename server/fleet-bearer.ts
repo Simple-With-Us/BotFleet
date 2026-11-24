@@ -76,6 +76,15 @@ export const FLEET_BEARER_TTL_MS = 15 * 60_000;
  * cost every turn a round trip. */
 export const FLEET_BEARER_FAILURE_BACKOFF_MS = 60_000;
 
+/** How long a cached bearer is served after its last successful read.
+ *
+ * A read that fails keeps the last good value, so a vault that is briefly
+ * down does not strip a bot of its tools.  It must not keep it FOREVER,
+ * though:  a bearer the owner revoked or rotated has to stop being
+ * served, and a value that is older than this window is not served at all
+ * until a read succeeds again. */
+export const FLEET_BEARER_MAX_STALE_MS = 60 * 60_000;
+
 /** How many bots' bearers are kept at once.
  *
  * The bound exists so a seat string nobody expected cannot grow the map for
@@ -110,6 +119,7 @@ export function resetFleetBearerCache(): void {
   cacheGeneration++;
   cache.clear();
   inflight.clear();
+  reportedWithoutBearer.clear();
 }
 
 /** The seat's entry, and the seat moved to the most recently used end of
@@ -204,8 +214,18 @@ export function primeFleetBearer(seat: string | null | undefined): void {
   const now = Date.now();
   if (entry && now - entry.readAt < FLEET_BEARER_TTL_MS) return;
   if (entry?.failedAt && now - entry.failedAt < FLEET_BEARER_FAILURE_BACKOFF_MS) return;
-  void readSeat(seat, secretPath);
+  // The backstop:  a read that throws for a reason the catch inside it
+  // does not cover must still be a logged failure and not an unhandled
+  // rejection.  Only the message is logged — never the seat's secret.
+  void readSeat(seat, secretPath).catch((error: Error) => {
+    const detail = redactSecretsInText(error.message);
+    console.warn(`[fleet-bearer] the seat's fleet bearer could not be read (${detail}); the child runs without one`);
+  });
 }
+
+/** The seats already reported as having no bearer, so the report is once
+ * per seat and not once per turn. */
+const reportedWithoutBearer = new Set<string>();
 
 /** The seat's cached fleet bearer, as the environment variable the fleet's
  * tools read.
@@ -213,11 +233,37 @@ export function primeFleetBearer(seat: string | null | undefined): void {
  * Empty when the seat has none, when the folder holds no bearer name, or
  * when the read has not landed yet.  The read is started by
  * `primeFleetBearer()`;  the first turn of a seat after the harness starts
- * may therefore run without the bearer, and the turns after it have one. */
-export function fleetBearerEnvironment(seat: string | null | undefined): Record<string, string> {
+ * may therefore run without the bearer, and the turns after it have one.
+ *
+ * A seat with no bearer is REPORTED once, not silently:  a bot that cannot
+ * reach the fleet's tools because its bearer was never provisioned is a
+ * gap the owner has to see, and a turn is not the place to fail over it —
+ * the bot still has every other tool it was given. */
+export function fleetBearerEnvironment(seat: string | null | undefined) {
   if (!seat) return {};
-  const value = readEntry(seat)?.value ?? "";
-  return value ? { [FLEET_BEARER_ENV_NAME]: value } : {};
+  const entry = readEntry(seat);
+  if (!entry?.value) {
+    reportMissingBearer(seat);
+    return {};
+  }
+  // A bearer that is older than the stale window is not served:  the vault
+  // has not confirmed it for too long, and a revoked or rotated bearer
+  // must stop being used.
+  if (Date.now() - entry.readAt > FLEET_BEARER_MAX_STALE_MS) {
+    reportMissingBearer(seat);
+    return {};
+  }
+  return { [FLEET_BEARER_ENV_NAME]: entry.value };
+}
+
+/** Say once that a seat has no bearer.  The seat is named, because the
+ * seat is not a secret;  nothing else is. */
+function reportMissingBearer(seat: string): void {
+  if (reportedWithoutBearer.has(seat)) return;
+  reportedWithoutBearer.add(seat);
+  console.warn(
+    `[fleet-bearer] ${seat}: no fleet bearer is available, so this seat's fleet tools will not answer; the child runs without one`,
+  );
 }
 
 /** Wait for the seat's bearer read to land, if one is in flight.
@@ -236,11 +282,11 @@ export async function awaitFleetBearer(seat: string | null | undefined): Promise
  * harness process or from an instance's own environment:  the harness may
  * hold a different seat's bearer, and a child that inherited it would act as
  * that seat. */
-export function applyFleetBearer(env: Record<string, string | undefined>, values: Record<string, string>) {
+export function applyFleetBearer(env: Record<string, string | undefined>, values: Record<string, string | undefined>) {
   const out = { ...env };
   delete out[FLEET_BEARER_ENV_NAME];
   for (const [name, value] of Object.entries(values)) {
-    if (value.length > 0) out[name] = value;
+    if (value !== undefined && value.length > 0) out[name] = value;
   }
   return out;
 }

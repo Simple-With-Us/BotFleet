@@ -8,6 +8,7 @@ import {
 import {
   FLEET_BEARER_CACHE_MAX,
   FLEET_BEARER_FAILURE_BACKOFF_MS,
+  FLEET_BEARER_MAX_STALE_MS,
   FLEET_BEARER_TTL_MS,
   applyFleetBearer,
   awaitFleetBearer,
@@ -311,6 +312,41 @@ describe("a launched child", () => {
     expect(withoutBearer[FLEET_BEARER_ENV_NAME]).toBeUndefined();
     // The seat's own value is never in the environment a second seat reads.
     expect(JSON.stringify(withoutBearer)).not.toContain("the-bearer");
+  });
+
+  it("stops serving a bearer the vault has not confirmed for too long", async () => {
+    // A read that fails keeps the last good value, so a brief vault outage
+    // does not strip a bot of its tools.  It must not keep it forever:  a
+    // bearer the owner revoked or rotated has to stop being served.
+    const stub = stubVault({ [FLEET_BEARER_ENV_NAME]: SENTINEL_BEARER });
+    setFleetBearerVault(stub.reader);
+    primeFleetBearer("BF-ORACLE");
+    await awaitFleetBearer("BF-ORACLE");
+    expect(fleetBearerEnvironment("BF-ORACLE")).toEqual({ [FLEET_BEARER_ENV_NAME]: SENTINEL_BEARER });
+
+    // The clock moves past the stale window:  the value is no longer served.
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now + FLEET_BEARER_MAX_STALE_MS + 1);
+    try {
+      expect(fleetBearerEnvironment("BF-ORACLE")).toEqual({});
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("reports once that a seat has no bearer, so the gap is not silent", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // No seat, no folder, no bearer:  the child runs without one.
+      expect(fleetBearerEnvironment("BF-MONITOR")).toEqual({});
+      expect(fleetBearerEnvironment("BF-MONITOR")).toEqual({});
+      const reported = warn.mock.calls.filter((call) => String(call[0]).includes("BF-MONITOR"));
+      // Once for the seat, not once per turn.
+      expect(reported).toHaveLength(1);
+      expect(String(reported[0]?.[0])).toContain("no fleet bearer is available");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("never puts the bearer in the config, the process environment or a log line", async () => {

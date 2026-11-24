@@ -72,7 +72,9 @@ export async function awaitSeatCredentials(seat: string | null | undefined): Pro
  */
 export function seatCredentialEnvironment(seat: string | null | undefined) {
   const merged = { ...cliLoginEnvironment(seat) };
-  for (const [name, value] of Object.entries(fleetBearerEnvironment(seat))) merged[name] = value;
+  for (const [name, value] of Object.entries(fleetBearerEnvironment(seat))) {
+    if (value !== undefined) merged[name] = value;
+  }
   return merged;
 }
 
