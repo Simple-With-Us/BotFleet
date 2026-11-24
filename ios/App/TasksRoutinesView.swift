@@ -412,7 +412,7 @@ private struct RoutineEditorView: View {
     /// line.  The disabled Save button gave no reason at all, so the work
     /// needed to unblock it was guesswork.
     private var saveBlockReason: String? {
-        scheduleBlockReason ?? workBlockReason
+        workBlockReason ?? scheduleBlockReason
     }
 
     /// The missing piece in the Work section, if any.
