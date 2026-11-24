@@ -29,7 +29,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { stripWorkspaceCredentialEnv } from "../config.ts";
-import { applyLaunchIdentity } from "../launch-identity.ts";
+import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials, seatCredentialsReady } from "../child-credentials.ts";
 import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
@@ -322,11 +322,22 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
 
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
+      // The seat's credentials are read in the BACKGROUND, and the read is
+      // started here, before the guard:  the guard and the registration
+      // that follows it have to stay free of `await`, or a second turn on
+      // this thread would walk through the guard the first one already
+      // passed.
+      primeSeatCredentials(turn.launchIdentity?.seat);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
       // Reserve the slot synchronously: the awaits below would otherwise let
       // a second sendTurn on the same thread pass the guard above.
       active.set(threadId, { stop: () => {}, turnId });
+      // The seat's credential read is started before the guard, so it may
+      // still be in flight here.  Waiting for it after the registration —
+      // which must stay synchronous with the guard — means the child is
+      // spawned with the credential rather than without it.
+      if (!seatCredentialsReady(turn.launchIdentity?.seat)) await awaitSeatCredentials(turn.launchIdentity?.seat);
       let settled = false;
 
       const message = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
@@ -352,7 +363,11 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
         child = spawnCli(cli, args, {
           stdio: ["ignore", "pipe", "pipe"],
           cwd: turn.cwd,
-          env: applyLaunchIdentity(zcodeEnvironment({ ...process.env, ...input.environment }), turn.launchIdentity),
+          env: launchedChildCredentials(
+            zcodeEnvironment({ ...process.env, ...input.environment }),
+            turn.launchIdentity,
+            turn.launchIdentity?.seat,
+          ),
         });
       } catch (err) {
         active.delete(threadId);
