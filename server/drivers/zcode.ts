@@ -337,7 +337,17 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
       // still be in flight here.  Waiting for it after the registration —
       // which must stay synchronous with the guard — means the child is
       // spawned with the credential rather than without it.
-      if (!seatCredentialsReady(turn.launchIdentity?.seat)) await awaitSeatCredentials(turn.launchIdentity?.seat);
+      if (!seatCredentialsReady(turn.launchIdentity?.seat)) {
+        try {
+          await awaitSeatCredentials(turn.launchIdentity?.seat);
+        } catch (error) {
+          // Release the claim before the failure propagates:  no child exists
+          // yet, and a stale entry would refuse every later turn on this
+          // thread as already running.
+          active.delete(threadId);
+          throw error;
+        }
+      }
       let settled = false;
 
       const message = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
