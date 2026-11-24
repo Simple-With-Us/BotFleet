@@ -232,6 +232,11 @@ public actor CostLedgerService {
         return max(maxEntries, max(tenX, 100_000))
     }
 
+    private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? Int.max : sum
+    }
+
     /// Records a single metered call idempotently by `entry.id`.
     public func record(_ entry: CostLedgerEntry, now: Date = Date()) throws {
         guard !entry.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -252,11 +257,11 @@ public actor CostLedgerService {
         guard entry.recordedAt.isFinite else {
             throw CostLedgerError.invalidEntry("recordedAt must be finite.")
         }
-        guard entry.recordedAt <= now.timeIntervalSince1970 + Self.defaultMaxFutureSkewSeconds else {
-            throw CostLedgerError.invalidEntry("recordedAt exceeds maximum allowed future clock skew.")
-        }
         if seenEntryIds.contains(entry.id) {
             return
+        }
+        guard entry.recordedAt <= now.timeIntervalSince1970 + Self.defaultMaxFutureSkewSeconds else {
+            throw CostLedgerError.invalidEntry("recordedAt exceeds maximum allowed future clock skew.")
         }
 
         var nextEntries = entriesStorage
@@ -309,9 +314,9 @@ public actor CostLedgerService {
             if !item.isPriced {
                 unpriced += 1
             }
-            input += item.inputTokens
-            output += item.outputTokens
-            cached += item.cachedInputTokens
+            input = Self.saturatingAdd(input, item.inputTokens)
+            output = Self.saturatingAdd(output, item.outputTokens)
+            cached = Self.saturatingAdd(cached, item.cachedInputTokens)
             cost += item.estimatedCostUSD
         }
         return CostLedgerTotals(
@@ -324,8 +329,9 @@ public actor CostLedgerService {
         )
     }
 
-    /// Computes spend inside `[now - windowSeconds, now + defaultMaxFutureSkewSeconds]` for rolling budget checks.
-    /// Small forward clock skew counts immediately without letting far-future timestamps stay in the window forever.
+    /// Computes spend for entries with `recordedAt >= now - windowSeconds`,
+    /// matching `server/rolling-spend.ts` (`parseTurnSpendLine` / `getWindow`).
+    /// Forward clock skew on newly ingested entries is bounded at `record(_:now:)`.
     public func rollingSpend(
         windowSeconds: TimeInterval,
         now: Date = Date(),
@@ -336,25 +342,27 @@ public actor CostLedgerService {
     }
 
     /// Checks whether current rolling spend stays strictly below `ceiling.maxSpendUSD`,
-    /// mirroring `spendCeilingDecision` (`server/rolling-spend.ts`): when `pricedShare` falls
-    /// below `ceiling.minPricedShare`, refuses to block on a known floor total and returns
-    /// `.allowedLowVisibility(...)`.  Non-finite or invalid ceilings fail closed.
+    /// mirroring `spendCeilingDecision` (`server/rolling-spend.ts`): unconfigured or
+    /// non-positive/non-finite spend ceilings fail open (`.allowed(remainingUSD: .infinity)`),
+    /// and when `pricedShare` falls below `ceiling.minPricedShare`, refuses to block on a
+    /// known floor total and returns `.allowedLowVisibility(...)`.  Positive caps with
+    /// invalid `windowSeconds` or `minPricedShare` fail closed.
     public func checkAdmission(
         ceiling: RollingSpendCeiling,
         now: Date = Date(),
         forBotId botId: String? = nil
     ) -> SpendAdmissionVerdict {
+        guard ceiling.maxSpendUSD.isFinite, ceiling.maxSpendUSD > 0 else {
+            return .allowed(remainingUSD: .infinity)
+        }
         let windowEntries = rollingWindowEntries(windowSeconds: ceiling.windowSeconds, now: now, forBotId: botId)
         let spent = windowEntries.reduce(0.0) { $0 + $1.estimatedCostUSD }
         guard ceiling.windowSeconds.isFinite,
               ceiling.windowSeconds > 0,
-              ceiling.maxSpendUSD.isFinite,
-              ceiling.maxSpendUSD > 0,
               ceiling.minPricedShare.isFinite,
               ceiling.minPricedShare >= 0,
               ceiling.minPricedShare <= 1 else {
-            let safeCeiling = (ceiling.maxSpendUSD.isFinite && ceiling.maxSpendUSD >= 0) ? ceiling.maxSpendUSD : 0
-            return .exceeded(spentUSD: spent, ceilingUSD: safeCeiling)
+            return .exceeded(spentUSD: spent, ceilingUSD: ceiling.maxSpendUSD)
         }
 
         let totalTurns = windowEntries.count
@@ -384,10 +392,8 @@ public actor CostLedgerService {
         forBotId botId: String?
     ) -> [CostLedgerEntry] {
         guard windowSeconds.isFinite, windowSeconds > 0 else { return [] }
-        let nowEpoch = now.timeIntervalSince1970
-        let cutoff = nowEpoch - windowSeconds
-        let upperBound = nowEpoch + Self.defaultMaxFutureSkewSeconds
-        return entries(forBotId: botId).filter { $0.recordedAt >= cutoff && $0.recordedAt <= upperBound }
+        let cutoff = now.timeIntervalSince1970 - windowSeconds
+        return entries(forBotId: botId).filter { $0.recordedAt >= cutoff }
     }
 
     private func persistIfConfigured(entries: [CostLedgerEntry], seenIds: [String]) throws {
