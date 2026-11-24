@@ -162,6 +162,8 @@ public protocol RecallSearchTransport: Sendable {
 /// Errors thrown by `NativeRecallClient` on invalid input, secret-gate refusals, or unconfigured transport.
 public enum NativeRecallError: LocalizedError, Equatable, Sendable {
     case emptyQuery
+    case queryTooLong(maxLength: Int)
+    case appFilterTooLong(maxLength: Int)
     case suspectedSecretRefused(field: String)
     case transportUnavailable
 
@@ -169,6 +171,10 @@ public enum NativeRecallError: LocalizedError, Equatable, Sendable {
         switch self {
         case .emptyQuery:
             return "Recall search query must not be empty."
+        case .queryTooLong(let maxLength):
+            return "Recall search query exceeds maximum length of \(maxLength) characters."
+        case .appFilterTooLong(let maxLength):
+            return "Recall search app filter exceeds maximum length of \(maxLength) characters."
         case .suspectedSecretRefused(let field):
             return "Refused recall search because '\(field)' appears to contain a credential or secret."
         case .transportUnavailable:
@@ -177,17 +183,21 @@ public enum NativeRecallError: LocalizedError, Equatable, Sendable {
     }
 }
 
-/// Swift Fleet Recall client (`BF-2620`) enforcing preflight credential scanning before
-/// any query leaves the process and tagging every result as untrusted data.
+/// Swift Fleet Recall client (`BF-2620`) enforcing bounded query/filter inputs and
+/// preflight credential scanning before any query leaves the process, while tagging
+/// every result as untrusted data.
 public actor NativeRecallClient {
+    public static let maxQueryLength = 500
+    public static let maxAppFilterLength = 256
+
     private let transport: (any RecallSearchTransport)?
 
     public init(transport: (any RecallSearchTransport)? = nil) {
         self.transport = transport
     }
 
-    /// Preflight-scans `query` and `app`, clamps `limit` to `1...10`, and marks every
-    /// returned hit `isUntrusted = true`.
+    /// Validates query/app length bounds, preflight-scans for secrets, clamps `limit` to `1...10`,
+    /// and marks every returned hit `isUntrusted = true`.
     public func search(
         query: String,
         app: String? = nil,
@@ -196,6 +206,9 @@ public actor NativeRecallClient {
         let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedQuery.isEmpty else {
             throw NativeRecallError.emptyQuery
+        }
+        guard trimmedQuery.count <= Self.maxQueryLength else {
+            throw NativeRecallError.queryTooLong(maxLength: Self.maxQueryLength)
         }
         guard DiagnosticsReporter.redactSecrets(in: trimmedQuery) == trimmedQuery else {
             throw NativeRecallError.suspectedSecretRefused(field: "query")
@@ -207,6 +220,9 @@ public actor NativeRecallClient {
             if trimmedApp.isEmpty {
                 cleanApp = nil
             } else {
+                guard trimmedApp.count <= Self.maxAppFilterLength else {
+                    throw NativeRecallError.appFilterTooLong(maxLength: Self.maxAppFilterLength)
+                }
                 guard DiagnosticsReporter.redactSecrets(in: trimmedApp) == trimmedApp else {
                     throw NativeRecallError.suspectedSecretRefused(field: "app")
                 }
