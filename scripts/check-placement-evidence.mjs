@@ -10,10 +10,11 @@ export const REQUIRED_PLACEMENT_EVIDENCE = [
   "mode-change-fence", "forced-takeover-and-return", "settings-saved-vs-applied",
   "headroom-enforced-mac", "headroom-enforced-server", "mount-loss-root-fallback",
   "other-apps-unchanged", "inventory-recorded", "rollback-keeps-epoch", "connect-and-revert-clean",
+  "server-first-mac-asleep-iphone",
 ];
 export const HAND_RUN_PLACEMENT_EVIDENCE = [
   "mac-high-cpu-accepted", "headroom-enforced-mac", "headroom-enforced-server",
-  "mount-loss-root-fallback", "other-apps-unchanged",
+  "mount-loss-root-fallback", "other-apps-unchanged", "server-first-mac-asleep-iphone",
 ];
 const nonempty = z.string().trim().min(1);
 const handRun = z.strictObject({
@@ -111,7 +112,7 @@ if (isEntry) {
         console.error("Placement evidence is BLOCKED:");
         for (const blocker of verdict.blockers) console.error(`  - ${blocker}`);
         process.exitCode = 1;
-      } else console.log("Placement evidence: all sixteen recipes asserted with inventory and hand-run artifacts");
+      } else console.log("Placement evidence: all seventeen recipes asserted with inventory and hand-run artifacts");
     } catch (error) {
       console.error(`Invalid placement evidence: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 2;

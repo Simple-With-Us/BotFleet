@@ -197,7 +197,7 @@ struct AgentProfileView: View {
                     .disabled(busy)
 
                     if current.avatarUrl != nil {
-                        Button("Use mascot", systemImage: "trash", role: .destructive) {
+                        Button("Use Mascot", systemImage: "trash", role: .destructive) {
                             Task { await clearImage() }
                         }
                         .disabled(busy)
@@ -211,7 +211,7 @@ struct AgentProfileView: View {
                 Section {
                     TextField("Art direction", text: $prompt, axis: .vertical)
                         .lineLimit(2...5)
-                    Button("Generate on computer", systemImage: "sparkles") {
+                    Button("Generate On Computer", systemImage: "sparkles") {
                         Task { await generateImage() }
                     }
                     .disabled(busy || !imageGenerationReady || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -252,15 +252,15 @@ struct AgentProfileView: View {
                     TextField("Name", text: $name)
                         .textInputAutocapitalization(.words)
                     TextField("Title", text: $title)
-                    TextField("What this agent does", text: $description, axis: .vertical)
+                    TextField("What This Bot Does", text: $description, axis: .vertical)
                         .lineLimit(3...8)
-                    Toggle("Agent notifications", isOn: $notifications)
+                    Toggle("Bot Notifications", isOn: $notifications)
                 }
 
                 if instances.isEmpty {
                     Section("Models") {
                         Text(instancesLoaded
-                             ? "No models to choose from.  Your computer did not report any."
+                             ? "No models to choose from.\u{00A0} Your computer did not report any."
                              : "Loading models\u{2026}")
                             .foregroundStyle(.secondary)
                         if instancesLoaded {
@@ -399,7 +399,7 @@ struct AgentProfileView: View {
 
                 if !Self.voiceSectionFirst { voiceSection }
 
-                Section("Speech to text") {
+                Section("Speech to Text") {
                     Label("Apple on-device dictation", systemImage: "waveform")
                     Text("Recordings you send from this iPhone keep their original audio and transcript on the message. Available languages depend on this device.")
                         .font(.footnote)
@@ -449,7 +449,7 @@ struct AgentProfileView: View {
 
                 deleteSection
             }
-            .navigationTitle("Agent Settings")
+            .navigationTitle("Bot Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -1210,7 +1210,7 @@ struct AgentProfileView: View {
     }
 
     private var toolRoundsCaption: String {
-        let base = "Per turn.  Empty uses \(Self.defaultToolRounds).  Cap is \(Self.maximumToolRoundsCap)."
+        let base = "Per turn.\u{00A0} Empty uses \(Self.defaultToolRounds).\u{00A0} Cap is \(Self.maximumToolRoundsCap)."
         guard !toolRoundsEditable else { return base }
         // "Does not apply" and "we do not know yet" are different claims, and on
         // a cold start this view renders before the engine list arrives.  Saying
@@ -1218,9 +1218,9 @@ struct AgentProfileView: View {
         // next load may make it editable.  Mirrors toolRoundsGate()'s
         // engine-presence check on the desktop.
         if toolRoundsEngine == nil {
-            return base + "  This engine has not reported its capabilities yet, so this ceiling may not apply to it."
+            return base + "\u{00A0} This engine has not reported its capabilities yet, so this ceiling may not apply to it."
         }
-        return base + "  This engine runs its own tool loop, so this ceiling does not apply to it."
+        return base + "\u{00A0} This engine runs its own tool loop, so this ceiling does not apply to it."
     }
 
     private static func roundsText(_ rounds: Int?) -> String {

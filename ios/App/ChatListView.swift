@@ -439,10 +439,10 @@ struct ChatListView: View {
         HStack(alignment: .center) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Chats")
-                    .font(.system(size: 17, weight: .semibold))
+                    .font(.scaled(17, weight: .semibold, relativeTo: .body))
                     .foregroundStyle(Color.primary)
                 Text(headerSubtitle)
-                    .font(.system(size: 13))
+                    .font(.scaled(13, relativeTo: .footnote))
                     .foregroundStyle(Color.secondary)
                     .lineLimit(1)
             }
@@ -466,10 +466,10 @@ struct ChatListView: View {
                     Group {
                         if isOpeningMacApp {
                             ProgressView("Opening on Mac…")
-                                .font(.system(size: 13, weight: .medium))
+                                .font(.scaled(13, weight: .medium, relativeTo: .footnote))
                         } else {
                             Label("Open on Mac", systemImage: "macwindow")
-                                .font(.system(size: 13, weight: .medium))
+                                .font(.scaled(13, weight: .medium, relativeTo: .footnote))
                         }
                     }
                     .foregroundStyle(Color.primary)
@@ -484,7 +484,7 @@ struct ChatListView: View {
 
             NavigationLink { SettingsView() } label: {
                 Image(systemName: "gearshape")
-                    .font(.system(size: 18, weight: .medium))
+                    .font(.scaled(18, weight: .medium, relativeTo: .headline))
                     .foregroundStyle(Color.primary)
                     .frame(width: 44, height: 44)
             }
@@ -540,15 +540,15 @@ struct ChatListView: View {
         } label: {
             HStack(spacing: 8) {
                 Text(title.uppercased())
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.scaled(13, weight: .semibold, relativeTo: .footnote))
                     .tracking(0.4)
                     .foregroundStyle(Color.secondary)
                 Image(systemName: expanded.wrappedValue ? "chevron.down" : "chevron.right")
-                    .font(.system(size: 11, weight: .bold))
+                    .font(.scaled(11, weight: .bold, relativeTo: .caption2))
                     .foregroundStyle(Color.secondary)
                 Spacer(minLength: 0)
                 Text("\(count)")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.scaled(13, weight: .medium, relativeTo: .footnote))
                     .foregroundStyle(Color.secondary)
             }
             .padding(.horizontal, 20)
@@ -569,7 +569,7 @@ struct ChatListView: View {
                 if searchOpen {
                     HStack(spacing: 8) {
                         Image(systemName: "magnifyingglass")
-                            .font(.system(size: 15, weight: .semibold))
+                            .font(.scaled(15, weight: .semibold, relativeTo: .subheadline))
                             .foregroundStyle(Color.secondary)
                         TextField("Search chats", text: $query)
                             .font(.body)
@@ -594,7 +594,7 @@ struct ChatListView: View {
                         searchOpen = false
                         searchFocused = false
                     }
-                    .font(.system(size: 17))
+                    .font(.scaled(17, relativeTo: .body))
                     .foregroundStyle(Color.primary)
                     .padding(.horizontal, 16)
                     .frame(height: 52)
@@ -788,7 +788,7 @@ struct ChatListView: View {
 
     private func sectionLabel(_ text: String) -> some View {
         Text(text.uppercased())
-            .font(.system(size: 13, weight: .semibold))
+            .font(.scaled(13, weight: .semibold, relativeTo: .footnote))
             .tracking(0.4)
             .foregroundStyle(Color.secondary)
             .padding(.horizontal, 20)
@@ -841,6 +841,7 @@ struct ChatListView: View {
         } else if let reason = BotOrganize.makeChiefBlockReason(for: bot, instances: session.cachedInstances) {
             Button("Make Chief Of Staff", systemImage: "crown") {}
                 .disabled(true)
+                .accessibilityHint(reason)
             Text(reason)
         } else {
             Button("Make Chief Of Staff", systemImage: "crown") {
@@ -854,6 +855,7 @@ struct ChatListView: View {
         if let reason = BotOrganize.archiveBlockReason(for: bot, among: session.state.bots) {
             Button("Archive", systemImage: "archivebox") {}
                 .disabled(true)
+                .accessibilityHint(reason)
             Text(reason)
         } else {
             // The open chat closes itself once its bot is archived (iPad:
@@ -916,15 +918,15 @@ struct ChatListView: View {
         } label: {
             HStack(spacing: 8) {
                 Text("Archived Bots".uppercased())
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.scaled(13, weight: .semibold, relativeTo: .footnote))
                     .tracking(0.4)
                     .foregroundStyle(Color.secondary)
                 Image(systemName: "chevron.right")
-                    .font(.system(size: 11, weight: .bold))
+                    .font(.scaled(11, weight: .bold, relativeTo: .caption2))
                     .foregroundStyle(Color.secondary)
                 Spacer(minLength: 0)
                 Text("\(archivedCount)")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.scaled(13, weight: .medium, relativeTo: .footnote))
                     .foregroundStyle(Color.secondary)
             }
             .padding(.horizontal, 20)
@@ -1006,12 +1008,12 @@ struct NewRoomRow: View {
                     .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [4, 4]))
                     .foregroundStyle(Color.secondary.opacity(0.6))
                 Image(systemName: "plus")
-                    .font(.system(size: 18, weight: .medium))
+                    .font(.scaled(18, weight: .medium, relativeTo: .headline))
                     .foregroundStyle(Color.secondary)
             }
             .frame(width: 52, height: 52)
             Text(label)
-                .font(.system(size: 17, weight: .semibold))
+                .font(.scaled(17, weight: .semibold, relativeTo: .body))
                 .foregroundStyle(Color.secondary)
             Spacer(minLength: 0)
         }
@@ -1057,18 +1059,20 @@ struct GroupTile: View {
                         .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [4, 4]))
                         .foregroundStyle(Color.secondary.opacity(0.6))
                     Image(systemName: "plus")
-                        .font(.system(size: 22, weight: .medium))
+                        .font(.scaled(22, weight: .medium, relativeTo: .title2))
                         .foregroundStyle(Color.secondary)
                 }
             }
             .frame(width: 64, height: 64)
 
             Text(room?.name ?? "New")
-                .font(.system(size: 12, weight: .medium))
+                .font(.scaled(12, weight: .medium, relativeTo: .caption))
                 .foregroundStyle(room == nil ? Color.secondary : Color.primary)
                 .lineLimit(1)
         }
-        .frame(width: 76)
+        // A floor, not a lid: a fixed width truncated the name at the
+        // accessibility text sizes.
+        .frame(minWidth: 76)
         .contentShape(Rectangle())
     }
 
@@ -1088,18 +1092,18 @@ struct ThreadRow: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: viewed ? "eye" : "text.bubble")
-                .font(.system(size: 14, weight: .medium))
+                .font(.scaled(14, weight: .medium, relativeTo: .footnote))
                 .foregroundStyle(Color.secondary)
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
                     Text(task.title.isEmpty ? "Untitled Thread" : task.title)
-                        .font(.system(size: 15, weight: active ? .semibold : .regular))
+                        .font(.scaled(15, weight: active ? .semibold : .regular, relativeTo: .subheadline))
                         .foregroundStyle(Color.primary)
                         .lineLimit(1)
                     if let fill {
                         Text(fill)
-                            .font(.system(size: 11, weight: .medium))
+                            .font(.scaled(11, weight: .medium, relativeTo: .caption2))
                             .monospacedDigit()
                             .foregroundStyle(Color.secondary)
                     }
@@ -1110,7 +1114,7 @@ struct ThreadRow: View {
                         Text("· Viewing")
                     }
                 }
-                .font(.system(size: 12))
+                .font(.scaled(12, relativeTo: .caption))
                 .foregroundStyle(Color.secondary)
             }
             Spacer(minLength: 0)
@@ -1160,14 +1164,14 @@ struct ChatRow: View {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
                         Text(chat.name)
-                            .font(.system(size: 17, weight: .semibold))
+                            .font(.scaled(17, weight: .semibold, relativeTo: .body))
                             .foregroundStyle(Color.primary)
                             .lineLimit(1)
                             .layoutPriority(1)
 
                         if let fill {
                             Text(fill)
-                                .font(.system(size: 12, weight: .medium))
+                                .font(.scaled(12, weight: .medium, relativeTo: .caption))
                                 .monospacedDigit()
                                 .foregroundStyle(Color.secondary)
                                 .padding(.horizontal, 7)
@@ -1178,7 +1182,7 @@ struct ChatRow: View {
 
                         if chat.isOff {
                             Text("Off")
-                                .font(.system(size: 12, weight: .semibold))
+                                .font(.scaled(12, weight: .semibold, relativeTo: .caption))
                                 .foregroundStyle(Color.secondary)
                                 .padding(.horizontal, 7)
                                 .padding(.vertical, 3)
@@ -1189,7 +1193,7 @@ struct ChatRow: View {
                         // the bot's job, the way the desktop shows it
                         if !chat.subtitle.isEmpty {
                             Text(chat.subtitle)
-                                .font(.system(size: 13))
+                                .font(.scaled(13, relativeTo: .footnote))
                                 .foregroundStyle(Color.secondary)
                                 .lineLimit(1)
                                 .padding(.horizontal, 8)
@@ -1200,18 +1204,18 @@ struct ChatRow: View {
                         Spacer(minLength: 4)
 
                         Text(RelativeStamp.list(at))
-                            .font(.system(size: 15))
+                            .font(.scaled(15, relativeTo: .subheadline))
                             .foregroundStyle(Color.secondary)
                             .fixedSize()
                         Image(systemName: "chevron.right")
-                            .font(.system(size: 13, weight: .semibold))
+                            .font(.scaled(13, weight: .semibold, relativeTo: .footnote))
                             .foregroundStyle(Color.secondary.opacity(0.5))
                     }
 
                     HStack(alignment: .top, spacing: 8) {
                         // one line for every bot, so the rows keep one rhythm
                         Text(preview.isEmpty ? " " : preview)
-                            .font(.system(size: 15))
+                            .font(.scaled(15, relativeTo: .subheadline))
                             .foregroundStyle(Color.secondary)
                             .lineLimit(1)
 
@@ -1224,8 +1228,10 @@ struct ChatRow: View {
 
                     if waiting {
                         Label("Waiting on you", systemImage: "hand.raised.fill")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.white)
+                            .font(.scaled(12, weight: .semibold, relativeTo: .caption))
+                            // The palette runs light, so white here vanishes on the
+                            // near-white bot colours; the helper picks the legibility.
+                            .foregroundStyle(BotPalette.contrastingForeground(for: chat.color))
                             .padding(.horizontal, 9)
                             .padding(.vertical, 4)
                             .background(Capsule().fill(BotPalette.color(chat.color)))
@@ -1261,34 +1267,25 @@ struct UpdatesPill: View {
                 }
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(spacing: 4) {
-                        if let first = updates.first {
-                            switch first.kind {
-                            case .needsYou:
-                                Image(systemName: "hand.raised.fill")
-                                    .font(.system(size: 11, weight: .bold))
-                                    .foregroundStyle(BotPalette.color(first.chat.color))
-                                Text("\(first.chat.name) needs you")
-                            case .working:
-                                Text("\(first.chat.name) is working")
-                            case .toReview:
-                                Text("\(first.chat.name) has an update")
-                            }
-                        } else {
-                            Text("All quiet")
+                        if let first = updates.first, first.kind == .needsYou {
+                            Image(systemName: "hand.raised.fill")
+                                .font(.scaled(11, weight: .bold, relativeTo: .caption2))
+                                .foregroundStyle(BotPalette.color(first.chat.color))
                         }
+                        Text(headline)
                     }
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.scaled(14, weight: .semibold, relativeTo: .footnote))
                     .foregroundStyle(updates.isEmpty ? Color.secondary : Color.primary)
                     .lineLimit(1)
 
                     Text(subline)
-                        .font(.system(size: 12))
+                        .font(.scaled(12, relativeTo: .caption))
                         .foregroundStyle(Color.secondary)
                         .lineLimit(1)
                 }
                 Spacer(minLength: 0)
                 Image(systemName: "chevron.up")
-                    .font(.system(size: 12, weight: .bold))
+                    .font(.scaled(12, weight: .bold, relativeTo: .caption))
                     .foregroundStyle(Color.secondary)
             }
             .padding(.leading, updates.isEmpty ? 16 : 7)
@@ -1298,7 +1295,21 @@ struct UpdatesPill: View {
         }
         .buttonStyle(.plain)
         .glassCapsule()
-        .accessibilityLabel("Updates")
+        // Both lines, in one label: naming only the group left out the
+        // state and the line under it, and naming only those left out the
+        // group.
+        .accessibilityLabel("Updates: \(headline).\u{00A0} \(subline)")
+    }
+
+    /// The line the pill leads with, kept beside the body so the
+    /// accessibility label can carry it too.
+    private var headline: String {
+        guard let first = updates.first else { return "All quiet" }
+        switch first.kind {
+        case .needsYou: return "\(first.chat.name) needs you"
+        case .working: return "\(first.chat.name) is working"
+        case .toReview: return "\(first.chat.name) has an update"
+        }
     }
 
     private var subline: String {
@@ -1484,17 +1495,17 @@ struct SearchHitRow: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text(hit.from ?? hit.name).font(.system(size: 15, weight: .semibold))
+                    Text(hit.from ?? hit.name).font(.scaled(15, weight: .semibold, relativeTo: .subheadline))
                     if let task = hit.task, !task.isEmpty {
-                        Text(task).font(.system(size: 12)).foregroundStyle(Color.secondary)
+                        Text(task).font(.scaled(12, relativeTo: .caption)).foregroundStyle(Color.secondary)
                     }
                     Spacer()
                     Text(RelativeStamp.list(hit.at))
-                        .font(.system(size: 12))
+                        .font(.scaled(12, relativeTo: .caption))
                         .foregroundStyle(Color.secondary)
                 }
                 Text(hit.snippet)
-                    .font(.system(size: 14))
+                    .font(.scaled(14, relativeTo: .footnote))
                     .foregroundStyle(Color.secondary)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)

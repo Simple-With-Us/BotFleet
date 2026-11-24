@@ -78,7 +78,7 @@ public struct MarkdownText: View {
             let page = item.codePage ?? CodeBlockWindow.preview(fullCode, anchorToEnd: false)
             VStack(alignment: .leading, spacing: 0) {
                 HStack {
-                    Text(language ?? "code")
+                    Text(language ?? "Code")
                         .font(.caption.monospaced())
                         .foregroundColor(.secondary)
                     Spacer()
@@ -109,7 +109,7 @@ public struct MarkdownText: View {
                         .padding(.bottom, 6)
                 }
             }
-            .background(Color.black.opacity(0.06))
+            .background(Color(nsColor: .controlBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 8))
 
         case .table(let header, let alignments, let rows):
@@ -118,7 +118,7 @@ public struct MarkdownText: View {
             // cannot hand layout thousands of cells at once.
             let visibleRows = Array(rows.prefix(200))
             VStack(alignment: .leading, spacing: 6) {
-                ScrollView(.horizontal, showsIndicators: false) {
+                ScrollView(.horizontal) {
                     Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
                         GridRow {
                             ForEach(header.indices, id: \.self) { column in

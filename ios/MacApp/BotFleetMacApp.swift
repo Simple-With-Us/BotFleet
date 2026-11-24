@@ -156,6 +156,10 @@ struct BotFleetMacApp: App {
                     ForEach(MacSettingsSection.allCases) { section in
                         Button(section.displayTitle) {
                             session.activeSettingsSection = section
+                            //  Picking the section is not enough:  the
+                            //  Settings window has to open, or the item does
+                            //  nothing.
+                            session.presentSettingsScene()
                         }
                     }
                 }
@@ -244,9 +248,16 @@ struct BotFleetMacApp: App {
                                 .foregroundColor(.secondary)
                         } else if section == .phone {
                             MacPhoneSettings(session: session)
-                        } else {
+                        } else if section.isImplemented {
                             Text(session.capabilities.versionStamp)
                                 .font(.caption)
+                                .foregroundColor(.secondary)
+                        } else {
+                            //  A section with no screen behind it says so.
+                            //  The version stamp stood in for the screen and
+                            //  read like one.
+                            Text(section.unavailableCopy)
+                                .font(.callout)
                                 .foregroundColor(.secondary)
                         }
 

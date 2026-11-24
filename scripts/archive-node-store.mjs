@@ -995,6 +995,139 @@ export function restoreArchive({ archiveDir, intoDir, restoredAt = new Date().to
 }
 
 /**
+ * Check a capture where it lies, without restoring it.
+ *
+ * The manifest comparison lived inside the restore, so the only way to ask
+ * whether a capture was intact was to write a copy of it out first.  This
+ * reads the manifest and the tree and writes nothing:  a check that is not a
+ * restore cannot become one, and a capture is never disturbed to be judged.
+ *
+ * Three kinds of disagreement are kept apart, because they answer different
+ * questions.  A file the manifest names and the tree does not hold, a file
+ * the tree holds and the manifest does not name, and a manifest whose own
+ * totals disagree with its own file list are three findings, and the file
+ * count only moves for the first of them.
+ */
+export function verifyArchive({ captureDir }) {
+  const archive = resolve(captureDir);
+  const manifest = JSON.parse(readFileSync(join(archive, "manifest.json"), "utf8"));
+  if (manifest.marker !== ARCHIVE_MARKER) throw new Error("not an archive manifest");
+  const tree = join(archive, "tree");
+
+  // A corrupt manifest has to finish and say so rather than crash, so a
+  // manifest without a file list is a finding and not a thrown error.
+  if (!Array.isArray(manifest.files)) {
+    return {
+      marker: "botfleet-node-store-verify-report",
+      version: ARCHIVE_VERSION,
+      capture: archive,
+      expectedFiles: 0,
+      verifiedFiles: 0,
+      mismatches: [{ path: "manifest.json", reason: "manifest-files-missing" }],
+      ok: false,
+    };
+  }
+
+  const fileMismatches = [];
+  const treeMismatches = [];
+  const manifestMismatches = [];
+
+  const named = new Set();
+  for (const row of manifest.files) {
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- a manifest row is untyped JSON, so the path it names has to be checked before it is used.
+    if (!row || typeof row.path !== "string") {
+      fileMismatches.push({ path: "manifest.json", reason: "malformed-manifest-row" });
+      continue;
+    }
+    named.add(row.path);
+    // A manifest names paths, and a tampered one names a path that leaves the
+    // tree, so every path is resolved and refused when it escapes.
+    const from = resolveInside(tree, row.path);
+    if (!from) {
+      fileMismatches.push({ path: row.path, reason: "unsafe-manifest-path" });
+      continue;
+    }
+    let archivedHash;
+    try {
+      archivedHash = hashFile(from);
+    } catch (error) {
+      // A missing or unreadable file is a mismatch, not a crash:  the check
+      // has to finish and say so.
+      fileMismatches.push({ path: row.path, reason: "archive-hash-mismatch", detail: error.code ?? "unreadable" });
+      continue;
+    }
+    if (archivedHash !== row.sha256) {
+      fileMismatches.push({ path: row.path, reason: "archive-hash-mismatch" });
+    }
+  }
+
+  // The tree is read rather than trusted, because a capture that was added to
+  // after it was written still carries a manifest that hashes every file it
+  // names:  only the tree itself shows the extra file.
+  let treeEntries = null;
+  try {
+    treeEntries = listTreeEntries(tree);
+  } catch (error) {
+    treeMismatches.push({ path: "tree", reason: "tree-unreadable", detail: error.code ?? "unreadable" });
+  }
+  if (treeEntries) {
+    for (const entry of treeEntries.files) {
+      if (!named.has(entry)) treeMismatches.push({ path: entry, reason: "unlisted-tree-file" });
+    }
+    for (const entry of treeEntries.skipped) {
+      treeMismatches.push({ path: entry.path, reason: "tree-entry-not-a-regular-file", detail: entry.reason });
+    }
+  }
+
+  // A manifest whose own totals disagree with its own file list is a manifest
+  // finding, and it does not move the file count:  the files it names were
+  // each checked on their own.
+  if (manifest.totals && manifest.totals.files !== manifest.files.length) {
+    manifestMismatches.push({ path: "manifest.json", reason: "totals-mismatch" });
+  }
+
+  const mismatches = [...fileMismatches, ...treeMismatches, ...manifestMismatches];
+  return {
+    marker: "botfleet-node-store-verify-report",
+    version: ARCHIVE_VERSION,
+    capture: archive,
+    expectedFiles: manifest.files.length,
+    verifiedFiles: manifest.files.length - fileMismatches.length,
+    mismatches,
+    ok: mismatches.length === 0,
+  };
+}
+
+/**
+ * Every entry a captured tree holds, named the way the manifest names them.
+ *
+ * A tree entry that is not a regular file is reported rather than skipped, so
+ * a symlink planted in a capture is a finding and not a silent pass.
+ */
+function listTreeEntries(root) {
+  const files = [];
+  const skipped = [];
+  const walk = (directory, prefix) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        walk(join(directory, entry.name), relative);
+        continue;
+      }
+      if (entry.isFile()) {
+        files.push(relative);
+        continue;
+      }
+      skipped.push({ path: relative, reason: entry.isSymbolicLink() ? "symbolic-link" : "not-a-regular-file" });
+    }
+  };
+  walk(root, "");
+  files.sort();
+  skipped.sort((a, b) => a.path.localeCompare(b.path));
+  return { files, skipped };
+}
+
+/**
  * The structural health of a restored store.
  *
  * This is a statement about the RESTORE, not about the store:  a file that
@@ -1543,6 +1676,17 @@ if (isEntry) {
         healthOk: health.ok,
       }));
       if (!rehearsal.ok || !health.ok) process.exitCode = 1;
+    } else if (command === "verify") {
+      const captureDir = flagValue(args, "--capture");
+      if (!captureDir) throw new Error("--capture <capture-directory> is required");
+      const verdict = verifyArchive({ captureDir });
+      console.log(JSON.stringify({
+        verified: verdict.ok,
+        expectedFiles: verdict.expectedFiles,
+        verifiedFiles: verdict.verifiedFiles,
+        mismatches: verdict.mismatches.length,
+      }));
+      if (!verdict.ok) process.exitCode = 1;
     } else if (command === "receipt") {
       const captureDir = flagValue(args, "--capture");
       const requestPath = flagValue(args, "--request");
@@ -1569,6 +1713,7 @@ if (isEntry) {
     } else {
       console.error(`usage: node scripts/archive-node-store.mjs archive --store <root> --out <dir> [--max-files <count, at most ${ABSOLUTE_MAX_FILES}>] [--max-bytes <bytes, at most ${ABSOLUTE_MAX_BYTES}>]`);
       console.error("       node scripts/archive-node-store.mjs restore --archive <dir> --into <scratch-root>");
+      console.error("       node scripts/archive-node-store.mjs verify --capture <dir>");
       console.error("       node scripts/archive-node-store.mjs receipt --capture <dir> --request <request.json> --provenance-record <file> --provenance-source <https-url> --provenance-by <who> [--parity-report <file>]");
       process.exitCode = 2;
     }
