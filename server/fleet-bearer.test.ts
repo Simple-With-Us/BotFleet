@@ -17,7 +17,7 @@ import {
   resetFleetBearerCache,
   setFleetBearerVault,
 } from "./fleet-bearer.ts";
-import { launchedChildCredentials, primeSeatCredentials, seatCredentialEnvironment } from "./child-credentials.ts";
+import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials, seatCredentialEnvironment } from "./child-credentials.ts";
 
 // Obviously fake, and never sent anywhere:  these exist so the assertions
 // below have credential-shaped strings to work on.
@@ -200,7 +200,7 @@ describe("a launched child", () => {
     primeSeatCredentials("BF-ORACLE");
     await awaitFleetBearer("BF-ORACLE");
 
-    const env = launchedChildCredentials(
+    const env = await launchedChildCredentials(
       { PATH: "/usr/bin", [FLEET_BEARER_ENV_NAME]: "the-harness-own-bearer" },
       { seat: "BF-ORACLE", session: "thread-1" },
       "BF-ORACLE",
@@ -219,7 +219,7 @@ describe("a launched child", () => {
 
     // A bot with no bearer of its own gets none, even though the harness
     // process holds one.
-    const env = launchedChildCredentials(
+    const env = await launchedChildCredentials(
       { [FLEET_BEARER_ENV_NAME]: "the-harness-own-bearer" },
       { seat: "BF-MONITOR", session: "thread-2" },
       "BF-MONITOR",
@@ -227,8 +227,8 @@ describe("a launched child", () => {
     expect(env[FLEET_BEARER_ENV_NAME]).toBeUndefined();
   });
 
-  it("gets no bearer and no login when it has no seat", () => {
-    const env = launchedChildCredentials(
+  it("gets no bearer and no login when it has no seat", async () => {
+    const env = await launchedChildCredentials(
       { [FLEET_BEARER_ENV_NAME]: "the-harness-own-bearer", GH_TOKEN: "the-harness-own-login" },
       { seat: null, session: "thread-3" },
       null,
@@ -246,7 +246,7 @@ describe("a launched child", () => {
     // The login table's cache is empty in this test, so the login is
     // absent, and the bearer is still there:  one missing credential does
     // not take the other with it.
-    const env = launchedChildCredentials({ PATH: "/usr/bin" }, { seat: "BF-ORACLE", session: "t" }, "BF-ORACLE");
+    const env = await launchedChildCredentials({ PATH: "/usr/bin" }, { seat: "BF-ORACLE", session: "t" }, "BF-ORACLE");
     expect(env[FLEET_BEARER_ENV_NAME]).toBe(SENTINEL_BEARER);
     expect(env.GH_TOKEN).toBeUndefined();
   });
@@ -256,6 +256,61 @@ describe("a launched child", () => {
     // The tables hold disjoint names, so the merge keeps both kinds.
     expect(merged).toEqual({});
     expect(Object.keys(merged)).not.toContain("GH_TOKEN");
+  });
+
+  it("waits for a credential read that has not landed yet", async () => {
+    // The read is started in the background, so it can still be in flight
+    // when the turn reaches its guard.  A child spawned before it lands
+    // carries no credential, and an engine that keeps a live session would
+    // carry none for every later turn — so the turn waits for the read it
+    // started, before it claims the thread.
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = () => resolve(undefined);
+    });
+    setFleetBearerVault({
+      async readProjectPath() {
+        await gate;
+        return new Map([[FLEET_BEARER_ENV_NAME, SENTINEL_BEARER]]);
+      },
+    });
+    primeSeatCredentials("BF-ORACLE");
+
+    let settled = false;
+    const waited = awaitSeatCredentials("BF-ORACLE").then(() => {
+      settled = true;
+    });
+
+    // The wait is still outstanding on the read.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(settled).toBe(false);
+
+    release();
+    await waited;
+    expect(settled).toBe(true);
+    expect(fleetBearerEnvironment("BF-ORACLE")).toEqual({ [FLEET_BEARER_ENV_NAME]: SENTINEL_BEARER });
+  });
+
+  it("carries the credential's presence, not its value, into what identifies a process", () => {
+    // A retained process is reused while its spawn contract is unchanged, so
+    // the contract has to say whether the credential was there — never what
+    // it was.  A process spawned before the read landed is therefore
+    // replaced once the credential arrives, instead of holding no bearer
+    // for every later turn.
+    const withBearer = launchedChildCredentials(
+      { [FLEET_BEARER_ENV_NAME]: "the-bearer" },
+      { seat: "BF-ORACLE", session: "thread-5" },
+      "BF-ORACLE",
+    );
+    const withoutBearer = launchedChildCredentials(
+      { [FLEET_BEARER_ENV_NAME]: "the-bearer" },
+      { seat: "BF-MONITOR", session: "thread-5" },
+      "BF-MONITOR",
+    );
+    expect(withBearer[FLEET_BEARER_ENV_NAME]).toBeUndefined();
+    expect(withoutBearer[FLEET_BEARER_ENV_NAME]).toBeUndefined();
+    // The seat's own value is never in the environment a second seat reads.
+    expect(JSON.stringify(withoutBearer)).not.toContain("the-bearer");
   });
 
   it("never puts the bearer in the config, the process environment or a log line", async () => {

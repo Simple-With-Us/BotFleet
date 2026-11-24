@@ -51,7 +51,8 @@ export { STATIC_CLAUDE_MODELS };
 import { computerProxyEnv } from "../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { launchedChildCredentials, primeSeatCredentials } from "../child-credentials.ts";
+import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials } from "../child-credentials.ts";
+import { FLEET_BEARER_ENV_NAME } from "../secret-map.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import {
   applyClaudeInject,
@@ -1171,6 +1172,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const preflight = { turnId, stop: () => { preflightCancelled = true; } };
       active.set(threadId, preflight);
       try {
+        // The seat's credential read is started before the guard, so it may
+        // still be in flight here.  Waiting for it here — after the
+        // registration, which must stay synchronous with the guard — means
+        // the child is spawned with the credential rather than without it.
+        await awaitSeatCredentials(turn.launchIdentity?.seat);
         await requireStrictMcp();
       } catch (error) {
         preflightError = error;
@@ -1389,6 +1395,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         // write into the process spawned for the first one's seat.
         seat: env.AGENT_LAUNCH_SEAT ?? null,
         session: env.AGENT_SESSION ?? null,
+        // Whether the seat's fleet bearer was present when this process was
+        // spawned.  The credential itself never enters the key — only
+        // whether it was there — so a retained process that was spawned
+        // before the read landed is replaced by one that carries it,
+        // instead of holding no bearer for every later turn.
+        hasFleetBearer: env[FLEET_BEARER_ENV_NAME] !== undefined,
       });
 
       // What the user turn carries besides its text.  The volatile half rides

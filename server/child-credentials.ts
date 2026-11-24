@@ -21,8 +21,8 @@
 // bearer, rather than somebody else's, and a bot whose vault folder holds
 // no credential gets none rather than a fallback.
 
-import { applyCliLogins, cliLoginEnvironment, primeCliLogin } from "./cli-logins.ts";
-import { applyFleetBearer, fleetBearerEnvironment, primeFleetBearer } from "./fleet-bearer.ts";
+import { applyCliLogins, awaitCliLogin, cliLoginEnvironment, primeCliLogin } from "./cli-logins.ts";
+import { applyFleetBearer, awaitFleetBearer, fleetBearerEnvironment, primeFleetBearer } from "./fleet-bearer.ts";
 import { applyLaunchIdentity } from "./launch-identity.ts";
 import type { LaunchIdentity } from "./contracts.ts";
 
@@ -37,6 +37,29 @@ import type { LaunchIdentity } from "./contracts.ts";
 export function primeSeatCredentials(seat: string | null | undefined): void {
   primeCliLogin(seat);
   primeFleetBearer(seat);
+}
+
+/**
+ * Wait for the seat's credential reads to land.
+ *
+ * The read is started in the background, so it may still be in flight when
+ * the turn reaches the spawn.  A child spawned before the read lands would
+ * carry no credential at all, and an engine that keeps a live session would
+ * keep carrying none for every later turn — so the spawn waits for the read
+ * it started.
+ *
+ * This is safe where it is called:  it sits BEFORE the turn's guard, so the
+ * segment from the guard to the registration stays free of `await` — which
+ * is the segment that must be atomic, or a second turn on the same thread
+ * would walk through a guard the first one already passed.  Two turns that
+ * both wait here still resolve in the order they started, so the first one
+ * to resume claims the thread and the second is refused.
+ *
+ * A read that fails is a failed read, so this never rejects and never fails
+ * a turn over a credential that is not there. */
+export async function awaitSeatCredentials(seat: string | null | undefined): Promise<void> {
+  await awaitCliLogin(seat);
+  await awaitFleetBearer(seat);
 }
 
 /**
