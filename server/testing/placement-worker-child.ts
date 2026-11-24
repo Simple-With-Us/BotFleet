@@ -52,9 +52,15 @@ const SAMPLE: CapacitySample = {
 async function readControllerPort(path: string, deadline: number): Promise<number> {
   for (;;) {
     if (existsSync(path)) {
-      const raw = readFileSync(path, "utf8").trim();
-      const port = Number(raw);
-      if (Number.isInteger(port) && port > 0) return port;
+      const raw = readFileSync(path, "utf8");
+      // The controller publishes the port as one newline-terminated write,
+      // so a read that catches the write mid-flight sees a truncated port
+      // with no newline:  only a complete, in-range payload is a port, and
+      // anything else retries until the deadline like a missing file.
+      if (raw.endsWith("\n")) {
+        const port = Number(raw.trim());
+        if (Number.isInteger(port) && port >= 1 && port <= 65535) return port;
+      }
     }
     if (Date.now() >= deadline) throw new Error("the controller never published its port");
     // The wait is short on purpose:  the producer starts this child right
