@@ -96,6 +96,9 @@ export function closeWorkerServer(server: Server): Promise<void> {
       // except "not running":  the server is already closed, which is
       // the state the caller wants, so a second close from a caller's
       // finally block stays a success instead of masking the test result.
+      // SAFETY:  the close callback's error is the Node system error for
+      // the close attempt, which carries a string code; the assertion
+      // only reads that code and changes nothing about the value.
       if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
         reject(error);
       } else {
