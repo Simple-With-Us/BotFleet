@@ -21,9 +21,8 @@
 // bearer, rather than somebody else's, and a bot whose vault folder holds
 // no credential gets none rather than a fallback.
 
-import { applyCliLogins, awaitCliLogin, cliLoginEnvironment, primeCliLogin } from "./cli-logins.ts";
-import { applyFleetBearer, awaitFleetBearer, fleetBearerEnvironment, primeFleetBearer } from "./fleet-bearer.ts";
-import { FLEET_BEARER_ENV_NAME } from "./secret-map.ts";
+import { applyCliLogins, awaitCliLogin, cliLoginEnvironment, cliLoginReadPending, primeCliLogin } from "./cli-logins.ts";
+import { applyFleetBearer, awaitFleetBearer, fleetBearerEnvironment, fleetBearerReadPending, primeFleetBearer } from "./fleet-bearer.ts";
 import { applyLaunchIdentity } from "./launch-identity.ts";
 import type { LaunchIdentity } from "./contracts.ts";
 
@@ -74,7 +73,12 @@ export async function awaitSeatCredentials(seat: string | null | undefined): Pro
  */
 export function seatCredentialsReady(seat: string | null | undefined): boolean {
   if (!seat) return true;
-  return cliLoginEnvironment(seat).GH_TOKEN !== undefined || fleetBearerEnvironment(seat)[FLEET_BEARER_ENV_NAME] !== undefined;
+  // Ready means NO credential is on its way.  A read that is still in
+  // flight is a credential the next child would miss, so the turn waits
+  // for it;  a read that has already come back — with a value or without
+  // one — is settled, and waiting for it again would only defer the
+  // registration for nothing.
+  return !cliLoginReadPending(seat) && !fleetBearerReadPending(seat);
 }
 
 /**

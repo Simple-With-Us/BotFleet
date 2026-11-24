@@ -293,6 +293,11 @@ function reportMissingBearer(seat: string): void {
  * The drivers do not wait for it — a turn's child is spawned with whatever
  * the cache holds — but a caller that needs the value now can, and a test
  * needs it to see a read at all. */
+export function fleetBearerReadPending(seat: string | null | undefined): boolean {
+  if (!seat) return false;
+  return inflight.has(seat);
+}
+
 export async function awaitFleetBearer(seat: string | null | undefined): Promise<void> {
   if (!seat) return;
   await inflight.get(seat);
