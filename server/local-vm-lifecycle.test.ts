@@ -7,6 +7,13 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { containerRuntimeLockdownEnv } from "./container-runtime-guard.ts";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
+import { freePortBlock } from "./testing/ports.ts";
+
+// The harness and the webhook receiver it opens one above itself, both taken
+// from the range BELOW the kernel's ephemeral range and probed first.  A port
+// inside the ephemeral range is one the OS may hand out to an outgoing
+// connection, and the suite runs hundreds of them.
+const portBlock = await freePortBlock([0, 1]);
 
 // Real HTTP admission and state changes, with every container executable
 // shadowed by a fixture.  A file gate holds cleanup before any container I/O.
@@ -17,7 +24,7 @@ describe.skipIf(process.platform === "win32")("Local VM lifecycle exclusion", ()
   let entered: string;
   let log: string;
   let stderr = "";
-  const port = 18800 + Math.floor(Math.random() * 10_000);
+  const port = portBlock;
   const base = `http://127.0.0.1:${port}`;
   const serverDir = dirname(fileURLToPath(import.meta.url));
   const api = async (method: string, path: string, body?: unknown) => {
@@ -86,7 +93,7 @@ fs.appendFileSync(path.join(home, "runtime.log"), args.join(" ") + "\\n");
         // Container runtimes are off for the harness except the fixture above,
         // which runs by absolute path so PATH can never reach the real docker.
         ...containerRuntimeLockdownEnv(), BOTFLEET_CONTAINER_RUNTIME_FIXTURE_DIR: bin,
-        OMB_PORT: String(port), OMB_WEBHOOK_PORT: String(39000 + Math.floor(Math.random() * 10000)),
+        OMB_PORT: String(port), OMB_WEBHOOK_PORT: String(port + 1),
         OMB_DISABLE_ANTIGRAVITY_QUOTA: "1", VITEST: "1" },
     });
     child.stdout!.resume();
