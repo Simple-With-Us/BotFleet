@@ -1133,7 +1133,11 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
             || normalized == "[::1]"
             || normalized.hasPrefix("127.")
         guard isLoopback else { return nil }
-        guard let baseURL = URL(string: "http://\(host):\(port)") else { return nil }
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let formattedHost = trimmedHost.contains(":") && !trimmedHost.hasPrefix("[")
+            ? "[\(trimmedHost)]"
+            : trimmedHost
+        guard let baseURL = URL(string: "http://\(formattedHost):\(port)") else { return nil }
         return MacControlStatusClient(baseURL: baseURL)
     }
 
@@ -1148,6 +1152,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         isRefreshingControlStatus = true
         defer { isRefreshingControlStatus = false }
         guard let client = makeControlStatusClient() else {
+            controlStatus = nil
             controlStatusError = Self.controlClientUnavailableMessage
             return
         }
