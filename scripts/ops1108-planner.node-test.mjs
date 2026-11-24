@@ -21,6 +21,8 @@ import {
   FIXTURE_MERGE_STAMP,
   PLANNER_CREDENTIALS,
   REDACTED_VALUE,
+  inputsFor,
+  parseArgs,
   planReceipt,
 } from "./ops1108-planner-receipt.mjs";
 
@@ -180,4 +182,28 @@ test("the iOS ship path asks the shared planner for its own platform", () => {
   // the iOS and the Mac build of one commit can differ by one.
   assert.match(source, /plan-release-build[^\n]*--platform/);
   assert.match(source, /plan_platform="ios"/);
+});
+
+test("a flag with no value is refused instead of eating the next flag", () => {
+  // `--out --sha` must not store the flag as the output path, because that
+  // would shift every later option with no error at all.
+  assert.throws(() => parseArgs(["--out", "--sha", "HEAD"]), /missing value for --out/);
+  assert.throws(() => parseArgs(["--sha"]), /missing value for --sha/);
+  assert.throws(() => parseArgs(["--repo-root", "--stamp", "202610290000"]), /missing value for --repo-root/);
+});
+
+test("a named SHA with no checkout is refused rather than answered with the fixture", () => {
+  // The receipt must not describe a commit nobody asked about: a lone --sha
+  // used to fall through to the synthetic fixture identity.
+  assert.throws(() => inputsFor(parseArgs(["--sha", "abc123"])), /--sha requires --repo-root/);
+  // The default still names the synthetic commit, and it says so.
+  const synthetic = inputsFor(parseArgs([]));
+  assert.equal(synthetic.commit, FIXTURE_COMMIT);
+  assert.equal(synthetic.commitKind, "synthetic");
+});
+
+test("a flag that takes a value keeps its own value", () => {
+  const args = parseArgs(["--out", "/tmp/receipt.json", "--stamp", "202610290000"]);
+  assert.equal(args.out, "/tmp/receipt.json");
+  assert.equal(args.stamp, "202610290000");
 });

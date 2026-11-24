@@ -895,7 +895,7 @@ set_feed_keys "app.example.mac" "" ""
 run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
 planned_pair
 check "paired: pairedBundleId is passed to plan-release-build" \
-  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} app.example.mac --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} app.example.mac --merge-stamp [0-9]{12}( --platform (ios|macos))?$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
 check "paired: the run still plans the stubbed build (got '${PLANNED_BUILD}')" \
   "$([[ "$PLANNED_BUILD" == "202610290005" ]] && echo 0 || echo 1)"
 # macBundleId stays an accepted alias.
@@ -903,12 +903,12 @@ set_feed_keys "" "app.example.mac-legacy" ""
 : >"$FAKE_ARGV_LOG"
 run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
 check "paired: macBundleId is still accepted as the paired id" \
-  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} app.example.mac-legacy --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} app.example.mac-legacy --merge-stamp [0-9]{12}( --platform (ios|macos))?$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
 # pairedBundleId wins when both are set.
 set_feed_keys "app.example.mac" "app.example.mac-legacy" ""
 : >"$FAKE_ARGV_LOG"
 run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
-_paired_exact="$(grep -a -E -c "plan-release-build ${FEEDBUNDLE} app.example.mac --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" || true)"
+_paired_exact="$(grep -a -E -c "plan-release-build ${FEEDBUNDLE} app.example.mac --merge-stamp [0-9]{12}( --platform (ios|macos))?$" "$FAKE_ARGV_LOG" || true)"
 _paired_legacy="$(grep -a -c "mac-legacy" "$FAKE_ARGV_LOG" || true)"
 check "paired: pairedBundleId is preferred over macBundleId" \
   "$([[ "$_paired_exact" -ge 1 && "$_paired_legacy" -eq 0 ]] && echo 0 || echo 1)"
@@ -946,7 +946,7 @@ FAKE_CURL_BODY='<rss><channel><item><sparkle:version>1500</sparkle:version></ite
 run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
 planned_pair
 check "feed: the max sparkle:version is passed as the floor" \
-  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} 1500 --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} 1500 --merge-stamp [0-9]{12}( --platform (ios|macos))?$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
 check "feed: the run still plans the stubbed build (got '${PLANNED_BUILD}')" \
   "$([[ "$PLANNED_BUILD" == "202610290005" ]] && echo 0 || echo 1)"
 # Whitespace-padded versions still count: the digits are extracted.
@@ -954,7 +954,7 @@ FAKE_CURL_BODY='<rss><channel><item><sparkle:version>  1501  </sparkle:version><
 : >"$FAKE_ARGV_LOG"
 run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
 check "feed: whitespace-padded sparkle:version is read as the floor" \
-  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} 1501 --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} 1501 --merge-stamp [0-9]{12}( --platform (ios|macos))?$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
 # A non-https feed is rejected before curl runs.
 set_feed_keys "" "" "http://example.invalid/appcast.xml"
 FAKE_CURL_BODY='<rss><channel><item><sparkle:version>1500</sparkle:version></item></channel></rss>'
@@ -974,13 +974,13 @@ planned_pair
 check "feed: floor 9999 plans the stubbed build (got '${PLANNED_BUILD}')" \
   "$([[ "$PLANNED_BUILD" == "202610290005" ]] && echo 0 || echo 1)"
 check "feed: floor 9999 reaches the planner" \
-  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} 9999 --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} 9999 --merge-stamp [0-9]{12}( --platform (ios|macos))?$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
 # A 12-digit Sparkle floor is valid and travels exactly, digit for digit.
 FAKE_CURL_BODY='<rss><channel><item><sparkle:version>202610290007</sparkle:version></item></channel></rss>'
 : >"$FAKE_ARGV_LOG"
 run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
 check "feed: a 12-digit floor reaches the planner exactly" \
-  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} 202610290007 --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} 202610290007 --merge-stamp [0-9]{12}( --platform (ios|macos))?$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
 # Past 12 digits the floor fails closed: it would plan a build the 12-digit
 # gate rejects, so the run stops with the feed URL and the value.
 FAKE_CURL_BODY='<rss><channel><item><sparkle:version>202610290000000001</sparkle:version></item></channel></rss>'
@@ -1004,7 +1004,7 @@ set_feed_keys "app.example.mac" "" "$FEED_URL"
 : >"$FAKE_ARGV_LOG"
 run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
 check "feed: paired id and feed floor travel together" \
-  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} app.example.mac 1500 --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} app.example.mac 1500 --merge-stamp [0-9]{12}( --platform (ios|macos))?$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
 FAKE_CURL_BODY=""
 # A macOS entry names the iOS bundle id as its paired id.
 python3 - "$FEEDDIR/apps.json" "$FEEDBUNDLE" <<'PY'
@@ -1028,7 +1028,7 @@ rm -f "${STATE}/build-seq-feedmac.txt" "${STATE}/last-ship-feedmac.txt"
 run_ship "feedmac" --repo-root "$REPO" --dry-run
 planned_pair
 check "paired: a macOS entry passes the iOS bundle id as the paired id" \
-  "$(grep -a -E -q "plan-release-build app.example.mac ${FEEDBUNDLE} --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+  "$(grep -a -E -q "plan-release-build app.example.mac ${FEEDBUNDLE} --merge-stamp [0-9]{12}( --platform (ios|macos))?$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
 check "paired: the macOS entry still plans the stubbed build (got '${PLANNED_BUILD}')" \
   "$([[ "$PLANNED_BUILD" == "202610290005" ]] && echo 0 || echo 1)"
 # A macOS entry with no paired id borrows the iOS peer that points at it.
@@ -1052,12 +1052,12 @@ set_feed_keys "app.example.revmac" "" ""
 : >"$FAKE_ARGV_LOG"
 run_ship "revmac" --repo-root "$REPO" --dry-run
 check "paired: macOS reverse lookup passes the iOS bundle id" \
-  "$(grep -a -E -q "plan-release-build app.example.revmac ${FEEDBUNDLE} --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+  "$(grep -a -E -q "plan-release-build app.example.revmac ${FEEDBUNDLE} --merge-stamp [0-9]{12}( --platform (ios|macos))?$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
 set_feed_keys "" "app.example.revmac" ""
 : >"$FAKE_ARGV_LOG"
 run_ship "revmac" --repo-root "$REPO" --dry-run
 check "paired: macOS reverse lookup follows the macBundleId alias" \
-  "$(grep -a -E -q "plan-release-build app.example.revmac ${FEEDBUNDLE} --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+  "$(grep -a -E -q "plan-release-build app.example.revmac ${FEEDBUNDLE} --merge-stamp [0-9]{12}( --platform (ios|macos))?$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
 set_feed_keys "" "" ""
 # The client joins both platforms of both apps, concurrently.
 check "union: plan-release-build reads IOS and MAC_OS for both apps via Promise.all" \

@@ -168,15 +168,22 @@ export function parseArgs(argv) {
   const args = { out: "", repoRoot: "", sha: "HEAD", commit: "", stamp: "" };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    const take = () => {
+    // A flag that takes a value must have one, and the value must not be
+    // another flag: `--out --sha` would otherwise store the flag as the
+    // output path and shift every later option with no error at all.
+    const take = (flag) => {
       index += 1;
-      return argv[index] ?? "";
+      const value = argv[index] ?? "";
+      if (value === "" || value.startsWith("--")) {
+        throw new Error(`missing value for ${flag}`);
+      }
+      return value;
     };
-    if (arg === "--out") args.out = take();
-    else if (arg === "--repo-root") args.repoRoot = take();
-    else if (arg === "--sha") args.sha = take();
-    else if (arg === "--commit") args.commit = take();
-    else if (arg === "--stamp") args.stamp = take();
+    if (arg === "--out") args.out = take(arg);
+    else if (arg === "--repo-root") args.repoRoot = take(arg);
+    else if (arg === "--sha") args.sha = take(arg);
+    else if (arg === "--commit") args.commit = take(arg);
+    else if (arg === "--stamp") args.stamp = take(arg);
     else throw new Error(`unknown argument: ${arg}`);
   }
   return args;
@@ -207,6 +214,12 @@ export function inputsFor(args) {
       mergeStamp: mergeStampFor(committerDateFor(args.repoRoot, args.sha)),
       commitKind: "checkout",
     };
+  }
+  // A named SHA with no checkout to read it from would be answered with the
+  // fixture's own synthetic commit, so the receipt would describe a commit
+  // nobody asked about. That is refused instead.
+  if (args.sha !== "HEAD") {
+    throw new Error("--sha requires --repo-root");
   }
   return {
     commit: FIXTURE_COMMIT,
