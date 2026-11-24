@@ -358,6 +358,8 @@ A pair of rows in the accepted form, with an example date:
 
 ## Step 6 — Verify The Retirement
 
+**Every capture is filed under the profile it was made in.**  The placement recipes are separate keys, and a receipt from one of them is not evidence for another:  the Mac-only startup, the awake server-first run and the server-first run with the Mac asleep are three profiles, and the last one has its own key (`server-first-mac-asleep-iphone`) because nothing on the Linux server dispatches APNs notifications while the Mac listener is asleep.  A capture taken under one profile is never filed as another profile's evidence, and a reviewer who cannot see which profile a receipt belongs to does not count it.
+
 ```bash
 # On the Mac.
 launchctl print gui/$(id -u)/app.botfleet.server
