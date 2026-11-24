@@ -52,7 +52,14 @@ const SAMPLE: CapacitySample = {
 async function readControllerPort(path: string, deadline: number): Promise<number> {
   for (;;) {
     if (existsSync(path)) {
-      const raw = readFileSync(path, "utf8");
+      let raw = "";
+      try {
+        raw = readFileSync(path, "utf8");
+      } catch {
+        // The file can vanish between the check and the read, and any
+        // other transient read error is the same shape:  fall through
+        // with no payload and let the loop retry until the deadline.
+      }
       // The controller publishes the port as one newline-terminated write,
       // so a read that catches the write mid-flight sees a truncated port
       // with no newline:  only a complete, in-range payload is a port, and
