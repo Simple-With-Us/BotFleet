@@ -41,6 +41,14 @@ export const PORT_POOL_BAND_WIDTH = 24;
 /** The last port of the pool, exclusive. */
 export const PORT_POOL_END = PORT_POOL_START + PORT_POOL_BANDS * PORT_POOL_BAND_WIDTH;
 
+/** The slice of the pool one process may take ports from. */
+export type PortBand = {
+  /** The first port of the band. */
+  start: number;
+  /** The last port of the band, exclusive. */
+  end: number;
+};
+
 /**
  * The band of the pool a process may take ports from.
  *
@@ -50,7 +58,7 @@ export const PORT_POOL_END = PORT_POOL_START + PORT_POOL_BANDS * PORT_POOL_BAND_
  * suite asks for, and two suites in the same worker run one after the
  * other, where the probe alone is enough.
  */
-export function portBand(pid: number = process.pid): { start: number; end: number } {
+export function portBand(pid: number = process.pid): PortBand {
   const band = ((pid % PORT_POOL_BANDS) + PORT_POOL_BANDS) % PORT_POOL_BANDS;
   const start = PORT_POOL_START + band * PORT_POOL_BAND_WIDTH;
   return { start, end: start + PORT_POOL_BAND_WIDTH };
