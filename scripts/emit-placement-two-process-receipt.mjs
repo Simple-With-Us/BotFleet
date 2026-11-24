@@ -195,7 +195,10 @@ export async function runTwoProcessFixture() {
   chmodSync(fixtureRoot, 0o700);
   const controllerDir = join(fixtureRoot, "controller");
   const workerDir = join(fixtureRoot, "worker");
-  const nonceDir = join(fixtureRoot, "nonce");
+  // The nonce directory carries a space on purpose:  the job's command is
+  // handed to a shell as one string, so this run is the proof that the
+  // segments of that command are quoted rather than pasted in.
+  const nonceDir = join(fixtureRoot, "nonce dir");
   mkdirSync(controllerDir, { recursive: true, mode: 0o700 });
   mkdirSync(workerDir, { recursive: true, mode: 0o700 });
   mkdirSync(nonceDir, { recursive: true, mode: 0o700 });
@@ -256,6 +259,9 @@ export async function runTwoProcessFixture() {
       controllerId,
       workerId,
       credentialId,
+      // The directory the job's nonce landed in, so a test can see that the
+      // path it was given carries a space.
+      nonceDir,
       // The fixture's own secret, in memory only:  the receipt carries the
       // digest and never this value.
       secret,

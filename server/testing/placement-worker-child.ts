@@ -135,29 +135,36 @@ async function main(): Promise<void> {
   // keep its loop alive, and the job's own exit is observed through the
   // spawned child's exit event, so this child holds the loop open itself
   // until the job settles.
+  //
+  // The hold is cleared in a `finally`, so a failure on the way through
+  // releases it too:  an interval that outlived the failure would keep this
+  // child alive until the producer's deadline, long after the job that was
+  // supposed to run had failed.
   const hold = setInterval(() => undefined, 200);
+  try {
+    const registration = await runtime.register();
+    if (registration.outcome !== "accepted") {
+      throw new Error(`the controller refused this worker's registration: ${registration.reason}`);
+    }
+    await runtime.tickHeartbeat();
+    const pulled = await runtime.pullAssignment();
+    if (!pulled.jobId) throw new Error("the controller offered this worker no assignment");
+    await runtime.waitForJob(pulled.jobId);
 
-  const registration = await runtime.register();
-  if (registration.outcome !== "accepted") {
-    throw new Error(`the controller refused this worker's registration: ${registration.reason}`);
+    writeFileSync(config.workerSummaryFile, `${JSON.stringify({
+      pid: process.pid,
+      controllerId: config.controllerId,
+      workerId: config.workerId,
+      epoch: config.epoch,
+      jobId: observed.jobId ?? pulled.jobId,
+      leaseId: observed.leaseId,
+      spawns: observed.spawns,
+      registered: runtime.isRegistered(),
+      pendingReports: spool.pending().length,
+    }, null, 2)}\n`, { mode: 0o600 });
+  } finally {
+    clearInterval(hold);
   }
-  await runtime.tickHeartbeat();
-  const pulled = await runtime.pullAssignment();
-  if (!pulled.jobId) throw new Error("the controller offered this worker no assignment");
-  await runtime.waitForJob(pulled.jobId);
-
-  clearInterval(hold);
-  writeFileSync(config.workerSummaryFile, `${JSON.stringify({
-    pid: process.pid,
-    controllerId: config.controllerId,
-    workerId: config.workerId,
-    epoch: config.epoch,
-    jobId: observed.jobId ?? pulled.jobId,
-    leaseId: observed.leaseId,
-    spawns: observed.spawns,
-    registered: runtime.isRegistered(),
-    pendingReports: spool.pending().length,
-  }, null, 2)}\n`, { mode: 0o600 });
 }
 
 main().catch((error) => {

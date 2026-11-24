@@ -17,6 +17,19 @@ import { HOST_ID_PATTERN, type HostId } from "../../shared/placement.ts";
 
 export const PLACEMENT_FIXTURE_CONFIG_VERSION = 1;
 
+/**
+ * One segment of a shell command, quoted for the shell that runs it.
+ *
+ * The job's command is handed to a shell as one string, so a path with a
+ * space in it (an interpreter under Program Files, a temporary directory with
+ * a space in its name) is split into the wrong words unless it is quoted.  A
+ * single quote is closed, escaped and reopened, which is the one form every
+ * POSIX shell reads the same way.
+ */
+export function quoteShellSegment(segment: string): string {
+  return `'${segment.replace(/'/g, "'\\''")}'`;
+}
+
 const hostIdSchema = z.string().regex(HOST_ID_PATTERN).transform((value) => {
   // SAFETY: the regex above matched the host id template, so this string is a HostId.
   return value as HostId;

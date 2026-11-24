@@ -16,40 +16,18 @@
 // It reads no environment value and holds no credential:  the presented
 // secret stays in the worker half, and only its digest reaches this file.
 import { writeFileSync } from "node:fs";
-import { createServer, type IncomingMessage } from "node:http";
-import { z } from "zod";
+import { createServer } from "node:http";
 import { PLACEMENT_WIRE_VERSION } from "../../shared/placement.ts";
 import { PlacementLeaseService } from "../placement-leases.ts";
 import { PlacementPayloadSpool } from "../placement-payloads.ts";
 import { openPlacementStore } from "../placement-store.ts";
 import { createWorkerRequestBoundary, type WorkerAuthorization } from "../placement-worker-auth.ts";
 import { createWorkerTransport } from "../placement-worker-routes.ts";
-import { readFixtureConfig } from "./placement-two-process-config.ts";
+import { quoteShellSegment, readFixtureConfig } from "./placement-two-process-config.ts";
+import { closeWorkerServer, listenOnLoopback, readWorkerBody } from "./placement-worker-link.ts";
 
 /** The statuses a lease settles into. */
 const TERMINAL_STATUSES = new Set(["completed", "failed", "killed", "lost"]);
-
-/**
- * The body of one worker request, read as JSON.
- *
- * The worker boundary parses this JSON against the worker's own schema
- * before any field of it is read, and it is the boundary's own contract
- * that a body arrives unparsed.
- */
-// oxlint-disable-next-line anti-slop/no-unknown-returns -- HTTP boundary: the worker boundary parses this JSON against the worker's own schema before any field of it is read
-function readBody(req: IncomingMessage): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const parts: Buffer[] = [];
-    req.on("data", (part: Buffer) => parts.push(part));
-    req.on("end", () => {
-      try {
-        resolve(JSON.parse(Buffer.concat(parts).toString("utf8")));
-      } catch (error) {
-        reject(error instanceof Error ? error : new Error("the worker body is not JSON"));
-      }
-    });
-  });
-}
 
 async function main(): Promise<void> {
   const configPath = process.argv[2];
@@ -67,7 +45,12 @@ async function main(): Promise<void> {
 
   // The job is offered before the worker can reach the controller, so the
   // worker never pulls an empty queue and never has to ask twice.
-  const command = `${config.nodePath} ${config.nonceScript} ${config.nonceDir} ${config.nonce}`;
+  // The job's command is handed to a shell as one string, so every segment
+  // is quoted:  a path with a space in it would otherwise be split into the
+  // wrong words and the job would never start.
+  const command = [config.nodePath, config.nonceScript, config.nonceDir, config.nonce]
+    .map(quoteShellSegment)
+    .join(" ");
   const enqueued = leases.enqueue({
     version: PLACEMENT_WIRE_VERSION,
     controllerId: config.controllerId,
@@ -99,15 +82,14 @@ async function main(): Promise<void> {
     audience: config.controllerId,
     source: { read: () => record },
     transport: createWorkerTransport(leases),
-    readBody,
+    readBody: readWorkerBody,
   });
   const server = createServer((req, res) => {
     void boundary(req, res).catch(() => {
       res.destroy();
     });
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const { port } = z.object({ port: z.number() }).parse(server.address());
+  const port = await listenOnLoopback(server);
 
   // The ready file is the only signal the producer waits for:  it appears
   // after the job is queued and the socket is listening, so the worker never
@@ -138,7 +120,7 @@ async function main(): Promise<void> {
     exitCode: job.report?.exitCode ?? null,
   }, null, 2)}\n`, { mode: 0o600 });
 
-  await new Promise<void>((resolve) => server.close(() => resolve()));
+  await closeWorkerServer(server);
   store.close();
 }
 
