@@ -81,6 +81,7 @@ struct MacPhoneSettings: View {
                             .resizable()
                             .interpolation(.none)
                             .frame(width: 180, height: 180)
+                            .accessibilityLabel("Pairing Code QR")
                     }
                     Text(PhoneSettingsDisplay.groupedCode(window.code))
                         .font(.system(size: 32, weight: .semibold, design: .monospaced))
@@ -98,7 +99,7 @@ struct MacPhoneSettings: View {
                         Task {
                             errorMessage = nil
                             if await session.openPhonePairingWindow() == nil {
-                                errorMessage = "Could not open a pairing window. Make sure the listener is on."
+                                errorMessage = "Could not open a pairing window.\u{00A0} Make sure the listener is on."
                             }
                             await reload()
                         }
@@ -205,7 +206,7 @@ struct MacPhoneSettings: View {
                 } else {
                     renderedQRKey = nil
                     renderedQR = nil
-                    errorMessage = "Could not draw the pairing code. Tap Refresh to try again."
+                    errorMessage = "Could not draw the pairing code.\u{00A0} Select Refresh to try again."
                 }
             }
         } else {

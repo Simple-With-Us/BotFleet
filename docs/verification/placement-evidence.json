@@ -15,7 +15,8 @@
     "other-apps-unchanged": false,
     "inventory-recorded": false,
     "rollback-keeps-epoch": false,
-    "connect-and-revert-clean": false
+    "connect-and-revert-clean": false,
+    "server-first-mac-asleep-iphone": false
   },
   "handRun": {},
   "inventory": {}

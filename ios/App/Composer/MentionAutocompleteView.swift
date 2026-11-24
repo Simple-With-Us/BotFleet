@@ -97,10 +97,10 @@ public struct MentionAutocompleteView: View {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 5) {
                     Image(systemName: trigger == "@" ? "at" : "number")
-                        .font(.system(size: 11, weight: .bold))
+                        .font(.scaled(11, weight: .bold, relativeTo: .caption2))
                         .foregroundColor(accentColor)
                     Text(trigger == "@" ? "BOTS" : "CHANNELS")
-                        .font(.system(size: 9.5, weight: .heavy, design: .monospaced))
+                        .font(.scaled(9.5, weight: .heavy, design: .monospaced, relativeTo: .caption2))
                         .foregroundColor(isDark ? Color(hex: "#94A3B8") : Color(hex: "#64748B"))
                     Spacer()
                 }
@@ -126,11 +126,11 @@ public struct MentionAutocompleteView: View {
                                     }
                                     VStack(alignment: .leading, spacing: 1) {
                                         Text("\(trigger)\(item.name)")
-                                            .font(.system(size: 13, weight: .semibold))
+                                            .font(.scaled(13, weight: .semibold, relativeTo: .footnote))
                                             .foregroundColor(.primary)
                                         if let detail = item.detail, !detail.isEmpty {
                                             Text(detail)
-                                                .font(.system(size: 10))
+                                                .font(.scaled(10, relativeTo: .caption2))
                                                 .foregroundColor(.secondary)
                                                 .lineLimit(1)
                                         }
