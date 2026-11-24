@@ -150,6 +150,16 @@ struct BotFleetMacApp: App {
                 }
                 .disabled(session.isShuttingDownServer)
 
+                Button("Start Shared VM") {
+                    Task { await session.startSharedVM() }
+                }
+                .disabled(!(session.controlStatus?.canStartSharedVM ?? false) || session.isControllingVM)
+
+                Button("Stop Local VMs") {
+                    Task { await session.stopLocalVMs() }
+                }
+                .disabled(!(session.controlStatus?.canStopSharedVM ?? false) || session.isControllingVM)
+
                 Divider()
 
                 Menu("Settings Section") {
@@ -237,6 +247,8 @@ struct BotFleetMacApp: App {
                             }
                         } else if section == .servers {
                             MacServersSettings(coordinator: session.servers) { session.connect(host: $0) }
+                        } else if section == .lifecycle {
+                            MacLifecycleSettingsView(session: session)
                         } else if section == .resources {
                             MacResourcesSettings(coordinator: session.resources)
                         } else if section == .secrets {

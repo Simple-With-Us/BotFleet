@@ -560,9 +560,12 @@ public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identif
     /// available yet instead of showing a stamp in its place.
     public var isImplemented: Bool {
         switch self {
-        case .general, .servers, .resources, .secrets, .permissions, .phone:
+        // BF-2688 gave `.lifecycle` a screen:  the harness status, the Local
+        // VM controls and the startup policy, the product half of the
+        // Decision 1 Option C split.
+        case .general, .servers, .resources, .secrets, .permissions, .phone, .lifecycle:
             return true
-        case .models, .voice, .shortcuts, .lifecycle:
+        case .models, .voice, .shortcuts:
             return false
         }
     }
@@ -576,8 +579,7 @@ public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identif
         case .models: return "Model settings are not available yet."
         case .voice: return "Voice settings are not available yet."
         case .shortcuts: return "Shortcuts are not available yet."
-        case .lifecycle: return "Lifecycle settings are not available yet."
-        case .general, .servers, .resources, .secrets, .permissions, .phone:
+        case .general, .servers, .resources, .secrets, .permissions, .phone, .lifecycle:
             return ""
         }
     }
