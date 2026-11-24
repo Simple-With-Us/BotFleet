@@ -213,6 +213,42 @@ struct NativeMacServicesParityTests {
         let expiredSkewSpend = await skewLedger.rollingSpend(windowSeconds: 60, now: t0.addingTimeInterval(361))
         #expect(abs(expiredSkewSpend - 0.0) < 0.0001)
 
+        // Idempotent replay succeeds even when now shifts backward past defaultMaxFutureSkewSeconds.
+        try await skewLedger.record(CostLedgerEntry(
+            id: "skew-1",
+            botId: "bot-a",
+            threadId: "thread-a",
+            provider: "anthropic",
+            model: "claude-sonnet",
+            inputTokens: 10,
+            outputTokens: 5,
+            estimatedCostUSD: 99.0,
+            isPriced: true,
+            recordedAt: t0.addingTimeInterval(300).timeIntervalSince1970
+        ), now: t0.addingTimeInterval(-60))
+        #expect(await skewLedger.totals().entryCount == 1)
+
+        // Persisted future-dated entries are counted in rollingSpend (matching server/rolling-spend.ts).
+        let futureFileURL = dir.appendingPathComponent("future-cost-ledger.json")
+        let persistedFutureEntries = [
+            CostLedgerEntry(
+                id: "persisted-future-1",
+                botId: "bot-a",
+                threadId: "thread-a",
+                provider: "anthropic",
+                model: "claude-sonnet",
+                inputTokens: 10,
+                outputTokens: 5,
+                estimatedCostUSD: 2.50,
+                isPriced: true,
+                recordedAt: t0.addingTimeInterval(600).timeIntervalSince1970
+            ),
+        ]
+        try JSONEncoder().encode(persistedFutureEntries).write(to: futureFileURL)
+        let persistedFutureLedger = try CostLedgerService(storageURL: futureFileURL)
+        let persistedFutureSpend = await persistedFutureLedger.rollingSpend(windowSeconds: 60, now: t0)
+        #expect(abs(persistedFutureSpend - 2.50) < 0.0001)
+
         // Low priced share fails open (mirroring server/rolling-spend.ts spendCeilingDecision).
         try await skewLedger.record(CostLedgerEntry(
             id: "unpriced-1",
@@ -257,6 +293,49 @@ struct NativeMacServicesParityTests {
             now: t0.addingTimeInterval(10)
         )
         #expect(enforcedVerdict == .exceeded(spentUSD: 4.0, ceilingUSD: 3.0))
+
+        // Unconfigured or non-positive/non-finite spend ceilings fail open (matching server/rolling-spend.ts).
+        for unconfiguredCeiling in [0.0, -5.0, Double.nan] {
+            let unconfiguredVerdict = await skewLedger.checkAdmission(
+                ceiling: RollingSpendCeiling(windowSeconds: 600, maxSpendUSD: unconfiguredCeiling, minPricedShare: 0.25),
+                now: t0.addingTimeInterval(10)
+            )
+            #expect(unconfiguredVerdict.isAllowed == true)
+            #expect(unconfiguredVerdict == .allowed(remainingUSD: .infinity))
+        }
+
+        // Token totals saturate at Int.max rather than trapping on overflow.
+        let saturatingLedger = CostLedgerService()
+        try await saturatingLedger.record(CostLedgerEntry(
+            id: "sat-1",
+            botId: "bot-sat",
+            threadId: "thread-sat",
+            provider: "anthropic",
+            model: "claude-sonnet",
+            inputTokens: Int.max - 5,
+            outputTokens: Int.max - 2,
+            cachedInputTokens: Int.max - 1,
+            estimatedCostUSD: 0.10,
+            isPriced: true,
+            recordedAt: t0.timeIntervalSince1970
+        ), now: t0)
+        try await saturatingLedger.record(CostLedgerEntry(
+            id: "sat-2",
+            botId: "bot-sat",
+            threadId: "thread-sat",
+            provider: "anthropic",
+            model: "claude-sonnet",
+            inputTokens: 100,
+            outputTokens: 50,
+            cachedInputTokens: 20,
+            estimatedCostUSD: 0.10,
+            isPriced: true,
+            recordedAt: t0.addingTimeInterval(1).timeIntervalSince1970
+        ), now: t0)
+        let saturatedTotals = await saturatingLedger.totals(forBotId: "bot-sat")
+        #expect(saturatedTotals.inputTokens == Int.max)
+        #expect(saturatedTotals.outputTokens == Int.max)
+        #expect(saturatedTotals.cachedInputTokens == Int.max)
     }
 
     // MARK: - NativeFaultBannerStore (BF-2618)
