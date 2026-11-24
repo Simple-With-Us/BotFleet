@@ -4,12 +4,18 @@
 # VITE_SENTRY_DSN at build time, so it must be in the environment before
 # `pnpm package:mac:local` (or any other package:* script) starts.
 #
-# Resolution order per name: already-exported environment variable ->
-# the shared scoped reader (Infisical Fleet-OPS prod, /botfleet-sentry;
-# AFC-359: the retired secrets folder is never read) -> the `infisical` CLI (only if
-# it is on PATH and already logged in -- this script never runs `infisical
-# login`).  A value found for SENTRY_DSN but not VITE_SENTRY_DSN is copied
-# across, since they are meant to be the same DSN.
+# Resolution order per name: the shared scoped reader (Infisical
+# Fleet-OPS prod, /botfleet-sentry; AFC-359: the retired secrets folder is
+# never read) -> the `infisical` CLI (only if it is on PATH and already
+# logged in -- this script never runs `infisical login`).  A value found
+# for SENTRY_DSN but not VITE_SENTRY_DSN is copied across, since they are
+# meant to be the same DSN.
+#
+# THE ENVIRONMENT IS NOT A SOURCE (OPS-1108).  An exported DSN was
+# removed here:  the store is the only source, and an inherited copy
+# never displaces the reviewed grant (owner ruling, November 22, 2026).
+# Nothing breaks when the store has nothing:  the package ships with
+# Sentry inert, which is what the script has always done for a missing DSN.
 # Never echoes, logs, traces, or otherwise prints a resolved value.
 #
 # Usage:
@@ -67,11 +73,11 @@ resolve_secret() {
   { set +x; } 2>/dev/null
 
   local name="$1"
-  local val="${!name:-}"
+  # The environment is not a source:  the read below is the store, and
+  # nothing the caller exported is looked at.
+  local val=""
 
-  if [[ -z "$val" ]]; then
-    val="$(fleet_secret_get "$name" "$SENTRY_FOLDER" "$SENTRY_SECRET_ACCOUNT" </dev/null 2>/dev/null || true)"
-  fi
+  val="$(fleet_secret_get "$name" "$SENTRY_FOLDER" "$SENTRY_SECRET_ACCOUNT" </dev/null 2>/dev/null || true)"
 
   if [[ -z "$val" ]] && command -v infisical >/dev/null 2>&1; then
     local project_id="${INFISICAL_PROJECT_ID:-}"
@@ -99,7 +105,7 @@ if [[ -z "$SENTRY_DSN" ]]; then
 fi
 
 if [[ -z "$SENTRY_DSN" ]]; then
-  echo "[with-sentry-dsn] no SENTRY_DSN found (checked env, the scoped reader $SENTRY_FOLDER, the infisical CLI); packaging with Sentry inert" >&2
+  echo "[with-sentry-dsn] no SENTRY_DSN found (checked the scoped reader $SENTRY_FOLDER and the infisical CLI); packaging with Sentry inert" >&2
 fi
 
 export SENTRY_DSN VITE_SENTRY_DSN
