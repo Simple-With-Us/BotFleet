@@ -3,11 +3,14 @@ import Foundation
 /// Errors emitted when registering interactive Mac bot execution profiles.
 public enum MacExecutionContextError: LocalizedError, Equatable, Sendable {
     case invalidProfile(String)
+    case externalExecutionContextActive
 
     public var errorDescription: String? {
         switch self {
         case .invalidProfile(let detail):
             return "Invalid Mac execution profile: \(detail)"
+        case .externalExecutionContextActive:
+            return "Cannot register interactive Mac bot profile while a custom NativeExecutionContextSource overrides MacExecutionContext."
         }
     }
 }
@@ -94,10 +97,13 @@ public actor MacExecutionContext: NativeExecutionContextSource {
         do {
             result = try await credentials.credentials(forBotId: profile.id)
         } catch {
-            guard !stopped, revision == generation else { throw NativeRuntimeServicesError.stopped }
+            if stopped { throw NativeRuntimeServicesError.stopped }
             return .held(.credentialsUnavailable)
         }
-        guard !stopped, revision == generation else { throw NativeRuntimeServicesError.stopped }
+        if stopped { throw NativeRuntimeServicesError.stopped }
+        guard revision == generation else {
+            return .held(.credentialsUnavailable)
+        }
         guard case .available(let environment) = result else {
             return .held(.credentialsUnavailable)
         }
@@ -106,10 +112,17 @@ public actor MacExecutionContext: NativeExecutionContextSource {
         }) else {
             return .held(.credentialsUnavailable)
         }
-        guard let workspace = try await workspaceSource.workspaceRoot(forRegisteredBotId: profile.id) else {
+        let workspace: URL?
+        do {
+            workspace = try await workspaceSource.workspaceRoot(forRegisteredBotId: profile.id)
+        } catch {
+            if stopped { throw NativeRuntimeServicesError.stopped }
             return .held(.credentialsUnavailable)
         }
-        guard !stopped, revision == generation else { throw NativeRuntimeServicesError.stopped }
+        if stopped { throw NativeRuntimeServicesError.stopped }
+        guard revision == generation, let workspace else {
+            return .held(.credentialsUnavailable)
+        }
         return .ready(
             TurnInput(
                 threadId: profile.threadId,
