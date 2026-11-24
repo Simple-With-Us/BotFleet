@@ -349,6 +349,22 @@ describe("a launched child", () => {
     }
   });
 
+  it("gives the child the bearer once the wait has landed", async () => {
+    // Every driver waits for the read before it spawns, so the child the
+    // engine starts carries the credential rather than reaching for it
+    // afterwards.
+    const stub = stubVault({ [FLEET_BEARER_ENV_NAME]: SENTINEL_BEARER });
+    setFleetBearerVault(stub.reader);
+    primeSeatCredentials("BF-ORACLE");
+    await awaitSeatCredentials("BF-ORACLE");
+    const env = launchedChildCredentials(
+      { PATH: "/usr/bin" },
+      { seat: "BF-ORACLE", session: "thread-6" },
+      "BF-ORACLE",
+    );
+    expect(env[FLEET_BEARER_ENV_NAME]).toBe(SENTINEL_BEARER);
+  });
+
   it("never puts the bearer in the config, the process environment or a log line", async () => {
     const stub = stubVault({ [FLEET_BEARER_ENV_NAME]: SENTINEL_BEARER });
     setFleetBearerVault(stub.reader);

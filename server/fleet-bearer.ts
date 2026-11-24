@@ -224,8 +224,26 @@ export function primeFleetBearer(seat: string | null | undefined): void {
 }
 
 /** The seats already reported as having no bearer, so the report is once
- * per seat and not once per turn. */
+ * per seat and not once per turn.
+ *
+ * The set is bounded like the cache:  a seat string nobody expected must
+ * not grow the map for the life of the process, and the least recently
+ * used seat is the one that goes. */
 const reportedWithoutBearer = new Set<string>();
+
+/** How many seats' absence may be remembered. */
+const REPORTED_WITHOUT_BEARER_MAX = 32;
+
+/** Say that a seat has no bearer, once. */
+function noteReportedWithoutBearer(seat: string): void {
+  reportedWithoutBearer.delete(seat);
+  reportedWithoutBearer.add(seat);
+  while (reportedWithoutBearer.size > REPORTED_WITHOUT_BEARER_MAX) {
+    const oldest = reportedWithoutBearer.keys().next();
+    if (oldest.done) return;
+    reportedWithoutBearer.delete(oldest.value);
+  }
+}
 
 /** The seat's cached fleet bearer, as the environment variable the fleet's
  * tools read.
@@ -243,7 +261,11 @@ export function fleetBearerEnvironment(seat: string | null | undefined) {
   if (!seat) return {};
   const entry = readEntry(seat);
   if (!entry?.value) {
-    reportMissingBearer(seat);
+    // A read that is still in flight is not an absent bearer:  the first
+    // turn of a seat would otherwise be reported as a gap that is really
+    // only a read that has not come back yet, and the once-only guard
+    // would then hide the real report.
+    if (!inflight.has(seat)) reportMissingBearer(seat);
     return {};
   }
   // A bearer that is older than the stale window is not served:  the vault
@@ -260,7 +282,7 @@ export function fleetBearerEnvironment(seat: string | null | undefined) {
  * seat is not a secret;  nothing else is. */
 function reportMissingBearer(seat: string): void {
   if (reportedWithoutBearer.has(seat)) return;
-  reportedWithoutBearer.add(seat);
+  noteReportedWithoutBearer(seat);
   console.warn(
     `[fleet-bearer] ${seat}: no fleet bearer is available, so this seat's fleet tools will not answer; the child runs without one`,
   );

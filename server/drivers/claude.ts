@@ -51,8 +51,8 @@ export { STATIC_CLAUDE_MODELS };
 import { computerProxyEnv } from "../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials } from "../child-credentials.ts";
-import { FLEET_BEARER_ENV_NAME } from "../secret-map.ts";
+import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials, seatCredentialsReady } from "../child-credentials.ts";
+import { CLI_LOGIN_ENV_NAMES, FLEET_BEARER_ENV_NAME } from "../secret-map.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import {
   applyClaudeInject,
@@ -1171,12 +1171,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       let preflightError: unknown;
       const preflight = { turnId, stop: () => { preflightCancelled = true; } };
       active.set(threadId, preflight);
+      // The seat's credential read is started before the guard, so it may
+      // still be in flight here.  Waiting for it here — after the
+      // registration, which must stay synchronous with the guard — means
+      // the child is spawned with the credential rather than without it.
+      if (!seatCredentialsReady(turn.launchIdentity?.seat)) await awaitSeatCredentials(turn.launchIdentity?.seat);
       try {
-        // The seat's credential read is started before the guard, so it may
-        // still be in flight here.  Waiting for it here — after the
-        // registration, which must stay synchronous with the guard — means
-        // the child is spawned with the credential rather than without it.
-        await awaitSeatCredentials(turn.launchIdentity?.seat);
         await requireStrictMcp();
       } catch (error) {
         preflightError = error;
@@ -1401,6 +1401,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         // before the read landed is replaced by one that carries it,
         // instead of holding no bearer for every later turn.
         hasFleetBearer: env[FLEET_BEARER_ENV_NAME] !== undefined,
+        // The same for the seat's CLI login:  a process spawned before that
+        // read landed was retained without it, and the contract is what
+        // decides whether a process is reused.
+        hasCliLogin: Object.keys(env).some((name) => CLI_LOGIN_ENV_NAMES.includes(name)),
       });
 
       // What the user turn carries besides its text.  The volatile half rides

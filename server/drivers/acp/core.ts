@@ -85,7 +85,7 @@ import type {
   ProviderErrorCode,
 } from "../../contracts.ts";
 import { newEventId, newId } from "../../contracts.ts";
-import { launchedChildCredentials, primeSeatCredentials } from "../../child-credentials.ts";
+import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials, seatCredentialsReady } from "../../child-credentials.ts";
 import { hostToolPrefix, turnComputerMounts } from "../../computer-grants.ts";
 import { augmentedPath } from "../../env-path.ts";
 
@@ -1068,6 +1068,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // this thread would walk through the guard the first one already
         // passed.
         primeSeatCredentials(turn.launchIdentity?.seat);
+      // The seat's credential read is started here, before the guard, so
+      // it may still be in flight.  Waiting for it before the guard
+      // keeps the slot free while the vault answers and leaves the
+      // guard and the registration that follows it atomic.
+      if (!seatCredentialsReady(turn.launchIdentity?.seat)) await awaitSeatCredentials(turn.launchIdentity?.seat);
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
         const turnId = newId();
         // Carried across a relaunch (see maybeRetry): `attempt` is how many

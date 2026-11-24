@@ -23,6 +23,7 @@
 
 import { applyCliLogins, awaitCliLogin, cliLoginEnvironment, primeCliLogin } from "./cli-logins.ts";
 import { applyFleetBearer, awaitFleetBearer, fleetBearerEnvironment, primeFleetBearer } from "./fleet-bearer.ts";
+import { FLEET_BEARER_ENV_NAME } from "./secret-map.ts";
 import { applyLaunchIdentity } from "./launch-identity.ts";
 import type { LaunchIdentity } from "./contracts.ts";
 
@@ -60,6 +61,20 @@ export function primeSeatCredentials(seat: string | null | undefined): void {
 export async function awaitSeatCredentials(seat: string | null | undefined): Promise<void> {
   await awaitCliLogin(seat);
   await awaitFleetBearer(seat);
+}
+
+/**
+ * Whether the seat's credentials are already here.
+ *
+ * The wait is only worth taking when they are not:  a driver that awaits
+ * one it does not need defers its thread's registration by a microtask,
+ * and a registration that a caller can miss is a turn that cannot be
+ * stopped.  So the check is a plain read, and the wait happens only when
+ * the seat's credentials are genuinely absent.
+ */
+export function seatCredentialsReady(seat: string | null | undefined): boolean {
+  if (!seat) return true;
+  return cliLoginEnvironment(seat).GH_TOKEN !== undefined || fleetBearerEnvironment(seat)[FLEET_BEARER_ENV_NAME] !== undefined;
 }
 
 /**

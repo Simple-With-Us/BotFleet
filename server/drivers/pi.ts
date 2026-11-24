@@ -55,7 +55,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { EFFORT_LEVELS, newEventId, newId } from "../contracts.ts";
-import { launchedChildCredentials, primeSeatCredentials } from "../child-credentials.ts";
+import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials, seatCredentialsReady } from "../child-credentials.ts";
 import {
   decodeInjectId,
   encodeInjectId,
@@ -527,6 +527,11 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       // have to stay free of `await`, or a second turn on this thread would walk
       // through the guard the first one already passed.
       primeSeatCredentials(turn.launchIdentity?.seat);
+      // The seat's credential read is started here, before the guard, so
+      // it may still be in flight.  Waiting for it before the guard
+      // keeps the slot free while the vault answers and leaves the
+      // guard and the registration that follows it atomic.
+      if (!seatCredentialsReady(turn.launchIdentity?.seat)) await awaitSeatCredentials(turn.launchIdentity?.seat);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       // Host control always routes through the permission card: the
       // pi-mcp-extension gates every `local-computer` scoped call behind

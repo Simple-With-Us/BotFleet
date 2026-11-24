@@ -75,7 +75,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { launchedChildCredentials, primeSeatCredentials } from "../child-credentials.ts";
+import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials, seatCredentialsReady } from "../child-credentials.ts";
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "antigravityAgent";
@@ -742,6 +742,11 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       primeSeatCredentials(turn.launchIdentity?.seat);
       if (active.has(threadId) || pending.has(threadId)) throw new Error("a turn is already running on this thread");
       pending.add(threadId);
+      // The seat's credential read is started before the guard, so it may
+      // still be in flight here.  Waiting for it after the registration —
+      // which must stay synchronous with the guard — means the child is
+      // spawned with the credential rather than without it.
+      if (!seatCredentialsReady(turn.launchIdentity?.seat)) await awaitSeatCredentials(turn.launchIdentity?.seat);
       const turnId = newId();
       // Carried across a relaunch (see maybeRetry): `attempt` counts the
       // transient failures this logical turn has already absorbed, and

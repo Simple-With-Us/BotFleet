@@ -29,7 +29,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { stripWorkspaceCredentialEnv } from "../config.ts";
-import { launchedChildCredentials, primeSeatCredentials } from "../child-credentials.ts";
+import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials, seatCredentialsReady } from "../child-credentials.ts";
 import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
@@ -333,6 +333,11 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
       // Reserve the slot synchronously: the awaits below would otherwise let
       // a second sendTurn on the same thread pass the guard above.
       active.set(threadId, { stop: () => {}, turnId });
+      // The seat's credential read is started before the guard, so it may
+      // still be in flight here.  Waiting for it after the registration —
+      // which must stay synchronous with the guard — means the child is
+      // spawned with the credential rather than without it.
+      if (!seatCredentialsReady(turn.launchIdentity?.seat)) await awaitSeatCredentials(turn.launchIdentity?.seat);
       let settled = false;
 
       const message = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;

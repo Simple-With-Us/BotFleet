@@ -15,7 +15,7 @@ import type {
   TurnStartResult,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { launchedChildCredentials, primeSeatCredentials } from "../child-credentials.ts";
+import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials, seatCredentialsReady } from "../child-credentials.ts";
 import { PROVIDER_CREDENTIAL_ENV, stripWorkspaceCredentialEnv } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
 import { describeSpawnFailure, execCli, isProbeTimeout, killCliTree, spawnCli } from "../procs.ts";
@@ -221,6 +221,11 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
         // this thread would walk through the guard the first one already
         // passed.
         primeSeatCredentials(turnInput.launchIdentity?.seat);
+      // The seat's credential read is started here, before the guard, so
+      // it may still be in flight.  Waiting for it before the guard
+      // keeps the slot free while the vault answers and leaves the
+      // guard and the registration that follows it atomic.
+      if (!seatCredentialsReady(turnInput.launchIdentity?.seat)) await awaitSeatCredentials(turnInput.launchIdentity?.seat);
         if (children.has(threadId)) throw new Error("a turn is already running on this thread");
 
         // Every driver opens its turn here, and sentry-ai.ts opens the
