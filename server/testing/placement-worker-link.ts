@@ -90,5 +90,13 @@ export function listenOnLoopback(server: Server, port = 0): Promise<number> {
  */
 export function closeWorkerServer(server: Server): Promise<void> {
   server.closeAllConnections();
-  return new Promise<void>((resolve) => server.close(() => resolve()));
+  return new Promise<void>((resolve, reject) =>
+    server.close((error?: Error) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    }),
+  );
 }
