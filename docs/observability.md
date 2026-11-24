@@ -193,12 +193,15 @@ the field leaves the stored value untouched).
    other install.  A total resolution failure warns and continues — it never
    fails the build.
 5. **Local desktop packaging.**  `scripts/with-sentry-dsn.sh` wraps a local
-   `pnpm package:mac:local` (or any other `package:*` script) with the same
-   three-tier resolution — already-exported environment, then
-   `fleet-secrets get NAME --path /botfleet-sentry` (Infisical Fleet-OPS),
-   then the `infisical` CLI (only if already logged in; this script never
-   calls `infisical login`) — and exports both `SENTRY_DSN` and
-   `VITE_SENTRY_DSN` before executing the wrapped command.  It turns xtrace
+   `pnpm package:mac:local` (or any other `package:*` script) with the
+   store — the shared scoped reader at `/botfleet-sentry` (Infisical
+   Fleet-OPS), then the `infisical` CLI (only if already logged in; this
+   script never calls `infisical login`) — and exports both `SENTRY_DSN` and
+   `VITE_SENTRY_DSN` before executing the wrapped command.  The
+   already-exported environment was the first tier and is gone (OPS-1108):
+   the environment is not a source, so an inherited DSN no longer displaces
+   the store's answer.  A missing DSN is still not an error: the package
+   ships with Sentry inert.  It turns xtrace
    off before it reads anything, so neither `bash -x` nor an inherited
    `SHELLOPTS` can echo a resolved value, and it never prints one in any
    branch.  Usage:
