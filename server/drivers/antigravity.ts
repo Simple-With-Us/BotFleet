@@ -758,7 +758,17 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       // still be in flight here.  Waiting for it after the registration —
       // which must stay synchronous with the guard — means the child is
       // spawned with the credential rather than without it.
-      if (!seatCredentialsReady(turn.launchIdentity?.seat)) await awaitSeatCredentials(turn.launchIdentity?.seat);
+      if (!seatCredentialsReady(turn.launchIdentity?.seat)) {
+        try {
+          await awaitSeatCredentials(turn.launchIdentity?.seat);
+        } catch (error) {
+          // Release the pending claim before the failure propagates:  no
+          // child exists yet, and a stale entry would refuse every later
+          // turn on this thread as already running.
+          pending.delete(threadId);
+          throw error;
+        }
+      }
       const turnId = newId();
       // Carried across a relaunch (see maybeRetry): `attempt` counts the
       // transient failures this logical turn has already absorbed, and
