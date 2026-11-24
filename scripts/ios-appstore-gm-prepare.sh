@@ -23,6 +23,14 @@ fi
 # Fleet names (ASC_*) if a sibling copy is ever mapped; otherwise the
 # six Plumber-set BotFleet names.  APPLE_API_KEY_P8_BASE64 is base64 of
 # the p8 body (the retired ios-testflight.yml decoded it the same way).
+#
+# PAIRED, NOT REMOVED (OPS-1108).  These names are still read from the
+# environment, which is the workflow's own copy of them, and they stay until
+# the hosted ship job binds the store instead of exporting a copy:  a
+# hosted runner has no scoped reader, so removing this read on its own would
+# take the signing identity with it and break the ship.  The
+# workflow-side change is filed and blocked, so the read stays and this note
+# names why.
 if [[ -z "${ASC_KEY_ID:-}" && -n "${APPLE_API_KEY_ID:-}" ]]; then
   ASC_KEY_ID="$APPLE_API_KEY_ID"
 fi
