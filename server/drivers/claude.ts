@@ -1176,7 +1176,17 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // still be in flight here.  Waiting for it here — after the
       // registration, which must stay synchronous with the guard — means
       // the child is spawned with the credential rather than without it.
-      if (!seatCredentialsReady(turn.launchIdentity?.seat)) await awaitSeatCredentials(turn.launchIdentity?.seat);
+      if (!seatCredentialsReady(turn.launchIdentity?.seat)) {
+        try {
+          await awaitSeatCredentials(turn.launchIdentity?.seat);
+        } catch (error) {
+          // The slot is claimed but no child exists yet:  a failed credential
+          // read must release the claim before the failure propagates, or
+          // every later turn on this thread is refused as already running.
+          if (active.get(threadId) === preflight) active.delete(threadId);
+          throw error;
+        }
+      }
       try {
         await requireStrictMcp();
       } catch (error) {
