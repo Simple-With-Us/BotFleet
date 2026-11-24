@@ -100,6 +100,28 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// toggles went back to their previous values.
     @Published public var lifecycleErrorMessage: String?
 
+    // Server status, Local VM controls and startup policy (BF-2688, Decision 1 Option C)
+    /// What `GET /api/system/control` last answered.  `nil` until the first
+    /// read lands, and left in place after a failed read so the section shows
+    /// the last known state beside the reason the refresh failed.
+    @Published public var controlStatus: MacControlStatus?
+    /// Why the last status read or VM action failed.
+    @Published public var controlStatusError: String?
+    @Published public var isRefreshingControlStatus = false
+    @Published public var isControllingVM = false
+    /// What the last VM action did, so the button is not the only witness.
+    @Published public var vmActionMessage: String?
+    /// The harness startup policy as the data directory's markers state it.
+    @Published public var startupPolicy: MacServerLoginPolicy = .legacy
+    /// Whether the installed wrapper honours the policy markers at all.  A
+    /// wrapper from before the policy ignores them, and the toggle says so
+    /// instead of writing files that change nothing.
+    @Published public private(set) var supportsStartupPolicy = false
+    /// Why the last startup-policy change failed.
+    @Published public var startupPolicyErrorMessage: String?
+    /// The startup-policy store for this Mac's data directory.
+    public let startupPolicyStore: MacStartupPolicyStore
+
     // Native companion listener lifecycle (BF-2590, the lifecycle half of BF-2511)
     /// What the native companion listener is doing, mirrored from the
     /// controller so the Settings section observes it.
@@ -179,9 +201,11 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
 
     public init(
         policyStore: MacPersistencePolicyStore = MacPersistencePolicyStore(),
+        startupPolicyStore: MacStartupPolicyStore = MacStartupPolicyStore(),
         permissionMonitor: CuaPermissionMonitor = CuaPermissionMonitor()
     ) {
         self.policyStore = policyStore
+        self.startupPolicyStore = startupPolicyStore
         let hostStore = HostStore(fileURL: policyStore.dataDir.appendingPathComponent("hosts.json"))
         self.servers = ServersCoordinator(store: hostStore)
         self.resources = ResourcesCoordinator(store: hostStore)
@@ -728,6 +752,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         // than as a setting that has not been read yet.
         Task { @MainActor [weak self] in
             await self?.refreshLifecycleSettings()
+            self?.refreshStartupPolicy()
             await self?.companionListener.applyLaunch()
         }
         let generation = connectionGeneration
@@ -949,6 +974,15 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
                     refreshLifecycleSettings: { [weak self] in
                         guard let self, self.connectionGeneration == generation, !Task.isCancelled else { return }
                         await self.refreshLifecycleSettings()
+                        // The policy read is a couple of file stats and
+                        // rides here;  the status read can take the harness
+                        // tens of seconds, so it runs detached rather than
+                        // holding the connection's hydration for it.
+                        self.refreshStartupPolicy()
+                        Task { [weak self, generation] in
+                            guard let self, self.connectionGeneration == generation, !Task.isCancelled else { return }
+                            await self.refreshControlStatus()
+                        }
                     }
                 )
                 guard connectionGeneration == generation, !Task.isCancelled else { return }
@@ -1077,6 +1111,126 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         await nativeListenerBackend.setAllowRemoteDesktopLaunch(
             lifecycleSettings.nativeDesktopLaunchAllowed
         )
+    }
+
+    // MARK: - Server Status & Local VM Controls (BF-2688, Decision 1 Option C)
+
+    /// The message when the control routes must not be asked at all.
+    private static let controlClientUnavailableMessage =
+        "The server controls answer only to the harness on this Mac."
+
+    /// The control-status client — and only for this Mac's loopback harness.
+    ///
+    /// The routes it calls answer only to the loopback and carry no token, so
+    /// a remote server must never be asked them:  an unauthenticated start or
+    /// stop POST sent to a remote address would be both refused and wrong.
+    /// `nil` means the connection is not loopback, or the endpoint is
+    /// malformed, and the caller says so instead of guessing.
+    private func makeControlStatusClient() -> MacControlStatusClient? {
+        let normalized = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let isLoopback = normalized == "localhost"
+            || normalized == "::1"
+            || normalized == "[::1]"
+            || normalized.hasPrefix("127.")
+        guard isLoopback else { return nil }
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let formattedHost = trimmedHost.contains(":") && !trimmedHost.hasPrefix("[")
+            ? "[\(trimmedHost)]"
+            : trimmedHost
+        guard let baseURL = URL(string: "http://\(formattedHost):\(port)") else { return nil }
+        return MacControlStatusClient(baseURL: baseURL)
+    }
+
+    /// Reads the harness status once per connection, the same cadence the
+    /// other lifecycle reads keep — but detached from them, because the
+    /// harness asks its container runtime about every VM before it answers,
+    /// and a slow answer must not hold up the event stream.  A failed read
+    /// keeps the last known state beside the reason, so a section that
+    /// answered a moment ago does not blank out because one request did.
+    public func refreshControlStatus() async {
+        guard !isRefreshingControlStatus else { return }
+        isRefreshingControlStatus = true
+        defer { isRefreshingControlStatus = false }
+        guard let client = makeControlStatusClient() else {
+            controlStatus = nil
+            controlStatusError = Self.controlClientUnavailableMessage
+            return
+        }
+        let generation = connectionGeneration
+        do {
+            let status = try await client.fetchStatus()
+            guard connectionGeneration == generation, !Task.isCancelled else { return }
+            controlStatus = status
+            controlStatusError = nil
+        } catch {
+            guard connectionGeneration == generation, !Task.isCancelled else { return }
+            controlStatusError = error.localizedDescription
+        }
+    }
+
+    /// Starts the shared Local VM from Settings or the menu.
+    public func startSharedVM() async {
+        await runVMAction { try await $0.startSharedVM() }
+    }
+
+    /// Stops every Local VM the harness manages.
+    public func stopLocalVMs() async {
+        await runVMAction { try await $0.stopLocalVMs() }
+    }
+
+    private func runVMAction(_ action: @Sendable (MacControlStatusClient) async throws -> String) async {
+        guard !isControllingVM else { return }
+        isControllingVM = true
+        defer { isControllingVM = false }
+        guard let client = makeControlStatusClient() else {
+            controlStatusError = Self.controlClientUnavailableMessage
+            return
+        }
+        let generation = connectionGeneration
+        do {
+            let note = try await action(client)
+            guard connectionGeneration == generation, !Task.isCancelled else { return }
+            vmActionMessage = note
+            controlStatusError = nil
+            await refreshControlStatus()
+        } catch {
+            guard connectionGeneration == generation, !Task.isCancelled else { return }
+            vmActionMessage = nil
+            controlStatusError = error.localizedDescription
+        }
+    }
+
+    // MARK: - Startup Policy (BF-2688, Decision 1 Option C)
+
+    /// Reads the startup policy from the data directory's markers.
+    ///
+    /// File reads, no harness round-trip, so this runs alongside the other
+    /// per-connection refreshes and after every change.
+    public func refreshStartupPolicy() {
+        startupPolicy = startupPolicyStore.loginPolicy()
+        supportsStartupPolicy = startupPolicyStore.supportsPolicy()
+    }
+
+    /// Sets "Start Server At Login" and records the boot session with it.
+    ///
+    /// A wrapper that predates the policy is refused with its own reason
+    /// instead of writing markers the wrapper would ignore, and a failed
+    /// write leaves the toggle on the value the data directory still holds.
+    public func setStartsAtLogin(_ enabled: Bool) {
+        guard supportsStartupPolicy else {
+            startupPolicyErrorMessage = MacStartupPolicyError.updateRequired.localizedDescription
+            startupPolicy = startupPolicyStore.loginPolicy()
+            return
+        }
+        do {
+            let bootSession = try startupPolicyStore.readBootSession()
+            try startupPolicyStore.setStartsAtLogin(enabled, bootSession: bootSession)
+            startupPolicy = startupPolicyStore.loginPolicy()
+            startupPolicyErrorMessage = nil
+        } catch {
+            startupPolicy = startupPolicyStore.loginPolicy()
+            startupPolicyErrorMessage = error.localizedDescription
+        }
     }
 
     public func shutDownServerAndLocalVM() async {

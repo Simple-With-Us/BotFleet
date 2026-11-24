@@ -93,10 +93,11 @@ final class MacHonestControlsTests: XCTestCase {
     // MARK: - The Settings sections with no screen behind them
 
     func testTheSectionsWithoutAScreenSaySo() {
-        //  These four render nothing but the version stamp, so they are not
-        //  available yet.  Lifecycle is reserved for its own slice and is not
-        //  filled in here.
-        for section in [MacSettingsSection.models, .voice, .shortcuts, .lifecycle] {
+        //  These three render nothing but the version stamp, so they are not
+        //  available yet.  Lifecycle used to be on this list and is not any
+        //  more:  BF-2688 gave it a screen, and the honest contract for a
+        //  section that gets one is the screen itself, not a stamp.
+        for section in [MacSettingsSection.models, .voice, .shortcuts] {
             XCTAssertFalse(section.isImplemented, section.displayTitle)
             XCTAssertFalse(section.unavailableCopy.isEmpty, section.displayTitle)
             XCTAssertTrue(
@@ -104,6 +105,17 @@ final class MacHonestControlsTests: XCTestCase {
                 section.unavailableCopy
             )
         }
+    }
+
+    func testTheLifecycleSectionHasAScreenBehindItNow() {
+        //  The Lifecycle section stopped being a placeholder when it took the
+        //  product controls over:  harness status, Local VM start and stop,
+        //  and the startup policy.  Its copy is empty because it has nothing
+        //  to apologise for.
+        let section = MacSettingsSection.lifecycle
+        XCTAssertTrue(section.isImplemented, section.displayTitle)
+        XCTAssertEqual(section.unavailableCopy, "", section.displayTitle)
+        XCTAssertEqual(section.displayTitle, "Lifecycle")
     }
 
     func testTheSectionsWithAScreenAreUnchanged() {
