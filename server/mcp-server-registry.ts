@@ -1,3 +1,4 @@
+/* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-known-value-widening, anti-slop/no-conditional-empty-object-spread -- The MCP server registry parses stored entries at their boundary, where the shape comes from a config file and a bot record, and the guards are the registry's own. */
 // The MCP servers a bot may mount:  the ones the workspace shares, and the
 // ones that belong to this bot alone.
 //
@@ -39,10 +40,16 @@ import type { McpServerSpec } from "./contracts.ts";
 import type { BotRecord } from "./store.ts";
 import { isJsonObject, type JsonValue } from "./schema.ts";
 import {
+  environmentNameError,
+  headerError,
   isHarnessOwnedMcpEnvName,
   isRemoteMcpServer,
+  MAX_ENV,
+  MAX_HEADERS,
   mcpServerNameError,
+  type McpOAuthClientConfig,
   type StoredMcpServer,
+  urlError,
 } from "./mcp-registry.ts";
 
 /** The servers this bot may mount, by name. */
@@ -83,19 +90,33 @@ export type McpServerView = RemoteMcpServerView | StdioMcpServerView;
 
 const stringRecord = z.record(z.string(), z.string());
 
-const stdioServerSchema = z.object({
-  command: z.string().trim().min(1),
-  args: z.array(z.string()).default([]),
-  env: stringRecord.default({}),
-  enabled: z.boolean().default(true),
-});
+/** The sign-in app a remote server carries, when it has one. */
+const oauthClientSchema = z
+  .object({
+    clientId: z.string().trim().min(1).max(512),
+    clientSecret: z.string().min(1).max(4096).optional(),
+    scopes: z.array(z.string().max(256)).max(32).optional(),
+  })
+  .strict();
 
-const remoteServerSchema = z.object({
-  type: z.enum(["http", "sse"]).default("http"),
-  url: z.string().trim().min(1),
-  headers: stringRecord.default({}),
-  enabled: z.boolean().default(true),
-});
+const stdioServerSchema = z
+  .object({
+    command: z.string().trim().min(1),
+    args: z.array(z.string()).default([]),
+    env: stringRecord.default({}),
+    enabled: z.boolean().default(true),
+  })
+  .strict();
+
+const remoteServerSchema = z
+  .object({
+    type: z.enum(["http", "sse"]).default("http"),
+    url: z.string().trim().min(1),
+    headers: stringRecord.default({}),
+    oauth: oauthClientSchema.optional(),
+    enabled: z.boolean().default(true),
+  })
+  .strict();
 
 /** The shape a stored server is read back in.  It is deliberately the
  * permissive one the workspace's own reader uses:  a stored entry that
@@ -112,36 +133,75 @@ export function parseMcpServerEntry(
   if (!isJsonObject(raw)) return { ok: false, reason: "expected an object" };
   const record: Record<string, JsonValue> = raw;
 
-  const remote = remoteServerSchema.safeParse(record);
-  if (remote.success) {
-    const badEnv = Object.keys(remote.data.headers).find((key) => isHarnessOwnedMcpEnvName(key));
-    if (badEnv) return { ok: false, reason: `header “${badEnv}” is reserved by the harness` };
+  // Exactly one transport.  An entry carrying both would parse as the
+  // remote one and silently drop the command, and an entry carrying
+  // neither is not a server at all.
+  const hasCommand = typeof record.command === "string" && record.command.length > 0;
+  const hasUrl = typeof record.url === "string" && record.url.length > 0;
+  if (hasCommand && hasUrl) {
+    return { ok: false, reason: "a server has either a command to run or an address to connect to, not both" };
+  }
+  if (!hasCommand && !hasUrl) return { ok: false, reason: "expected a command or a url" };
+
+  if (hasUrl) {
+    const remote = remoteServerSchema.safeParse(record);
+    if (!remote.success) {
+      return { ok: false, reason: remote.error.issues[0]?.message ?? "invalid remote server" };
+    }
+    const badAddress = urlError(remote.data.url);
+    if (badAddress) return { ok: false, reason: badAddress };
+    if (Object.keys(remote.data.headers).length > MAX_HEADERS) {
+      return { ok: false, reason: `use at most ${MAX_HEADERS} headers` };
+    }
+    for (const [header, value] of Object.entries(remote.data.headers)) {
+      const problem = headerError(header, value);
+      if (problem) return { ok: false, reason: problem };
+      if (isHarnessOwnedMcpEnvName(header)) {
+        return { ok: false, reason: `header “${header}” is reserved by the harness` };
+      }
+    }
+    const oauth: McpOAuthClientConfig | undefined = remote.data.oauth
+      ? {
+          clientId: remote.data.oauth.clientId,
+          ...(remote.data.oauth.clientSecret ? { clientSecret: remote.data.oauth.clientSecret } : {}),
+          ...(remote.data.oauth.scopes ? { scopes: remote.data.oauth.scopes } : {}),
+        }
+      : undefined;
     return {
       ok: true,
       server: {
         type: remote.data.type,
         url: remote.data.url,
         headers: remote.data.headers,
+        ...(oauth ? { oauth } : {}),
         enabled: remote.data.enabled,
       },
     };
   }
 
   const stdio = stdioServerSchema.safeParse(record);
-  if (stdio.success) {
-    const badEnv = Object.keys(stdio.data.env).find((key) => isHarnessOwnedMcpEnvName(key));
-    if (badEnv) return { ok: false, reason: `environment variable “${badEnv}” is reserved by the harness` };
-    return {
-      ok: true,
-      server: {
-        command: stdio.data.command,
-        args: stdio.data.args,
-        env: stdio.data.env,
-        enabled: stdio.data.enabled,
-      },
-    };
+  if (!stdio.success) {
+    return { ok: false, reason: stdio.error.issues[0]?.message ?? "invalid local server" };
   }
-  return { ok: false, reason: "expected a command or a url" };
+  if (Object.keys(stdio.data.env).length > MAX_ENV) {
+    return { ok: false, reason: `use at most ${MAX_ENV} environment variables` };
+  }
+  for (const [name_, value] of Object.entries(stdio.data.env)) {
+    const problem = environmentNameError(name_, value);
+    if (problem) return { ok: false, reason: problem };
+    if (isHarnessOwnedMcpEnvName(name_)) {
+      return { ok: false, reason: `environment variable “${name_}” is reserved by the harness` };
+    }
+  }
+  return {
+    ok: true,
+    server: {
+      command: stdio.data.command,
+      args: stdio.data.args,
+      env: stdio.data.env,
+      enabled: stdio.data.enabled,
+    },
+  };
 }
 
 /** The workspace's shared servers, parsed and filtered.
@@ -160,20 +220,49 @@ export function sharedMcpServers(cfg: AppConfig, only?: string[] | null): McpSer
   return out;
 }
 
-/** The bot's own servers.
+/** The bot's own servers, parsed by the same parser the shared ones use.
  *
- * They are already in the stored shape, so they are read through their own
- * path:  the name rule and the switch still apply, because a stored server
- * written before a rule changed must not mount under a name it may not
- * have now. */
+ * A stored server written before a rule changed must not mount under a
+ * name it may not have now, and must not carry an environment variable
+ * the harness owns — so the bot's own entries go through exactly the same
+ * checks as the shared ones rather than a second, weaker path. */
 export function botMcpServers(bot: Pick<BotRecord, "ownMcpServers">): McpServersByName {
   const out: McpServersByName = {};
   for (const [name, server] of Object.entries(bot.ownMcpServers ?? {})) {
-    if (mcpServerNameError(name)) continue;
-    if (!server.enabled) continue;
-    out[name] = server;
+    const parsed = parseMcpServerEntry(name, server as unknown as JsonValue);
+    if (!parsed.ok) continue;
+    if (!parsed.server.enabled) continue;
+    out[name] = parsed.server;
   }
   return out;
+}
+
+/** Every server a bot holds, both scopes, whether it is on or off.
+ *
+ * The listing is built from this and not from the mounted set, so a server
+ * that was turned off is still visible — and can be turned back on, or
+ * removed.  A server that vanished from the listing could never be
+ * re-enabled. */
+export function allMcpServersForBot(
+  cfg: AppConfig,
+  bot: Pick<BotRecord, "mcpServers" | "ownMcpServers">,
+): { servers: McpServersByName; scopes: Record<string, McpServerScope> } {
+  const servers: McpServersByName = {};
+  const scopes: Record<string, McpServerScope> = {};
+  for (const [name, raw] of Object.entries(cfg.mcpServers ?? {})) {
+    if (bot.mcpServers && !bot.mcpServers.includes(name)) continue;
+    const parsed = parseMcpServerEntry(name, raw);
+    if (!parsed.ok) continue;
+    servers[name] = parsed.server;
+    scopes[name] = "shared";
+  }
+  for (const [name, server] of Object.entries(bot.ownMcpServers ?? {})) {
+    const parsed = parseMcpServerEntry(name, server as unknown as JsonValue);
+    if (!parsed.ok) continue;
+    servers[name] = parsed.server;
+    scopes[name] = "bot";
+  }
+  return { servers, scopes };
 }
 
 /** Every server this bot may mount, and which scope each came from.
@@ -224,7 +313,9 @@ export function listMcpServersForBot(
   cfg: AppConfig,
   bot: Pick<BotRecord, "mcpServers" | "ownMcpServers">,
 ): McpServerView[] {
-  const { servers, scopes } = resolveMcpServers(cfg, bot);
+  // The full set, not the mounted one:  a server that was turned off has to
+  // stay visible, or there is no way to turn it back on or to remove it.
+  const { servers, scopes } = allMcpServersForBot(cfg, bot);
   const views: McpServerView[] = [];
   for (const [name, server] of Object.entries(servers)) {
     if (isRemoteMcpServer(server)) {

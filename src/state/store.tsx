@@ -464,9 +464,11 @@ export interface Bot {
    * only what it names. A PATCH may send `null` to clear back to legacy,
    * mirroring avatarUrl. */
   connectorTools?: Record<string, ConnectorToolGrant> | null;
-  /** The workspace's shared MCP servers this bot may mount.  Unset means
-   * every enabled shared server;  a list narrows it to those names. */
-  mcpServers?: string[];
+  /** The workspace's shared MCP servers this bot may mount.  Unset — or
+   * null — means every enabled shared server;  a list narrows it to those
+   * names.  Null is the clear the panel sends, the way a cleared
+   * connectorTools grant is. */
+  mcpServers?: string[] | null;
   /** The MCP servers that belong to this bot alone, by name.  A name here
    * wins over a shared server of the same name. */
   ownMcpServers?: Record<string, McpServerEntry>;

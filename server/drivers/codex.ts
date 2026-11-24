@@ -144,7 +144,9 @@ function mountMcpServer(
   env: Record<string, string | undefined>,
   name: string,
   server: StdioMcpServer,
+  mounted?: Set<string>,
 ): void {
+  mounted?.add(name);
   Object.assign(env, server.env);
   const prefix = `mcp_servers.${name}`;
   appServerArgs.push(
@@ -320,6 +322,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // `childEnv()` is the instance's; the launch identity is this bot's
         // and this turn's, so it goes on last (a relaunch rebuilds it).
         const env = launchedChildEnvironment(childEnv(), turn.launchIdentity, cliLoginEnvironment(turn.launchIdentity?.seat));
+        // The names this turn has already mounted.  A custom server of the
+        // same name must not redirect one of the harness's own proxies, so
+        // the custom set skips a name that is already taken.
+        const mountedMcpNames = new Set<string>();
         const appServerArgs = [
           "app-server",
           ...codexLocalProviderArgs(env, turn.model),
@@ -328,10 +334,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           ...codexShellPolicyArgs(turn.launchIdentity),
         ];
         if (turn.integrations?.composio) {
-          mountMcpServer(appServerArgs, env, "botfleet_connectors", turn.integrations.composio);
+          mountMcpServer(appServerArgs, env, "botfleet_connectors", turn.integrations.composio, mountedMcpNames);
         }
         if (turn.integrations?.agents) {
-          mountMcpServer(appServerArgs, env, "agents", turn.integrations.agents);
+          mountMcpServer(appServerArgs, env, "agents", turn.integrations.agents, mountedMcpNames);
         }
         // One server per granted computer. This was an if/else if, which
         // handed a bot holding two desktops exactly one of them.
@@ -351,11 +357,11 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                 OMB_CONTROL_URL: proxyEnv.OMB_CONTROL_URL ?? "",
                 OMB_CONTROL_TOKEN: proxyEnv.OMB_CONTROL_TOKEN ?? "",
               },
-            });
+            }, mountedMcpNames);
           } else if (mount.stdio) {
             // The host daemon, the isolated Local VM, and a VPS desktop all
             // arrive as a direct CUA Driver stdio MCP server.
-            mountMcpServer(appServerArgs, env, mount.name, mount.stdio);
+            mountMcpServer(appServerArgs, env, mount.name, mount.stdio, mountedMcpNames);
           }
         }
         if (turn.integrations?.phone) {
@@ -370,7 +376,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           );
         }
         if (turn.integrations?.qdrant) {
-          mountMcpServer(appServerArgs, env, "qdrant", turn.integrations.qdrant);
+          mountMcpServer(appServerArgs, env, "qdrant", turn.integrations.qdrant, mountedMcpNames);
         }
         // The person's own MCP servers:  the ones the workspace shares and
         // the ones this bot owns.  A URL server rides BotFleet's remote
@@ -378,13 +384,17 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // other server here does, and a credential in its headers stays in
         // the child environment rather than on argv.
         for (const [name, server] of Object.entries(turn.integrations?.custom ?? {})) {
+          // A name the harness already mounted keeps the harness's mount:
+          // a custom server of the same name must not redirect one of the
+          // harness's own proxies.
+          if (mountedMcpNames.has(name)) continue;
           const stdio = mcpStdioServer(server, { nodeEnv: { ELECTRON_RUN_AS_NODE: "1" } });
           if (!stdio) continue;
           mountMcpServer(appServerArgs, env, name, {
             command: stdio.command,
             args: stdio.args ?? [],
             env: stdio.env ?? {},
-          });
+          }, mountedMcpNames);
         }
 
         const child = spawnCli(config.cli, appServerArgs, {

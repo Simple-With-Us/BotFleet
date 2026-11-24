@@ -1,3 +1,4 @@
+/* oxlint-disable anti-slop/no-shape-in-symbol-names -- The listing's field names are the server's own vocabulary, not this module's symbols. */
 // The MCP servers a bot may mount:  the ones the workspace shares and the
 // ones that belong to this bot alone.
 //
@@ -5,7 +6,9 @@
 // of its own and narrow the shared set.  It never shows a credential:  the
 // server's own env and header values are write-only, and the listing names
 // the FIELDS a server carries without ever returning their values.  So the
-// panel shows a server's field names and never their contents.
+// panel shows a server's field names and never their contents, and a save
+// carries the fields it knows while the server keeps the credentials it
+// already has for the fields the panel cannot see.
 import { useEffect, useState } from "react";
 
 import { cn } from "@/lib/cn";
@@ -33,6 +36,18 @@ export interface McpServerView {
   headerKeys?: string[];
 }
 
+/** The fields of a server the panel knows and can therefore send back.
+ *
+ * The credential fields are deliberately absent:  the panel never learns
+ * their values, so a save omits them and the server keeps what it has. */
+export interface McpServerShape {
+  command?: string;
+  args?: string[];
+  type?: "http" | "sse";
+  url?: string;
+  enabled?: boolean;
+}
+
 /** Parse the `KEY=value` lines a credential box holds into a record.  A
  * line without an `=` is dropped rather than stored half-formed:  a
  * credential with no value is not a credential. */
@@ -57,6 +72,35 @@ export function credentialLinesFrom(keys: string[] | undefined): string {
   return (keys ?? []).map((key) => `${key}=`).join("\n");
 }
 
+/** Split a command line into the binary and its arguments.
+ *
+ * A quoted argument stays one argument, so a path with a space in it
+ * survives:  the quotes are the person's, and the binary is the first
+ * thing outside them. */
+export function splitCommand(line: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  let quoted = false;
+  let started = false;
+  for (const character of line) {
+    if (character === '"') {
+      quoted = !quoted;
+      started = true;
+      continue;
+    }
+    if (!quoted && /\s/.test(character)) {
+      if (started) parts.push(current);
+      current = "";
+      started = false;
+      continue;
+    }
+    current += character;
+    started = true;
+  }
+  if (started) parts.push(current);
+  return parts;
+}
+
 /** A server's own label:  the command it runs, or the address it answers
  * on. */
 export function serverDescriptor(server: McpServerView): string {
@@ -67,6 +111,14 @@ export function serverDescriptor(server: McpServerView): string {
   return "";
 }
 
+/** The shape the panel can send back for a server it has seen. */
+export function serverShape(server: McpServerView): McpServerShape {
+  if (server.command) {
+    return { command: server.command, args: server.args ?? [], enabled: server.enabled };
+  }
+  return { type: server.type ?? "http", url: server.url ?? "", enabled: server.enabled };
+}
+
 export function McpServersSettings({
   bot,
   servers,
@@ -75,7 +127,7 @@ export function McpServersSettings({
 }: {
   bot: Bot;
   servers: McpServerView[];
-  onPatch: (patch: { ownMcpServers?: Record<string, McpServerEntry>; mcpServers?: string[] }) => void;
+  onPatch: (patch: { ownMcpServers?: Record<string, McpServerEntry>; mcpServers?: string[] | null }) => void;
   onError?: (message: string) => void;
 }) {
   const [name, setName] = useState("");
@@ -86,9 +138,19 @@ export function McpServersSettings({
   const shared = servers.filter((server) => server.scope === "shared");
   const own = servers.filter((server) => server.scope === "bot");
 
-  // The bot's shared narrowing list, as the names it holds.
+  // The bot's own servers, as the panel knows them.  The bot record does
+  // not carry them —  their credentials never leave the server — so this
+  // is built from the listing.
+  const [ownShapes, setOwnShapes] = useState<Record<string, McpServerShape>>({});
+  useEffect(() => {
+    const shapes: Record<string, McpServerShape> = {};
+    for (const server of own) shapes[server.name] = serverShape(server);
+    setOwnShapes(shapes);
+  }, [own]);
+
+  // The shared narrowing list.  Absent means every enabled shared server.
+  const narrowed = bot.mcpServers !== undefined && bot.mcpServers !== null;
   const allowedShared = new Set(bot.mcpServers ?? []);
-  const narrowed = bot.mcpServers !== undefined;
 
   useEffect(() => {
     setCredential("");
@@ -114,15 +176,19 @@ export function McpServersSettings({
       onError?.("A server has either a command to run or an address to connect to, not both.");
       return;
     }
+    // The command box holds the binary AND its arguments, so it is split
+    // here:  a spawn that receives the whole line as a path fails on the
+    // first space.
+    const [binary, ...rest] = splitCommand(command.trim());
     const entry: McpServerEntry = isRemote
       ? { type: "http", url: url.trim(), headers: parseCredentialLines(credential), enabled: true }
       : {
-          command: command.trim(),
-          args: command.trim().split(/\s+/).slice(1),
+          command: binary,
+          args: rest,
           env: parseCredentialLines(credential),
           enabled: true,
         };
-    onPatch({ ownMcpServers: { ...bot.ownMcpServers, [trimmed]: entry } });
+    onPatch({ ownMcpServers: { ...ownShapes, [trimmed]: entry } });
     setName("");
     setCommand("");
     setUrl("");
@@ -130,7 +196,7 @@ export function McpServersSettings({
   };
 
   const remove = (serverName: string) => {
-    const next = { ...bot.ownMcpServers };
+    const next = { ...ownShapes };
     delete next[serverName];
     onPatch({ ownMcpServers: next });
   };
@@ -153,8 +219,18 @@ export function McpServersSettings({
 
       {shared.length > 0 && (
         <div>
-          <div className="text-[13px] font-medium text-ink-secondary">
-            {narrowed ? "Shared servers this bot may use" : "Shared servers (all available)"}
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-[13px] font-medium text-ink-secondary">Shared servers</div>
+            {narrowed && (
+              <button
+                type="button"
+                aria-label="Use every shared server"
+                onClick={() => onPatch({ mcpServers: null })}
+                className="text-[12px] text-ink-secondary hover:text-ink"
+              >
+                Use all
+              </button>
+            )}
           </div>
           <div className="mt-2 flex flex-col gap-1.5">
             {shared.map((server) => (
@@ -168,17 +244,15 @@ export function McpServersSettings({
                     {serverDescriptor(server)}
                   </div>
                 </div>
-                {narrowed && (
-                  <label className="flex shrink-0 items-center gap-2 text-[12px] text-ink-secondary">
-                    <input
-                      type="checkbox"
-                      aria-label={`Allow the shared server ${server.name}`}
-                      checked={allowedShared.has(server.name)}
-                      onChange={() => toggleShared(server.name)}
-                    />
-                    Allow
-                  </label>
-                )}
+                <label className="flex shrink-0 items-center gap-2 text-[12px] text-ink-secondary">
+                  <input
+                    type="checkbox"
+                    aria-label={`Allow the shared server ${server.name}`}
+                    checked={!narrowed || allowedShared.has(server.name)}
+                    onChange={() => toggleShared(server.name)}
+                  />
+                  Allow
+                </label>
               </div>
             ))}
           </div>

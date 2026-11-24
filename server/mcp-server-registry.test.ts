@@ -1,3 +1,4 @@
+/* oxlint-disable anti-slop/require-safety-comment-for-type-assertion -- The fixtures build a stored entry and a config map from the shapes the registry reads, and a test fixture is not the dispatch's own object. */
 import { describe, expect, it } from "vitest";
 
 import {
@@ -35,9 +36,16 @@ function bot(overrides: Partial<Pick<BotRecord, "mcpServers" | "ownMcpServers">>
 /** A stored server of the bot's own, in the shape the record holds.
  *
  * The stored shape is the registry's own, so the fixture builds one field
- * at a time rather than asserting an unrelated object into it. */
+ * at a time rather than asserting an unrelated object into it.  The
+ * defaults fill in the fields a KIND of server carries and no other:  a
+ * server has either a command or an address, never both, so the fixture
+ * must not put a command on a remote one. */
 function ownServer(server: Partial<StoredMcpServer>): BotRecord["ownMcpServers"] {
-  return { mine: { command: "", args: [], env: {}, enabled: true, ...server } };
+  const remote = server.url !== undefined;
+  const base = remote
+    ? { type: "http" as const, url: "", headers: {}, enabled: true }
+    : { command: "", args: [], env: {}, enabled: true };
+  return { mine: { ...base, ...server } as StoredMcpServer };
 }
 
 // The stored shapes, typed as the config's own JSON value so a fixture
@@ -219,6 +227,62 @@ describe("what the person sees", () => {
     );
     expect(views).toHaveLength(1);
     expect(views[0].scope).toBe("bot");
+  });
+});
+
+describe("the rules a stored entry has to keep", () => {
+  it("refuses an entry that carries both a command and an address", () => {
+    // The remote shape would win and the command would be dropped without
+    // a word, so the entry would mount the wrong transport.
+    const parsed = parseMcpServerEntry("both", { command: "npx", url: "https://example.com/mcp" } as JsonValue);
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.reason).toContain("not both");
+  });
+
+  it("refuses an entry that carries neither", () => {
+    expect(parseMcpServerEntry("neither", { args: [] } as JsonValue).ok).toBe(false);
+  });
+
+  it("refuses an address that is not a full http(s) URL", () => {
+    expect(parseMcpServerEntry("bad", { url: "example.com/mcp" } as JsonValue).ok).toBe(false);
+    expect(parseMcpServerEntry("creds", { url: "https://example.com/mcp", headers: { Authorization: "x" } } as JsonValue).ok).toBe(true);
+  });
+
+  it("refuses an environment variable the harness owns", () => {
+    const parsed = parseMcpServerEntry("mine", { command: "npx", env: { OMB_CONTROL_TOKEN: "x" } } as JsonValue);
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.reason).toContain("reserved");
+  });
+
+  it("refuses an unknown field rather than dropping it", () => {
+    expect(parseMcpServerEntry("mine", { command: "npx", enve: {} } as JsonValue).ok).toBe(false);
+  });
+
+  it("refuses a bot's own server that breaks the same rules", () => {
+    // The bot's own entries go through the same parser as the shared ones,
+    // so a malformed or reserved one cannot mount.
+    const servers = botMcpServers({
+      ownMcpServers: {
+        good: { command: "npx", args: [], env: {}, enabled: true },
+        bad: { command: "npx", args: [], env: { OMB_CONTROL_TOKEN: "x" }, enabled: true },
+      } as never,
+    });
+    expect(Object.keys(servers)).toEqual(["good"]);
+  });
+});
+
+describe("a disabled server", () => {
+  it("does not mount", () => {
+    const servers = sharedMcpServers(config({ off: { ...LOCAL, enabled: false } as JsonValue }));
+    expect(servers).toEqual({});
+  });
+
+  it("stays visible in the listing, so it can be turned back on or removed", () => {
+    const views = listMcpServersForBot(config({ off: { ...LOCAL, enabled: false } as JsonValue }), bot());
+    expect(views.map((view) => view.name)).toEqual(["off"]);
+    expect(views[0].enabled).toBe(false);
   });
 });
 

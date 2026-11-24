@@ -10,6 +10,7 @@ import {
   credentialLinesFrom,
   parseCredentialLines,
   serverDescriptor,
+  splitCommand,
 } from "./McpServersSettings";
 
 /** Only the MCP fields decide what this card renders, so a bot literal is
@@ -78,6 +79,21 @@ describe("credentialLinesFrom", () => {
   });
 });
 
+describe("splitCommand", () => {
+  it("splits a command into the binary and its arguments", () => {
+    expect(splitCommand("npx -y my-mcp")).toEqual(["npx", "-y", "my-mcp"]);
+  });
+
+  it("keeps a quoted argument together", () => {
+    expect(splitCommand('"/opt/my tools/mcp" --flag')).toEqual(["/opt/my tools/mcp", "--flag"]);
+  });
+
+  it("is empty for an empty line", () => {
+    expect(splitCommand("")).toEqual([]);
+    expect(splitCommand("   ")).toEqual([]);
+  });
+});
+
 describe("serverDescriptor", () => {
   it("names the command a local server runs", () => {
     expect(serverDescriptor({ name: "x", scope: "bot", enabled: true, command: "npx", args: ["-y", "mcp"] })).toBe("npx -y mcp");
@@ -115,20 +131,24 @@ describe("the card", () => {
     expect(html).not.toContain("secret-value");
   });
 
-  it("offers the shared narrowing only when the bot has one", () => {
-    const narrowed = markup(
-      { mcpServers: ["one"] },
-      [{ name: "one", scope: "shared", enabled: true, command: "npx", args: [], envKeys: [] }],
-    );
-    expect(narrowed).toContain("Shared servers this bot may use");
-    expect(narrowed).toContain("Allow");
-
+  it("always offers the shared narrowing, so the list can move to a subset", () => {
+    // The checkboxes are rendered whether or not the bot has narrowed the
+    // shared set:  a list that only appears once a narrowing exists can
+    // never be created.
     const unnarrowed = markup(
       {},
       [{ name: "one", scope: "shared", enabled: true, command: "npx", args: [], envKeys: [] }],
     );
-    expect(unnarrowed).toContain("Shared servers (all available)");
-    expect(unnarrowed).not.toContain("Shared servers this bot may use");
+    expect(unnarrowed).toContain("Allow");
+    expect(unnarrowed).not.toContain("Use all");
+
+    const narrowed = markup(
+      { mcpServers: ["one"] },
+      [{ name: "one", scope: "shared", enabled: true, command: "npx", args: [], envKeys: [] }],
+    );
+    expect(narrowed).toContain("Allow");
+    // And a narrowed bot can go back to every shared server.
+    expect(narrowed).toContain("Use all");
   });
 
   it("says what the two scopes mean", () => {

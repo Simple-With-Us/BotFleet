@@ -423,13 +423,17 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
       .then((result: { servers?: McpServerView[] }) => {
         if (live) setMcpServers(result.servers ?? []);
       })
-      .catch(() => {
+      .catch((error: Error) => {
+        // The list is empty when the read fails, and the reason is logged:
+        // a fetch outage that leaves no trace is the hardest kind of
+        // failure to notice.
+        console.warn("[mcp-servers] the bot's MCP servers could not be read", error);
         if (live) setMcpServers([]);
       });
     return () => {
       live = false;
     };
-  }, [bot.id]);
+  }, [bot.id, bot.mcpServers, bot.ownMcpServers]);
 
   const patch = (
     p: Partial<BotUpdatePatch> & {
@@ -441,7 +445,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
       bypassLocalComputer?: Bot["bypassLocalComputer"];
       alwaysAllow?: Bot["alwaysAllow"];
       connectorTools?: Bot["connectorTools"];
-      mcpServers?: Bot["mcpServers"];
+      mcpServers?: Bot["mcpServers"] | null;
       ownMcpServers?: Bot["ownMcpServers"];
     },
   ) => dispatch({ type: "updateBot", botId: bot.id, patch: p });
@@ -682,7 +686,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             <McpServersSettings
               bot={bot}
               servers={mcpServers}
-              onPatch={patch}
+              onPatch={(mcpPatch) => patch(mcpPatch)}
               onError={setMcpError}
             />
           )}

@@ -3400,8 +3400,25 @@ const wireGroupTask = (task: GroupTaskRecord) => {
   return { ...task, lastActivity: last?.at ?? task.createdAt, lastMessage: last };
 };
 
+/** The body the MCP server route accepts.
+ *
+ * `shared` narrows the workspace's shared servers for this bot;  `servers`
+ * is the bot's own set, and it is the COMPLETE set:  a name that is not in
+ * it is gone, and a name that is in it keeps the credential it already has
+ * unless the request carries a new one. */
+const botMcpServersBodySchema = z
+  .object({
+    shared: z.array(z.string().min(1).max(64)).max(20).optional(),
+    servers: z.record(z.string().min(1).max(64), z.json()).optional(),
+  })
+  .strict();
+
 const wireBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
-  const { resumeCursors, tasks, ...rest } = bot;
+  // `ownMcpServers` never goes out on the wire:  a server's env and header
+  // values are its credentials, and a bot frame reaches every client and
+  // every SSE broadcast.  The panel reads what it needs from the bot's own
+  // listing route, which reports the field NAMES and never the values.
+  const { resumeCursors, tasks, ownMcpServers: _ownMcpServers, ...rest } = bot;
   // avatarUrl and voices go out as null when unset, so a client that merges
   // bot frames into what it holds (object spread, Codable defaults) clears a
   // value another device removed instead of keeping the stale one.
@@ -16207,9 +16224,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // rules and the reserved-name refusal are the ones every other bot
       // field already uses.
       const body = await readBody(req);
+      // The body is parsed before anything is read off it, so a shape the
+      // route did not expect is a refusal rather than a surprise.
+      const parsedBody = botMcpServersBodySchema.safeParse(body);
+      if (!parsedBody.success) {
+        return json(res, 400, { error: parsedBody.error.issues[0]?.message ?? "invalid MCP server request" });
+      }
       const requested: Record<string, JsonValue> = {};
-      if (body.shared !== undefined) requested.mcpServers = body.shared;
-      if (body.servers !== undefined) requested.ownMcpServers = body.servers;
+      if (parsedBody.data.shared !== undefined) requested.mcpServers = parsedBody.data.shared;
+      if (parsedBody.data.servers !== undefined) requested.ownMcpServers = parsedBody.data.servers;
       const parsed = parseBotProfilePatch(requested, true, bot);
       if (!parsed.ok) return json(res, 400, { error: parsed.error });
       if (parsed.patch.mcpServers === undefined && parsed.patch.ownMcpServers === undefined) {
