@@ -37,7 +37,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
+import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials, seatCredentialsReady } from "../child-credentials.ts";
 import { codexShellPolicyArgs } from "../launch-identity.ts";
 import {
   decodeCodexSelection,
@@ -278,7 +278,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       // that follows it have to stay free of `await`, or a second turn on
       // this thread would walk through the guard the first one already
       // passed.
-      primeCliLogin(turn.launchIdentity?.seat);
+      primeSeatCredentials(turn.launchIdentity?.seat);
+      // The seat's credential read is started here, before the guard, so
+      // it may still be in flight.  Waiting for it before the guard
+      // keeps the slot free while the vault answers and leaves the
+      // guard and the registration that follows it atomic.
+      if (!seatCredentialsReady(turn.launchIdentity?.seat)) await awaitSeatCredentials(turn.launchIdentity?.seat);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
       // Host control means the user's real desktop — the Local VM and a VPS
@@ -318,7 +323,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       const launchAttempt = async (attempt: number): Promise<void> => {
         // `childEnv()` is the instance's; the launch identity is this bot's
         // and this turn's, so it goes on last (a relaunch rebuilds it).
-        const env = launchedChildEnvironment(childEnv(), turn.launchIdentity, cliLoginEnvironment(turn.launchIdentity?.seat));
+        const env = launchedChildCredentials(childEnv(), turn.launchIdentity, turn.launchIdentity?.seat);
         const appServerArgs = [
           "app-server",
           ...codexLocalProviderArgs(env, turn.model),

@@ -15,7 +15,7 @@ import type {
   TurnStartResult,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
+import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials, seatCredentialsReady } from "../child-credentials.ts";
 import { PROVIDER_CREDENTIAL_ENV, stripWorkspaceCredentialEnv } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
 import { describeSpawnFailure, execCli, isProbeTimeout, killCliTree, spawnCli } from "../procs.ts";
@@ -220,7 +220,12 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
         // that follows it have to stay free of `await`, or a second turn on
         // this thread would walk through the guard the first one already
         // passed.
-        primeCliLogin(turnInput.launchIdentity?.seat);
+        primeSeatCredentials(turnInput.launchIdentity?.seat);
+      // The seat's credential read is started here, before the guard, so
+      // it may still be in flight.  Waiting for it before the guard
+      // keeps the slot free while the vault answers and leaves the
+      // guard and the registration that follows it atomic.
+      if (!seatCredentialsReady(turnInput.launchIdentity?.seat)) await awaitSeatCredentials(turnInput.launchIdentity?.seat);
         if (children.has(threadId)) throw new Error("a turn is already running on this thread");
 
         // Every driver opens its turn here, and sentry-ai.ts opens the
@@ -266,7 +271,7 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
           // handler that keeps a dead child's EPIPE from killing the harness.
           child = spawnCli(config.command, args, {
             cwd: turnInput.cwd ?? homedir(),
-            env: launchedChildEnvironment(childEnv(), turnInput.launchIdentity, cliLoginEnvironment(turnInput.launchIdentity?.seat)),
+            env: launchedChildCredentials(childEnv(), turnInput.launchIdentity, turnInput.launchIdentity?.seat),
             stdio: ["pipe", "pipe", "pipe"],
           });
         } catch (err) {

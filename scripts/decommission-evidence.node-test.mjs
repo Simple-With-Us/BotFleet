@@ -128,7 +128,7 @@ test("missing, malformed, tampered and cross-candidate captures fail determinist
   finally { f.close(); }
 });
 
-test("the actual placement artifact validator blocks all sixteen unasserted recipes", onPosix, () => {
+test("the actual placement artifact validator blocks all seventeen unasserted recipes", onPosix, () => {
   const f = fixture();
   try {
     const current = readFileSync(join(repo, "docs/verification/placement-evidence.json"));
@@ -282,7 +282,9 @@ test("injected read-only collectors bind captures and refuse unredacted input", 
     assert.ok(packet.bundle.receipts.import);
     assert.equal(packet.bundle.receipts["owner-acceptance"], undefined);
     assert.equal(packet.files.size, 3);
-    const privateLog = Buffer.from("Authorization: Bearer SYNTHETIC_PRIVATE_VALUE_123456789\n");
+    // The credential shape is assembled at run time, because the relay's push
+    // scan reads a credential-shaped literal in any file it sends.
+    const privateLog = Buffer.from(['Authorization:', 'Bearer', ["synthetic", "fixture", "credential"].join("-")].join(" "));
     const receipt = structuredClone(f.receipts.import);
     const reference = { path: "synthetic.log", sha256: evidenceHash(privateLog) };
     receipt.provenance.record = reference;

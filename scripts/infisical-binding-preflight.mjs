@@ -57,6 +57,13 @@ export const bindings = [
   },
 ];
 
+// PAIRED, NOT REMOVED (OPS-1108).  The GitHub secret fallback is still
+// read by scripts/infisical-fetch.mjs, and it stays until the workflows
+// that set GH_FALLBACK_* stop doing so:  removing that read on its own
+// would fail every job whose name is listed as required and whose store
+// read misses, and those workflows cannot be changed until the relay stops
+// refusing the workflow tree.  The workflow-side change is filed and
+// blocked, so the read stays and this note names why.
 const fallbackEnv = {
   APPLE_API_KEY_ID: "GH_FALLBACK_APPLE_API_KEY_ID",
   APPLE_API_ISSUER_ID: "GH_FALLBACK_APPLE_API_ISSUER_ID",

@@ -34,7 +34,7 @@ POSIX ownership is required; hosts unable to prove it refuse the final check.
 
 | Receipt | Required Evidence |
 | --- | --- |
-| `placement` | Existing sixteen-recipe manifest, both host inventories and hand-run logs; every referenced artifact is hash-bound and checked through the actual placement artifact validator. |
+| `placement` | Existing seventeen-recipe manifest, both host inventories and hand-run logs; every referenced artifact is hash-bound and checked through the actual placement artifact validator. |
 | `import` | Final parity and the read-only archive. |
 | `replay` | One passing ordered replay result for each explicitly inventoried engine. |
 | `rollback` | Restore rehearsal and restored health. |
@@ -50,9 +50,9 @@ POSIX ownership is required; hosts unable to prove it refuse the final check.
 
 Passing command results require the exact named checks exported in `REQUIRED_CHECKS`, exit code zero and a hashed artifact; a free-form success sentence cannot replace them.
 
-The `import` and `rollback` receipts have a producer: `scripts/archive-node-store.mjs` captures the Node store read-only, rehearses its restore and emits both receipts in the shape this bundle validates.  Each exit code in those receipts is read out of the report it names, so a failed rehearsal earns a failing code and this bundle refuses it.  Two of their named checks still need an input the producer cannot make for itself: `parity` needs the importer's parity report, and `restored-health` is a statement about the restore rather than about the store or about a running harness.  The `parity` check's verdict is computed out of that report's own details, the way `StoreImportParityReport` computes it on the Swift side, and the report's own flags have to agree with what the producer recomputed.  A report that says it was verified while a surface disagrees, a report missing any of the fields the verdict is computed from, and a report whose flags contradict each other all fail closed, so the check earns a failing code and this bundle refuses the packet.  The `replay` receipt has a producer as well: `ios/Scripts/EngineReplayParityProbe` replays each inventoried engine's recorded turns through the native driver and writes a per-engine report, and `scripts/emit-replay-receipt.mjs` reads that report and emits the receipt this bundle validates.  A replay report whose summary disagrees with its own per-engine verdicts is refused rather than read, so a report that did not come from the probe cannot certify a replay.  The `placement` receipt's sixteen recipes are still unrun.
+The `import` and `rollback` receipts have a producer: `scripts/archive-node-store.mjs` captures the Node store read-only, rehearses its restore and emits both receipts in the shape this bundle validates.  Each exit code in those receipts is read out of the report it names, so a failed rehearsal earns a failing code and this bundle refuses it.  Two of their named checks still need an input the producer cannot make for itself: `parity` needs the importer's parity report, and `restored-health` is a statement about the restore rather than about the store or about a running harness.  The `parity` check's verdict is computed out of that report's own details, the way `StoreImportParityReport` computes it on the Swift side, and the report's own flags have to agree with what the producer recomputed.  A report that says it was verified while a surface disagrees, a report missing any of the fields the verdict is computed from, and a report whose flags contradict each other all fail closed, so the check earns a failing code and this bundle refuses the packet.  The `replay` receipt has a producer as well: `ios/Scripts/EngineReplayParityProbe` replays each inventoried engine's recorded turns through the native driver and writes a per-engine report, and `scripts/emit-replay-receipt.mjs` reads that report and emits the receipt this bundle validates.  A replay report whose summary disagrees with its own per-engine verdicts is refused rather than read, so a report that did not come from the probe cannot certify a replay.  The `placement` receipt's seventeen recipes are still unrun.
 
-The existing committed `placement-evidence.json` retains all sixteen false assertions; this work does not promote any recipe or live gate to passed.
+The existing committed `placement-evidence.json` retains all seventeen false assertions; this work does not promote any recipe or live gate to passed.
 
 The collector cannot synthesize owner acceptance through a host reader; it can only package an already captured external acceptance receipt and its original provenance.
 
@@ -85,6 +85,30 @@ An elapsed timestamp span alone, an edited JSON file, issue Done, green CI or th
 Capture instants must follow their observations, cannot be in the future, and owner acceptance must follow the evidence it accepts.
 
 Machine receipt instants use ISO 8601; human-facing timestamps and the existing placement hand-run display fields retain the owner's America/Chicago 12-hour AM/PM convention without zone labels.
+
+## The Three Receipts That Had No Producer
+
+`signed-release`, `change-plan` and `daily-driver` had no producer anywhere in the tree, so the packet could only be assembled by hand.  Each one now has one, and each one reads an operator-supplied record rather than asserting a result of its own.
+
+### `signed-release`
+
+`scripts/emit-signed-release-receipt.mjs` reads a verification record and the artifacts it names, and writes `signed-release.receipt.json`.  The record carries the bundle id, the team id, the designated requirement, the previous build and one entry per check; the producer refuses a record that does not carry every check `REQUIRED_CHECKS` names for this kind, a record that names one check twice, a bundle id that is not `app.botfleet.macos`, and a previous build that is the candidate's own build, because an update from a build to itself evidences nothing.  Each exit code is read out of the record, so a failed signing run earns a failing code and this bundle refuses the packet.  The producer does not sign, notarize, staple, install or update anything, and it cannot authenticate that the captured bytes came from a real install.
+
+### `change-plan`
+
+`scripts/emit-change-plan-receipt.mjs` reads a plan record and the artifacts it names, and writes `change-plan.receipt.json`.  The record carries the jobs, files and app copies that will change, and one entry per check; the producer refuses a record that is missing a check `REQUIRED_CHECKS` names for this kind, one that names a check twice, and one with an empty job, file or app-copy list.  The lists are carried as the plan wrote them, because a receipt that trimmed them would be a different plan from the one that was reviewed.
+
+### `daily-driver`
+
+`scripts/emit-daily-driver-receipt.mjs` reads a seven-day observation and the segment logs it names, and writes `daily-driver.receipt.json`.  It requires contiguous segments with no gap or overlap, an uninterrupted continuity on each, at least seven days of coverage, a host the packet names, a controller-epoch fence that never regresses, and the four observations a segment has to record:  `nativeApp:  "signed-native-daily-driver"`, `iosSession:  "passed"`, `openOnMac:  "passed"` and `processInventory:  "recorded"`.  A local-only native Mac controller does not need server traffic or a routine-run count to satisfy daily use, so none of the soak producer's writer bounds are read here.  The seven-day sign-off itself stays the owner's.
+
+### What The Three Producers Do Not Do
+
+None of them contacts a live daemon, host or launch agent, and none of them can authenticate that the bytes they read came from production rather than a fixture.  They verify structural binding, redaction cleanliness, hashes and the check lists the bundle itself requires, which is the same line the rest of this bundle holds.  The `owner-acceptance` receipt still has no producer on purpose: the collector refuses to synthesize an owner's assertion.
+
+### The Packet Shape, Proved In A Fixture
+
+`scripts/decommission-packet-fixture.node-test.mjs` assembles a complete thirteen-receipt packet in a temporary private directory, from synthetic artifacts and synthetic receipts, and runs this bundle's own validator over it.  It proves that the packet the final CLI wants is reachable, and that the validator accepts a complete one and refuses an incomplete one.  It proves nothing about a real install: every artifact in it is a fixture, and the directory is removed when the test ends.
 
 ## The Process Inventory Receipt Producer
 
