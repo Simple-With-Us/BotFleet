@@ -16,6 +16,7 @@ import {
   PORT_POOL_START,
   portBand,
   portBlockBases,
+  portBlockOrder,
 } from "./ports.ts";
 
 /** The lowest ephemeral port the kernel hands out on the CI runners. */
@@ -78,5 +79,17 @@ describe("the free-port pool", () => {
     const band = portBand(1);
     const bases = portBlockBases(band, [0, PORT_POOL_BAND_WIDTH]);
     expect(bases.last).toBeLessThan(bases.first);
+  });
+
+  it("tries every base of the band once, so a free block is never missed", () => {
+    // A draw with replacement can miss the one free base that is left and
+    // then throw although a free block was there the whole time.  Every
+    // base appears exactly once, so the free one is always reached.
+    const band = portBand(7);
+    const order = portBlockOrder(band, [0, 1]);
+    expect(new Set(order).size).toBe(order.length);
+    expect([...order].sort((left, right) => left - right)).toEqual(
+      Array.from({ length: order.length }, (_, index) => band.start + index),
+    );
   });
 });

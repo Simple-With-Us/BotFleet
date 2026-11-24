@@ -94,6 +94,32 @@ export function portBlockBases(
 }
 
 /**
+ * The bases a block may take inside the band, in the order they are tried.
+ *
+ * Every base is tried exactly once:  a draw with replacement can miss the
+ * one free base that is left, and then the suite throws although a free
+ * block was there the whole time.  The order is shuffled so two suites in
+ * the same band do not both reach for the same base first.
+ */
+export function portBlockOrder(band: PortBand, offsets: number[]): number[] {
+  const bases = portBlockBases(band, offsets);
+  if (bases.last < bases.first) {
+    throw new Error(
+      `a block of offsets ${offsets.join(",")} does not fit in a band of ${PORT_POOL_BAND_WIDTH} ports`,
+    );
+  }
+  const order: number[] = [];
+  for (let base = bases.first; base <= bases.last; base += 1) order.push(base);
+  for (let index = order.length - 1; index > 0; index -= 1) {
+    const swap = Math.floor(Math.random() * (index + 1));
+    const held = order[index];
+    order[index] = order[swap];
+    order[swap] = held;
+  }
+  return order;
+}
+
+/**
  * Find a base port where every `base + offset` is free.
  *
  * Offsets rather than a count because the ports a suite needs are rarely
@@ -108,15 +134,7 @@ export function portBlockBases(
  */
 export async function freePortBlock(offsets: number[]): Promise<number> {
   const band = portBand();
-  const bases = portBlockBases(band, offsets);
-  if (bases.last < bases.first) {
-    throw new Error(
-      `a block of offsets ${offsets.join(",")} does not fit in a band of ${PORT_POOL_BAND_WIDTH} ports`,
-    );
-  }
-  const width = bases.last - bases.first + 1;
-  for (let attempt = 0; attempt < 40; attempt++) {
-    const base = bases.first + Math.floor(Math.random() * width);
+  for (const base of portBlockOrder(band, offsets)) {
     const checks = await Promise.all(offsets.map((offset) => isFree(base + offset)));
     if (checks.every(Boolean)) return base;
   }
