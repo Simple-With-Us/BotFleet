@@ -2,8 +2,16 @@ import { randomUUID } from "node:crypto";
 import { request } from "node:http";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-// Point BOTFLEET_MCP_PORT to a dynamic port for testing
-const TEST_PORT = 38794 + Math.floor(Math.random() * 1000);
+import { freePortBlock } from "./testing/ports.ts";
+
+// Point BOTFLEET_MCP_PORT to a dynamic port for testing.
+// The port is taken from the range BELOW the kernel's ephemeral range and
+// probed first.  A port inside the ephemeral range is one the OS may hand out
+// to an outgoing connection, and this suite runs hundreds of them:  the
+// server then loses its own bind to a connection that has nothing to do
+// with it, and the suite fails on EADDRINUSE instead of on anything it
+// actually asserts.
+const TEST_PORT = await freePortBlock([0]);
 process.env.BOTFLEET_MCP_PORT = String(TEST_PORT);
 process.env.BOTFLEET_MCP_HOST = "127.0.0.1";
 process.env.BOTFLEET_URL = "http://127.0.0.1:8799";

@@ -1,0 +1,106 @@
+{
+  "schema": 1,
+  "kind": "ops1108-planner-receipt",
+  "fixture": true,
+  "hostedProof": false,
+  "notice": "This receipt is a synthetic fixture.  It is produced offline over a synthetic inventory, and it is not proof that a hosted job ran.",
+  "commit": "1111111111111111111111111111111111111111",
+  "commitKind": "synthetic",
+  "mergeStamp": "202611231950",
+  "marketingVersion": "0.1.0",
+  "sharedBuild": "202611231950",
+  "inventory": {
+    "kind": "synthetic",
+    "iosBuilds": [
+      "202611221200"
+    ],
+    "macBuilds": [
+      "202611221200"
+    ],
+    "extraFloors": []
+  },
+  "plans": {
+    "ios": {
+      "platform": "ios",
+      "build": "202611231950",
+      "planner": "scripts/ios-fleet/shared-build.mjs nextSharedBuild(platform: ios)"
+    },
+    "macos": {
+      "platform": "macos",
+      "build": "202611231950",
+      "planner": "scripts/ios-fleet/shared-build.mjs nextSharedBuild(platform: macos)"
+    }
+  },
+  "credentials": [
+    {
+      "name": "ASC_KEY_ID",
+      "store": "Infisical fleet-ops prod /asc",
+      "grant": "fleet-tools-mm-asc-ro",
+      "scope": "read",
+      "value": "sha256:redacted"
+    },
+    {
+      "name": "ASC_ISSUER_ID",
+      "store": "Infisical fleet-ops prod /asc",
+      "grant": "fleet-tools-mm-asc-ro",
+      "scope": "read",
+      "value": "sha256:redacted"
+    },
+    {
+      "name": "ASC_KEY_P8",
+      "store": "Infisical fleet-ops prod /asc",
+      "grant": "fleet-tools-mm-asc-ro",
+      "scope": "read",
+      "value": "sha256:redacted"
+    },
+    {
+      "name": "APPLE_API_KEY_ID",
+      "store": "Infisical fleet-ops prod /asc",
+      "grant": "hosted job service token",
+      "scope": "read",
+      "value": "sha256:redacted"
+    },
+    {
+      "name": "APPLE_API_ISSUER_ID",
+      "store": "Infisical fleet-ops prod /asc",
+      "grant": "hosted job service token",
+      "scope": "read",
+      "value": "sha256:redacted"
+    },
+    {
+      "name": "APPLE_API_KEY_P8_BASE64",
+      "store": "Infisical fleet-ops prod /asc",
+      "grant": "hosted job service token",
+      "scope": "read",
+      "value": "sha256:redacted"
+    },
+    {
+      "name": "IOS_CERT_P12_BASE64",
+      "store": "Infisical fleet-ops prod /",
+      "grant": "INFISICAL_IOS_SHIP_READ_TOKEN",
+      "scope": "read",
+      "value": "sha256:redacted"
+    },
+    {
+      "name": "IOS_CERT_PASSWORD",
+      "store": "Infisical fleet-ops prod /",
+      "grant": "INFISICAL_IOS_SHIP_READ_TOKEN",
+      "scope": "read",
+      "value": "sha256:redacted"
+    },
+    {
+      "name": "SENTRY_DSN",
+      "store": "Infisical fleet-ops prod /global-api-keys",
+      "grant": "sentry read token",
+      "scope": "read",
+      "value": "sha256:redacted"
+    },
+    {
+      "name": "SENTRY_AUTH_TOKEN",
+      "store": "Infisical fleet-ops prod /global-api-keys",
+      "grant": "sentry read token",
+      "scope": "read",
+      "value": "sha256:redacted"
+    }
+  ]
+}

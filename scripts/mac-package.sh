@@ -235,7 +235,15 @@ TEAM="$(codesign -dv --verbose=4 "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
 [ "$TEAM" = "CC8UTF7ATG" ] || { echo "app is signed by team '${TEAM:-none}', not CC8UTF7ATG" >&2; exit 69; }
 echo "ok: signature verifies (team $TEAM)"
 
-resolve_notary_credentials
+# The notarization credentials are resolved only on the path that notarizes.  A
+# --skip-notarize build is a developer build:  it submits nothing to
+# Apple, it writes to an UNSIGNED/ directory and it is labelled NOT
+# DISTRIBUTABLE, so reading the API key and the notarytool profile would be a
+# secret lookup for a step that never runs.  The reads live inside
+# resolve_notary_credentials, so guarding the call guards the reads.
+if [ "$SKIP_NOTARIZE" -eq 0 ]; then
+  resolve_notary_credentials
+fi
 
 notarize() {
   # $1 = file to submit.  Requires an "Accepted" result; a rejection stops
