@@ -75,7 +75,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
+import { launchedChildCredentials, primeSeatCredentials } from "../child-credentials.ts";
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "antigravityAgent";
@@ -739,7 +739,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       // here, before the guard:  the guard and the registration that follows it
       // have to stay free of `await`, or a second turn on this thread would walk
       // through the guard the first one already passed.
-      primeCliLogin(turn.launchIdentity?.seat);
+      primeSeatCredentials(turn.launchIdentity?.seat);
       if (active.has(threadId) || pending.has(threadId)) throw new Error("a turn is already running on this thread");
       pending.add(threadId);
       const turnId = newId();
@@ -947,7 +947,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           cwd,
           // `env` is built once per instance and shared by every turn; the
           // launch identity is this bot's and this turn's, applied to a copy.
-          env: launchedChildEnvironment(env, turn.launchIdentity, cliLoginEnvironment(turn.launchIdentity?.seat)),
+          env: launchedChildCredentials(env, turn.launchIdentity, turn.launchIdentity?.seat),
           stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
         });
         if (useStdin && child.stdin) {
