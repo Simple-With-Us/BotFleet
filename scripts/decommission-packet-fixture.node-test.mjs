@@ -115,7 +115,7 @@ function placementArtifacts() {
 /**
  * The placement evidence manifest the placement receipt carries.
  *
- * The sixteen recipes are asserted here because this is a fixture:  the
+ * The seventeen recipes are asserted here because this is a fixture:  the
  * packet's shape is what is being proved, and every artifact it names is a
  * synthetic file in a temporary directory that the test removes.  A real
  * packet carries the receipts the owner's runs produced.

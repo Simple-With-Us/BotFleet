@@ -13,8 +13,8 @@ function complete() {
   };
 }
 
-test("all sixteen recipes require explicit assertions", () => {
-  assert.equal(REQUIRED_PLACEMENT_EVIDENCE.length, 16);
+test("all seventeen recipes require explicit assertions", () => {
+  assert.equal(REQUIRED_PLACEMENT_EVIDENCE.length, 17);
   assert.equal(evaluatePlacementEvidence(complete()).ok, true);
   for (const key of REQUIRED_PLACEMENT_EVIDENCE) {
     const state = complete();
