@@ -81,7 +81,8 @@ public actor NativeFaultBannerStore {
                    entry.summary == normalizedSummary &&
                    entry.detail == normalizedDetail &&
                    entry.severity == severity &&
-                   abs(nowEpoch - entry.recordedAt) <= dedupWindowSeconds
+                   entry.recordedAt <= nowEpoch &&
+                   (nowEpoch - entry.recordedAt) <= dedupWindowSeconds
            }) {
             records[existingIndex].recordedAt = nowEpoch
             return records[existingIndex]
