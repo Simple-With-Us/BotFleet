@@ -112,7 +112,7 @@ if (isEntry) {
         console.error("Placement evidence is BLOCKED:");
         for (const blocker of verdict.blockers) console.error(`  - ${blocker}`);
         process.exitCode = 1;
-      } else console.log("Placement evidence: all sixteen recipes asserted with inventory and hand-run artifacts");
+      } else console.log("Placement evidence: all seventeen recipes asserted with inventory and hand-run artifacts");
     } catch (error) {
       console.error(`Invalid placement evidence: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 2;

@@ -11,7 +11,7 @@
 // against the owner's own data.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -110,6 +110,62 @@ test("the verify command answers with a verdict and writes nothing", { skip: ROO
   assert.equal(answer.mismatches, 0);
   assert.ok(answer.verifiedFiles > 0);
   assert.deepEqual(fileList(captureDir), before, "the command wrote into the capture");
+});
+
+test("a file added to the tree is caught by the check", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeSyntheticStore();
+  const parent = privateScratch("verify-");
+  const captureDir = join(parent, "capture");
+  await archiveStore({ storeRoot: store, outDir: captureDir });
+  // A capture that was added to after it was written still carries a manifest
+  // that hashes every file it names, so only reading the tree itself shows the
+  // extra file.
+  chmodSync(join(captureDir, "tree"), 0o755);
+  writeFileSync(join(captureDir, "tree", "added.json"), "{}\n");
+
+  const verdict = verifyArchive({ captureDir });
+  assert.equal(verdict.ok, false);
+  assert.equal(verdict.mismatches.length, 1);
+  assert.equal(verdict.mismatches[0].path, "added.json");
+  assert.equal(verdict.mismatches[0].reason, "unlisted-tree-file");
+  assert.equal(verdict.verifiedFiles, verdict.expectedFiles, "the named files still verified");
+});
+
+test("a manifest without a file list is a finding, not a crash", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeSyntheticStore();
+  const parent = privateScratch("verify-");
+  const captureDir = join(parent, "capture");
+  await archiveStore({ storeRoot: store, outDir: captureDir });
+  const manifestPath = join(captureDir, "manifest.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  delete manifest.files;
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const verdict = verifyArchive({ captureDir });
+  assert.equal(verdict.ok, false);
+  assert.equal(verdict.mismatches.length, 1);
+  assert.equal(verdict.mismatches[0].path, "manifest.json");
+  assert.equal(verdict.mismatches[0].reason, "manifest-files-missing");
+});
+
+test("a totals disagreement does not move the verified file count", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeSyntheticStore();
+  const parent = privateScratch("verify-");
+  const captureDir = join(parent, "capture");
+  await archiveStore({ storeRoot: store, outDir: captureDir });
+  const manifestPath = join(captureDir, "manifest.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.totals.files = manifest.files.length + 1;
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const verdict = verifyArchive({ captureDir });
+  assert.equal(verdict.ok, false);
+  assert.equal(verdict.mismatches.length, 1);
+  assert.equal(verdict.mismatches[0].path, "manifest.json");
+  assert.equal(verdict.mismatches[0].reason, "totals-mismatch");
+  // The named files were each checked on their own, so the count does not
+  // move and it never goes negative.
+  assert.equal(verdict.verifiedFiles, verdict.expectedFiles);
 });
 
 test("the verify command fails on a tampered capture and says so", { skip: ROOT_IS_ROOT }, async () => {
