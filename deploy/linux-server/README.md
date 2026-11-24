@@ -72,9 +72,9 @@ sudo install -m 600 -o jay -g fleet /dev/null /mnt/fleet-extra/apps/botfleet-ser
 
 The token is read from the terminal without echo and written straight into the file, so it never reaches argv or the shell history.
 
-### Harness vault token: config/harness-infisical-token
+### The harness vault token file
 
-A second local file, distinct from the gate's token above: the key the harness itself reads its vault secrets with.
+A second local file, distinct from the gate's token above: the key the harness itself reads its vault secrets with.  It lives beside the gate's file, as `config/harness-infisical-token`.
 
 ```
 /mnt/fleet-extra/apps/botfleet-server/config/harness-infisical-token
@@ -183,6 +183,61 @@ The command prompts for the value, so the token never reaches argv or the shell 
 The old `server-target.json` in the app's user-data directory is no longer read.  When it is still there the app says so once at launch and keeps going; delete it.
 
 The app reaches the gate, the gate checks the credential the app presented, and the request continues to the harness on loopback.  The token is never written to a log and never leaves this Mac.
+
+## The Companion Bridge (Default-Off)
+
+The bridge is a restricted companion route for a phone that must reach the server while the Mac is asleep.  It sits beside the owner gate, listens on loopback only, and answers the same owner credential the gate does: a Tailscale login on the allowlist, or the desktop gate token.  The routes it serves are the ones the phone uses, and the harness routes it forwards cross byte for byte, so a cursor parameter never changes shape on the way through.
+
+It is default-off in two layers, and neither is optional:
+
+- The installer writes and enables the unit only when the host asks for it:  `BF_COMPANION_BRIDGE=1`.  Without that, `install.sh`, `update.sh` and `uninstall.sh` behave exactly as they do without it, and no bridge unit, route or file exists.
+- The process itself refuses to start without an owner credential, so an installed but unconfigured unit fails loudly instead of serving an open route.
+
+### Installing It
+
+```sh
+sudo BF_COMPANION_BRIDGE=1 deploy/linux-server/install.sh
+```
+
+### Publishing Its Tailnet Route
+
+The installer prints the command and does not run it.  Publishing a route is a deliberate act, so it stays a deliberate act:
+
+```sh
+tailscale serve --bg --https=8800 http://127.0.0.1:8797
+```
+
+Tailscale Serve stays inside the tailnet.  Never enable Funnel:  Funnel is public and adds no identity header, which would leave the bridge without an owner check at all.  The bridge takes its own https port, so publishing it never disturbs the harness's route.
+
+### What It Holds
+
+The bridge owns its own pairing window, its own device registry and its own advertisement; no secret is shared with the Mac.  The registry holds digests only: a redeemed credential is shown to the phone once and kept as its sha256, compared with a timing-safe comparison, and a malformed entry is skipped rather than trusted.  A revoked device keeps its row, so a replayed pairing cannot mint a fresh credential for it.
+
+### Its Own State
+
+
+The bridge keeps its device registry and its pairing window in one state file, under the fleet volume, written owner-only and replaced atomically.  A paired phone that forgets its pairing after a restart is a phone the owner has to pair again, and a revocation a restart forgets is a revocation that does not exist.  The file holds digests only: the device credential itself is never written down, so a copied state file cannot be replayed as a credential.  A state file that is a symlink, that anyone but the owner can read, or that has a second name is refused rather than read.
+
+### The APNs Sender
+
+The bridge reads its APNs key material through the scoped read-only Infisical path (`APNS_KEY_P8` and `APNS_KEY_ID`, or `AUTHKEY_<KEY_ID>` for a pinned key) and through nothing else.  The key id and the team id come from the vault as well, never from source:  a governed identifier pinned in code goes stale and reads as one nobody reviewed.  With no key id or no team id in the vault, the sender is off and the startup line says which name is missing.  It does not read the environment for a key, and it does not create a key or a grant: the sender is off until the owner has put key material in the vault.  The startup line says which of those it is, and never prints a value.
+
+### Verifying It, In Isolation
+
+The recipe below runs the bridge against a fake harness on loopback.  It touches no live service, no phone and no vault:
+
+```sh
+export PATH=/mnt/fleet-extra/apps/scratch/bin:$PATH TMPDIR=/tmp
+node --test deploy/linux-server/companion-bridge-server.node-test.mjs
+```
+
+That covers the owner credential, the default-deny route table, the pairing window and its spend and replay, the digest-only registry, the byte-for-byte proxying and the APNs locus.  The real-phone end-to-end run is BF-2652, and it needs a physical iPhone and an owner-authorized route; neither is done by the bridge.
+
+### What The Bridge Does Not Do
+
+- It does not retire the Node `:8810` companion sidecar.  That stays until a real-phone end-to-end run passes.
+- It does not send push notifications.  It resolves the key material; the sender itself is the harness's, and one device never has two senders.
+- It does not change any harness route, and it does not answer a route the phone does not use.
 
 ## Health Checks
 

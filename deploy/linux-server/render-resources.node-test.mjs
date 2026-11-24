@@ -118,4 +118,17 @@ test("unit guards the mount, pins the namespace and moves literal temporary path
   assert.match(gate, /StandardOutput=journal/);
   assert.doesNotMatch(gate, /StandardOutput=append:/);
   assert.match(gate, /ExecStartPre=.*check-storage.mjs/);
+  const bridge = renderUnit(readFileSync(new URL("./botfleet-companion-bridge.service.in", import.meta.url), "utf8"), options);
+  assert.match(bridge, /RequiresMountsFor=\/fixture-volume/);
+  assert.match(bridge, /ConditionPathIsMountPoint=\/fixture-volume/);
+  assert.match(bridge, /MountFlags=private/);
+  assert.match(bridge, /ProtectSystem=strict/);
+  assert.match(bridge, /ProtectHome=read-only/);
+  assert.match(bridge, /ReadWritePaths=\/fixture-volume/);
+  assert.match(bridge, /NoNewPrivileges=yes/);
+  assert.match(bridge, /StandardOutput=journal/);
+  assert.doesNotMatch(bridge, /StandardOutput=append:/);
+  assert.match(bridge, /ExecStartPre=.*check-storage.mjs/);
+  assert.match(bridge, /ExecStart=.*companion-bridge-server.mjs --bootstrap-token-file/);
+  assert.doesNotMatch(bridge, /@[A-Z_]+@/);
 });

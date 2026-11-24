@@ -122,7 +122,7 @@ export function writeUnitFile(template, options, target) {
 }
 
 function runCli() {
-  const unitMode = process.argv.length === 4 && ["--unit", "--write-unit"].includes(process.argv[2]) && ["botfleet-server.service.in", "botfleet-owner-gate.service.in"].includes(process.argv[3]);
+  const unitMode = process.argv.length === 4 && ["--unit", "--write-unit"].includes(process.argv[2]) && ["botfleet-server.service.in", "botfleet-owner-gate.service.in", "botfleet-companion-bridge.service.in"].includes(process.argv[3]);
   if (!unitMode && (process.argv.length !== 3 || !["--write", "--dry-run"].includes(process.argv[2]))) throw new Error("usage: node render-resources.mjs --write|--dry-run|--unit|--write-unit <known-template>");
   const options = { volume: process.env.BF_VOLUME, root: process.env.BF_ROOT, code: process.env.BF_CODE, user: process.env.BF_USER, group: process.env.BF_GROUP };
   validateDeployPaths(options);

@@ -145,7 +145,7 @@ struct PhoneSettingsModelTests {
     func backendAdvertisesOnlyWhatItServed() async {
         // The closure only runs on start; this test never starts the
         // listener, so nothing is bound and no store is opened.
-        let backend = NativeCompanionListenerBackend {
+        let backend = NativeCompanionListenerBackend { _ in
             fatalError("the cache test never starts the listener")
         }
         #expect(await backend.currentAdvertisement() == CompanionEndpointAdvertisement())
@@ -170,7 +170,7 @@ struct PhoneSettingsModelTests {
         let pairingTag = "bf_test_" + "stop_clears"
         let server = NativeCompanionServer(database: database, pairedTokens: [pairingTag])
         let headers = ["Authorization": "Bearer \(pairingTag)"]
-        let backend = NativeCompanionListenerBackend { server }
+        let backend = NativeCompanionListenerBackend { _ in server }
         _ = try await backend.start(advertising: nil) { _ in }
         let hosted = hostedAdvertisement()
         await backend.setEndpointAdvertisement(hosted)
