@@ -108,7 +108,7 @@ When we forked, that project already shipped the core app this repo still runs o
 - **Streaming tool-run chips**, native macOS dictation from the composer mic, cursor mascots, and screenshots of the bot's work folded into the transcript.
 - **MCP control plane** — a stdio MCP server for Claude Desktop / Cursor to inspect bots and channels, page transcripts, create work, wait, switch models, and interrupt.  It does not expose approval grants, deletion, arbitrary settings, credentials, or computer lifecycle.
 - **Routines and webhooks** — one-shot or weekday schedules, plus a dedicated webhook receiver on `127.0.0.1:8800`.
-- **Desktop shells** — packaged macOS, Windows, and Ubuntu 24.04 apps with an embedded harness.
+- **Desktop shells** — a packaged macOS app with an embedded harness; the Windows and Ubuntu 24.04 shells build from source only, with no published packages (BF-2500).
 
 See the [OpenMausBot repository](https://github.com/milind-soni/OpenMausBot) for the current upstream project, including later changes this fork has not pulled.
 
