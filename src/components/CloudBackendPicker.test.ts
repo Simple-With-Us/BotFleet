@@ -89,7 +89,7 @@ describe("CloudBackendPicker", () => {
     expect(litSegment(html)).toBe("vps");
     expect(vpsButton(html)).toContain("disabled");
     expect(html).toContain(
-      "This engine can&#x27;t run a desktop on your own server.\u00a0 Pick an engine that can control a computer, such as Claude, to use Self-hosted VPS.",
+      "This engine can&#x27;t run a desktop on your own server.\u00a0 Pick an engine that can control a computer to use Self-hosted VPS.",
     );
     expect(html).not.toContain("Self-hosted VPS requires");
     expect(html).not.toContain("ACP");
@@ -104,7 +104,7 @@ describe("CloudBackendPicker", () => {
   it("names the engine in the disabled note when engineName is given", () => {
     const html = markup({ ...base, vpsSupported: false, value: "box", engineName: "MiniMax" });
     expect(html).toContain(
-      "MiniMax can&#x27;t run a desktop on your own server.\u00a0 Pick an engine that can control a computer, such as Claude, to use Self-hosted VPS.",
+      "MiniMax can&#x27;t run a desktop on your own server.\u00a0 Pick an engine that can control a computer to use Self-hosted VPS.",
     );
     expect(html).not.toContain("This engine can&#x27;t run a desktop");
   });
