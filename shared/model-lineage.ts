@@ -277,6 +277,8 @@ const GEMINI: Family = {
   ],
   classify(id) {
     if (GEMINI_HYDROGEN.test(id)) return { classKey: "flash", rank: rankOf(4) };
+    const lite = GEMINI_FLASH_LITE.exec(id);
+    if (lite) return { classKey: "lite", rank: rankOf(num(lite[1]), num(lite[2])) };
     const flash = GEMINI_FLASH.exec(id);
     if (flash) return { classKey: "flash", rank: rankOf(num(flash[1]), num(flash[2])) };
     if (GEMINI_NEON.test(id)) return { classKey: "pro", rank: rankOf(4) };
