@@ -194,12 +194,12 @@ test("the 2026-10-25 history entry does not backdate the Z Code pane", () => {
   const historyStart = source.indexOf("### History");
   assert.notEqual(historyStart, -1, "sentence-gap must keep a History section");
   const history = source.slice(historyStart);
-  const oct = history.indexOf("**2026-10-25 update");
   const nov = history.indexOf("**2026-11-11 update");
-  const next = history.indexOf("**2026-10-23 update", nov);
-  assert.ok(oct !== -1 && nov > oct && next > nov, "history must keep the 2026-10-25, 2026-11-11, then 2026-10-23 entries in that order");
-  const octEntry = history.slice(oct, nov);
-  const novEntry = history.slice(nov, next);
+  const oct = history.indexOf("**2026-10-25 update");
+  const next = history.indexOf("**2026-10-23 update", oct);
+  assert.ok(nov !== -1 && oct > nov && next > oct, "history must keep the 2026-11-11, 2026-10-25, then 2026-10-23 entries in that order");
+  const novEntry = history.slice(nov, oct);
+  const octEntry = history.slice(oct, next);
   assert.ok(octEntry.includes("Claude Code"), "2026-10-25 history must name Claude Code");
   assert.ok(octEntry.includes("MiniMax Code"), "2026-10-25 history must name MiniMax Code");
   assert.ok(!octEntry.includes("Z Code"), "2026-10-25 history must not name the Z Code pane");
@@ -214,14 +214,14 @@ test("the 2026-11-21 history entry names the Antigravity pane and no earlier ent
   assert.notEqual(historyStart, -1, "sentence-gap must keep a History section");
   const history = source.slice(historyStart);
   const latest = history.indexOf("**2026-11-21 update");
-  const oct = history.indexOf("**2026-10-25 update");
   const nov = history.indexOf("**2026-11-11 update");
-  assert.ok(latest !== -1 && oct > latest && nov > oct, "history must keep the 2026-11-21 entry before the 2026-10-25 and 2026-11-11 entries");
-  assert.ok(history.slice(latest, oct).includes("Antigravity"), "2026-11-21 history must name the Antigravity pane");
-  assert.ok(!history.slice(oct, nov).includes("Antigravity"), "2026-10-25 history must not name the Antigravity pane");
-  const next = history.indexOf("**2026-10-23 update", nov);
-  assert.ok(next > nov, "history must keep the 2026-10-23 entry after the 2026-11-11 entry");
-  assert.ok(!history.slice(nov, next).includes("Antigravity"), "2026-11-11 history must not name the Antigravity pane");
+  const oct = history.indexOf("**2026-10-25 update");
+  assert.ok(latest !== -1 && nov > latest && oct > nov, "history must keep the 2026-11-21, 2026-11-11, then 2026-10-25 entries in that order");
+  assert.ok(history.slice(latest, nov).includes("Antigravity"), "2026-11-21 history must name the Antigravity pane");
+  assert.ok(!history.slice(nov, oct).includes("Antigravity"), "2026-11-11 history must not name the Antigravity pane");
+  const next = history.indexOf("**2026-10-23 update", oct);
+  assert.ok(next > oct, "history must keep the 2026-10-23 entry after the 2026-10-25 entry");
+  assert.ok(!history.slice(oct, next).includes("Antigravity"), "2026-10-25 history must not name the Antigravity pane");
 });
 
 test("no operative rule closes the chat panes out of the exception", () => {

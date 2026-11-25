@@ -98,13 +98,13 @@ the text as it is, never switch to the `&nbsp;` entity, and report the surface i
 
 **2026-11-21 update — Antigravity chat pane.**  The owner added the Antigravity chat pane as the fourth pane that takes the `&nbsp;` entity plus a normal space.  Screenshots in that pane showed a raw U+00A0 collapsing to one visible space and the entity rendering a wider gap with no literal text outside code spans.  Every other surface is unchanged.
 
+**2026-11-11 update — Z Code chat pane.**  The owner added the Z Code chat pane as the third pane that takes the `&nbsp;` entity plus a normal space, after a byte-level check on 2026-11-10.  Every other surface is unchanged.
+
 **2026-10-25 update — one exception.**  The owner reaffirmed the one mechanism and named the one
 exception:  the chat panes of Claude Code (the Code tab) and MiniMax Code (the MiniMax Code
 pane) take the `&nbsp;` entity plus a normal space, because they normalize a raw U+00A0 away
 and collapse two ASCII spaces.  Everywhere else is a real U+00A0 plus a normal space.  The
 MiniMax Code chat pane always takes the entity.
-
-**2026-11-11 update — Z Code chat pane.**  The owner added the Z Code chat pane as the third pane that takes the `&nbsp;` entity plus a normal space, after a byte-level check on 2026-11-10.  Every other surface is unchanged.
 
 **2026-10-23 update — one mechanism everywhere.**  The owner replaced every per-surface rule
 with one:  a real U+00A0 plus a normal space on every surface, never the `&nbsp;` entity, and
