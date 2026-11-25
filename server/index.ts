@@ -161,7 +161,7 @@ import {
   NAMED_TUNNEL_MUTATION_FORBIDDEN,
 } from "./named-tunnel-gate.ts";
 import { isTunnelWebhookPath, proxyTunnelWebhook } from "./hooks-tunnel-proxy.ts";
-import { botOffError, botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
+import { botOffError, isBotOffError } from "./bot-stop-policy.ts";
 import {
   BOT_OFF_CODE,
   BOT_OFF_REFUSAL,
@@ -4076,11 +4076,11 @@ async function interruptBot(
         return { ok: false, status: 409, error: "this bot is running a routine in another conversation" };
       }
     }
-    // Cancel all active and queued routine runs for this bot and snooze automated triggers
-    // so background webhooks and scheduled routines do not restart it.
+    // Cancel all active and queued routine runs for this bot.  Stop is this
+    // turn only (server/bot-stop-policy.ts): no latch is set, so the next
+    // webhook, schedule or trigger starts work exactly as it would have.
     jobHost?.stopThread(bot.id, interruptLiveThreadId);
     const cancelledRuns = await routines.cancelAllRunsForBot(bot.id);
-    routines.snoozeBot(bot.id);
     cancelledRunCount = cancelledRuns.length;
     if (cancelledRuns.length > 0) {
       stopped = true;
@@ -7038,10 +7038,6 @@ function runQueuedSend(send: Omit<HeldSend, "heldAt">, userMessage: Message, hel
     excludeMessageIds: send.excludeIds,
     linqChatId: send.linqChatId,
     unattended: send.relayed || undefined,
-    // person-initiated: the person's OWN messages, held only because the
-    // bot was busy.  Draining them is that person asking, so it wakes a
-    // stopped bot — the same as typing them into an idle bot.
-    personInitiated: true,
   }).catch((err) => {
     // The bot was taken first (a routine the scheduler ticked, a resumed
     // turn), or an update fenced in between: the words are in the thread
@@ -7309,14 +7305,6 @@ async function startTurn(
     modelSelection?: ModelSelection;
     from?: Message["from"];
     comm?: Message["comm"];
-    /**
-     * True only when a PERSON asked for this specific turn.  Every
-     * system-initiated dispatch — update resume, boot recovery, a card
-     * continuation, a job, a routine, a webhook — leaves this false, so a bot
-     * they stopped cannot be re-dispatched behind their back.  See
-     * `server/bot-stop-policy.ts`.
-     */
-    personInitiated?: boolean;
     /** A routine's command allowlist (server/tool-policy.ts).  Stored on the
      *  turn's prompt message, so every re-dispatch of that message (a model
      *  fail-over, a credential card, a boot resume) keeps it. */
@@ -7335,24 +7323,11 @@ async function startTurn(
   }
   const bot = store.bot(botId);
   if (!bot) throw Object.assign(new Error("no such bot"), { status: 404 });
-  // Off outranks everything below, even a person's own message, and runs
-  // BEFORE the stop decision so a refused message cannot clear a stop.  It
-  // gates STARTING a turn only; room turns have their own gate.
+  // Off outranks everything below, even a person's own message.  It gates
+  // STARTING a turn only; room turns have their own gate.  There is no stop
+  // decision here any more: Stop is scoped to the turn it interrupted and
+  // leaves no latch to enforce or clear (server/bot-stop-policy.ts).
   if (botIsOff(bot)) throw botOffError();
-  // A stop is a decision about the BOT, not about the turn in flight, so it
-  // is enforced here — the one place every dispatch passes through — rather
-  // than in each caller.  A resume used to clear the stop on its way past
-  // (no `automationSource` on a replayed human prompt) and start the bot.
-  const stopDecision = decideBotStop({
-    stopped: routines?.isBotSnoozed(botId) === true,
-    personInitiated: opts?.personInitiated === true,
-  });
-  if (stopDecision.action === "refuse") {
-    throw Object.assign(new Error(botStopRefusalMessage()), { status: 409, code: "bot_stopped" });
-  }
-  if (stopDecision.clearsStop) {
-    routines?.clearBotSnooze(botId);
-  }
   if (providerReloadInProgress) {
     throw Object.assign(new Error("provider settings are being reloaded — retry when the reload finishes"), {
       status: 409,
@@ -10016,7 +9991,7 @@ function recoverInflightTurn(botId: string, action: BootRecoveryAction = "contin
     // A deliberate stop is not a resume failure.  Record it as the person
     // stopping the bot, drop the marker, and do NOT remember a failure — a
     // remembered one is permanent noise on a thread nobody is trying to run.
-    if (isBotStoppedError(error)) {
+    if (isBotOffError(error)) {
       console.log(`boot recovery: not resuming ${bot.name} (${threadId}) — the bot is stopped or off`);
       releaseBootResume(bot.id, threadId);
       store.patchBot(bot.id, { inflightThreadId: undefined });
@@ -11242,7 +11217,7 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
     // than parking it in a retry loop that can never succeed.
     if (isBotStoppedError(error)) {
       // The refusal's own message says which: turn the bot on, or start it again.
-      markConnectorResumeFailed(entry.threadId, entry.resumeKey, error instanceof Error ? error.message : botStopRefusalMessage());
+      markConnectorResumeFailed(entry.threadId, entry.resumeKey, error instanceof Error ? error.message : BOT_OFF_REFUSAL);
       return;
     }
     const message = error instanceof Error ? error.message : String(error);
@@ -12379,10 +12354,6 @@ function drainCredentialFallbacks(): void {
       modelSelection: entry.selection,
       automationSource: entry.userMessage.automationSource,
       unattended: isUnattended(entry.botId),
-      // person-initiated: the person answered the card, so they are asking
-      // for the turn to continue — the same as retyping it.  A stop set
-      // while the card was open is lifted by that answer, not overridden.
-      personInitiated: true,
     }).catch((error) => {
       if (isExternalCredentialPendingError(error)) pendingCredentialFallback.set(key, entry);
       else console.error(`credential fallback resume failed for ${entry.botId}:`, error);
@@ -17110,10 +17081,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           recording,
           ...(fromImessage ? { automationSource: "imessage" as const } : {}),
           unattended: relaySourced || undefined,
-          // person-initiated: a person sent this.  Relayed or not, someone
-          // typed it on purpose, which is how a stopped bot is meant to be
-          // woken — `interrupt` stops automation, not the owner.
-          personInitiated: true,
         });
         return { status: 202, body: { ok: true } };
       };
@@ -17221,10 +17188,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           recording,
           automationSource: fromImessage ? "imessage" : undefined,
           unattended: relaySourced || undefined,
-          // person-initiated: a person targeted this thread on purpose,
-          // which is how a stopped bot is meant to be woken — `interrupt`
-          // stops automation, not the owner.
-          personInitiated: true,
         });
         return { status: 202, body: { ok: true } };
       };
@@ -17290,8 +17253,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         replyTo,
         automationSource: message.automationSource,
         unattended: message.role === "system" ? isUnattended(bot.id) : undefined,
-        // person-initiated: a person hitting retry/rewind on a message.
-        personInitiated: true,
       });
       return json(res, 202, { ok: true });
     }
@@ -17313,7 +17274,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (m && method === "POST") {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
-      routines?.clearBotSnooze(bot.id);
       const body = await readBody(req);
       const behavior = requestBehavior(body.behavior);
       if (!behavior) return json(res, 400, { error: "behavior must be allow, deny, or answer" });
@@ -21190,13 +21150,10 @@ zulipHub = new ZulipHub({
   startTurn: async (botId, text, conversation) => {
     const bot = store.bot(botId);
     if (!bot) throw Object.assign(new Error("no such bot"), { status: 404 });
-    // The refusals startTurn would make anyway, made before a task exists:
-    // an Off or stopped bot must not collect an empty Zulip task per
-    // conversation (or a re-broadcast of one on every retry).
+    // The refusal startTurn would make anyway, made before a task exists:
+    // an Off bot must not collect an empty Zulip task per conversation (or
+    // a re-broadcast of one on every retry).
     if (botIsOff(bot)) throw botOffError();
-    if (routines?.isBotSnoozed(botId) === true) {
-      throw Object.assign(new Error(botStopRefusalMessage()), { status: 409, code: "bot_stopped" });
-    }
     // Each Zulip conversation runs in a task of its own, created the way a
     // routine's or a webhook's is and never activated: never the owner's
     // active thread, whose transcript a peer-woken turn must not be able to
