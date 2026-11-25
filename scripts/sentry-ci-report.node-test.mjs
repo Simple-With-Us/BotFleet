@@ -179,6 +179,14 @@ test("a stale UNMONITORED_SCHEDULES entry is reported like a stale cron key (AFC
   assert.deepEqual(stale, unmonitored);
   assert.deepEqual(caseFolded, []);
 
+  // A name listed in both maps is drift too, since it would never check in.
+  const overlap = probeReporter([
+    "m.CRON_SCHEDULES['Auto-merge PRs'] = '*/15 * * * *'",
+    "live = set(m.CRON_SCHEDULES) | set(m.UNMONITORED_SCHEDULES)",
+    "print(json.dumps(m.find_cron_schedule_drift(live)))",
+  ]);
+  assert.deepEqual(overlap, ["Auto-merge PRs"]);
+
   const sent = probeReporter([
     "sent = []",
     "env = {",
