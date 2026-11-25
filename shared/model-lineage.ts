@@ -308,6 +308,7 @@ const GEMINI: Family = {
   statsCarriers: {
     flash: "gemini-4-hydrogen",
     pro: "gemini-4-neon",
+    lite: "gemini-2.5-flash-lite",
   },
 };
 
