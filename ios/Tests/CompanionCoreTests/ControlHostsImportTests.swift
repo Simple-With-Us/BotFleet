@@ -33,31 +33,33 @@ private final class FakeEffects: ControlHostsImportEffects, @unchecked Sendable 
     }
 
     func readNativeHosts() async throws -> [HostRecord] {
-        lock.lock(); defer { lock.unlock() }
-        return native
+        //  `withLock` rather than `lock()`/`unlock()`:  the raw pair is
+        //  unavailable from an async context in Swift 6.
+        lock.withLock { native }
     }
 
     func nativeHasCredential(for host: HostRecord) async throws -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return credentials.contains(host.id)
+        lock.withLock { credentials.contains(host.id) }
     }
 
     func enroll(_ token: String, for host: HostRecord) async throws {
-        lock.lock()
-        enrollments += 1
-        let failing = failOnEnrollmentNumber == enrollments
-        if !failing {
-            credentials.append(host.id)
-            enrolled.append(host.id)
+        let failing = lock.withLock {
+            enrollments += 1
+            let failing = failOnEnrollmentNumber == enrollments
+            if !failing {
+                credentials.append(host.id)
+                enrolled.append(host.id)
+            }
+            return failing
         }
-        lock.unlock()
         if failing { throw ControlHostsImportError.unreadableFile }
     }
 
     func upsert(_ host: HostRecord) async throws {
-        lock.lock(); defer { lock.unlock() }
-        native.append(host)
-        upserted.append(host.id)
+        lock.withLock {
+            native.append(host)
+            upserted.append(host.id)
+        }
     }
 
     func removeRecord(id: String) throws {
@@ -118,7 +120,7 @@ private func fixtureEntries() -> [ControlHostEntry] {
 /// The synthetic Control file on disk, owner-only, the way Control writes it.
 private func writeControlFile(_ entries: [ControlHostEntry], into dir: URL) -> URL {
     let url = dir.appendingPathComponent("control-hosts.json")
-    let data = try! ControlHostsImport.fileData(entries)
+    let data = try! ControlHostEntry.fileData(entries)
     try! data.write(to: url)
     try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     return url
