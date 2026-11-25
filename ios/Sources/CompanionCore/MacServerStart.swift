@@ -563,6 +563,8 @@ public final class MacServerLaunchController: @unchecked Sendable {
         guard fstat(descriptor, &opened) == 0,
               opened.st_mode & S_IFMT == S_IFREG,
               opened.st_nlink == 1,
+              opened.st_size >= 0,
+              opened.st_size <= largest,
               opened.st_dev == listed.st_dev,
               opened.st_ino == listed.st_ino else {
             throw MacServerStartError.sessionFileUnreadable
@@ -616,15 +618,30 @@ public final class MacServerLaunchController: @unchecked Sendable {
             return
         }
         guard ftruncate(descriptor, 0) == 0 else { return }
+        //  A short write or an EINTR must not leave a partial session behind:
+        //  the whole of the prior bytes go down, and a write that cannot
+        //  finish leaves the file empty rather than half-written.
+        var writeFailed = false
         prior.withUnsafeBytes { buffer in
-            guard let base = buffer.baseAddress else { return }
+            guard let base = buffer.baseAddress else {
+                writeFailed = true
+                return
+            }
             var offset = 0
             while offset < buffer.count {
                 let written = Darwin.write(descriptor, base.advanced(by: offset), buffer.count - offset)
-                if written <= 0 { break }
-                offset += written
+                if written > 0 {
+                    offset += written
+                } else if written < 0, errno == EINTR {
+                    continue
+                } else {
+                    writeFailed = true
+                    break
+                }
             }
+            if offset != buffer.count { writeFailed = true }
         }
+        if writeFailed { _ = ftruncate(descriptor, 0) }
     }
 
     // MARK: - The Deliberate-Stop Marker
