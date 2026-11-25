@@ -529,6 +529,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       { id: "gemini-3.1-pro-low", display: "Gemini 3.1 Pro (Low)", ctxTokens: 1_000_000 },
       { id: "gemini-3.8-flash-medium", display: "Gemini 3.8 Flash (Medium)", ctxTokens: 1_000_000 },
       { id: "gemini-3.8-flash-low", display: "Gemini 3.8 Flash (Low)", ctxTokens: 1_000_000 },
+      { id: "gemini-2.5-flash-lite", display: "Gemini 2.5 Flash Lite", ctxTokens: 1_000_000 },
       // Retired 2.5 ids kept at the tail so legacy tasks banked under them still
       // attribute to Antigravity via uniqueModelToEngineId.
       { id: "gemini-2.5-pro", display: "Gemini 2.5 Pro", ctxTokens: 1_000_000 },

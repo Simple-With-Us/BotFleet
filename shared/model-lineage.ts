@@ -256,10 +256,14 @@ const GROK: Family = {
 // member of a class attribute to that member (performanceStatsCarrier).
 // Gemini 4 Argon is not a BotFleet model option at all (owner
 // correction, 2026-11-21) and Carbon is outside the scheme: both are
-// deliberately unclassified, so their stats stay their own.  The Gemini
+// deliberately unclassified, so their stats stay their own.  Flash Lite
+// ids (gemini-<version>-flash-lite) are their own lite class (owner,
+// 2026-11-25): their stats carry to the current Flash Lite member and
+// never fold into the Flash class's Hydrogen.  The Gemini
 // driver kinds are deliberately absent from DRIVER_LINEAGE below —
 // selection, picker, and latest resolution for them do not change.
-const GEMINI_FLASH = /^gemini-(\d+)(?:\.(\d+))?-flash(?:-(?:lite|low|medium|high|xhigh))?$/;
+const GEMINI_FLASH_LITE = /^gemini-(\d+)(?:\.(\d+))?-flash-lite$/;
+const GEMINI_FLASH = /^gemini-(\d+)(?:\.(\d+))?-flash(?:-(?:low|medium|high|xhigh))?$/;
 const GEMINI_PRO = /^gemini-(\d+)(?:\.(\d+))?-pro(?:-(?:preview|low|medium|high|xhigh))?$/;
 const GEMINI_HYDROGEN = /^gemini-4-hydrogen(?:-(?:low|medium|high|xhigh))?$/;
 const GEMINI_NEON = /^gemini-4-neon(?:-(?:low|medium|high|xhigh))?$/;
@@ -269,9 +273,12 @@ const GEMINI: Family = {
   classes: [
     { key: "flash", label: "Flash" },
     { key: "pro", label: "Pro" },
+    { key: "lite", label: "Flash Lite" },
   ],
   classify(id) {
     if (GEMINI_HYDROGEN.test(id)) return { classKey: "flash", rank: rankOf(4) };
+    const lite = GEMINI_FLASH_LITE.exec(id);
+    if (lite) return { classKey: "lite", rank: rankOf(num(lite[1]), num(lite[2])) };
     const flash = GEMINI_FLASH.exec(id);
     if (flash) return { classKey: "flash", rank: rankOf(num(flash[1]), num(flash[2])) };
     if (GEMINI_NEON.test(id)) return { classKey: "pro", rank: rankOf(4) };
@@ -280,17 +287,20 @@ const GEMINI: Family = {
     return null;
   },
   label(_id, c) {
+    if (c.classKey === "lite") return `Gemini ${versionText(c.rank)} Flash Lite`;
     return c.classKey === "flash"
       ? `Gemini ${versionText(c.rank)} Flash`
       : `Gemini ${versionText(c.rank)} Pro`;
   },
   // Google API list prices per million tokens.  Flash: 2.5 Flash
   // $0.30/$2.50, 3.8 Flash $0.75/$3.75, 4 Hydrogen $1.50/$7.50.  Pro:
-  // 2.5 Pro and 3.1 Pro $1.25/$10, 4 Neon $3/$15.
+  // 2.5 Pro and 3.1 Pro $1.25/$10, 4 Neon $3/$15.  Flash Lite:
+  // 2.5 Flash Lite $0.10/$0.40.
   prices: {
     "flash@2.5": { input: 0.3, output: 2.5 },
     "flash@3.8": { input: 0.75, output: 3.75 },
     "flash@4": { input: 1.5, output: 7.5 },
+    "lite@2.5": { input: 0.1, output: 0.4 },
     "pro@2.5": { input: 1.25, output: 10 },
     "pro@3.1": { input: 1.25, output: 10 },
     "pro@4": { input: 3, output: 15 },
@@ -298,6 +308,7 @@ const GEMINI: Family = {
   statsCarriers: {
     flash: "gemini-4-hydrogen",
     pro: "gemini-4-neon",
+    lite: "gemini-2.5-flash-lite",
   },
 };
 

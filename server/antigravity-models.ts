@@ -27,6 +27,7 @@ export const STATIC_ANTIGRAVITY_MODELS: ModelCatalog = {
     { id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High)" },
     { id: "gemini-3.8-flash-medium", label: "Gemini 3.8 Flash (Medium)" },
     { id: "gemini-3.8-flash-low", label: "Gemini 3.8 Flash (Low)" },
+    { id: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash Lite" },
     { id: "claude-opus-5-5-high", label: "Claude Opus 5.5 (High)" },
     { id: "claude-opus-5-5-medium", label: "Claude Opus 5.5 (Medium)" },
     { id: "claude-opus-5-5-low", label: "Claude Opus 5.5 (Low)" },
