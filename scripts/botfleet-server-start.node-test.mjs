@@ -7,9 +7,10 @@
 // scripts/botfleet-server-start.sh and docs/audits/2026-09-24-efficiency-audit.md OP10.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -1396,20 +1397,25 @@ function makeRuntimeFixture() {
 function installBoundRuntime(fixture, { version = "v22.14.0", executable = true } = {}) {
   const dir = join(fixture.storeRoot, "runtimes");
   mkdirSync(dir, { recursive: true });
-  const path = join(dir, "c".repeat(64));
   const argsFile = join(fixture.dir, "bound-runtime-args");
-  writeRuntimeStub(path, { version, record: argsFile, executable });
-  return { path, argsFile };
+  // The store names a kept runtime by the digest of its own bytes, so the
+  // fixture has to do the same: the file's NAME is its digest.
+  const staging = join(fixture.dir, "bound-runtime-staging");
+  writeRuntimeStub(staging, { version, record: argsFile, executable });
+  const digest = createHash("sha256").update(readFileSync(staging)).digest("hex");
+  const path = join(dir, digest);
+  renameSync(staging, path);
+  return { path, argsFile, digest };
 }
 
 // The binding record the store writes beside a release.
-function writeBinding(fixture, runtimePath, { commit = RUNTIME_COMMIT } = {}) {
+function writeBinding(fixture, runtimePath, { commit = RUNTIME_COMMIT, sha256 } = {}) {
   const dir = join(fixture.storeRoot, "runtime-bindings");
   mkdirSync(dir, { recursive: true });
   const record = {
     schemaVersion: 1,
     commit,
-    runtime: { path: runtimePath, sha256: "c".repeat(64), bytes: 12345, format: "elf" },
+    runtime: { path: runtimePath, sha256: sha256 ?? basename(runtimePath), bytes: 12345, format: "elf" },
     boundAt: "2026-11-25T12:00:00.000Z",
   };
   const path = join(dir, `${commit}.json`);
@@ -1529,6 +1535,64 @@ test("a binding record that is not valid JSON falls back to the configured node"
     assert.equal(result.status, 0, result.stderr);
     const said = `${result.stdout || ""}${result.stderr || ""}`;
     assert.match(said, /not valid JSON/);
+    assert.match(result.stdout, /--experimental-strip-types server\/index\.ts/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a binding that names a runtime outside the store's runtimes area is refused", () => {
+  const fixture = makeRuntimeFixture();
+  // A perfectly good executable, and not one the store keeps.
+  const outside = join(fixture.dir, "outside-runtime");
+  writeRuntimeStub(outside, { version: "v22.14.0" });
+  writeBinding(fixture, outside, { sha256: "c".repeat(64) });
+  try {
+    const result = runRuntime(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const said = `${result.stdout || ""}${result.stderr || ""}`;
+    assert.match(said, /not in the store's runtimes area/);
+    assert.match(result.stdout, /--experimental-strip-types server\/index\.ts/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a kept runtime whose bytes no longer match the digest it is named by is refused", () => {
+  const fixture = makeRuntimeFixture();
+  const bound = installBoundRuntime(fixture);
+  writeBinding(fixture, bound.path);
+  // The file keeps its name, and its bytes change underneath it.
+  appendFileSync(bound.path, "one changed byte\n");
+  try {
+    const result = runRuntime(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const said = `${result.stdout || ""}${result.stderr || ""}`;
+    assert.match(said, /hashes to [a-f0-9]{64}, not the digest it is named by/);
+    assert.match(result.stdout, /--experimental-strip-types server\/index\.ts/);
+    assert.equal(existsSync(bound.argsFile), false, "a runtime that fails its digest must never run the harness");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a bound runtime that cannot report its version falls back instead of stopping the service", () => {
+  const fixture = makeRuntimeFixture();
+  const dir = join(fixture.storeRoot, "runtimes");
+  mkdirSync(dir, { recursive: true });
+  const staging = join(fixture.dir, "broken-runtime");
+  writeFileSync(staging, "#!/bin/sh\nexit 3\n");
+  chmodSync(staging, 0o755);
+  const digest = createHash("sha256").update(readFileSync(staging)).digest("hex");
+  const path = join(dir, digest);
+  renameSync(staging, path);
+  writeBinding(fixture, path);
+  try {
+    const result = runRuntime(fixture);
+    // The always-on service must not die because a probe failed.
+    assert.equal(result.status, 0, result.stderr);
+    const said = `${result.stdout || ""}${result.stderr || ""}`;
+    assert.match(said, /too old for --experimental-strip-types/);
     assert.match(result.stdout, /--experimental-strip-types server\/index\.ts/);
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });

@@ -424,6 +424,22 @@ release_store_root() {
   dirname "$parent"
 }
 
+# The sha256 of a file, or nothing when no hasher is available.
+#
+# The bound runtime is checked against the digest the store recorded, so the
+# bytes that are about to run are the bytes the store kept.
+store_runtime_digest() {
+  local path="$1" output=""
+  if [ -x /usr/bin/shasum ]; then
+    output="$(/usr/bin/shasum -a 256 "$path" 2>/dev/null)" || return 1
+  elif command -v sha256sum >/dev/null 2>&1; then
+    output="$(sha256sum "$path" 2>/dev/null)" || return 1
+  else
+    return 1
+  fi
+  printf '%s' "${output%% *}"
+}
+
 # Whether a node version carries the harness's type-stripping support.
 #
 # Node strips types from 22.6 onwards, and the harness runs under
@@ -514,7 +530,12 @@ if (!/^\//.test(runtime.path)) {
   process.stdout.write("reason: the record names no absolute runtime path\n");
   process.exit(0);
 }
+if (!/^[a-f0-9]{64}$/.test(runtime.sha256 || "")) {
+  process.stdout.write("reason: the record names no runtime digest\n");
+  process.exit(0);
+}
 process.stdout.write(runtime.path + "\n");
+process.stdout.write(runtime.sha256 + "\n");
 ' -- "$record" "$commit" 2>/dev/null || true)"
   case "$readout" in
     "")
@@ -526,7 +547,8 @@ process.stdout.write(runtime.path + "\n");
       return 0
       ;;
   esac
-  candidate="$readout"
+  candidate="$(printf '%s\n' "$readout" | /usr/bin/head -n 1)"
+  expected_digest="$(printf '%s\n' "$readout" | /usr/bin/sed -n '2p')"
   if [ ! -e "$candidate" ]; then
     log_err "the runtime bound to $commit is missing at $candidate; starting under $NODE instead"
     return 0
@@ -539,7 +561,30 @@ process.stdout.write(runtime.path + "\n");
     log_err "the runtime bound to $commit is not executable at $candidate; starting under $NODE instead"
     return 0
   fi
-  version="$("$candidate" --version 2>/dev/null | /usr/bin/head -n 1)"
+  # The bound runtime is the store's OWN kept bytes, so it has to be in the
+  # store's runtimes area, named by the digest the record carries, and still
+  # hold those bytes.  A record that names any other file names a program
+  # this launcher must not run.
+  if [ "$(/usr/bin/dirname "$candidate")" != "$store/runtimes" ]; then
+    log_err "the runtime bound to $commit is not in the store's runtimes area; starting under $NODE instead"
+    return 0
+  fi
+  if [ "$(/usr/bin/basename "$candidate")" != "$expected_digest" ]; then
+    log_err "the runtime bound to $commit is not named by the digest the record carries; starting under $NODE instead"
+    return 0
+  fi
+  actual_digest="$(store_runtime_digest "$candidate")" || actual_digest=""
+  if [ -z "$actual_digest" ]; then
+    log_err "the runtime bound to $commit could not be hashed; starting under $NODE instead"
+    return 0
+  fi
+  if [ "$actual_digest" != "$expected_digest" ]; then
+    log_err "the runtime bound to $commit hashes to $actual_digest, not the digest it is named by; starting under $NODE instead"
+    return 0
+  fi
+  # A runtime that cannot even report its version is not usable, and a probe
+  # that fails must not take the always-on service down with it.
+  version="$("$candidate" --version 2>/dev/null | /usr/bin/head -n 1)" || version=""
   if ! runtime_supports_strip_types "$version"; then
     log_err "the runtime bound to $commit reports version ${version:-unknown}, which is too old for --experimental-strip-types; starting under $NODE instead"
     return 0
