@@ -586,8 +586,9 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         // thread survives only while it is the selected bot's own main
         // thread or the thread the menubar pinned for that bot.
         if case .bot(let botId) = selection,
+           let bot = state.bots.first(where: { $0.id == botId }),
            let picked = selectedThreadId,
-           picked != state.bots.first(where: { $0.id == botId })?.threadId,
+           picked != bot.threadId,
            waitingThreadPin.threadId != picked {
             selectedThreadId = nil
         }
