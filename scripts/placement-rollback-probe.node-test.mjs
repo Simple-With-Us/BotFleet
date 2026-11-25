@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
   appendFileSync, chmodSync, closeSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync,
   renameSync, rmSync, statSync, symlinkSync, writeFileSync,
@@ -7,10 +8,10 @@ import {
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { promoteStaging, stagingPath, validateReleaseManifest } from "./harness-release-store.mjs";
+import { promoteStaging, retainRuntime, stagingPath, validateReleaseManifest } from "./harness-release-store.mjs";
 import {
   APPLICATION_HOMES,
   CONTAINER_LOCKDOWN_ENV,
@@ -45,7 +46,20 @@ function privateNodeCopy(path) {
   return copy;
 }
 const HOST_NODE = realpathSync(process.execPath);
+// The machine's own Node: a runtime that lives OUTSIDE every release store.
 const NODE = HOST_NODE.split("/").some((part) => part.startsWith(".") && part.toLowerCase() !== ".botfleet") ? privateNodeCopy(HOST_NODE) : HOST_NODE;
+
+// ONE store for the whole file, and ONE retained copy of the host Node in
+// it.  A release-store candidate binds only a runtime the store that owns
+// the release KEEPS, so every fixture here shares this store and names its
+// retained Node.  The host Node is about 150 MB, so it is copied once per
+// file and never once per fixture.
+const SHARED_STORE = realpathSync(mkdtempSync(join(tmpdir(), "bf-rollback-probe-store-")));
+after(() => {
+  execFileSync("chmod", ["-R", "u+w", SHARED_STORE]);
+  rmSync(SHARED_STORE, { recursive: true, force: true });
+});
+const RETAINED_NODE = await retainRuntime({ source: NODE, env: { BOTFLEET_RELEASES_ROOT: SHARED_STORE } });
 // Only a deadline is shortened here.  The recovery wait and the stop grace are
 // recipe steps a caller cannot shorten, so every case that reaches the passive
 // comparison pays the full recovery wait, exactly as a real run does.
@@ -197,12 +211,16 @@ createServer(async (req, res) => {
 }
 
 /**
- * A real repository, a real export and a real promotion into a temporary
- * release store: the binding's whole claim is byte-equality with git's
- * objects and the store's own manifest, so faking either would test the fake.
- * The store root is always the temporary directory, never the default.
+ * A real repository, a real export and a real promotion into a release
+ * store: the binding's whole claim is byte-equality with git's objects and
+ * the store's own manifest, so faking either would test the fake.
+ *
+ * The store is this file's shared one unless a case names another, and the
+ * candidate's runtime is a runtime THAT store keeps.  Every candidate needs
+ * a commit of its own, because two identical trees committed in the same
+ * second would promote to the same release directory.
  */
-async function makeCandidate(t, { variant = "bridge", files = {} } = {}) {
+async function makeCandidate(t, { variant = "bridge", files = {}, store = SHARED_STORE, runtimePath = RETAINED_NODE.path } = {}) {
   const root = mkdtempSync(join(tmpdir(), "bf-rollback-probe-test-"));
   t.after(() => {
     execFileSync("chmod", ["-R", "u+w", root]);
@@ -210,7 +228,7 @@ async function makeCandidate(t, { variant = "bridge", files = {} } = {}) {
   });
   const repo = join(root, "repo");
   const receipts = join(root, "receipts");
-  const env = { BOTFLEET_RELEASES_ROOT: join(root, "store") };
+  const env = { BOTFLEET_RELEASES_ROOT: store };
   mkdirSync(repo);
   mkdirSync(receipts);
   const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
@@ -220,6 +238,7 @@ async function makeCandidate(t, { variant = "bridge", files = {} } = {}) {
   const tree = {
     "package.json": '{"name":"botfleet","version":"0.1.0","type":"module"}\n',
     "server/index.ts": fixtureServerSource(variant),
+    "server/fixture-id.txt": `${randomBytes(8).toString("hex")}\n`,
     ...files,
   };
   for (const [path, content] of Object.entries(tree)) {
@@ -235,20 +254,33 @@ async function makeCandidate(t, { variant = "bridge", files = {} } = {}) {
   execFileSync("tar", ["-xf", join(root, "tree.tar"), "-C", staging]);
   const releaseRoot = realpathSync(await promoteStaging({ commit, env }));
   return {
-    root, repo, receipts, commit, releaseRoot,
-    candidate: { kind: "release-store", releaseRoot, sourceCommit: commit, sourceRepo: repo, runtimePath: NODE },
+    root, repo, receipts, commit, releaseRoot, store, env,
+    candidate: { kind: "release-store", releaseRoot, sourceCommit: commit, sourceRepo: repo, runtimePath },
   };
 }
 
 /**
- * A runtime whose bytes a test can change: a private copy of this Node.  It
- * has to be a real binary, because the binding refuses an interpreter script.
+ * A runtime a test may change: a small file whose first four bytes are the
+ * ELF magic and which carries the executable bit.  The binding reads the
+ * magic and the bit of a runtime it never starts and nothing else, so this
+ * stands in for a real binary, and it costs a few dozen bytes to copy,
+ * change and link.
  */
-function copiedRuntime(root, name = "fixture-runtime") {
+function elfRuntime(root, name = "elf-runtime") {
   const path = join(root, name);
-  copyFileSync(NODE, path);
+  writeFileSync(path, Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(60, 0x41)]));
   chmodSync(path, 0o755);
   return path;
+}
+
+/** A store of its own, for the cases that change a runtime's bytes. */
+function privateStore(t, prefix = "bf-rollback-probe-store-") {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+  t.after(() => {
+    execFileSync("chmod", ["-R", "u+w", dir]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+  return dir;
 }
 
 /** What the binding must refuse: a script whose `#!` line names the real runtime. */
@@ -330,8 +362,8 @@ test("a clean generated release needs a probe and is never called verified by in
   assert.equal(result.binding.provenance.dependencies, "absent");
   assert.match(result.binding.tree.fingerprint, /^[a-f0-9]{64}$/);
   assert.match(result.binding.runtime.sha256, /^[a-f0-9]{64}$/);
-  assert.equal(result.binding.runtime.bytes, statSync(NODE).size);
-  assert.equal(result.binding.runtime.path, NODE);
+  assert.equal(result.binding.runtime.bytes, statSync(RETAINED_NODE.path).size);
+  assert.equal(result.binding.runtime.path, RETAINED_NODE.path);
   assert.match(result.binding.runtime.format, /^(elf|mach-o)$/);
   // The binding names the physical repository that vouched for the commit.
   assert.deepEqual(result.binding.source, { repository: realpathSync(fixture.repo), referenceDeps: null });
@@ -424,43 +456,54 @@ test("changed artifact bytes are blocked as drift, whether edited, added or remo
 
 test("the runtime is bound by its bytes, and a missing, linked, scripted or non-executable one is blocked", { skip: POSIX_ONLY }, async (t) => {
   const fixture = await makeCandidate(t);
-  const runtimePath = copiedRuntime(fixture.root);
-  const first = await inspectPlacementRollbackCandidate({ ...fixture.candidate, runtimePath });
+  // A retained runtime binds: the store KEEPS those bytes under their own
+  // digest, so the name of the file is the digest of the bytes that run.
+  const first = await inspectPlacementRollbackCandidate(fixture.candidate);
   assert.equal(first.status, "probe-required");
-  appendFileSync(runtimePath, "one changed byte\n");
-  const second = await inspectPlacementRollbackCandidate({ ...fixture.candidate, runtimePath });
-  assert.equal(second.status, "probe-required");
-  assert.notEqual(second.binding.runtime.sha256, first.binding.runtime.sha256);
-  assert.notEqual(second.bindingDigest, first.bindingDigest);
-  assert.equal(second.binding.tree.fingerprint, first.binding.tree.fingerprint);
+  assert.equal(first.binding.runtime.path, RETAINED_NODE.path);
+  assert.equal(first.binding.runtime.sha256, RETAINED_NODE.sha256);
 
   // A runtime reached through a linked DIRECTORY is bound by where it really
   // is, so repointing the link later cannot change which file was named.
-  const realDir = join(realpathSync(fixture.root), "runtime-v1");
-  mkdirSync(realDir);
-  renameSync(runtimePath, join(realDir, "node"));
-  symlinkSync(realDir, join(fixture.root, "runtime-current"));
-  const throughLink = await inspectPlacementRollbackCandidate({ ...fixture.candidate, runtimePath: join(fixture.root, "runtime-current", "node") });
+  symlinkSync(dirname(RETAINED_NODE.path), join(fixture.root, "runtime-current"));
+  const throughLink = await inspectPlacementRollbackCandidate({
+    ...fixture.candidate,
+    runtimePath: join(fixture.root, "runtime-current", basename(RETAINED_NODE.path)),
+  });
   assert.equal(throughLink.status, "probe-required");
-  assert.equal(throughLink.binding.runtime.path, join(realDir, "node"));
-  assert.equal(throughLink.binding.runtime.sha256, second.binding.runtime.sha256);
+  assert.equal(throughLink.binding.runtime.path, RETAINED_NODE.path);
+  assert.equal(throughLink.binding.runtime.sha256, first.binding.runtime.sha256);
+  assert.equal(throughLink.bindingDigest, first.bindingDigest);
 
-  const physical = join(realDir, "node");
+  // A retained runtime whose bytes no longer match the name it is stored
+  // under is refused: the store keeps the bytes under their own digest, so
+  // changed bytes are not that retained runtime any more.
+  const changedStore = privateStore(t);
+  const changedRuntime = await retainRuntime({ source: elfRuntime(fixture.root, "changed-runtime"), env: { BOTFLEET_RELEASES_ROOT: changedStore } });
+  const changed = await makeCandidate(t, { store: changedStore, runtimePath: changedRuntime.path });
+  chmodSync(changedRuntime.path, 0o755);
+  appendFileSync(changedRuntime.path, "one changed byte\n");
+  const mutated = await inspectPlacementRollbackCandidate({ ...changed.candidate, runtimePath: changedRuntime.path });
+  assertNeverActivates(mutated);
+  assert.deepEqual(codes(mutated), ["runtime-changed"]);
+  assert.equal(mutated.binding, null);
+
   const link = join(fixture.root, "runtime-link");
-  symlinkSync(physical, link);
   const empty = join(fixture.root, "empty-runtime");
   writeFileSync(empty, "", { mode: 0o755 });
   chmodSync(empty, 0o755);
-  chmodSync(physical, 0o644);
+  const notExecutable = elfRuntime(fixture.root, "not-executable-runtime");
+  chmodSync(notExecutable, 0o644);
+  symlinkSync(notExecutable, link);
   // Another name for the same bytes: the hash would not be the hash of what runs.
-  const hardLinked = copiedRuntime(fixture.root, "hard-linked-runtime");
+  const hardLinked = elfRuntime(fixture.root, "hard-linked-runtime");
   linkSync(hardLinked, join(fixture.root, "second-name-for-runtime"));
   const cases = [
     [join(fixture.root, "no-such-runtime"), "runtime-missing"],
     [join(fixture.root, "no-such-directory", "node"), "runtime-missing"],
     [link, "runtime-symlink"],
     [fixture.root, "runtime-not-file"],
-    [physical, "runtime-not-executable"],
+    [notExecutable, "runtime-not-executable"],
     // The script's own bytes would be bound while a different program ran.
     [scriptRuntime(fixture.root), "runtime-not-binary"],
     [empty, "runtime-not-binary"],
@@ -472,6 +515,26 @@ test("the runtime is bound by its bytes, and a missing, linked, scripted or non-
     assertNeverActivates(result);
     assert.deepEqual(codes(result), [code]);
   }
+});
+
+test("a candidate that names the machine's own Node is refused: a runtime outside the store binds the machine's bytes", { skip: POSIX_ONLY }, async (t) => {
+  const fixture = await makeCandidate(t);
+  const result = await inspectPlacementRollbackCandidate({ ...fixture.candidate, runtimePath: NODE });
+  assertNeverActivates(result);
+  assert.deepEqual(codes(result), ["runtime-not-retained"]);
+  assert.equal(result.binding, null);
+  assert.match(result.blockers[0].detail, /not a retained runtime/);
+});
+
+test("a release that is not in a release store is refused: no store means no retained runtime to bind", { skip: POSIX_ONLY }, async (t) => {
+  const fixture = await makeCandidate(t);
+  const outside = join(fixture.root, "not-a-store", fixture.commit);
+  mkdirSync(dirname(outside), { recursive: true });
+  execFileSync("cp", ["-Rp", fixture.releaseRoot, outside]);
+  const result = await inspectPlacementRollbackCandidate({ ...fixture.candidate, releaseRoot: outside });
+  assertNeverActivates(result);
+  assert.deepEqual(codes(result), ["release-store-root-unknown"]);
+  assert.equal(result.binding, null);
 });
 
 test("a file is opened without following a link in its last component, or not at all", { skip: POSIX_ONLY }, (t) => {
@@ -509,8 +572,7 @@ test("a candidate path that names or leads into a credential, login or dot direc
   // An innocent name that is a link into one: the repository and the runtime.
   const aws = join(root, ".aws");
   mkdirSync(aws);
-  copyFileSync(NODE, join(aws, "node"));
-  chmodSync(join(aws, "node"), 0o755);
+  elfRuntime(aws, "node");
   const innocent = join(root, "innocent");
   symlinkSync(aws, innocent);
   await blockedFor({ runtimePath: join(innocent, "node") }, "candidate-path-protected", /^runtimePath .* leads into a credential, login or dot directory/);
@@ -532,10 +594,14 @@ test("a candidate path that names or leads into a credential, login or dot direc
 
   // The one exception is BotFleet's own application home:  the release store's
   // default root is ~/.botfleet, so a release root there is the ordinary case.
-  const store = join(root, ".botfleet", "releases", fixture.commit);
+  const appStore = join(root, ".botfleet");
+  const store = join(appStore, "releases", fixture.commit);
   mkdirSync(dirname(store), { recursive: true });
   execFileSync("cp", ["-Rp", fixture.releaseRoot, store]);
-  const ordinary = await inspectPlacementRollbackCandidate({ ...fixture.candidate, releaseRoot: store });
+  // The store that owns that release keeps its own runtime, and the binding
+  // names the one THAT store holds.
+  const appRuntime = await retainRuntime({ source: elfRuntime(root, "application-home-runtime"), env: { BOTFLEET_RELEASES_ROOT: appStore } });
+  const ordinary = await inspectPlacementRollbackCandidate({ ...fixture.candidate, releaseRoot: store, runtimePath: appRuntime.path });
   assertNeverActivates(ordinary);
   assert.deepEqual(ordinary.blockers, []);
   assert.equal(ordinary.status, "probe-required");
@@ -837,11 +903,19 @@ test("artifact bytes changed during the probe are caught by the recheck", { skip
 });
 
 test("runtime bytes changed during the probe are caught by the recheck", { skip: POSIX_ONLY }, async (t) => {
-  const fixture = await makeCandidate(t);
-  const runtimePath = copiedRuntime(realpathSync(fixture.root));
-  fixture.candidate = { ...fixture.candidate, runtimePath };
+  // The runtime whose bytes change here is this case's OWN retained copy:
+  // the shared retained Node belongs to every other case and must stay
+  // exactly as the store kept it.
+  const store = privateStore(t);
+  const runtime = await retainRuntime({ source: NODE, env: { BOTFLEET_RELEASES_ROOT: store } });
+  const fixture = await makeCandidate(t, { store, runtimePath: runtime.path });
   const result = await probe(fixture, {
-    onPhase: ({ phase }) => { if (phase === "before-recheck") appendUnderLoad(runtimePath, "changed while the probe ran\n"); },
+    onPhase: ({ phase }) => {
+      if (phase !== "before-recheck") return;
+      // The bytes under the name the store gave them change.
+      chmodSync(runtime.path, 0o755);
+      appendUnderLoad(runtime.path, "changed while the probe ran\n");
+    },
   });
   assertNeverActivates(result);
   assert.deepEqual(result.blockers.map((entry) => [entry.code, entry.phase]), [["runtime-changed", "recheck"]]);
