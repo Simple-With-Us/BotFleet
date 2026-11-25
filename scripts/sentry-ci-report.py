@@ -217,7 +217,9 @@ def monitor_config_for(workflow_name: str, cron_expr: str) -> dict:
     }
     threshold = _CRON_FAILURE_THRESHOLD_FOLDED.get(folded)
     if threshold is not None:
-        config["failure_issue_threshold"] = threshold
+        # Sentry rejects a failure_issue_threshold below 1, and alerting on the
+        # first miss is what 0 asks for anyway, so a configured 0 is sent as 1.
+        config["failure_issue_threshold"] = max(threshold, 1)
         config["recovery_threshold"] = 1
     return config
 
