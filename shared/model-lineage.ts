@@ -294,7 +294,8 @@ const GEMINI: Family = {
   },
   // Google API list prices per million tokens.  Flash: 2.5 Flash
   // $0.30/$2.50, 3.8 Flash $0.75/$3.75, 4 Hydrogen $1.50/$7.50.  Pro:
-  // 2.5 Pro and 3.1 Pro $1.25/$10, 4 Neon $3/$15.
+  // 2.5 Pro and 3.1 Pro $1.25/$10, 4 Neon $3/$15.  Flash Lite:
+  // 2.5 Flash Lite $0.10/$0.40.
   prices: {
     "flash@2.5": { input: 0.3, output: 2.5 },
     "flash@3.8": { input: 0.75, output: 3.75 },
