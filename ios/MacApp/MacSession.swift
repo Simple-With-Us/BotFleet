@@ -1393,7 +1393,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     // MARK: - Phone Settings (BF-2652)
     //
     // Thin delegates to the concrete listener backend for the Settings >
-    // Phone tab.  They never change bind, power, or credential policy: the
+    // Phone tab. They never change bind, power, or credential policy: the
     // toggle stays on `setCompanionListenerEnabled` above.
 
     public func openPhonePairingWindow() async -> NativePairingWindow? {
