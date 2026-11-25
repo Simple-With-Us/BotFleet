@@ -54,7 +54,7 @@ struct MacLifecycleSettingsView: View {
                     }
                     Spacer()
                 }
-                if let outcome = session.serverStartMessage {
+                if let outcome = session.startServerDisplayMessage {
                     Text(outcome)
                         .font(.caption)
                         .foregroundColor(.secondary)

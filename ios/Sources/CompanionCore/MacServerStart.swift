@@ -11,7 +11,7 @@ public struct MacCommandOutcome: Equatable, Sendable {
     /// refusal there, so a caller can tell "no such service" from a request
     /// launchd could not answer.
     public let errorOutput: String
-    /// False when the reply was cut off at the byte bound.  A command that did
+    /// False when the reply was cut off at the byte bound.  A command that did
     /// not finish inside its time bound is reported as nil instead, because
     /// nothing it printed by then is a whole answer.
     public let complete: Bool
@@ -30,7 +30,7 @@ public struct MacCommandOutcome: Equatable, Sendable {
 /// Runs one fixed system command.
 ///
 /// The app's runner speaks to `/bin/launchctl` and to nothing else, so no
-/// caller can talk it into running anything else.  A test records what it was
+/// caller can talk it into running anything else.  A test records what it was
 /// asked and scripts the answers.
 public protocol MacCommandRunning: Sendable {
     /// Nil when the runner cannot run the command at all, which reads as
@@ -41,11 +41,11 @@ public protocol MacCommandRunning: Sendable {
 /// Runs `/bin/launchctl`, bounded in time and in how much it will read.
 public struct MacLaunchctlRunner: MacCommandRunning {
     public static let executable = "/bin/launchctl"
-    /// launchctl answers in well under a second.  Fifteen is the bound the
+    /// launchctl answers in well under a second.  Fifteen is the bound the
     /// BotFleet Control runner used, and long enough that a busy Mac is not
     /// read as a refusal.
     public static let timeout: TimeInterval = 15
-    /// `launchctl list` on a loaded Mac is a few kilobytes.  A reply past this
+    /// `launchctl list` on a loaded Mac is a few kilobytes.  A reply past this
     /// is cut off and reported as incomplete rather than read as whole.
     public static let maximumOutputBytes = 1_048_576
 
@@ -96,7 +96,7 @@ public struct MacLaunchctlRunner: MacCommandRunning {
 /// Collects one command's output from the pipes launchd's tool writes to.
 ///
 /// The pipes are read from the queue, so a reply that fills its pipe cannot
-/// block the command this is waiting on.  Everything is behind one lock,
+/// block the command this is waiting on.  Everything is behind one lock,
 /// because the readers, the deadline and the exit all arrive on their own.
 private final class MacLaunchctlCapture: @unchecked Sendable {
     private let lock = NSLock()
@@ -154,9 +154,9 @@ public enum MacInstalledServerState: Equatable, Sendable {
 
     /// The state one `launchctl list` output states for a label.
     ///
-    /// The listing has `PID`, `Status` and `Label` columns.  The row whose
+    /// The listing has `PID`, `Status` and `Label` columns.  The row whose
     /// last column is the label carries a process id when the job is running
-    /// and a dash when it is loaded without one.  No row means the job is not
+    /// and a dash when it is loaded without one.  No row means the job is not
     /// loaded, which is stopped as well:  a start loads it.
     public static func state(fromListing listing: String, label: String) -> MacInstalledServerState {
         for line in listing.split(separator: "\n").prefix(4_096) {
@@ -172,21 +172,21 @@ public enum MacInstalledServerState: Equatable, Sendable {
 public enum MacServerPresence: Equatable, Sendable {
     /// The route answered.
     case answering
-    /// The connection was refused.  Of every way a read can fail, this is the
+    /// The connection was refused.  Of every way a read can fail, this is the
     /// one that proves nothing is listening.
     case refused
     /// The route has not been read, timed out, or answered something that
-    /// could not be read.  None of that says whether the server is up.
+    /// could not be read.  None of that says whether the server is up.
     case unknown
 
     /// The presence a status read leaves behind:  the error it ended with, or
     /// the status when the read had none, or neither before the first read.
     ///
-    /// The error is read first, and on purpose.  A failed read keeps the last
+    /// The error is read first, and on purpose.  A failed read keeps the last
     /// known status in place so the section can show it beside the reason, so
     /// a stale status beside a refused connection is a server that answered
     /// earlier and has stopped since —  which is exactly the case the start
-    /// control exists for.  An error that is not a refusal, an older server or
+    /// control exists for.  An error that is not a refusal, an older server or
     /// a foreign service, says only that something answered.
     public static func after(status: MacControlStatus?, error: MacControlStatusError?) -> MacServerPresence {
         if let error = error { return error == .notReachable ? .refused : .unknown }
@@ -204,6 +204,10 @@ public enum MacServerStartOutcome: Equatable, Sendable {
     /// launchd could not be asked afterwards, so nothing can be said, and the
     /// deliberate stop stays lifted.
     case stateUnknown
+    /// The server did not stay up, and the deliberate stop this start lifted
+    /// could not be written back.  The stop is not in place, and saying it was
+    /// restored would invert the owner's choice.
+    case stopNotRestored
 
     /// The one sentence the surface shows for it.
     public var message: String {
@@ -217,6 +221,8 @@ public enum MacServerStartOutcome: Equatable, Sendable {
             return "The BotFleet Server did not stay running.\(gap)Check the server log, then try again."
         case .stateUnknown:
             return "The BotFleet Server was asked to start, but this Mac could not say whether it is running.\(gap)Open this section again to re-check."
+        case .stopNotRestored:
+            return "The BotFleet Server did not stay running, and the earlier stop could not be put back.\(gap)Stop the server again to restore it."
         }
     }
 }
@@ -224,7 +230,7 @@ public enum MacServerStartOutcome: Equatable, Sendable {
 /// What a deliberate start did to the deliberate-stop marker.
 ///
 /// The marker is how a stop survives logins and the wrapper's tick, so a
-/// start clears it and remembers the bytes it had.  A start that then does
+/// start clears it and remembers the bytes it had.  A start that then does
 /// not bring the server up puts them back:  it must not lift a stop the
 /// owner asked for and leave the server down.
 public final class MacDeliberateStop {
@@ -242,51 +248,61 @@ public final class MacDeliberateStop {
     }
 
     /// Puts the marker back with the bytes it had, when it was there.
-    public func restore() {
-        guard let contents = contents else { return }
-        try? files.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? contents.write(to: marker, options: .atomic)
+    ///
+    /// Returns whether the marker is back.  A failed write leaves the stop
+    /// lifted, and a caller that reported it restored would have silently
+    /// inverted the owner's choice — so the result is the caller's to check.
+    @discardableResult
+    public func restore() -> Bool {
+        guard let contents = contents else { return true }
+        do {
+            try files.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try contents.write(to: marker, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
     }
 }
 
 /// Starts the installed harness LaunchAgent the way BotFleet Control did.
 ///
 /// The app cannot start the harness itself:  the installed wrapper owns that,
-/// under launchd.  So a start asks launchd for the `app.botfleet.server` job
-/// and for nothing else, in the order Control used.  Each step is there for a
+/// under launchd.  So a start asks launchd for the `app.botfleet.server` job
+/// and for nothing else, in the order Control used.  Each step is there for a
 /// reason the wrapper's own contract states.
 ///
-/// 1. The wrapper must honour the startup policy.  One from before the policy
+/// 1. The wrapper must honour the startup policy.  One from before the policy
 ///    existed ignores the session a start records, so it is refused.
 /// 2. The LaunchAgent must be installed.
 /// 3. The deliberate-stop marker is read safely, and its bytes are kept.
 /// 4. The boot session is recorded, the marker is cleared, and the job is
 ///    enabled, loaded when it is not loaded, and kickstarted.
 ///
-/// A kickstart that exits zero proves only that launchd took the request.  So
+/// A kickstart that exits zero proves only that launchd took the request.  So
 /// `startServerAndSettle` then watches the job, and a start that leaves no
 /// process behind the label puts the deliberate stop back as it was.
 ///
 /// The session file is the other half of a start, and it is what makes the
 /// start work at all under a "do not start at login" policy.  launchd runs the
 /// wrapper for a kickstart like any other tick, and the wrapper leaves a
-/// disabled policy alone unless the recorded session is this boot.  The start
+/// disabled policy alone unless the recorded session is this boot.  The start
 /// records it first, so the wrapper sees a choice made in this boot.
 ///
 /// Nothing here changes live configuration beyond that one job, installs
 /// anything, or asks for a privilege:  the job is the user's own, and a Mac
 /// where launchd refuses says so through `MacServerStartError`.
 public final class MacServerLaunchController: @unchecked Sendable {
-    /// Control settled for eight looks a quarter of a second apart.  That is
+    /// Control settled for eight looks a quarter of a second apart.  That is
     /// long enough to tell a job that stays from one the wrapper leaves
-    /// within milliseconds, and too short to sit through a hang.  The process
+    /// within milliseconds, and too short to sit through a hang.  The process
     /// appears behind the label as soon as launchd spawns the job, so the
     /// status read that follows is what waits for the harness itself.
     public static let settleAttempts = 8
     public static let settleInterval: TimeInterval = 0.25
     /// The largest deliberate-stop marker that is read rather than refused.
     public static let maximumStopMarkerBytes = 64 * 1024
-    /// How much of launchctl's own explanation is shown.  The rest of a long
+    /// How much of launchctl's own explanation is shown.  The rest of a long
     /// one is not a sentence anyone can act on.
     public static let maximumExplanationLength = 280
 
@@ -339,9 +355,9 @@ public final class MacServerLaunchController: @unchecked Sendable {
     ///
     /// The offer needs three facts that agree:  the wrapper can be started
     /// through the policy, nothing answered on the harness port, and the job
-    /// is installed without a live process behind it.  The third is what
+    /// is installed without a live process behind it.  The third is what
     /// keeps a hung server from being offered a start:  it refuses the
-    /// connection too, but launchd still shows its process (BF-2527).  A
+    /// connection too, but launchd still shows its process (BF-2527).  A
     /// server older than the control routes answered, so it is running, and
     /// an unread route says nothing.
     public static func startRefusal(
@@ -380,7 +396,8 @@ public final class MacServerLaunchController: @unchecked Sendable {
         let observed = await settle(attempts: attempts, interval: interval)
         if observed == .running { return .started }
         if observed == .unknown { return .stateUnknown }
-        deliberateStop.restore()
+        let restored = deliberateStop.restore()
+        if deliberateStop.wasStoppedByOwner && !restored { return .stopNotRestored }
         return .didNotStart(restoredStop: deliberateStop.wasStoppedByOwner)
     }
 
@@ -397,6 +414,11 @@ public final class MacServerLaunchController: @unchecked Sendable {
         let plist = store.launchAgentPlist(label: MacStartupPolicyStore.serverAgentLabel)
         guard files.fileExists(atPath: plist.path) else { throw MacServerStartError.launchAgentMissing }
         let markerContents = try readStopMarker(at: marker)
+        //  The session file is as much the owner's state as the marker is.
+        //  What it held before this start is kept, so a start launchd refuses
+        //  cannot leave the wrapper told a deliberate start happened in this
+        //  boot while the stop it was paired with is put back.
+        let priorSession = try? Data(contentsOf: store.sessionFile())
         let boot = try recordedBootSession()
         try store.recordBootSession(boot)
         if markerContents != nil { try files.removeItem(at: marker) }
@@ -404,7 +426,8 @@ public final class MacServerLaunchController: @unchecked Sendable {
         do {
             try await startAgent(plist: plist)
         } catch {
-            deliberateStop.restore()
+            restoreSessionFile(priorSession)
+            _ = deliberateStop.restore()
             throw error
         }
         return deliberateStop
@@ -413,7 +436,7 @@ public final class MacServerLaunchController: @unchecked Sendable {
     /// Enables the job, loads it when launchd has not loaded it, and starts it.
     ///
     /// A kickstart does not replace a running instance, so this leaves a job
-    /// that is already up alone.  `print` is the question "is it loaded":
+    /// that is already up alone.  `print` is the question "is it loaded":
     /// launchd refuses it for a job it does not know, and that refusal is the
     /// signal to bootstrap.
     private func startAgent(plist: URL) async throws {
@@ -421,11 +444,33 @@ public final class MacServerLaunchController: @unchecked Sendable {
         let domain = "gui/\(uid)"
         let service = "\(domain)/\(label)"
         try await launchctl(["enable", service], operation: "enable")
-        let loaded = await commands.run(executable: launchctl, arguments: ["print", service])
-        if loaded?.succeeded != true {
+        //  `print` answers three ways:  the job is loaded, launchd says it does
+        //  not know it, or launchd could not be asked.  Only the second is a
+        //  reason to bootstrap.  Bootstrapping after a timeout would stack a
+        //  second request on a job that may already be loaded, and the error
+        //  the owner saw would be launchd's complaint about the second one.
+        guard let printed = await commands.run(executable: launchctl, arguments: ["print", service]) else {
+            throw MacServerStartError.launchdNotAsked(operation: "print")
+        }
+        if !printed.succeeded {
+            guard MacServerLaunchController.saysNotLoaded(printed) else {
+                throw MacServerStartError.launchdRefused(operation: "print", detail: printed.errorOutput)
+            }
             try await launchctl(["bootstrap", domain, plist.path], operation: "load")
         }
         try await launchctl(["kickstart", service], operation: "start")
+    }
+
+    /// Whether `launchctl print` said it does not know the job.
+    ///
+    /// launchd exits 113 for a service it has not loaded, and names the
+    /// missing service in its explanation.  Any other failure is launchd
+    /// refusing to answer, which is not the same thing and must not be read as
+    /// an empty slot.
+    public static func saysNotLoaded(_ outcome: MacCommandOutcome) -> Bool {
+        if outcome.status == 113 { return true }
+        let text = (outcome.output + " " + outcome.errorOutput).lowercased()
+        return text.contains("could not find service") || text.contains("no such process")
     }
 
     /// Runs one launchctl request, and turns a refusal into the reason for it.
@@ -440,10 +485,10 @@ public final class MacServerLaunchController: @unchecked Sendable {
 
     /// Watches the job for the whole window, and reports what was seen last.
     ///
-    /// The window is always watched to its end, and nothing ends it early.  A
+    /// The window is always watched to its end, and nothing ends it early.  A
     /// job launchd spawned and then left on purpose shows a process for a
     /// moment first:  the wrapper leaves quietly, within milliseconds, when
-    /// its policy or the stop marker says no.  A process seen once proves
+    /// its policy or the stop marker says no.  A process seen once proves
     /// that launchd spawned something, and a process still there when the
     /// window ends is what a start means.
     private func settle(attempts: Int, interval: TimeInterval) async -> MacInstalledServerState {
@@ -466,9 +511,9 @@ public final class MacServerLaunchController: @unchecked Sendable {
     ///
     /// The wrapper compares the recorded session with the boot it is running
     /// in byte for byte, so the value has to be the boot session exactly:
-    /// trimmed, and a UUID.  A reader that fails, answers whitespace, or
+    /// trimmed, and a UUID.  A reader that fails, answers whitespace, or
     /// answers anything else is one refusal, and it is this controller's own
-    /// error rather than the reader's.  The case of the value is kept, because
+    /// error rather than the reader's.  The case of the value is kept, because
     /// the wrapper does not fold case and a changed one never matches.
     private func recordedBootSession() throws -> String {
         let boot: String
@@ -481,11 +526,25 @@ public final class MacServerLaunchController: @unchecked Sendable {
         return boot
     }
 
+    /// Puts the session file back to what a start found.
+    ///
+    /// A session file that was there is written back with its bytes; one that
+    /// was not is removed, because a start that did not happen must not leave
+    /// the record of one behind.
+    private func restoreSessionFile(_ prior: Data?) {
+        let url = store.sessionFile()
+        if let prior = prior {
+            try? prior.write(to: url, options: .atomic)
+        } else {
+            try? files.removeItem(at: url)
+        }
+    }
+
     // MARK: - The Deliberate-Stop Marker
 
     /// The marker's exact bytes, or nil when the server was not stopped on purpose.
     ///
-    /// The bytes are kept because they go back unchanged.  The file is small,
+    /// The bytes are kept because they go back unchanged.  The file is small,
     /// so anything larger, anything that is not a plain file, and anything
     /// reached through a link is refused rather than read:  a marker this app
     /// cannot understand is one it must not clear.
@@ -503,7 +562,13 @@ public final class MacServerLaunchController: @unchecked Sendable {
         guard descriptor >= 0 else { throw MacServerStartError.stopMarkerUnreadable }
         defer { close(descriptor) }
         var opened = stat()
+        //  The handle has to be the very file the path listed a moment ago:  a
+        //  regular file, with one name, on the same device and at the same
+        //  inode.  Without that, a swapped parent or a hard link could point
+        //  this read at a different file than the one that was judged.
         guard fstat(descriptor, &opened) == 0, opened.st_mode & S_IFMT == S_IFREG,
+              opened.st_nlink == 1,
+              opened.st_dev == listed.st_dev, opened.st_ino == listed.st_ino,
               opened.st_size >= 0, opened.st_size <= largest else {
             throw MacServerStartError.stopMarkerUnreadable
         }
@@ -533,14 +598,15 @@ public enum MacServerStartError: LocalizedError, Equatable, Sendable {
     /// The server was stopped on purpose and that marker could not be read
     /// safely, so it was left in place and nothing was started.
     case stopMarkerUnreadable
-    /// launchctl was run and refused.  Its own explanation is the detail.
+    /// launchctl was run and refused.  Its own explanation is the detail.
     case launchdRefused(operation: String, detail: String)
     /// launchctl could not be run or did not finish, so launchd was not asked.
     case launchdNotAsked(operation: String)
 
     /// launchctl's explanation, made one line and kept short enough to read.
     static func explanation(from detail: String) -> String {
-        let words = detail.split(whereSeparator: \.isWhitespaceAndNewlines)
+        //  Character.isWhitespace already includes every newline character.
+        let words = detail.split(whereSeparator: \.isWhitespace)
         var text = words.joined(separator: " ")
         if text.count > MacServerLaunchController.maximumExplanationLength {
             text = String(text.prefix(MacServerLaunchController.maximumExplanationLength)) + "…"

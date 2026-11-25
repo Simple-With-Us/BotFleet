@@ -135,6 +135,10 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     @Published public private(set) var isStartingServer = false
     /// What the last start attempt did, or why the control is not offered.
     @Published public var serverStartMessage: String?
+    /// The presence the last outcome was about.  An outcome is evidence about
+    /// the state it was observed in; once the state moves, showing it would
+    /// describe a server that is no longer there.
+    @Published private var serverStartMessagePresence: MacServerPresence?
 
     // Native companion listener lifecycle (BF-2590, the lifecycle half of BF-2511)
     /// What the native companion listener is doing, mirrored from the
@@ -1009,7 +1013,6 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
                         self.refreshStartupPolicy()
                         Task { [weak self, generation] in
                             guard let self, self.connectionGeneration == generation, !Task.isCancelled else { return }
-                            await self.refreshInstalledServerState()
                             await self.refreshControlStatus()
                         }
                     }
@@ -1180,6 +1183,11 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         guard !isRefreshingControlStatus else { return }
         isRefreshingControlStatus = true
         defer { isRefreshingControlStatus = false }
+        //  launchd is asked first, before anything that can return early.  The
+        //  offer's third fact has to be current even when the endpoint is
+        //  refused or the read is cancelled, which is exactly the state a
+        //  server that is down leaves behind.
+        await refreshInstalledServerState()
         guard let client = makeControlStatusClient() else {
             controlStatus = nil
             controlStatusError = Self.controlClientUnavailableMessage
@@ -1198,10 +1206,6 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
             controlStatusError = error.localizedDescription
             controlPresence = MacServerPresence.after(status: controlStatus, error: error as? MacControlStatusError)
         }
-        //  The offer needs its third fact whether or not the harness answered,
-        //  so launchd is asked beside the read, in its own task:  it costs a
-        //  few list calls and must not hold the status read up either way.
-        await refreshInstalledServerState()
     }
 
     /// Reads the installed LaunchAgent's state from launchd (BF-2700).
@@ -1268,6 +1272,16 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         )
     }
 
+    /// The last start outcome, while it still describes this server.
+    ///
+    /// Nil once the presence has moved since the outcome was recorded, so a
+    /// success cannot sit over a server that has since stopped, and a refusal
+    /// cannot outlive the state it explained.
+    public var startServerDisplayMessage: String? {
+        guard serverStartMessagePresence == controlPresence else { return nil }
+        return serverStartMessage
+    }
+
     /// Starts the installed harness LaunchAgent and reports what happened.
     ///
     /// The app does not start the harness itself:  launchd runs the installed
@@ -1278,6 +1292,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         guard !isStartingServer else { return }
         if let refusal = startServerRefusal {
             serverStartMessage = refusal
+            serverStartMessagePresence = controlPresence
             return
         }
         isStartingServer = true
@@ -1285,6 +1300,10 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         do {
             let outcome = try await serverLaunchController.startServerAndSettle()
             serverStartMessage = outcome.message
+            //  A start that did not take leaves the presence where it was, so
+            //  the outcome is tied to the read that follows rather than to the
+            //  one this start began under.
+            serverStartMessagePresence = controlPresence
             installedServerState = await serverLaunchController.installedServerState()
             //  The status read follows the start itself:  a process behind the
             //  label proves launchd took the request, and only the harness
@@ -1293,6 +1312,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         } catch {
             serverStartMessage = error.localizedDescription
             installedServerState = await serverLaunchController.installedServerState()
+            serverStartMessagePresence = controlPresence
         }
     }
 
@@ -1373,7 +1393,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     // MARK: - Phone Settings (BF-2652)
     //
     // Thin delegates to the concrete listener backend for the Settings >
-    // Phone tab. They never change bind, power, or credential policy: the
+    // Phone tab.  They never change bind, power, or credential policy: the
     // toggle stays on `setCompanionListenerEnabled` above.
 
     public func openPhonePairingWindow() async -> NativePairingWindow? {

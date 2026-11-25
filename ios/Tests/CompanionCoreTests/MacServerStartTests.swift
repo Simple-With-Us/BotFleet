@@ -7,7 +7,7 @@ import Testing
 
 /// Answers each launchctl request from a script and remembers every request.
 ///
-/// Nothing here reaches launchd.  A verb without a scripted answer succeeds
+/// Nothing here reaches launchd.  A verb without a scripted answer succeeds
 /// quietly, and `list` answers from its own queue so a test can show the job
 /// appearing behind its label, or never appearing at all.
 private final class ScriptedLaunchctl: MacCommandRunning, @unchecked Sendable {
@@ -18,6 +18,9 @@ private final class ScriptedLaunchctl: MacCommandRunning, @unchecked Sendable {
     private var answers: [String: Answer] = [:]
     private var listings: [(status: Int32, output: String)] = []
     private var runnerMissing = false
+    /// Verbs the runner cannot answer at all, as a launchctl that timed out
+    /// would not:  nil, not a refusal.
+    private var silentVerbs: Set<String> = []
 
     /// The answer to one launchctl verb.
     func answering(_ verb: String, status: Int32 = 0, output: String = "", error: String = "") -> ScriptedLaunchctl {
@@ -26,10 +29,17 @@ private final class ScriptedLaunchctl: MacCommandRunning, @unchecked Sendable {
         return self
     }
 
-    /// One more answer to `launchctl list`, in order.  The last one repeats.
+    /// One more answer to `launchctl list`, in order.  The last one repeats.
     func listing(_ output: String, status: Int32 = 0) -> ScriptedLaunchctl {
         lock.lock(); defer { lock.unlock() }
         listings.append((status, output))
+        return self
+    }
+
+    /// Leaves one verb unanswered, as a launchctl that timed out would.
+    func notAnswering(_ verb: String) -> ScriptedLaunchctl {
+        lock.lock(); defer { lock.unlock() }
+        silentVerbs.insert(verb)
         return self
     }
 
@@ -45,6 +55,7 @@ private final class ScriptedLaunchctl: MacCommandRunning, @unchecked Sendable {
         requests.append([executable] + arguments)
         if runnerMissing { return nil }
         let verb = arguments.first ?? ""
+        if silentVerbs.contains(verb) { return nil }
         if verb == "list", !listings.isEmpty {
             let answer = listings.count > 1 ? listings.removeFirst() : listings[0]
             return MacCommandOutcome(output: answer.output, status: answer.status)
@@ -366,6 +377,73 @@ struct MacServerStartTests {
         #expect(launchctl.verbs == ["enable", "print", "kickstart"])
     }
 
+    @Test("A print that cannot be answered does not bootstrap, and says launchd was not asked")
+    func testAPrintThatCannotBeAnsweredDoesNotBootstrap() async throws {
+        let fixture = try makeFixture()
+        defer { remove(fixture) }
+        try Self.stoppedBytes.write(to: fixture.marker)
+        let launchctl = ScriptedLaunchctl().notAnswering("print")
+        let (controller, _) = makeController(fixture, launchctl: launchctl)
+
+        do {
+            _ = try await controller.startServer()
+            Issue.record("The start should have been refused.")
+        } catch let error as MacServerStartError {
+            #expect(error == .launchdNotAsked(operation: "print"))
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+        //  No second request is stacked on a job that may already be loaded.
+        #expect(launchctl.verbs == ["enable", "print"])
+        let restored = try Data(contentsOf: fixture.marker)
+        #expect(restored == Self.stoppedBytes)
+    }
+
+    @Test("A print refused for any other reason is not read as an empty slot")
+    func testAPrintRefusedForAnotherReasonDoesNotBootstrap() async throws {
+        let fixture = try makeFixture()
+        defer { remove(fixture) }
+        let launchctl = ScriptedLaunchctl().answering("print", status: 1, error: "Operation not permitted")
+        let (controller, _) = makeController(fixture, launchctl: launchctl)
+
+        do {
+            _ = try await controller.startServer()
+            Issue.record("The start should have been refused.")
+        } catch let error as MacServerStartError {
+            //  The refusal names the failed request, and the explanation is
+            //  launchctl's own rather than an invented one.
+            guard case .launchdRefused(let operation, let detail) = error else {
+                return Issue.record("unexpected refusal: \(error)")
+            }
+            #expect(operation == "print")
+            #expect(detail == "Operation not permitted")
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+        #expect(launchctl.verbs == ["enable", "print"], "no bootstrap after a refusal it cannot read as not-loaded")
+    }
+
+    @Test("Only launchd's own not-loaded answers count as an empty slot")
+    func testOnlyNotLoadedAnswersReadAsEmpty() {
+        #expect(MacServerLaunchController.saysNotLoaded(MacCommandOutcome(output: "", status: 113)))
+        #expect(MacServerLaunchController.saysNotLoaded(MacCommandOutcome(output: "Could not find service \"app.botfleet.server\" in domain", status: 1)))
+        #expect(MacServerLaunchController.saysNotLoaded(MacCommandOutcome(output: "", status: 3, errorOutput: "No such process")))
+        //  Anything else is launchd refusing to answer, not an empty slot.
+        #expect(!MacServerLaunchController.saysNotLoaded(MacCommandOutcome(output: "", status: 1, errorOutput: "Operation not permitted")))
+        #expect(!MacServerLaunchController.saysNotLoaded(MacCommandOutcome(output: "program = /bin/sh", status: 0)))
+    }
+
+    @Test("A stop that could not be put back says so instead of claiming it was")
+    func testAStopThatCouldNotBeRestoredSaysSo() {
+        let gap = "\u{00A0} "
+        #expect(MacServerStartOutcome.stopNotRestored.message
+            == "The BotFleet Server did not stay running, and the earlier stop could not be put back.\(gap)Stop the server again to restore it.")
+        //  And it is a different outcome from the one that claims a restore,
+        //  so a caller cannot confuse the two.
+        #expect(MacServerStartOutcome.stopNotRestored != MacServerStartOutcome.didNotStart(restoredStop: true))
+        #expect(MacServerStartOutcome.stopNotRestored != MacServerStartOutcome.didNotStart(restoredStop: false))
+    }
+
     @Test("A launchctl refusal puts the deliberate stop back byte for byte")
     func testARefusedRequestRestoresTheStop() async throws {
         for (verb, detail, expected) in [
@@ -496,7 +574,7 @@ struct MacServerStartTests {
         try Self.stoppedBytes.write(to: fixture.marker)
         let launchctl = ScriptedLaunchctl()
         //  Empty, whitespace, and something that is not a boot session are
-        //  each refused.  The wrapper compares the recorded session byte for
+        //  each refused.  The wrapper compares the recorded session byte for
         //  byte, so none of them could ever match the boot it is running in.
         for answer in ["", "   ", "not-a-boot-session", "\(Self.boot)-extra"] {
             let (controller, _) = makeController(fixture, launchctl: launchctl, bootSession: { answer })
@@ -656,7 +734,7 @@ struct MacServerStartTests {
         let outcome = try await controller.startServerAndSettle()
 
         //  A launchd that stops answering is asked again for as long as the
-        //  wait lasts:  one refusal to answer is not a state.  What is seen
+        //  wait lasts:  one refusal to answer is not a state.  What is seen
         //  last is what is reported, and an unknown state proves nothing, so
         //  the deliberate stop this start lifted is not put back on it.
         #expect(outcome == .stateUnknown)
