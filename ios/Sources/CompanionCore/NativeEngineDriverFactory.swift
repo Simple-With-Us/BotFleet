@@ -6,6 +6,11 @@ public enum NativeEngineDriverFactoryError: LocalizedError, Equatable, Sendable 
     case noNativeDriver(engineId: String)
     /// The matrix row names no executable to launch.
     case missingExecutable(engineId: String)
+    /// The engine has a native driver, but this host has no owned-process
+    /// launcher to run it with (off macOS).  Distinct from `noNativeDriver`
+    /// so callers can tell an unsupported engine from a missing platform
+    /// launcher.
+    case missingLauncher(engineId: String)
 
     public var errorDescription: String? {
         switch self {
@@ -13,6 +18,8 @@ public enum NativeEngineDriverFactoryError: LocalizedError, Equatable, Sendable 
             return "Engine '\(engineId)' has no native Swift driver yet."
         case .missingExecutable(let engineId):
             return "Engine '\(engineId)' names no executable."
+        case .missingLauncher(let engineId):
+            return "Engine '\(engineId)' has a native driver, but this host has no process launcher for it."
         }
     }
 }
@@ -40,7 +47,8 @@ public enum NativeEngineDriverFactory {
         guard supports(id) else {
             throw NativeEngineDriverFactoryError.noNativeDriver(engineId: id.rawValue)
         }
-        guard let executable = executableOverride ?? descriptor.executable, !executable.isEmpty else {
+        guard let executable = executableOverride ?? descriptor.executable,
+              !executable.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NativeEngineDriverFactoryError.missingExecutable(engineId: id.rawValue)
         }
         switch id {
@@ -71,7 +79,7 @@ extension NativeMacCompanionRuntime {
         matrixEngine id: EngineMatrixID
     ) async throws {
         guard let launcher = ownedProcessLauncher else {
-            throw NativeEngineDriverFactoryError.noNativeDriver(engineId: id.rawValue)
+            throw NativeEngineDriverFactoryError.missingLauncher(engineId: id.rawValue)
         }
         let driver = try NativeEngineDriverFactory.makeDriver(for: id, launcher: launcher)
         let resolved = MacBotExecutionProfile(

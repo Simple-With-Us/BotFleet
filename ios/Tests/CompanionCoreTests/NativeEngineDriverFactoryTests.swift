@@ -35,4 +35,17 @@ struct NativeEngineDriverFactoryTests {
             _ = try NativeEngineDriverFactory.makeDriver(for: .claude, launcher: NeverLauncher(), executableOverride: "")
         }
     }
+
+    @Test("A whitespace-only executable override is refused, not deferred to spawn")
+    func whitespaceExecutableRefused() {
+        #expect(throws: NativeEngineDriverFactoryError.missingExecutable(engineId: "claude")) {
+            _ = try NativeEngineDriverFactory.makeDriver(for: .claude, launcher: NeverLauncher(), executableOverride: "  \n\t ")
+        }
+    }
+
+    @Test("A missing launcher is a distinct error from an unsupported engine")
+    func missingLauncherIsDistinct() {
+        #expect(NativeEngineDriverFactoryError.missingLauncher(engineId: "claude")
+            != NativeEngineDriverFactoryError.noNativeDriver(engineId: "claude"))
+    }
 }
