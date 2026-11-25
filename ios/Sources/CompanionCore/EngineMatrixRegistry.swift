@@ -287,7 +287,7 @@ public enum EngineMatrixRegistry {
             baseArguments: ["-p", "--verbose", "--output-format", "stream-json", "--input-format", "stream-json"],
             wireProtocol: .streamJSONStdio,
             authRequirement: .cliManagedLogin(cliBinary: "claude"),
-            defaultModel: "claude-sonnet-4-6"
+            defaultModel: "claude-sonnet-5-5"
         ),
         .codex: EngineDriverDescriptor(
             id: .codex,
@@ -307,7 +307,7 @@ public enum EngineMatrixRegistry {
             baseArguments: ["agent", "stdio"],
             wireProtocol: .acpJSONRPC,
             authRequirement: .cliManagedLogin(cliBinary: "grok"),
-            defaultModel: "grok-4"
+            defaultModel: "grok-4.7"
         ),
         .grokApi: EngineDriverDescriptor(
             id: .grokApi,
@@ -317,7 +317,7 @@ public enum EngineMatrixRegistry {
             baseArguments: [],
             wireProtocol: .httpsSSE,
             authRequirement: .infisicalSecret(key: "XAI_API_KEY", provider: .xAI),
-            defaultModel: "grok-4-0709"
+            defaultModel: "grok-4.7"
         ),
         .mcode: EngineDriverDescriptor(
             id: .mcode,
