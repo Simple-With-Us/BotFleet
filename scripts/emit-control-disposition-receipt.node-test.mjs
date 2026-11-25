@@ -12,7 +12,7 @@
 // checkout, a real data directory, a launchd job or a network.
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -25,7 +25,7 @@ import {
 import { REQUIRED_RECEIPTS, checkFinalEvidenceBundle, evidenceHash } from "./decommission-evidence-bundle.mjs";
 import {
   CONTROL_DISPOSITION_ARTIFACTS, CONTROL_DISPOSITION_CHECKS, CONTROL_DISPOSITION_RECEIPT_FILE,
-  emitControlDispositionReceipt, parseCliArgs,
+  buildChecks, emitControlDispositionReceipt, parseCliArgs,
 } from "./emit-control-disposition-receipt.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -646,6 +646,108 @@ test("a refusal leaves a receipt from an earlier good run as it was", () => {
     );
     assert.ok(readFileSync(receiptPath).equals(before));
     assert.equal(evidenceHash(readFileSync(receiptPath)), first.reference.sha256);
+  } finally {
+    scene.clean();
+  }
+});
+
+test("an unwritable receipt path is refused before any artifact an earlier run wrote is replaced", () => {
+  const scene = scenario();
+  try {
+    const first = scene.emit();
+    const receiptPath = join(scene.root, CONTROL_DISPOSITION_RECEIPT_FILE);
+    const ownerDecision = join(scene.root, CONTROL_DISPOSITION_ARTIFACTS["owner-decision"]);
+    const beforeReceipt = readFileSync(receiptPath);
+    const beforeOwnerDecision = readFileSync(ownerDecision);
+
+    //  A directory where the receipt belongs:  the preflight refuses it, and
+    //  nothing an earlier good run left behind is touched on the way out.
+    //  Without the preflight this would replace the three artifacts first and
+    //  fail afterwards, leaving an earlier receipt citing bytes it never wrote.
+    rmSync(receiptPath);
+    mkdirSync(receiptPath);
+
+    assert.throws(
+      () => scene.emit(),
+      /the receipt path is not a plain single-link file/,
+    );
+    assert.ok(readFileSync(ownerDecision).equals(beforeOwnerDecision),
+      "the artifacts an earlier run wrote must not be replaced by a refusal");
+
+    rmdirSync(receiptPath);
+    writeFileSync(receiptPath, beforeReceipt, { mode: 0o600 });
+    assert.equal(evidenceHash(readFileSync(receiptPath)), first.reference.sha256);
+  } finally {
+    scene.clean();
+  }
+});
+
+test("a check the bundle starts to carry that this receipt has not is refused by name", () => {
+  //  The trigger is the bundle's own check list changing, which no fixture
+  //  can make in place, so the refusal is reachable as a pure function.  A
+  //  TypeError inside the loop would have escaped every refusal and written
+  //  nothing useful while reporting something unreadable.
+  const stated = {
+    "owner-decision": { ok: true, exitCode: 0 },
+    "landed-implementation": { ok: true, exitCode: 0 },
+  };
+  const refs = {
+    "owner-decision": { path: "a.json", sha256: "0".repeat(64) },
+    "landed-implementation": { path: "b.json", sha256: "1".repeat(64) },
+    "muster-disposition": { path: "c.json", sha256: "2".repeat(64) },
+  };
+  assert.throws(
+    () => buildChecks([...CONTROL_DISPOSITION_CHECKS, "a-new-check"], stated, refs),
+    /the bundle names a check this receipt does not have: a-new-check, so nothing was written/,
+  );
+  assert.throws(
+    () => buildChecks(["a-renamed-check"], stated, refs),
+    /does not have: a-renamed-check/,
+  );
+  //  The three the bundle does name still build, and the attestation's own
+  //  check is the one that never comes from the verdict.
+  const built = buildChecks(CONTROL_DISPOSITION_CHECKS, stated, refs);
+  assert.equal(built.length, 3);
+  assert.deepEqual(built.map((check) => check.name), [...CONTROL_DISPOSITION_CHECKS]);
+  assert.equal(built.find((check) => check.name === "muster-disposition").exitCode, 0);
+  assert.equal(built[0].exitCode, 0);
+  //  A verdict that answers nothing, and a check with nothing staged, are
+  //  their own refusals rather than an undefined read.
+  assert.throws(() => buildChecks(CONTROL_DISPOSITION_CHECKS, {}, refs), /has no result for owner-decision/);
+  const noArtifact = { ...refs };
+  delete noArtifact["landed-implementation"];
+  assert.throws(
+    () => buildChecks(CONTROL_DISPOSITION_CHECKS, stated, noArtifact),
+    /the landed-implementation artifact was not staged/,
+  );
+});
+
+test("an artifact destination that cannot be replaced is refused before anything is written", () => {
+  const scene = scenario();
+  try {
+    const first = scene.emit();
+    const receiptPath = join(scene.root, CONTROL_DISPOSITION_RECEIPT_FILE);
+    const beforeReceipt = readFileSync(receiptPath);
+    const intact = CONTROL_DISPOSITION_ARTIFACTS["owner-decision"];
+    const beforeIntact = readFileSync(join(scene.root, intact));
+
+    //  A folder where one artifact belongs:  the preflight refuses it before
+    //  the first artifact of this run is replaced, so the receipt and the
+    //  other artifacts an earlier good run left are still the ones it cites.
+    const blocked = CONTROL_DISPOSITION_ARTIFACTS["muster-disposition"];
+    rmSync(join(scene.root, blocked));
+    mkdirSync(join(scene.root, blocked));
+
+    assert.throws(
+      () => scene.emit(),
+      /the .*artifact could not be replaced, so nothing was written/,
+    );
+    assert.ok(readFileSync(receiptPath).equals(beforeReceipt), "an earlier receipt must stand");
+    assert.ok(readFileSync(join(scene.root, intact)).equals(beforeIntact), "the other artifacts must stand");
+
+    rmdirSync(join(scene.root, blocked));
+    const after = scene.emit();
+    assert.equal(after.reference.sha256, first.reference.sha256, "a clean re-run reproduces the receipt");
   } finally {
     scene.clean();
   }

@@ -32,6 +32,11 @@
 // check is one the bundle refuses.  A refusal also leaves a receipt from an
 // earlier good run as it is, because a broken input today says nothing against
 // evidence that was measured against the same commit.
+// Both the receipt's own path and every artifact destination are inspected
+// before the first file is replaced, so a structural refusal lands while
+// nothing has moved.  A device failure partway through the writes themselves
+// can still leave an older receipt beside new bytes;  the bundle's hash check
+// refuses that pair, which is the honest outcome for a run that died.
 //
 // What this script does NOT do: it does not retire anything, run a job, read a
 // data directory or contact a network, and it cannot say the controls work.
@@ -54,13 +59,13 @@ import { redactSecretsInText } from "../shared/redact.ts";
 import { validateBundleRequest } from "./archive-node-store.mjs";
 import {
   CONTROL_DISPOSITION_VERDICT_KIND, CONTROL_DISPOSITION_VERDICT_VERSION, FLEET_ADMIN_ITEMS, PRODUCT_CONTROLS, RULING,
-  summarizeControlDisposition, writeOwnerOnly,
+  summarizeControlDisposition,
 } from "./check-control-disposition.mjs";
 import {
   assertReceiptBinding, createEvidenceReader, evidenceHash, MAX_EVIDENCE_FILE_BYTES,
   parseEvidenceReceipt, REQUIRED_CHECKS,
 } from "./decommission-evidence-bundle.mjs";
-import { writeReceiptFile } from "./emit-process-inventory-receipt.mjs";
+import { assertWritableReceiptPath, writeReceiptFile } from "./emit-process-inventory-receipt.mjs";
 import { assertPrivateCaptureDir } from "./emit-replay-receipt.mjs";
 
 export const CONTROL_DISPOSITION_RECEIPT_VERSION = 1;
@@ -299,7 +304,51 @@ function artifactBytes(value) {
 }
 
 /**
+ * The receipt's checks, or a refusal that names the one that does not fit.
+ *
+ * Exported so the refusal itself is reachable from a test:  the trigger is a
+ * change to the bundle's own check list, which no fixture can make in place.
+ * The three names are the ones this receipt can produce;  a name that is none
+ * of them is a configuration mismatch, a name the verdict does not answer is
+ * an incomplete verdict, and a name with no staged artifact cannot be cited.
+ * All three refuse by name before a single byte is written, which is what a
+ * TypeError inside this loop could never do.
+ *
+ * @param {string[]} names the checks the bundle requires for this kind
+ * @param {object} stated the verdict's two results
+ * @param {object} references the staged artifact references, by check name
+ */
+export function buildChecks(names, stated, references) {
+  return names.map((name) => {
+    if (name !== "owner-decision" && name !== "landed-implementation" && name !== "muster-disposition") {
+      throw new Error(`the bundle names a check this receipt does not have: ${name}, so nothing was written`);
+    }
+    if (name !== "muster-disposition" && stated[name] === undefined) {
+      throw new Error(`the verdict has no result for ${name}, so nothing was written`);
+    }
+    if (references[name] === undefined) {
+      throw new Error(`the ${name} artifact was not staged, so nothing was written`);
+    }
+    return {
+      name,
+      exitCode: name === "muster-disposition" ? 0 : stated[name].exitCode,
+      artifact: references[name],
+    };
+  });
+}
+
+/**
  * Emit the `control-disposition` receipt.
+ *
+ * The order is the contract.  Judge every input, refuse a receipt path that
+ * cannot be written, then write the three artifacts, read them back, and only
+ * then write the receipt that cites them.  The preflight refuses the
+ * structural causes —  a path that is not a plain single-link file this user
+ * owns —  before any artifact an earlier run wrote is replaced, because new
+ * files beside an old receipt is a pair the bundle's hash check refuses.  A
+ * device failure during the receipt's own last write can still leave that
+ * pair, and the bundle refuses it too:  a run that died partway is never read
+ * as a good one.
  *
  * @returns {{receipt: object, reference: object, kind: string}}
  */
@@ -399,6 +448,14 @@ export function emitControlDispositionReceipt({
     throw new Error(`the provenance record contains unredacted credentials: ${provenanceRecord}`);
   }
 
+  // The receipt's own path is settled here, before the first artifact is
+  // staged.  A receipt path that cannot be written would otherwise only be
+  // discovered after three files it cites had been replaced, and then the
+  // artifacts on disk would no longer hash to the receipt an earlier good run
+  // wrote.
+  const receiptPath = join(capture, CONTROL_DISPOSITION_RECEIPT_FILE);
+  assertWritableReceiptPath(receiptPath);
+
   const artifactsToWrite = new Map();
   const references = {};
   for (const name of CONTROL_DISPOSITION_CHECKS) {
@@ -417,11 +474,7 @@ export function emitControlDispositionReceipt({
     references[name] = { path, sha256: evidenceHash(bytes) };
   }
 
-  const checks = CONTROL_DISPOSITION_CHECKS.map((name) => ({
-    name,
-    exitCode: name === "muster-disposition" ? 0 : stated[name].exitCode,
-    artifact: references[name],
-  }));
+  const checks = buildChecks(CONTROL_DISPOSITION_CHECKS, stated, references);
   if (checks.some((check) => check.exitCode !== 0)) {
     throw new Error("a check did not hold, so nothing was written");
   }
@@ -448,7 +501,21 @@ export function emitControlDispositionReceipt({
     throw new Error(`the receipt would not match the bundle's schema, so nothing was written: ${printable(error.message)}`);
   }
 
-  for (const [path, bytes] of artifactsToWrite) writeOwnerOnly(join(capture, path), bytes);
+  // The artifact destinations are inspected before any of them is replaced,
+  // for the same reason the receipt's own path is:  a destination that is a
+  // link, a folder or a name with two links would only be found by the write
+  // that has already replaced what an earlier good run left behind, and that
+  // run's receipt would then cite bytes that are gone.
+  for (const path of artifactsToWrite.keys()) {
+    try {
+      assertWritableReceiptPath(join(capture, path));
+    } catch (error) {
+      throw new Error(`the ${path} artifact could not be replaced, so nothing was written: ${printable(error.message)}`);
+    }
+  }
+  // Each write goes through the house helper, which re-checks the handle it
+  // opened after the look, rather than writing blind.
+  for (const [path, bytes] of artifactsToWrite) writeReceiptFile(join(capture, path), bytes);
   // Read back through the bundle's own reader: the producer never cites a
   // file the bundle would refuse, and the hash in the receipt is the hash of
   // the bytes that are on disk.
@@ -458,7 +525,7 @@ export function emitControlDispositionReceipt({
     }
   }
 
-  writeReceiptFile(join(capture, CONTROL_DISPOSITION_RECEIPT_FILE), receiptBytes);
+  writeReceiptFile(receiptPath, receiptBytes);
   return {
     receipt,
     reference: { path: CONTROL_DISPOSITION_RECEIPT_FILE, sha256: evidenceHash(receiptBytes) },
