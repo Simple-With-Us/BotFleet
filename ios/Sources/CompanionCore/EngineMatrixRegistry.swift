@@ -307,7 +307,7 @@ public enum EngineMatrixRegistry {
             baseArguments: ["agent", "stdio"],
             wireProtocol: .acpJSONRPC,
             authRequirement: .cliManagedLogin(cliBinary: "grok"),
-            defaultModel: "grok-4"
+            defaultModel: "grok-4.7"
         ),
         .grokApi: EngineDriverDescriptor(
             id: .grokApi,
