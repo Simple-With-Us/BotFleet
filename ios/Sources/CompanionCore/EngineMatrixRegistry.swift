@@ -317,7 +317,7 @@ public enum EngineMatrixRegistry {
             baseArguments: [],
             wireProtocol: .httpsSSE,
             authRequirement: .infisicalSecret(key: "XAI_API_KEY", provider: .xAI),
-            defaultModel: "grok-4-0709"
+            defaultModel: "grok-4.7"
         ),
         .mcode: EngineDriverDescriptor(
             id: .mcode,
