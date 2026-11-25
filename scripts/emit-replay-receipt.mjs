@@ -65,23 +65,6 @@ export const REPLAY_RECEIPT_FILE = "replay.receipt.json";
 export const CHECK_NAME_LIMIT = 2048;
 
 /**
- * The report's shape, as far as the receipt reads it.
- *
- * The report is the probe's own output and it is parsed at the boundary
- * rather than narrowed as it is used:  the receipt needs the engine id and
- * the verdict, and a report that does not carry them is refused here, where
- * the reason can be said, instead of being read loosely and turned into an
- * exit code.
- *
- * The report's summary is checked against its own details here as well.  The
- * probe computes the summary as "every engine held", so a report whose
- * summary says one thing and whose per-engine verdicts say another is not a
- * report the probe wrote, and a report that was not written by the probe is
- * not evidence of a replay.  The same goes for an engine's own counts:  a
- * verdict that claims more fixtures passed than were run is refused rather
- * than read as a pass.
- */
-/**
  * One engine's entry in the report.
  *
  * The probe writes more than the verdict.  For every engine it records
@@ -109,6 +92,23 @@ const ReplayEngineSchema = z.looseObject({
   isFullyVerified: z.boolean(),
 });
 
+/**
+ * The report's shape, as far as the receipt reads it.
+ *
+ * The report is the probe's own output and it is parsed at the boundary
+ * rather than narrowed as it is used:  the receipt needs the engine id and
+ * the verdict, and a report that does not carry them is refused here, where
+ * the reason can be said, instead of being read loosely and turned into an
+ * exit code.
+ *
+ * The report's summary is checked against its own details here as well.  The
+ * probe computes the summary as "every engine held", so a report whose
+ * summary says one thing and whose per-engine verdicts say another is not a
+ * report the probe wrote, and a report that was not written by the probe is
+ * not evidence of a replay.  The same goes for an engine's own counts:  a
+ * verdict that claims more fixtures passed than were run is refused rather
+ * than read as a pass.
+ */
 const ReplayReportSchema = z.looseObject({
   version: z.literal(1),
   // The report is external input, so its lists are bounded:  the bundle's
