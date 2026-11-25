@@ -11215,7 +11215,7 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
   }).catch((error) => {
     // A stopped bot is a decision, not a fault: settle the card quietly rather
     // than parking it in a retry loop that can never succeed.
-    if (isBotStoppedError(error)) {
+    if (isBotOffError(error)) {
       // The refusal's own message says which: turn the bot on, or start it again.
       markConnectorResumeFailed(entry.threadId, entry.resumeKey, error instanceof Error ? error.message : BOT_OFF_REFUSAL);
       return;
@@ -11336,8 +11336,8 @@ function dispatchSecretResume(entry: SecretResumeEntry) {
   }).catch((error) => {
     // See the connector resume above: a stopped bot settles the card instead
     // of retrying forever.
-    if (isBotStoppedError(error)) {
-      markSecretResumeFailed(entry.threadId, entry.messageId, error instanceof Error ? error.message : botStopRefusalMessage());
+    if (isBotOffError(error)) {
+      markSecretResumeFailed(entry.threadId, entry.messageId, error instanceof Error ? error.message : BOT_OFF_REFUSAL);
       return;
     }
     const message = error instanceof Error ? error.message : String(error);
@@ -11450,8 +11450,8 @@ function dispatchSignInResume(entry: SignInResumeEntry) {
     toolPolicy: continuedTurnToolPolicy(store.activePath(entry.threadId)),
     onDispatchError: (message) => markSignInResumeFailed(entry.threadId, entry.messageId, message),
   }).catch((error) => {
-    if (isBotStoppedError(error)) {
-      markSignInResumeFailed(entry.threadId, entry.messageId, error instanceof Error ? error.message : botStopRefusalMessage());
+    if (isBotOffError(error)) {
+      markSignInResumeFailed(entry.threadId, entry.messageId, error instanceof Error ? error.message : BOT_OFF_REFUSAL);
       return;
     }
     const message = error instanceof Error ? error.message : String(error);
@@ -13095,7 +13095,7 @@ async function resumeInterruptedChatTurns(
           } : {}),
         });
       } catch (error) {
-        if (isBotStoppedError(error)) {
+        if (isBotOffError(error)) {
           // Their stop outranks our replay.  Say so in the log rather than
           // retrying: the thread stays put until the person starts the bot.
           console.log(`[${context}] not resuming ${resumeBot.name} — the bot is stopped or off`);
