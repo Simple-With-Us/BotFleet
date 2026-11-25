@@ -153,9 +153,10 @@ struct ControlHostsImportTests {
         let effects = FakeEffects(native: existingNative(), controlFile: fixtureEntries())
         let summary = ControlHostsImport.dryRun(entries: fixtureEntries(), existing: effects.currentNative)
 
-        //  Two remotes become records, one credential moves for the native
-        //  origin, and the anchor and the seed are left alone.
-        #expect(summary.toImport == 2)
+        //  Three remotes become records -- two with tokens and one without --
+        //  one credential moves for the native origin, and the anchor and the
+        //  seed are left alone.
+        #expect(summary.toImport == 3)
         #expect(summary.credentialsForExisting == 1)
         #expect(summary.leftInPlace[.localAnchor] == 1)
         #expect(summary.leftInPlace[.syntheticSeed] == 1)
@@ -237,15 +238,17 @@ struct ControlHostsImportTests {
         let effects = FakeEffects(native: existingNative(), controlFile: fixture)
         let summary = try await ControlHostsImport.run(entries: fixture, effects: effects)
 
-        #expect(summary.toImport == 2)
-        #expect(effects.writtenIDs.count == 2)
-        #expect(effects.enrolledIDs.count == 3)     //  h1, h2, and h4's credential
+        #expect(summary.toImport == 3)
+        #expect(effects.writtenIDs.count == 3)
+        #expect(effects.enrolledIDs.count == 3)     //  h1, h2, and h4's credential; h3 has none
 
         //  Every new record carries a fresh, valid native id.
-        #expect(Set(effects.writtenIDs).count == 2)
+        #expect(Set(effects.writtenIDs).count == 3)
         let written = effects.currentNative
-        #expect(written.count == existingNative().count + 2)
-        for record in written {
+        #expect(written.count == existingNative().count + 3)
+        //  The records this run wrote, not the fixture's own synthetic id,
+        //  which the real store would never hold.
+        for record in written.dropFirst(existingNative().count) {
             #expect(throws: Never.self) { try record.validate() }
         }
 
@@ -271,7 +274,7 @@ struct ControlHostsImportTests {
         _ = try await ControlHostsImport.run(entries: fixtureEntries(), effects: effects)
 
         let after = effects.currentNative
-        #expect(after.count == before.count + 2)
+        #expect(after.count == before.count + 3)
         //  The hosts that were there first are still there, unchanged, in
         //  their original order:  the run appends, it never rewrites the list.
         for (index, record) in before.enumerated() {
@@ -288,7 +291,7 @@ struct ControlHostsImportTests {
         let effects = FakeEffects(native: existingNative(), controlFile: fixtureEntries())
 
         let first = try await ControlHostsImport.run(entries: fixtureEntries(), effects: effects)
-        #expect(first.toImport == 2)
+        #expect(first.toImport == 3)
 
         //  Control's file as the first run left it:  the moved hosts carry no
         //  token now, which is the state a repeat run finds.
@@ -299,9 +302,9 @@ struct ControlHostsImportTests {
         #expect(second.credentialsForExisting == 0)
         #expect(second.isEmpty)
 
-        #expect(effects.writtenIDs.count == 2, "no new record appeared")
+        #expect(effects.writtenIDs.count == 3, "no new record appeared")
         #expect(effects.writeCount == 1, "Control's file was not rewritten")
-        #expect(effects.currentNative.count == existingNative().count + 2)
+        #expect(effects.currentNative.count == existingNative().count + 3)
 
         //  No duplicate origin anywhere in the native store.
         let origins = originStrings(effects.currentNative)
@@ -364,8 +367,8 @@ struct ControlHostsImportTests {
         )
         let summary = try await ControlHostsImport.run(entries: fixture, effects: healthy)
 
-        #expect(summary.toImport == 2)
-        #expect(healthy.currentNative.count == existingNative().count + 2)
+        #expect(summary.toImport == 3)
+        #expect(healthy.currentNative.count == existingNative().count + 3)
         let origins = originStrings(healthy.currentNative)
         #expect(Set(origins).count == origins.count, "the retry created a duplicate")
     }
@@ -455,7 +458,7 @@ struct ControlHostsImportTests {
 
         effects.failControlWrite = false
         let retried = try await ControlHostsImport.run(entries: fixture, effects: effects)
-        #expect(retried.toImport == 2)
+        #expect(retried.toImport == 3)
         #expect(effects.currentControlFile.first { $0.id == "h1" }?.authToken == nil, "the retry strips the token")
     }
 
@@ -490,6 +493,7 @@ struct ControlHostsImportTests {
         )
         try await effects.enroll("stored-earlier", for: host)
         #expect(effects.credentialIDs == ["kept-native"])
+        let enrolledBeforeRun = effects.enrolledIDs
 
         let summary = try await ControlHostsImport.run(
             entries: [entry(id: "k2", name: "Kept", url: "https://kept.example.invalid", token: "x")],
@@ -497,7 +501,7 @@ struct ControlHostsImportTests {
         )
 
         //  Nothing was enrolled over it and nothing was created for it.
-        #expect(effects.enrolledIDs.isEmpty, "a credential native holds is not replaced")
+        #expect(effects.enrolledIDs == enrolledBeforeRun, "a credential native holds is not replaced")
         #expect(effects.writtenIDs.isEmpty, "one origin is one record")
         #expect(effects.currentNative.count == 2)
         //  Control keeps its copy:  this run never moved it, so it must not
