@@ -556,6 +556,25 @@ test("a report that says an engine was not measured and gives no reason is refus
   );
 });
 
+test("a report that names a reason for an engine it did measure is refused", () => {
+  // The two optional fields belong to one case each:  the family to a
+  // measured engine, the reason to an unmeasured one.  A measured engine
+  // that carries a reason says it could not be measured while saying it
+  // was, and that is a contradiction the contract can see.
+  const path = writeReport({
+    version: 1,
+    requestedEngines: ["claude"],
+    isFullyVerified: true,
+    engines: [
+      { engineId: "claude", family: "claude", measured: true, unmeasuredReason: "no replay family drives this engine", fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+    ],
+  });
+  assert.throws(
+    () => readReplayReport(path),
+    /was measured and gives the reason "no replay family drives this engine" anyway/,
+  );
+});
+
 test("a report that names a family for an engine it did not measure is refused", () => {
   const path = writeReport({
     version: 1,

@@ -184,12 +184,21 @@ const ReplayReportSchema = z.looseObject({
     // the reason it could not measure one it did not.  One without the other
     // is a report the probe did not write, and a report the probe did not
     // write is not evidence that a replay held.
-    if (entry.measured && !entry.family) {
-      ctx.addIssue({
-        code: "custom",
-        path: [...where, "family"],
-        message: `the engine "${entry.engineId}" was measured and names no family behind the run`,
-      });
+    if (entry.measured) {
+      if (!entry.family) {
+        ctx.addIssue({
+          code: "custom",
+          path: [...where, "family"],
+          message: `the engine "${entry.engineId}" was measured and names no family behind the run`,
+        });
+      }
+      if (entry.unmeasuredReason) {
+        ctx.addIssue({
+          code: "custom",
+          path: [...where, "unmeasuredReason"],
+          message: `the engine "${entry.engineId}" was measured and gives the reason "${entry.unmeasuredReason}" anyway`,
+        });
+      }
     }
     if (!entry.measured) {
       if (entry.family) {
