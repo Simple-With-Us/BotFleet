@@ -50,6 +50,8 @@ public final class MacStartupPolicyStore: @unchecked Sendable {
 
     public let dataDir: URL
     public let wrapper: URL
+    /// The user's home, which the LaunchAgent plist lives under.
+    public let home: URL
     private let files: FileManager
 
     /// The current user's home directory.
@@ -81,11 +83,17 @@ public final class MacStartupPolicyStore: @unchecked Sendable {
         // The launchd plist runs the wrapper from an absolute path, and the
         // install that ships it puts it beside the other fleet helpers in the
         // home's apps folder.  A relocated wrapper is given explicitly.
+        self.home = home
         self.wrapper = wrapper ?? home.appendingPathComponent("apps/botfleet-server-start.sh", isDirectory: false)
         self.files = files
     }
 
     // MARK: - Locations
+
+    /// The LaunchAgent plist that installs a label.
+    public func launchAgentPlist(label: String) -> URL {
+        home.appendingPathComponent("Library/LaunchAgents/\(label).plist", isDirectory: false)
+    }
 
     public func enabledMarker(dataDir: URL? = nil) -> URL {
         (dataDir ?? self.dataDir).appendingPathComponent(Self.enabledMarkerFileName)
@@ -171,6 +179,19 @@ public final class MacStartupPolicyStore: @unchecked Sendable {
     ) throws {
         try MacStartupPolicyStore(dataDir: dataDir)
             .setStartsAtLogin(enabled, bootSession: bootSession, dataDir: dataDir)
+    }
+
+    /// Records the boot session a deliberate start was made in.
+    ///
+    /// A start is a choice too:  the wrapper compares this file with the
+    /// current boot to tell "this was asked for" from "the machine rebooted
+    /// into the default", exactly as it does for a policy change.
+    public func recordBootSession(_ bootSession: String) throws {
+        guard !bootSession.isEmpty else {
+            throw MacStartupPolicyError.bootSessionUnavailable
+        }
+        try files.createDirectory(at: dataDir, withIntermediateDirectories: true)
+        try writeSessionFile(bootSession, dataDir: dataDir)
     }
 
     /// Returns the policy to its install default by removing both markers.

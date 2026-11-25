@@ -15,6 +15,7 @@ struct MacLifecycleSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             statusGroup
+            serverGroup
             vmGroup
             startupGroup
             if let errorMessage = session.controlStatusError {
@@ -27,6 +28,48 @@ struct MacLifecycleSettingsView: View {
                     .font(.caption)
                     .foregroundColor(.red)
             }
+        }
+    }
+
+    // MARK: - Start Server
+
+    /// Start the installed harness on request (BF-2700).
+    ///
+    /// The button is enabled on the same three facts the control's own fence
+    /// asks for, and the sentence that says why it is not offered is shown in
+    /// its place, so a greyed-out control never leaves the section silent.
+    /// The outcome of the last attempt is shown instead of the refusal, and
+    /// only while one applies:  the same sentence twice reads like two things
+    /// happened.
+    private var serverGroup: some View {
+        GroupBox("Start Server") {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Button("Start Server") {
+                        Task { await session.startServer() }
+                    }
+                    .disabled(session.startServerRefusal != nil)
+                    if session.isStartingServer {
+                        ProgressView().controlSize(.small)
+                    }
+                    Spacer()
+                }
+                if let outcome = session.startServerDisplayMessage {
+                    Text(outcome)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else if let refusal = session.startServerRefusal {
+                    Text(refusal)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else {
+                    Text("Nothing is listening on the harness port, so the server can be started from here.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 

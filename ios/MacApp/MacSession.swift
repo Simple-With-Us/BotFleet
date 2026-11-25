@@ -121,6 +121,24 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     @Published public var startupPolicyErrorMessage: String?
     /// The startup-policy store for this Mac's data directory.
     public let startupPolicyStore: MacStartupPolicyStore
+    /// What the last status read proved about whether the harness is up.
+    ///
+    /// The read's own outcome, never `controlStatus`:  a failed read keeps
+    /// the last known status in place beside the reason, so the status alone
+    /// would call a server that answered and has since stopped an answering
+    /// one and hold the start control off for good.
+    @Published public private(set) var controlPresence: MacServerPresence = .unknown
+    /// The state of the installed LaunchAgent, as launchd last said it.
+    @Published public private(set) var installedServerState: MacInstalledServerState?
+    /// Whether a start is running, so the button waits with it instead of
+    /// firing a second request the launchd fence would refuse anyway.
+    @Published public private(set) var isStartingServer = false
+    /// What the last start attempt did, or why the control is not offered.
+    @Published public var serverStartMessage: String?
+    /// The presence the last outcome was about.  An outcome is evidence about
+    /// the state it was observed in; once the state moves, showing it would
+    /// describe a server that is no longer there.
+    @Published private var serverStartMessagePresence: MacServerPresence?
 
     // Native companion listener lifecycle (BF-2590, the lifecycle half of BF-2511)
     /// What the native companion listener is doing, mirrored from the
@@ -185,6 +203,10 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     private var connectionGeneration = UUID()
     private var reconnectAttempt = 0
     private let policyStore: MacPersistencePolicyStore
+    /// Starts the installed harness LaunchAgent on request (BF-2700).  Its
+    /// boot-session reader is injected so the app reads the real boot and a
+    /// test can supply its own.
+    private let serverLaunchController: MacServerLaunchController
     private let permissionMonitor: CuaPermissionMonitor
     private let cuaStatusState = CuaStatusState()
     private var hasLaunched = false
@@ -202,10 +224,15 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     public init(
         policyStore: MacPersistencePolicyStore = MacPersistencePolicyStore(),
         startupPolicyStore: MacStartupPolicyStore = MacStartupPolicyStore(),
+        serverLaunchController: MacServerLaunchController? = nil,
         permissionMonitor: CuaPermissionMonitor = CuaPermissionMonitor()
     ) {
         self.policyStore = policyStore
         self.startupPolicyStore = startupPolicyStore
+        self.serverLaunchController = serverLaunchController ?? MacServerLaunchController(
+            store: startupPolicyStore,
+            bootSession: { try startupPolicyStore.readBootSession() }
+        )
         let hostStore = HostStore(fileURL: policyStore.dataDir.appendingPathComponent("hosts.json"))
         self.servers = ServersCoordinator(store: hostStore)
         self.resources = ResourcesCoordinator(store: hostStore)
@@ -753,6 +780,11 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         Task { @MainActor [weak self] in
             await self?.refreshLifecycleSettings()
             self?.refreshStartupPolicy()
+            //  launchd is asked at launch and not only from the connection's
+            //  callback:  a harness that is down never hydrates, so the start
+            //  control would otherwise stay unofferable in the one case it
+            //  exists for.
+            await self?.refreshInstalledServerState()
             await self?.companionListener.applyLaunch()
         }
         let generation = connectionGeneration
@@ -1151,9 +1183,15 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         guard !isRefreshingControlStatus else { return }
         isRefreshingControlStatus = true
         defer { isRefreshingControlStatus = false }
+        //  launchd is asked first, before anything that can return early.  The
+        //  offer's third fact has to be current even when the endpoint is
+        //  refused or the read is cancelled, which is exactly the state a
+        //  server that is down leaves behind.
+        await refreshInstalledServerState()
         guard let client = makeControlStatusClient() else {
             controlStatus = nil
             controlStatusError = Self.controlClientUnavailableMessage
+            controlPresence = .unknown
             return
         }
         let generation = connectionGeneration
@@ -1162,10 +1200,23 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
             guard connectionGeneration == generation, !Task.isCancelled else { return }
             controlStatus = status
             controlStatusError = nil
+            controlPresence = .answering
         } catch {
             guard connectionGeneration == generation, !Task.isCancelled else { return }
             controlStatusError = error.localizedDescription
+            controlPresence = MacServerPresence.after(status: controlStatus, error: error as? MacControlStatusError)
         }
+    }
+
+    /// Reads the installed LaunchAgent's state from launchd (BF-2700).
+    ///
+    /// A fresh connection asks so the start control is offerable from the
+    /// first look, not only after a status read that may never come while the
+    /// harness is down.
+    public func refreshInstalledServerState() async {
+        let state = await serverLaunchController.installedServerState()
+        guard !Task.isCancelled else { return }
+        installedServerState = state
     }
 
     /// Starts the shared Local VM from Settings or the menu.
@@ -1197,6 +1248,72 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
             guard connectionGeneration == generation, !Task.isCancelled else { return }
             vmActionMessage = nil
             controlStatusError = error.localizedDescription
+        }
+    }
+
+    // MARK: - Start Server (BF-2700)
+
+    /// Whether the Start Server control may be used, and when it may not, the
+    /// one sentence that says why.
+    ///
+    /// `nil` means it is offered.  The three facts are the ones the control's
+    /// own fence asks for:  the wrapper can be started through the policy,
+    /// nothing answered on the harness port, and the job is installed without
+    /// a live process behind the label.  Anything not yet known is a sentence
+    /// that says to look again, never an offer.
+    public var startServerRefusal: String? {
+        guard !isStartingServer else {
+            return "The server is starting.\u{00A0} Wait for it to settle."
+        }
+        return MacServerLaunchController.startRefusal(
+            policySupported: supportsStartupPolicy,
+            presence: controlPresence,
+            installedState: installedServerState
+        )
+    }
+
+    /// The last start outcome, while it still describes this server.
+    ///
+    /// Nil once the presence has moved since the outcome was recorded, so a
+    /// success cannot sit over a server that has since stopped, and a refusal
+    /// cannot outlive the state it explained.
+    public var startServerDisplayMessage: String? {
+        guard serverStartMessagePresence == controlPresence else { return nil }
+        return serverStartMessage
+    }
+
+    /// Starts the installed harness LaunchAgent and reports what happened.
+    ///
+    /// The app does not start the harness itself:  launchd runs the installed
+    /// wrapper, and this asks launchd for that one job.  It is refused before
+    /// it begins whenever `startServerRefusal` is a sentence, so a control
+    /// that is greyed out can never start something the fence would not.
+    public func startServer() async {
+        guard !isStartingServer else { return }
+        if let refusal = startServerRefusal {
+            serverStartMessage = refusal
+            serverStartMessagePresence = controlPresence
+            return
+        }
+        isStartingServer = true
+        defer { isStartingServer = false }
+        do {
+            let outcome = try await serverLaunchController.startServerAndSettle()
+            serverStartMessage = outcome.message
+            //  The status read follows the start itself:  a process behind the
+            //  label proves launchd took the request, and only the harness
+            //  answering proves it is up.  That read also asks launchd for the
+            //  installed state, so one start lists the label once.
+            await refreshControlStatus()
+            //  The outcome is tied to the presence the reads above settled on:
+            //  a start that moved the port from refused to answering keeps the
+            //  sentence that says so, and a presence that moves later still
+            //  hides it.
+            serverStartMessagePresence = controlPresence
+        } catch {
+            serverStartMessage = error.localizedDescription
+            installedServerState = await serverLaunchController.installedServerState()
+            serverStartMessagePresence = controlPresence
         }
     }
 
