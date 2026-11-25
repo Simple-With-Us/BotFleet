@@ -22,8 +22,14 @@
 // at all:  the bundle validator accepts a check whose exit code is zero and
 // whose artifact hashes correctly, so a hardcoded zero would turn a failed
 // replay into evidence of a successful one.  So every exit code here comes
-// from the artifact it names, and an engine the report does not cover earns a
-// failing code rather than a passing one.
+// from the artifact it names.
+
+// The report has to be the measurement of THIS packet's inventory.  The
+// receipt's checks are named from `bundle.engines`, so a report that never
+// covered an engine the packet names is not evidence about this packet:  it
+// is a report about a different inventory, and it is refused rather than
+// scored.  A report that covers more than the packet asks for is fine, since
+// the packet may name a subset of what was measured.
 
 // The report's summary is checked against the report's own details.  The probe
 // computes that summary as "every engine the packet named was measured and
@@ -35,7 +41,11 @@
 //
 // An engine the packet names that no replay family drives earns the same
 // failing code, because the probe cannot measure it.  The reason is in the
-// report, which travels in the packet as the check's artifact.
+// report, which travels in the packet as the check's artifact, and the
+// contract asks for it:  a failing check that cannot say why it failed is a
+// packet the operator cannot act on.  The corpus behind a measured engine is
+// named for the same reason:  a verdict that does not say what was replayed
+// against it is a verdict without a subject.
 //
 // Usage:
 //   node scripts/emit-replay-receipt.mjs --capture <capture-dir> \
@@ -53,6 +63,34 @@ export const REPLAY_RECEIPT_FILE = "replay.receipt.json";
 
 /** The longest a check name may be, which is the bundle's own text limit. */
 export const CHECK_NAME_LIMIT = 2048;
+
+/**
+ * One engine's entry in the report.
+ *
+ * The probe writes more than the verdict.  For every engine it records
+ * whether it could be measured at all, why it could not when it could not,
+ * and the replay family whose corpus drove the run.  Those two strings are
+ * what make the entry readable as evidence:  a failing check that cannot say
+ * why it failed is a packet the operator cannot act on, and a verdict that
+ * does not name the corpus it was measured against is a verdict without a
+ * subject.  Each is optional in the report's own encoding, because the probe
+ * omits the one that does not apply, so the contract asks for the right one
+ * per case rather than for both.
+ *
+ * The family is not a list of names here.  Which engine id resolves to which
+ * family is a fact of the Swift tree, derived there by the executable the
+ * driver would launch, and writing that mapping down on this side would
+ * create exactly the second vocabulary the runbook says must not exist.
+ */
+const ReplayEngineSchema = z.looseObject({
+  engineId: z.string().min(1).max(2041),
+  family: z.string().min(1).max(64).nullish(),
+  measured: z.boolean(),
+  unmeasuredReason: z.string().min(1).max(512).nullish(),
+  fixtureCount: z.number().int().nonnegative(),
+  passedCount: z.number().int().nonnegative(),
+  isFullyVerified: z.boolean(),
+});
 
 /**
  * The report's shape, as far as the receipt reads it.
@@ -83,13 +121,7 @@ const ReplayReportSchema = z.looseObject({
   // rather than producing a check name the bundle will not accept.
   requestedEngines: z.array(z.string().min(1).max(2041)).min(1).max(32),
   isFullyVerified: z.boolean(),
-  engines: z.array(z.looseObject({
-    engineId: z.string().min(1).max(2041),
-    measured: z.boolean(),
-    fixtureCount: z.number().int().nonnegative(),
-    passedCount: z.number().int().nonnegative(),
-    isFullyVerified: z.boolean(),
-  })).min(1).max(32),
+  engines: z.array(ReplayEngineSchema).min(1).max(32),
 }).superRefine((report, ctx) => {
   // One engine id, one verdict.  The verdict is read by first match, so a
   // report that names the same engine twice could hide a failing verdict
@@ -148,6 +180,42 @@ const ReplayReportSchema = z.looseObject({
   // An engine's verdict has to agree with what it measured.
   report.engines.forEach((entry, index) => {
     const where = ["engines", index];
+    // The probe names the family whose corpus drove a measured engine, and
+    // the reason it could not measure one it did not.  One without the other
+    // is a report the probe did not write, and a report the probe did not
+    // write is not evidence that a replay held.
+    if (entry.measured) {
+      if (!entry.family) {
+        ctx.addIssue({
+          code: "custom",
+          path: [...where, "family"],
+          message: `the engine "${entry.engineId}" was measured and names no family behind the run`,
+        });
+      }
+      if (entry.unmeasuredReason) {
+        ctx.addIssue({
+          code: "custom",
+          path: [...where, "unmeasuredReason"],
+          message: `the engine "${entry.engineId}" was measured and gives the reason "${entry.unmeasuredReason}" anyway`,
+        });
+      }
+    }
+    if (!entry.measured) {
+      if (entry.family) {
+        ctx.addIssue({
+          code: "custom",
+          path: [...where, "family"],
+          message: `the engine "${entry.engineId}" was not measured and names the family "${entry.family}" anyway`,
+        });
+      }
+      if (!entry.unmeasuredReason) {
+        ctx.addIssue({
+          code: "custom",
+          path: [...where, "unmeasuredReason"],
+          message: `the engine "${entry.engineId}" was not measured and gives no reason`,
+        });
+      }
+    }
     if (entry.passedCount > entry.fixtureCount) {
       ctx.addIssue({
         code: "custom",
@@ -210,6 +278,30 @@ const ReplayReportSchema = z.looseObject({
 
 /** The provenance source has to be an https URL, because the receipt says where the run came from. */
 const ProvenanceSourceSchema = z.string().startsWith("https://");
+
+/**
+ * The report has to have measured the inventory the packet names.
+ *
+ * The receipt's checks are named from the packet's own engine list, so a
+ * report that measured a different list is not evidence about this packet:
+ * every check would read a verdict out of a report that never mentions that
+ * engine, and the packet would carry a receipt whose artifact is about
+ * something else.  That is a refusal rather than a failing check, because a
+ * report about a different inventory is not a replay that failed.
+ *
+ * A report that covers more than the packet asks for is fine:  the packet
+ * may name a subset of what was measured, and the receipt names its checks
+ * from the packet's list either way.
+ */
+export function assertInventoryCoverage(report, bundle) {
+  const measured = new Set(report.requestedEngines);
+  const missing = bundle.engines.filter((engine) => !measured.has(engine));
+  if (missing.length > 0) {
+    throw new Error(
+      `the replay report does not cover the engine${missing.length === 1 ? "" : "s"} the packet names: ${missing.join(", ")}`,
+    );
+  }
+}
 
 /**
  * Whether the report says the engine held.
@@ -281,25 +373,29 @@ export function emitReplayReceipt({ captureDir, request, provenance, reportPath 
   if (!source.success) {
     throw new Error("the provenance source must be an https URL");
   }
-  const report = readReplayReport(reportPath);
-  const reportReference = evidenceRef(capture, reportPath);
-
   // A check name the bundle's own schema refuses is a receipt the bundle
   // will reject, so the bundle's engine id is checked against that limit
-  // before anything is written.
-  const checks = bundle.engines.map((engine) => {
+  // before anything is written.  It is checked before the report is read,
+  // because it is a fact about the packet rather than about the report.
+  bundle.engines.forEach((engine) => {
     const name = `engine:${engine}`;
     if (name.length > CHECK_NAME_LIMIT) {
       throw new Error(
         `the check name for the engine "${engine.slice(0, 32)}" is ${name.length} characters, which is over the bundle's check-name limit of ${CHECK_NAME_LIMIT}`,
       );
     }
-    return {
-      name,
-      exitCode: replayVerdict(report, engine) ? 0 : 1,
-      artifact: reportReference,
-    };
   });
+
+  const report = readReplayReport(reportPath);
+  // The report has to have measured the inventory the packet names.
+  assertInventoryCoverage(report, bundle);
+  const reportReference = evidenceRef(capture, reportPath);
+
+  const checks = bundle.engines.map((engine) => ({
+    name: `engine:${engine}`,
+    exitCode: replayVerdict(report, engine) ? 0 : 1,
+    artifact: reportReference,
+  }));
 
   const receipt = {
     version: REPLAY_RECEIPT_VERSION,
