@@ -300,6 +300,7 @@ const GEMINI: Family = {
     "flash@2.5": { input: 0.3, output: 2.5 },
     "flash@3.8": { input: 0.75, output: 3.75 },
     "flash@4": { input: 1.5, output: 7.5 },
+    "lite@2.5": { input: 0.1, output: 0.4 },
     "pro@2.5": { input: 1.25, output: 10 },
     "pro@3.1": { input: 1.25, output: 10 },
     "pro@4": { input: 3, output: 15 },
