@@ -101,6 +101,11 @@ public enum MacControlStatusError: LocalizedError, Equatable, Sendable {
     case invalidURL
     case invalidResponse
     case httpError(statusCode: Int, message: String)
+    /// Nothing answered on the port:  the connection was refused.  Of every
+    /// way a read can fail, this is the one that proves the server is not
+    /// running.  A timeout or an unreadable reply says nothing, and a server
+    /// older than the control routes answered.
+    case notReachable
     /// The harness answered but has no control route:  it predates the
     /// surface this app speaks.  It is running;  it is just older.
     case outdatedServer
@@ -113,6 +118,8 @@ public enum MacControlStatusError: LocalizedError, Equatable, Sendable {
             return "The local harness URL is invalid."
         case .invalidResponse:
             return "The local harness returned an invalid response."
+        case .notReachable:
+            return "Nothing answered on the local harness port."
         case .httpError(_, let message):
             return message
         case .outdatedServer:
@@ -218,6 +225,8 @@ public final class MacControlStatusClient: @unchecked Sendable {
             (data, response) = try await session.data(for: request)
         } catch let error as MacControlStatusError {
             throw error
+        } catch let error as URLError where error.code == .cannotConnectToHost {
+            throw MacControlStatusError.notReachable
         } catch {
             throw MacControlStatusError.invalidResponse
         }

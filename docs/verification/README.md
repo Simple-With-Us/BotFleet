@@ -25,6 +25,7 @@ Verification uses these isolated fixtures:
 - [Model fallback on quota chips](quota-fallback.md) — provider failover when quota is exhausted
 - [Mac updater transaction](mac-updater.md) — signed update delivery and application
 - [Independent server controls](server-controls.md) — native menu bar controls, startup policy and protected VM shutdown
+- [Native Lifecycle Controls](native-lifecycle-controls.md) — Start Server, the startup policy and the Local VM controls in BotFleetMac's own Settings
 - [Placement and ownership](placement.md) — shared job contract, local identity and seventeen required multi-host acceptance recipes
 - [Host headroom](headroom.md) — inventory, honest enforcement, pressure, storage isolation and authorized server fixture evidence
 - [Native host package smoke](native-host-package.md) — the real packager, the real archive and the packaged executable's own identity
