@@ -14,10 +14,14 @@ BF-2652 closes only when three different kinds of evidence exist, and none of th
 
 A green Slot 1 says nothing about Slot 2, and a foreground receipt in Slot 3 does not prove a background wake.  Each slot is filed under its own evidence and never borrowed from another.
 
+## Topology (Owner Direction, Nov 25)
+
+Linux/Hetzner is the primary BotFleet server.  Both the Mac app and the iPhone connect to it.  The Mac's secondary server runs only work that requires the Mac; it is not a peer primary and it is not the iPhone's dependency.  Standalone Mac operation, if supported separately, stays distinct from fleet operation.  No automatic promotion or failover is assumed, and no source merge counts as installed proof.
+
 ## Slot 1 Receipt: Packaged Source At An Exact Revision
 
-- **Exact tested revision:** `c202b4d67060dec62d486c97fbf47be6022668c8` (`origin/main`, the BF-2694 iOS slice, PR #2195). This revision contains the merged bridge core (#2171, #2177), the Phone tab (#2170), and the default-off Linux bridge listener, unit, and policy from BF-2691 (#2190, `37969f8b7`).
-- **Lane:** `muse-code/bf2652-checklist-receipt`, cut from `origin/main` at that revision. Dependencies installed with `pnpm install --frozen-lockfile`.
+- **Exact tested revision:** `c202b4d67060dec62d486c97fbf47be6022668c8` (`origin/main`, the BF-2694 iOS slice, PR #2195).  This revision contains the merged bridge core (#2171, #2177), the Phone tab (#2170), and the default-off Linux bridge listener, unit, and policy from BF-2691 (#2190, `37969f8b7`).
+- **Lane:** `muse-code/bf2652-checklist-receipt`, cut from `origin/main` at that revision.  Dependencies installed with `pnpm install --frozen-lockfile`.
 - **Host limit, recorded plainly:** this host runs Node `v22.22.1` while the package requires Node `>=24`, so TypeScript type-stripping is unavailable here. The bridge server tests were run with `node --experimental-strip-types`, which this Node build accepts for the bridge's own modules. The two retained-source tests in the wider suite fail here with `ERR_NO_TYPESCRIPT` for the same host reason; they are not bridge failures and are not claimed as verified on this host. Hosted CI on Node 24 remains the oracle for those two files.
 
 | Command (in the lane, at the revision above) | Result |
@@ -55,6 +59,7 @@ Prerequisites, all owner-side:
 | P4 | Revoke the device mid-socket | The stream terminates at once and re-pairing is required (`401` until then) | Revocation is live, not just stored |
 | P5 | Background the app, then trigger a server-owned event | An APNs alert arrives from the Linux sender | Background wake — the row P3 cannot close |
 | P6 | Trigger an approval with the app terminated | The alert and Live Activity arrive; one device, one sender | The one-sender rule across the Mac-asleep seam |
+| P7 | Queue a Mac-only job while the Mac is asleep, then wake the Mac | The job visibly waits for the Mac secondary, then resumes exactly once, with no duplicate execution and no second authoritative writer | Primary and secondary stay in their lanes |
 
 ## Non-Authorizations
 
