@@ -186,6 +186,13 @@ test("a stale UNMONITORED_SCHEDULES entry is reported like a stale cron key (AFC
     "print(json.dumps(m.find_cron_schedule_drift(live)))",
   ]);
   assert.deepEqual(overlap, ["Auto-merge PRs"]);
+  // A duplicate that differs only by case reports both spellings.
+  const caseOverlap = probeReporter([
+    "m.CRON_SCHEDULES['AUTO-MERGE PRS'] = '*/15 * * * *'",
+    "live = set(m.CRON_SCHEDULES) | set(m.UNMONITORED_SCHEDULES)",
+    "print(json.dumps(m.find_cron_schedule_drift(live)))",
+  ]);
+  assert.deepEqual(caseOverlap, ["AUTO-MERGE PRS", "Auto-merge PRs"]);
 
   const sent = probeReporter([
     "sent = []",
