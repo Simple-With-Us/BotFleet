@@ -224,7 +224,7 @@ def monitor_config_for(workflow_name: str, cron_expr: str) -> dict:
 
 def find_cron_schedule_drift(known_names: set[str] | None) -> list[str]:
     """CRON_SCHEDULES keys and UNMONITORED_SCHEDULES names that match no real
-    workflow `name:`, case-insensitively.
+    workflow `name:`, case-insensitively, plus any name listed in both maps.
 
     A stale UNMONITORED_SCHEDULES entry is drift too: after a rename it exempts
     nothing, while the renamed workflow raises unmapped-schedule drift on every
@@ -234,8 +234,12 @@ def find_cron_schedule_drift(known_names: set[str] | None) -> list[str]:
     if not known_names:
         return []
     folded = {name.casefold() for name in known_names}
+    unmonitored_folded = {name.casefold() for name in UNMONITORED_SCHEDULES}
+    # A name in both maps is drift as well: UNMONITORED_SCHEDULES wins, so its
+    # CRON_SCHEDULES entry would silently never check in.
+    overlap = {key for key in CRON_SCHEDULES if key.casefold() in unmonitored_folded}
     configured = set(CRON_SCHEDULES) | set(UNMONITORED_SCHEDULES)
-    return sorted(key for key in configured if key.casefold() not in folded)
+    return sorted(key for key in configured if key.casefold() not in folded or key in overlap)
 
 
 def parse_dsn(dsn: str) -> tuple[str, str, str]:
@@ -375,16 +379,17 @@ def main() -> int:
         joined = ", ".join(repr(key) for key in stale_keys)
         print(
             f"::error::CRON_SCHEDULES / UNMONITORED_SCHEDULES name(s) {joined} match no "
-            "workflow `name:` under .github/workflows/ — a stale CRON_SCHEDULES key "
-            "sends no cron check-in, and a stale UNMONITORED_SCHEDULES entry exempts "
-            "nothing.  Re-key it in scripts/sentry-ci-report.py to the current name."
+            "workflow `name:` under .github/workflows/, or are listed in both maps — "
+            "a stale CRON_SCHEDULES key sends no cron check-in, a stale "
+            "UNMONITORED_SCHEDULES entry exempts nothing, and a name in both never "
+            "checks in.  Re-key or de-duplicate it in scripts/sentry-ci-report.py."
         )
         send_config_drift_event(
             envelope_url,
             auth_header,
             "stale-cron-key",
-            f"sentry-ci-report CRON_SCHEDULES/UNMONITORED_SCHEDULES has stale workflow "
-            f"name(s): {joined} [{APP}]",
+            f"sentry-ci-report CRON_SCHEDULES/UNMONITORED_SCHEDULES has stale or duplicated "
+            f"workflow name(s): {joined} [{APP}]",
             ["ci-report-config-drift", APP, "stale-cron-key"],
             {"stale_keys": stale_keys, "run_url": run_url},
         )
