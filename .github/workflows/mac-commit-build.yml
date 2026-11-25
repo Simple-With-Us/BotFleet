@@ -73,6 +73,16 @@ jobs:
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
           token: ${{ secrets.INFISICAL_IOS_SHIP_READ_TOKEN }}
       - id: pin
+        env:
+          # The shared planner reads the credential from the store through its
+          # own bootstrap binding, never from the environment (INFISICAL.md
+          # §12).  These two names ARE that binding:  a read-only service
+          # token that reaches Infisical, not a copy of the credential.  The
+          # token and the project id are the same pair the adjacent
+          # infisical-secrets action consumes, so the grant the action uses
+          # is the grant the planner uses.
+          INFISICAL_TOKEN: ${{ secrets.INFISICAL_IOS_SHIP_READ_TOKEN }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
         run: |
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           # The shared planner answers three values (BF-2588):  the fixed
