@@ -111,7 +111,7 @@ struct EngineRunnerAndSupervisorTests {
             "--print-timeout", "11m",
             "--add-dir", "/tmp/ws-agy",
             "--mode", "accept-edits",
-            "--model", "gemini-3.1-pro-high"
+            "--model", "gemini-4-neon"
         ])
         #expect(defaultSpec.unsetEnvironmentKeys == AntigravityStreamRunner.workspaceCredentialEnvKeys)
         #expect(defaultSpec.environment["CUSTOM_ENV"] == "keep-me")
