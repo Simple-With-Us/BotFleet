@@ -216,22 +216,26 @@ def monitor_config_for(workflow_name: str, cron_expr: str) -> dict:
         "timezone": "UTC",
     }
     threshold = _CRON_FAILURE_THRESHOLD_FOLDED.get(folded)
-    if threshold:
+    if threshold is not None:
         config["failure_issue_threshold"] = threshold
         config["recovery_threshold"] = 1
     return config
 
 
 def find_cron_schedule_drift(known_names: set[str] | None) -> list[str]:
-    """CRON_SCHEDULES keys that match no real workflow `name:`, case-insensitively.
+    """CRON_SCHEDULES keys and UNMONITORED_SCHEDULES names that match no real
+    workflow `name:`, case-insensitively.
 
-    Empty when the workflow set is unknown (None) or empty — "I could not read
-    the workflows" must never masquerade as "every key is stale".
+    A stale UNMONITORED_SCHEDULES entry is drift too: after a rename it exempts
+    nothing, while the renamed workflow raises unmapped-schedule drift on every
+    tick.  Empty when the workflow set is unknown (None) or empty — "I could
+    not read the workflows" must never masquerade as "every key is stale".
     """
     if not known_names:
         return []
     folded = {name.casefold() for name in known_names}
-    return sorted(key for key in CRON_SCHEDULES if key.casefold() not in folded)
+    configured = set(CRON_SCHEDULES) | set(UNMONITORED_SCHEDULES)
+    return sorted(key for key in configured if key.casefold() not in folded)
 
 
 def parse_dsn(dsn: str) -> tuple[str, str, str]:
@@ -312,8 +316,12 @@ def cron_checkin_status(workflow_name: str, event: str, branch: str, conclusion:
     A production heartbeat also checks in when the same job finishes on
     main from `workflow_run` or `workflow_dispatch`.  Cancelled and skipped
     heartbeat runs check in as nothing, so a dropped duplicate does not
-    invent a failure and does not count as a success.
+    invent a failure and does not count as a success.  A name listed in
+    UNMONITORED_SCHEDULES never checks in, whatever its trigger, even if it is
+    also mapped in CRON_SCHEDULES (AFC-626).
     """
+    if workflow_name.casefold() in _UNMONITORED_FOLDED:
+        return None
     if workflow_name.casefold() not in _CRON_SCHEDULES_FOLDED:
         return None
     if event == "schedule" and workflow_name.casefold() not in _HEARTBEAT_FOLDED:
@@ -366,15 +374,17 @@ def main() -> int:
     if stale_keys:
         joined = ", ".join(repr(key) for key in stale_keys)
         print(
-            f"::error::CRON_SCHEDULES key(s) {joined} match no workflow `name:` under "
-            ".github/workflows/ — those cron check-ins are not being sent.  "
-            "Re-key CRON_SCHEDULES in scripts/sentry-ci-report.py to the current name."
+            f"::error::CRON_SCHEDULES / UNMONITORED_SCHEDULES name(s) {joined} match no "
+            "workflow `name:` under .github/workflows/ — a stale CRON_SCHEDULES key "
+            "sends no cron check-in, and a stale UNMONITORED_SCHEDULES entry exempts "
+            "nothing.  Re-key it in scripts/sentry-ci-report.py to the current name."
         )
         send_config_drift_event(
             envelope_url,
             auth_header,
             "stale-cron-key",
-            f"sentry-ci-report CRON_SCHEDULES has stale workflow name(s): {joined} [{APP}]",
+            f"sentry-ci-report CRON_SCHEDULES/UNMONITORED_SCHEDULES has stale workflow "
+            f"name(s): {joined} [{APP}]",
             ["ci-report-config-drift", APP, "stale-cron-key"],
             {"stale_keys": stale_keys, "run_url": run_url},
         )
@@ -407,8 +417,9 @@ def main() -> int:
     if checkin_status is None and event == "schedule":
         # Case-folded lookup: a workflow rename that only changes capitalisation
         # must never again silently detach a job from its Crons monitor.
-        # cron_checkin_status already returns None for an unmapped name, and
-        # for a heartbeat completion that was cancelled or skipped.
+        # cron_checkin_status already returns None for an unmapped name, for
+        # an UNMONITORED_SCHEDULES name, and for a heartbeat completion that
+        # was cancelled or skipped.
         if workflow_name.casefold() in _UNMONITORED_FOLDED:
             print(
                 f"Workflow '{workflow_name}' is listed in UNMONITORED_SCHEDULES; "
