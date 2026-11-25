@@ -51,17 +51,20 @@ private final class ScriptedLaunchctl: MacCommandRunning, @unchecked Sendable {
     }
 
     func run(executable: String, arguments: [String]) async -> MacCommandOutcome? {
-        lock.lock(); defer { lock.unlock() }
-        requests.append([executable] + arguments)
-        if runnerMissing { return nil }
-        let verb = arguments.first ?? ""
-        if silentVerbs.contains(verb) { return nil }
-        if verb == "list", !listings.isEmpty {
-            let answer = listings.count > 1 ? listings.removeFirst() : listings[0]
-            return MacCommandOutcome(output: answer.output, status: answer.status)
+        //  `withLock` rather than `lock()`/`unlock()`:  the raw pair is
+        //  unavailable from an async context in Swift 6.
+        lock.withLock {
+            requests.append([executable] + arguments)
+            if runnerMissing { return nil }
+            let verb = arguments.first ?? ""
+            if silentVerbs.contains(verb) { return nil }
+            if verb == "list", !listings.isEmpty {
+                let answer = listings.count > 1 ? listings.removeFirst() : listings[0]
+                return MacCommandOutcome(output: answer.output, status: answer.status)
+            }
+            let answer = answers[verb] ?? (0, "", "")
+            return MacCommandOutcome(output: answer.output, status: answer.status, errorOutput: answer.error)
         }
-        let answer = answers[verb] ?? (0, "", "")
-        return MacCommandOutcome(output: answer.output, status: answer.status, errorOutput: answer.error)
     }
 
     /// The verbs asked of launchctl, in order.
@@ -83,8 +86,7 @@ private final class Pauses: @unchecked Sendable {
     private var seconds: [TimeInterval] = []
 
     func pause(_ interval: TimeInterval) async {
-        lock.lock(); defer { lock.unlock() }
-        seconds.append(interval)
+        lock.withLock { seconds.append(interval) }
     }
 
     var recorded: [TimeInterval] {
@@ -290,7 +292,7 @@ struct MacServerStartTests {
 
     @Test("Only a refused connection counts as nothing listening")
     func testPresenceNeedsARefusedConnection() {
-        #expect(MacServerPresence.after(status: MacControlStatus(activeBotCount: 0, localVMs: []), error: nil) == .answering)
+        #expect(MacServerPresence.after(status: MacControlStatus(activeBotCount: 0, localVms: []), error: nil) == .answering)
         #expect(MacServerPresence.after(status: nil, error: .notReachable) == .refused)
         #expect(MacServerPresence.after(status: nil, error: nil) == .unknown)
         for error in [MacControlStatusError.invalidResponse, .invalidURL, .outdatedServer, .foreignService,
@@ -301,7 +303,7 @@ struct MacServerStartTests {
         //  failed, so a status is only evidence while no error contradicts
         //  it:  a server that answered and has since stopped still shows its
         //  status, and it is the refusal that says it is down.
-        let stale = MacControlStatus(activeBotCount: 3, localVMs: [])
+        let stale = MacControlStatus(activeBotCount: 3, localVms: [])
         #expect(MacServerPresence.after(status: stale, error: .notReachable) == .refused)
         #expect(MacServerPresence.after(status: stale, error: .outdatedServer) == .unknown)
         #expect(MacServerPresence.after(status: stale, error: nil) == .answering)
@@ -412,11 +414,12 @@ struct MacServerStartTests {
         } catch let error as MacServerStartError {
             //  The refusal names the failed request, and the explanation is
             //  launchctl's own rather than an invented one.
-            guard case .launchdRefused(let operation, let detail) = error else {
-                return Issue.record("unexpected refusal: \(error)")
+            if case .launchdRefused(let operation, let detail) = error {
+                #expect(operation == "print")
+                #expect(detail == "Operation not permitted")
+            } else {
+                Issue.record("unexpected refusal: \(error)")
             }
-            #expect(operation == "print")
-            #expect(detail == "Operation not permitted")
         } catch {
             Issue.record("Unexpected error: \(error)")
         }
