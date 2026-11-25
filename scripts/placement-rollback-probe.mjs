@@ -358,6 +358,12 @@ function fingerprintSignedArtifact(named) {
     if (!opened.isFile() || opened.dev !== seen.stat.dev || opened.ino !== seen.stat.ino) {
       return { blocker: blocker("signed-artifact-unreadable", `${path} changed while it was being opened`) };
     }
+    // Another name for these bytes is another way to change them.  An
+    // artifact with one name is the only one whose hash pins the bytes that
+    // were checked (the runtime fingerprint above holds the same rule).
+    if (opened.nlink !== 1) {
+      return { blocker: blocker("signed-artifact-hard-linked", `${path} has another hard link; name a signed artifact file that has one name`) };
+    }
     const hash = createHash("sha256");
     const chunk = Buffer.allocUnsafe(1024 * 1024);
     let bytes = 0;
@@ -694,7 +700,10 @@ async function bindCandidate(candidate, { platform = process.platform } = {}) {
     if (signedArtifactProvenance.commit !== sourceCommit) {
       return refused(kind, blocker("artifact-commit-mismatch", `The signed artifact names commit ${signedArtifactProvenance.commit}, not the release's commit ${sourceCommit}`));
     }
-    if (isText(manifest.build) && signedArtifactProvenance.build !== manifest.build) {
+    if (!isText(manifest.build)) {
+      return refused(kind, blocker("release-build-missing", "The release manifest names no build, so the signed artifact's build cannot be tied to this release"));
+    }
+    if (signedArtifactProvenance.build !== manifest.build) {
       return refused(kind, blocker("artifact-build-mismatch", `The signed artifact names build ${signedArtifactProvenance.build}, not the release's build ${manifest.build}`));
     }
   }
@@ -1730,7 +1739,14 @@ export async function recheckPlacementRollbackCandidate(candidate) {
 
   // The shipped runtime: the same file, still with one name, still the same
   // bytes.  A runtime that has been replaced or has vanished fails by name.
-  const runtime = fingerprintRuntime(resolve(proof.runtime.path));
+  // The proof record names this path, so the protected-path guard that
+  // binding applied to caller-named paths is re-applied here before any
+  // bytes are read: a tampered proof must not steer the recheck into
+  // hashing a credential, login or dot-directory file.
+  const runtimeProtected = protectedPathBlocker("runtime", proof.runtime.path);
+  const runtime = runtimeProtected
+    ? { blocker: runtimeProtected }
+    : fingerprintRuntime(resolve(proof.runtime.path));
   if (runtime.blocker) {
     refuse(runtime.blocker.code, `The proved runtime is no longer usable: ${runtime.blocker.detail}`);
   } else {
@@ -1752,8 +1768,12 @@ export async function recheckPlacementRollbackCandidate(candidate) {
   const link = await releaseProofMatches({ commit, build: proof.provenance.build, env });
   if (!link.ok) refuse(link.reason, link.detail);
 
-  // The signed artifact's bytes.
-  const artifact = fingerprintSignedArtifact(proof.artifact.path);
+  // The signed artifact's bytes.  Same re-guard as the runtime above: the
+  // path comes from the proof record, not from a caller who was checked.
+  const artifactProtected = protectedPathBlocker("signedArtifact", proof.artifact.path);
+  const artifact = artifactProtected
+    ? { blocker: artifactProtected }
+    : fingerprintSignedArtifact(proof.artifact.path);
   if (artifact.blocker) {
     refuse(artifact.blocker.code, `The proved signed artifact is no longer readable: ${artifact.blocker.detail}`);
   } else {
