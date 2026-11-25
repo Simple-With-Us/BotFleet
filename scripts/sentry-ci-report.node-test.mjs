@@ -156,12 +156,12 @@ test("an unmonitored name never checks in, even when also mapped (AFC-626)", () 
   assert.deepEqual(statuses, [null, null, null, null]);
 });
 
-test("a configured failure threshold of 0 is sent, not dropped (AFC-626)", () => {
+test("a configured failure threshold of 0 is sent as Sentry's minimum of 1 (AFC-626)", () => {
   const config = probeReporter([
     "m._CRON_FAILURE_THRESHOLD_FOLDED['ci'] = 0",
     "print(json.dumps(m.monitor_config_for('CI', '17 9 * * 1')))",
   ]);
-  assert.equal(config.failure_issue_threshold, 0);
+  assert.equal(config.failure_issue_threshold, 1);
   assert.equal(config.recovery_threshold, 1);
 });
 
