@@ -71,7 +71,6 @@ describe("job host", () => {
           if (listener === fn) listener = undefined;
         };
       },
-      snoozed: () => false,
       unattended: () => false,
       finishedRetentionMs,
     });
@@ -424,7 +423,6 @@ describe("job host", () => {
       approvalBus: approval,
       startTurn: async (botId, text) => { starts.push({ botId, text }); },
       subscribe: () => () => {},
-      snoozed: () => false,
       unattended: () => false,
     });
     host.boot();

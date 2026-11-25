@@ -2352,7 +2352,6 @@ export class RoutineManager {
       return;
     }
     mkdirSync(dirname(this.file), { recursive: true });
-    const now = this.now();
     writeFileAtomic(this.file, JSON.stringify({
       version: 1,
       routines: this.routines,
