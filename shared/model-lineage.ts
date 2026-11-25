@@ -287,6 +287,7 @@ const GEMINI: Family = {
     return null;
   },
   label(_id, c) {
+    if (c.classKey === "lite") return `Gemini ${versionText(c.rank)} Flash Lite`;
     return c.classKey === "flash"
       ? `Gemini ${versionText(c.rank)} Flash`
       : `Gemini ${versionText(c.rank)} Pro`;
