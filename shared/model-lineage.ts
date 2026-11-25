@@ -262,7 +262,8 @@ const GROK: Family = {
 // never fold into the Flash class's Hydrogen.  The Gemini
 // driver kinds are deliberately absent from DRIVER_LINEAGE below —
 // selection, picker, and latest resolution for them do not change.
-const GEMINI_FLASH = /^gemini-(\d+)(?:\.(\d+))?-flash(?:-(?:lite|low|medium|high|xhigh))?$/;
+const GEMINI_FLASH_LITE = /^gemini-(\d+)(?:\.(\d+))?-flash-lite$/;
+const GEMINI_FLASH = /^gemini-(\d+)(?:\.(\d+))?-flash(?:-(?:low|medium|high|xhigh))?$/;
 const GEMINI_PRO = /^gemini-(\d+)(?:\.(\d+))?-pro(?:-(?:preview|low|medium|high|xhigh))?$/;
 const GEMINI_HYDROGEN = /^gemini-4-hydrogen(?:-(?:low|medium|high|xhigh))?$/;
 const GEMINI_NEON = /^gemini-4-neon(?:-(?:low|medium|high|xhigh))?$/;
