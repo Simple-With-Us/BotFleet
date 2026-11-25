@@ -273,6 +273,7 @@ const GEMINI: Family = {
   classes: [
     { key: "flash", label: "Flash" },
     { key: "pro", label: "Pro" },
+    { key: "lite", label: "Flash Lite" },
   ],
   classify(id) {
     if (GEMINI_HYDROGEN.test(id)) return { classKey: "flash", rank: rankOf(4) };
