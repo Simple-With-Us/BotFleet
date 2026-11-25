@@ -113,7 +113,6 @@ export const STATIC_CURSOR_MODELS: ModelCatalog = {
     { id: "composer-2.5", label: "Composer 2.5" },
     { id: "composer-2.5-fast", label: "Composer 2.5 Fast" },
     { id: "gemini-4-hydrogen-high", label: "Gemini 4 Hydrogen High" },
-    { id: "gemini-4-argon-high", label: "Gemini 4 Argon High" },
     { id: "gemini-4-carbon-high", label: "Gemini 4 Carbon High" },
     { id: "claude-opus-5-5-high", label: "Claude Opus 5.5 1M High" },
     { id: "claude-sonnet-5-thinking-high", label: "Claude Sonnet 5 1M Thinking" },
