@@ -157,9 +157,14 @@ public enum ControlHostsImport {
     /// with, and a seed the owner has since given a token is a real host and
     /// is imported like any other.
     public static func isSyntheticSeed(_ entry: ControlHostEntry) -> Bool {
-        entry.id == "hetzner" && entry.name == "Hetzner Server"
-            && entry.baseURL.absoluteString == "https://hetzner.botfleet.app"
-            && entry.authToken == nil
+        //  Compared as origins, not as strings:  HostOrigin folds the case,
+        //  drops a trailing slash and drops the scheme's default port, so a
+        //  seed spelled any of those ways is still the same server.
+        guard entry.id == "hetzner", entry.name == "Hetzner Server",
+              entry.authToken == nil,
+              let origin = try? HostOrigin(entry.baseURL.absoluteString),
+              let seed = try? HostOrigin("https://hetzner.botfleet.app") else { return false }
+        return origin == seed
     }
 
     public static func plan(entries: [ControlHostEntry], existing: [HostRecord]) -> [ControlHostImportOutcome] {
@@ -317,12 +322,15 @@ public enum ControlHostsImport {
                 // The record could not be removed, so it keeps its credential.
             }
         }
+        // A credential whose record was never written is nobody's:  an
+        // enrollment that succeeded before its upsert failed would otherwise
+        // leave a Keychain entry no record names, which no retry can repair.
+        for id in enrolledNewRecords.reversed() where !createdRecords.contains(id) {
+            effects.removeCredential(recordID: id)
+        }
         for id in enrolledExistingRecords.reversed() {
             effects.removeCredential(recordID: id)
         }
-        // New-record credentials whose records went are already gone above;
-        // the list is kept beside createdRecords so the pairing stays explicit.
-        _ = enrolledNewRecords
     }
 
     /// The counts a dry run and a completed run both report.

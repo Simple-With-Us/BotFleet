@@ -22,14 +22,24 @@ private final class FakeEffects: ControlHostsImportEffects, @unchecked Sendable 
     /// When set, the enrollment at this one-based position fails, so a run
     /// can be broken after its earlier writes are already in flight.
     private var failOnEnrollmentNumber: Int?
+    /// When set, the upsert at this one-based position fails after its
+    /// enrollment already succeeded, so a credential has no record.
+    private var failOnUpsertNumber: Int?
+    private var upserts = 0
     /// Makes Control's rewrite fail, so the transaction's last step can be
     /// broken after its earlier writes.
     var failControlWrite = false
 
-    init(native: [HostRecord] = [], controlFile: [ControlHostEntry] = [], failOnEnrollmentNumber: Int? = nil) {
+    init(
+        native: [HostRecord] = [],
+        controlFile: [ControlHostEntry] = [],
+        failOnEnrollmentNumber: Int? = nil,
+        failOnUpsertNumber: Int? = nil
+    ) {
         self.native = native
         self.controlFile = controlFile
         self.failOnEnrollmentNumber = failOnEnrollmentNumber
+        self.failOnUpsertNumber = failOnUpsertNumber
     }
 
     func readNativeHosts() async throws -> [HostRecord] {
@@ -56,10 +66,16 @@ private final class FakeEffects: ControlHostsImportEffects, @unchecked Sendable 
     }
 
     func upsert(_ host: HostRecord) async throws {
-        lock.withLock {
-            native.append(host)
-            upserted.append(host.id)
+        let failing = lock.withLock {
+            upserts += 1
+            let failing = failOnUpsertNumber == upserts
+            if !failing {
+                native.append(host)
+                upserted.append(host.id)
+            }
+            return failing
         }
+        if failing { throw ControlHostsImportError.unreadableFile }
     }
 
     func removeRecord(id: String) throws {
@@ -431,6 +447,11 @@ struct ControlHostsImportTests {
 
         #expect(!effects.currentControlFile.contains(where: ControlHostsImport.isSyntheticSeed))
         #expect(effects.writeCount == 1, "dropping the seed alone is a rewrite")
+        //  A seed spelled with a trailing slash, another case or the scheme's
+        //  default port names the same origin and is dropped the same way.
+        for url in ["https://hetzner.botfleet.app/", "https://Hetzner.BotFleet.App", "https://hetzner.botfleet.app:443"] {
+            #expect(ControlHostsImport.isSyntheticSeed(entry(id: "hetzner", name: "Hetzner Server", url: url)))
+        }
         //  A seed the owner gave a token is a real host and is imported.
         let tokenSeed = entry(id: "hetzner", name: "Hetzner Server", url: "https://hetzner.botfleet.app", token: "t")
         #expect(!ControlHostsImport.isSyntheticSeed(tokenSeed))
@@ -510,6 +531,26 @@ struct ControlHostsImportTests {
         #expect(effects.currentControlFile[0].authToken == "x")
         #expect(effects.writeCount == 0, "nothing moved, so the file was not rewritten")
         #expect(summary.credentialAlreadyNative == 1)
+    }
+
+    @Test("An upsert that fails after its enrollment leaves no orphan credential")
+    func testAFailedUpsertLeavesNoOrphanCredential() async throws {
+        let fixture = fixtureEntries()
+        let effects = FakeEffects(native: existingNative(), controlFile: fixture, failOnUpsertNumber: 1)
+        do {
+            _ = try await ControlHostsImport.run(entries: fixture, effects: effects)
+            Issue.record("the run should have failed")
+        } catch {
+            //  Expected:  the first record's upsert failed after its enrollment.
+        }
+
+        //  h1's credential was enrolled before its record write failed, and
+        //  the rollback removes it:  a credential no record names is an entry
+        //  the app can neither use nor repair.
+        #expect(effects.credentialIDs.isEmpty, "no credential survives a record that was never written")
+        #expect(effects.writtenIDs.isEmpty)
+        #expect(effects.currentNative == existingNative())
+        #expect(effects.writeCount == 0)
     }
 }
 #endif
