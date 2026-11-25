@@ -210,9 +210,10 @@ final class FleetServicesTests: XCTestCase {
 
     func testTheFleetServicesMenuHasOneRowPerService() {
         let services = FleetServices(serverState: .running, states: [:])
-        XCTAssertEqual(services.menuItems.count, 12)
+        XCTAssertEqual(services.menuItems.count, 11)
+        XCTAssertFalse(services.menuItems.contains { $0.id == "seat-mcp" })
         XCTAssertEqual(services.menuItems.first?.id, "botfleet-mcp")
-        XCTAssertEqual(services.menuTitle, "Fleet Services (12)")
+        XCTAssertEqual(services.menuTitle, "Fleet Services (11)")
     }
 
     func testEachMenuRowShowsTheStateAndTheActions() {
