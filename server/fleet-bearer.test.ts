@@ -93,7 +93,7 @@ describe("a host with no fleet-ops project", () => {
   it("attempts no read, reports no gap, and launches the child without a bearer", async () => {
     delete process.env.INFISICAL_FLEET_OPS_PROJECT_ID;
     const vault = stubVault({ [FLEET_BEARER_ENV_NAME]: SENTINEL_BEARER });
-    setFleetBearerVault(vault.reader as never);
+    setFleetBearerVault(vault.reader);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     primeFleetBearer("BF-ECHO");
     await awaitFleetBearer("BF-ECHO");
@@ -105,7 +105,7 @@ describe("a host with no fleet-ops project", () => {
 
   it("stops serving a cached bearer when the project locator is removed", async () => {
     const vault = stubVault({ [FLEET_BEARER_ENV_NAME]: SENTINEL_BEARER });
-    setFleetBearerVault(vault.reader as never);
+    setFleetBearerVault(vault.reader);
     primeFleetBearer("BF-ECHO");
     await awaitFleetBearer("BF-ECHO");
     expect(fleetBearerEnvironment("BF-ECHO")).toEqual({ [FLEET_BEARER_ENV_NAME]: SENTINEL_BEARER });
@@ -114,10 +114,27 @@ describe("a host with no fleet-ops project", () => {
     expect(seatCredentialEnvironment("BF-ECHO")).not.toHaveProperty(FLEET_BEARER_ENV_NAME);
   });
 
+  it("re-arms the once-only disable note across a configured episode", async () => {
+    delete process.env.INFISICAL_FLEET_OPS_PROJECT_ID;
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    primeFleetBearer("BF-ECHO");
+    primeFleetBearer("BF-ECHO");
+    expect(info).toHaveBeenCalledTimes(1);
+    process.env.INFISICAL_FLEET_OPS_PROJECT_ID = "fleet-ops-test-project";
+    const vault = stubVault({ [FLEET_BEARER_ENV_NAME]: SENTINEL_BEARER });
+    setFleetBearerVault(vault.reader);
+    primeFleetBearer("BF-ECHO");
+    await awaitFleetBearer("BF-ECHO");
+    delete process.env.INFISICAL_FLEET_OPS_PROJECT_ID;
+    primeFleetBearer("BF-ECHO");
+    expect(info).toHaveBeenCalledTimes(2);
+    info.mockRestore();
+  });
+
   it("starts reading once the project locator lands", async () => {
     delete process.env.INFISICAL_FLEET_OPS_PROJECT_ID;
     const vault = stubVault({ [FLEET_BEARER_ENV_NAME]: SENTINEL_BEARER });
-    setFleetBearerVault(vault.reader as never);
+    setFleetBearerVault(vault.reader);
     primeFleetBearer("BF-ECHO");
     expect(vault.calls).toEqual([]);
     process.env.INFISICAL_FLEET_OPS_PROJECT_ID = "fleet-ops-test-project";

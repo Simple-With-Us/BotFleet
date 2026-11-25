@@ -220,6 +220,9 @@ export function primeFleetBearer(seat: string | null | undefined): void {
     noteDeliveryOff();
     return;
   }
+  // A configured episode re-arms the once-only note, so the disable that
+  // follows it is said too rather than swallowed by an old latch.
+  reportedDeliveryOff = false;
   const entry = readEntry(seat);
   const now = Date.now();
   if (entry && now - entry.readAt < FLEET_BEARER_TTL_MS) return;
@@ -304,7 +307,8 @@ let reportedDeliveryOff = false;
 /** No fleet-ops project on this host is a configuration state, not a
  * failed read:  the seat's tools fall back to the seat's own custody,
  * so a missing-bearer report would accuse a gap the seat may not have.
- * Said once, at info, because it is the expected state on such a host. */
+ * Said once per disable episode, at info, because it is the expected
+ * state on such a host:  a configured episode re-arms the note. */
 function noteDeliveryOff(): void {
   if (reportedDeliveryOff) return;
   reportedDeliveryOff = true;
