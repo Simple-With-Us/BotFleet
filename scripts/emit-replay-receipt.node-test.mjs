@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { emitReplayReceipt, readReplayReport, replayVerdict } from "./emit-replay-receipt.mjs";
+import { assertInventoryCoverage, emitReplayReceipt, readReplayReport, replayVerdict } from "./emit-replay-receipt.mjs";
 import { assertReceiptBinding, parseEvidenceReceipt } from "./decommission-evidence-bundle.mjs";
 
 /** A request the receipt is bound to. */
@@ -101,21 +101,21 @@ test("the exit code is read out of the report the check names, not asserted", ()
   assert.match(receipt.data.checks[0].artifact.sha256, /^[0-9a-f]{64}$/);
 });
 
-test("an engine the report never covered earns a failing code, never a passing one", () => {
+test("a report that never covered an engine the packet names is refused, not scored", () => {
+  // The report was measured for an inventory the packet does not name.  That
+  // is not a replay that failed:  it is a report about something else, and
+  // scoring it would put a verdict on an engine nobody replayed.
   const request = makeRequest(["claude", "cursor"]);
   const captureDir = makeCapture(makeReport([
     { engineId: "claude", family: "claude", measured: true, isFullyVerified: true, fixtureCount: 20, passedCount: 20 },
   ]));
 
-  const receipt = emitReplayReceipt({
+  assert.throws(() => emitReplayReceipt({
     captureDir,
     request,
     reportPath: join(captureDir, "replay-parity.json"),
     provenance: { ...PROVENANCE, record: join(captureDir, "provenance.txt") },
-  });
-
-  assert.deepEqual(receipt.data.checks.map((check) => check.name), ["engine:claude", "engine:cursor"]);
-  assert.deepEqual(receipt.data.checks.map((check) => check.exitCode), [0, 1]);
+  }), /does not cover the engine the packet names: cursor/);
 });
 
 test("an engine the probe could not measure earns a failing code", () => {
@@ -148,8 +148,8 @@ test("a report that names the same engine twice is refused, so a failing verdict
     requestedEngines: ["claude"],
     isFullyVerified: false,
     engines: [
-      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
-      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 19, isFullyVerified: false },
+      { engineId: "claude", family: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+      { engineId: "claude", family: "claude", measured: true, fixtureCount: 20, passedCount: 19, isFullyVerified: false },
     ],
   };
   writeFileSync(join(captureDir, "replay-parity.json"), JSON.stringify(report), { mode: 0o600 });
@@ -258,8 +258,8 @@ test("a report whose summary says every engine held while an engine did not is r
     requestedEngines: ["claude", "grok-acp"],
     isFullyVerified: true,
     engines: [
-      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
-      { engineId: "grok-acp", measured: true, fixtureCount: 27, passedCount: 26, isFullyVerified: false },
+      { engineId: "claude", family: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+      { engineId: "grok-acp", family: "grok", measured: true, fixtureCount: 27, passedCount: 26, isFullyVerified: false },
     ],
   });
   assert.throws(
@@ -274,7 +274,7 @@ test("a report whose summary says an engine did not hold while every engine held
     requestedEngines: ["claude"],
     isFullyVerified: false,
     engines: [
-      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+      { engineId: "claude", family: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
     ],
   });
   assert.throws(
@@ -289,7 +289,7 @@ test("a report that asks for an engine it carries no verdict for is refused", ()
     requestedEngines: ["claude", "grok-acp"],
     isFullyVerified: false,
     engines: [
-      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+      { engineId: "claude", family: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
     ],
   });
   assert.throws(
@@ -304,8 +304,8 @@ test("a report that carries a verdict for an engine it did not ask for is refuse
     requestedEngines: ["claude"],
     isFullyVerified: false,
     engines: [
-      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
-      { engineId: "grok-acp", measured: true, fixtureCount: 27, passedCount: 27, isFullyVerified: true },
+      { engineId: "claude", family: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+      { engineId: "grok-acp", family: "grok", measured: true, fixtureCount: 27, passedCount: 27, isFullyVerified: true },
     ],
   });
   assert.throws(
@@ -320,7 +320,7 @@ test("a report that asks for the same engine twice is refused", () => {
     requestedEngines: ["claude", "claude"],
     isFullyVerified: false,
     engines: [
-      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+      { engineId: "claude", family: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
     ],
   });
   assert.throws(
@@ -335,7 +335,7 @@ test("an engine that claims more fixtures passed than it ran is refused", () => 
     requestedEngines: ["claude"],
     isFullyVerified: true,
     engines: [
-      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 21, isFullyVerified: true },
+      { engineId: "claude", family: "claude", measured: true, fixtureCount: 20, passedCount: 21, isFullyVerified: true },
     ],
   });
   assert.throws(
@@ -365,7 +365,7 @@ test("an engine that says it held while a fixture did not pass is refused", () =
     requestedEngines: ["claude"],
     isFullyVerified: true,
     engines: [
-      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 19, isFullyVerified: true },
+      { engineId: "claude", family: "claude", measured: true, fixtureCount: 20, passedCount: 19, isFullyVerified: true },
     ],
   });
   assert.throws(
@@ -383,7 +383,7 @@ test("an engine that says it held without measuring a fixture is refused", () =>
     requestedEngines: ["claude"],
     isFullyVerified: true,
     engines: [
-      { engineId: "claude", measured: true, fixtureCount: 0, passedCount: 0, isFullyVerified: true },
+      { engineId: "claude", family: "claude", measured: true, fixtureCount: 0, passedCount: 0, isFullyVerified: true },
     ],
   });
   assert.throws(
@@ -397,6 +397,7 @@ test("a report carrying more engines than the bundle inventory holds is refused"
   // at most 32 engines, and the probe reports one entry per engine.
   const engines = Array.from({ length: 33 }, (_, index) => ({
     engineId: `engine-${index}`,
+    family: "synthetic",
     measured: true,
     fixtureCount: 1,
     passedCount: 1,
@@ -421,7 +422,7 @@ test("a report naming an engine id as long as a check name allows still decodes"
     requestedEngines: [engineId],
     isFullyVerified: true,
     engines: [
-      { engineId, measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+      { engineId, family: "synthetic", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
     ],
   });
   const report = readReplayReport(path);
@@ -440,7 +441,7 @@ test("a report naming an engine id longer than a check name allows is refused", 
     requestedEngines: [engineId],
     isFullyVerified: true,
     engines: [
-      { engineId, measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+      { engineId, family: "synthetic", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
     ],
   });
   assert.throws(() => readReplayReport(path), /does not match the contract/);
@@ -518,4 +519,106 @@ test("the golden Swift fixture decodes as the report the receipt reads", () => {
   const unmeasured = report.engines.find((entry) => entry.engineId === "dsh");
   assert.equal("family" in unmeasured, false);
   assert.equal(unmeasured.measured, false);
+});
+
+// The corpus behind a verdict, and the reason a measurement was impossible.
+// The probe writes both, and an entry without them is an entry that cannot
+// be read as evidence:  a check that passed without saying what it was
+// replayed against, or a check that failed without saying why.
+
+test("a report that measured an engine and names no family is refused", () => {
+  const path = writeReport({
+    version: 1,
+    requestedEngines: ["claude"],
+    isFullyVerified: true,
+    engines: [
+      { engineId: "claude", measured: true, fixtureCount: 20, passedCount: 20, isFullyVerified: true },
+    ],
+  });
+  assert.throws(
+    () => readReplayReport(path),
+    /was measured and names no family behind the run/,
+  );
+});
+
+test("a report that says an engine was not measured and gives no reason is refused", () => {
+  const path = writeReport({
+    version: 1,
+    requestedEngines: ["opencode"],
+    isFullyVerified: false,
+    engines: [
+      { engineId: "opencode", measured: false, fixtureCount: 0, passedCount: 0, isFullyVerified: false },
+    ],
+  });
+  assert.throws(
+    () => readReplayReport(path),
+    /was not measured and gives no reason/,
+  );
+});
+
+test("a report that names a family for an engine it did not measure is refused", () => {
+  const path = writeReport({
+    version: 1,
+    requestedEngines: ["opencode"],
+    isFullyVerified: false,
+    engines: [
+      { engineId: "opencode", family: "claude", measured: false, unmeasuredReason: "no replay family drives this engine", fixtureCount: 0, passedCount: 0, isFullyVerified: false },
+    ],
+  });
+  assert.throws(
+    () => readReplayReport(path),
+    /was not measured and names the family "claude" anyway/,
+  );
+});
+
+// The inventory binding.  The receipt's checks are named from the packet's
+// own engine list, so the report has to have been measured for that list.
+
+test("a report that measured a different inventory than the packet names is refused", () => {
+  const request = makeRequest(["claude", "cursor"]);
+  const captureDir = makeCapture(makeReport([
+    { engineId: "claude", family: "claude", measured: true, isFullyVerified: true, fixtureCount: 20, passedCount: 20 },
+  ]));
+
+  assert.throws(() => emitReplayReceipt({
+    captureDir,
+    request,
+    reportPath: join(captureDir, "replay-parity.json"),
+    provenance: { ...PROVENANCE, record: join(captureDir, "provenance.txt") },
+  }), /does not cover the engine the packet names: cursor/);
+});
+
+test("a report that covers more than the packet names is accepted", () => {
+  // The packet may name a subset of what was measured.  The report covers
+  // the packet's inventory, so the receipt is honest about every engine it
+  // names.
+  const request = makeRequest(["claude"]);
+  const captureDir = makeCapture(makeReport([
+    { engineId: "claude", family: "claude", measured: true, isFullyVerified: true, fixtureCount: 20, passedCount: 20 },
+    { engineId: "grok-acp", family: "grok", measured: true, isFullyVerified: true, fixtureCount: 27, passedCount: 27 },
+  ]));
+
+  const receipt = emitReplayReceipt({
+    captureDir,
+    request,
+    reportPath: join(captureDir, "replay-parity.json"),
+    provenance: { ...PROVENANCE, record: join(captureDir, "provenance.txt") },
+  });
+
+  assert.deepEqual(receipt.data.checks.map((check) => check.name), ["engine:claude"]);
+  assert.equal(receipt.data.checks[0].exitCode, 0);
+});
+
+test("the coverage check names every engine the packet names", () => {
+  assert.doesNotThrow(() => assertInventoryCoverage(
+    { requestedEngines: ["claude", "grok-acp"] },
+    { engines: ["claude", "grok-acp"] },
+  ));
+});
+
+test("the coverage check names the engine the packet names and the report left out", () => {
+  assert.throws(
+    () => assertInventoryCoverage({ requestedEngines: ["claude"] }, { engines: ["claude", "grok-acp"] }),
+    /does not cover the engine the packet names: grok-acp/,
+  );
 });
