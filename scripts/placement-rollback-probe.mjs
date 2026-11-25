@@ -56,6 +56,7 @@ import {
   readReleaseProof,
   releasePath,
   releaseProofMatches,
+  runtimesRoot,
   storeRootForReleaseDirectory,
   validateReleaseManifest,
   writeReleaseProof,
@@ -324,6 +325,49 @@ function fingerprintRuntime(named) {
 }
 
 /**
+ * A blocker when the named runtime is not a RETAINED runtime of the store that
+ * owns the release, and null when it is.
+ *
+ * A release ships its tree and its node_modules and nothing else, so the only
+ * runtime an operator can name today is one that lives outside the store: the
+ * machine's own node.  Binding that proves the machine's bytes rather than
+ * the candidate's, and a node upgrade then changes the bytes under a proof
+ * that was written against them, so the activation-boundary recheck refuses
+ * the release by name.  That refusal is correct for a binding that was never
+ * stable, and it means no release can be proved at all.
+ *
+ * A retained runtime is a copy the store keeps, in the store's own area and
+ * named by its own digest.  Those bytes cannot change under a proof, which is
+ * the whole point of keeping them.
+ */
+function retainedRuntimeBlocker(releaseRoot, runtime) {
+  const storeRoot = storeRootForReleaseDirectory(releaseRoot);
+  if (!storeRoot) {
+    return blocker("release-store-root-unknown", `The release at ${releaseRoot} is not a release directory of a release store, so no retained runtime can be bound to it`);
+  }
+  // The store root is derived from the PHYSICAL release directory, so the
+  // area to compare against is the physical one too: a store reached
+  // through a link has a physical runtimes directory that is not the path
+  // the name spells out.
+  let expected = null;
+  try {
+    expected = realpathSync(runtimesRoot({ BOTFLEET_RELEASES_ROOT: storeRoot }));
+  } catch {
+    expected = null;
+  }
+  if (expected === null || dirname(runtime.path) !== expected) {
+    return blocker("runtime-not-retained", `The runtime at ${runtime.path} is not a retained runtime of the store at ${storeRoot}; a runtime outside the store binds the machine's bytes rather than the candidate's`);
+  }
+  if (basename(runtime.path) !== runtime.sha256) {
+    // The file is in the store's kept area and its bytes are no longer the
+    // bytes its name stands for.  That is a runtime whose bytes changed, not
+    // a runtime that was never kept, and it is named apart on purpose.
+    return blocker("runtime-changed", `The retained runtime at ${runtime.path} now hashes to ${runtime.sha256}, not the digest it is stored under (${basename(runtime.path)})`);
+  }
+  return null;
+}
+
+/**
  * sha256 of the signed artifact file, opened without following a link in its
  * last component.
  *
@@ -410,7 +454,7 @@ function readListedRegularFile(path, listed) {
  * (that file is TypeScript and imports zod, so this module cannot); the
  * probe's own test pins the two lists together.  Like that file's
  * isProtectedPath, any other path component that starts with a dot is refused
- * too, with one deliberate exception: APPLICATION_HOMES, BotFleet's own
+ * too, with one deliberate exception:  APPLICATION_HOMES, BotFleet's own
  * non-secret home.  The release store's default root is ~/.botfleet, so a
  * release root there is the normal case and has to inspect.
  */
@@ -712,6 +756,12 @@ async function bindCandidate(candidate, { platform = process.platform } = {}) {
   if (runtime.blocker) blockers.push(runtime.blocker);
   else if (isText(runtimeSha256) && runtime.runtime.sha256 !== runtimeSha256) {
     blockers.push(blocker("runtime-digest-mismatch", `The runtime binary hashes to ${runtime.runtime.sha256}, not the expected ${runtimeSha256}`));
+  } else {
+    // The runtime has to be bytes the store KEEPS.  The machine's own node is
+    // refused here rather than bound: its bytes change on a node upgrade, and
+    // a proof written against them could never be re-verified.
+    const retained = retainedRuntimeBlocker(physicalRoot, runtime.runtime);
+    if (retained) blockers.push(retained);
   }
 
   if (blockers.length) return refused(kind, ...blockers);
@@ -1365,7 +1415,7 @@ export async function runPlacementRollbackFixtureProbe(candidate, options = {}) 
       port = await freeLoopbackPortPair();
       const base = `http://127.0.0.1:${port}`;
 
-      // 1. Strict legacy epoch fixture: the pair stays rollback-readable and
+      // 1.  Strict legacy epoch fixture: the pair stays rollback-readable and
       //    no SQLite authority or payload namespace appears.
       await boot("legacy", "legacy-boot-failed");
       await observe("legacy-booted", { dataDir, port, pid: run.child.pid });
@@ -1383,7 +1433,7 @@ export async function runPlacementRollbackFixtureProbe(candidate, options = {}) 
       record("legacy-readable", "identity reported the seeded legacy fence; no SQLite authority or payload namespace was created");
       await stop("legacy stage");
 
-      // 2. Normalized fixture, prepared by the reviewed migration helper
+      // 2.  Normalized fixture, prepared by the reviewed migration helper
       //    after the legacy child is completely gone.
       const prepared = await writeFixture(dataDir, home, "prepare", timeouts);
       const normalizedPair = { controllerId: FIXTURE.nextId, epoch: FIXTURE.normalizedEpoch };
@@ -1414,7 +1464,7 @@ export async function runPlacementRollbackFixtureProbe(candidate, options = {}) 
       record("normalized-prepared", `schema ${before.schema}; fence ${normalizedPair.controllerId} at epoch ${normalizedPair.epoch}`);
       await observe("normalized-prepared", { dataDir, port });
 
-      // 3. The candidate reads the stored fence and refuses every placement POST.
+      // 3.  The candidate reads the stored fence and refuses every placement POST.
       const pid = await boot("normalized", "normalized-boot-failed");
       await observe("normalized-booted", { dataDir, port, pid });
       await requireIdentity(base, normalizedPair, timeouts, "normalized-identity-mismatch");
@@ -1429,7 +1479,7 @@ export async function runPlacementRollbackFixtureProbe(candidate, options = {}) 
       const refused = await requirePlacementRefusals(base, normalizedPair, dataDir, timeouts, "at the stored fence");
       record("placement-posts-refused", `${refused} placement POSTs refused with 503 at the stored fence`);
 
-      // 4. The hold cannot be released, and nothing mutating is admitted.
+      // 4.  The hold cannot be released, and nothing mutating is admitted.
       let nonce = null;
       try {
         nonce = JSON.parse(readFileSync(join(dataDir, "harness-owner.json"), "utf8"))?.nonce;
@@ -1460,14 +1510,14 @@ export async function runPlacementRollbackFixtureProbe(candidate, options = {}) 
       }
       record("hold-kept", "quiesce POST and DELETE kept the read-only hold; application mutation and updater run refused");
 
-      // 5. Passive: after the recovery delay the saved evidence, the logical
+      // 5.  Passive: after the recovery delay the saved evidence, the logical
       //    ledger and the authoritative bytes are exactly what they were.
       await sleep(timeouts.settleMs);
       requireSavedEvidence("while the candidate ran against the stored fence");
       requireUnchangedLedger(before, await ledgerOrBlock(dataDir), "while the candidate ran against the stored fence");
       record("ledger-unchanged", "logical digest and database, WAL and marker bytes unchanged");
 
-      // 6. The fixture writer deliberately commits a newer fence; the SAME
+      // 6.  The fixture writer deliberately commits a newer fence; the SAME
       //    child converges on it without a restart.
       const advancedPair = { controllerId: FIXTURE.hostId, epoch: FIXTURE.advancedEpoch };
       const advancedBy = await writeFixture(dataDir, home, "advance", timeouts);
@@ -1493,14 +1543,14 @@ export async function runPlacementRollbackFixtureProbe(candidate, options = {}) 
       requireSavedEvidence("after the newer fence");
       requireUnchangedLedger(advanced, await ledgerOrBlock(dataDir), "after the fixture writer's own commit");
 
-      // 7. Stop the child completely, then look once more.
+      // 7.  Stop the child completely, then look once more.
       await observe("before-teardown", { dataDir, port, pid });
       await stop("normalized stage");
       requireSavedEvidence("after teardown");
       requireUnchangedLedger(advanced, await ledgerOrBlock(dataDir), "across teardown");
       record("ledger-unchanged-after-teardown", "logical digest and database, WAL and marker bytes unchanged across teardown");
 
-      // 8. Start it once more against the fence it converged on.  A build
+      // 8.  Start it once more against the fence it converged on.  A build
       //    that reports the newer fence while it runs and then regresses, or
       //    rewrites the ledger, on its NEXT boot is not rollback-compatible,
       //    and nothing before this step would notice.
@@ -1523,7 +1573,7 @@ export async function runPlacementRollbackFixtureProbe(candidate, options = {}) 
       }
     }
 
-    // 9. Recheck.  The bytes that ran must still be the bytes that were
+    // 9.  Recheck.  The bytes that ran must still be the bytes that were
     //    bound, in the same physical directory: a generation replaced under
     //    the probe is not the generation the probe exercised.
     try {
@@ -1550,7 +1600,7 @@ export async function runPlacementRollbackFixtureProbe(candidate, options = {}) 
     }
     if (blockers.length === 0) record("binding-rechecked", "artifact, runtime and physical release unchanged after execution");
 
-    // 10. The proof record.  It lives in the store's own area, beside the
+    // 10.  The proof record.  It lives in the store's own area, beside the
     //     releases and never inside one, so the promoted tree and its strict
     //     manifest stay exactly as they were promoted.
     if (blockers.length === 0 && bound.binding.signedArtifact) {
@@ -1627,7 +1677,7 @@ export async function runPlacementRollbackFixtureProbe(candidate, options = {}) 
     receiptKind: "placement-rollback-fixture-probe",
     status,
     activationAllowed: false,
-    scope: "Isolated fixture recipe evidence for the bound release and runtime bytes only.  It grants no authority to migrate, enable a mode, update authentication or prune a rollback generation.",
+    scope: "Isolated fixture recipe evidence for the bound release and runtime bytes only.  It grants no authority to migrate, enable a mode, update authentication or prune a rollback generation.",
     recipeVersion: PLACEMENT_ROLLBACK_RECIPE_VERSION,
     schema: PLACEMENT_ROLLBACK_SCHEMA,
     kind: bound.kind,

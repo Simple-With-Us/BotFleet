@@ -24,12 +24,16 @@ import { realpathSync } from "node:fs";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  bindReleaseRuntime,
   currentCommit,
   listReleases,
+  listRetainedRuntimes,
   promoteStaging,
   pruneReleases,
   releasePath,
+  releaseRuntime,
   resolveCurrent,
+  retainRuntime,
   stageRelease,
   swapCurrent,
 } from "./harness-release-store.mjs";
@@ -49,9 +53,18 @@ function usage() {
       "  activate <commit> [--repo <path>] [--version v]   stage, promote and swap",
       "  promote/activate stamp --version/--build into the release manifest;",
       "  without them the staged package.json version is recorded",
+      "  promote/activate bind a runtime with --runtime <path> (or --source);",
+      "  the bytes are kept in the store and bound to that release",
       "  status                                            where current points",
       "  list                                              every release in the store",
       "  prune [--keep N]                                  drop old, unheld releases",
+      "  retain-runtime [--source <path>]                   keep a copy of a runtime binary",
+      "                                                   (defaults to this node)",
+      "  bind-runtime <commit> [--source <path>]           keep the bytes and bind them",
+      "                                                   to one release",
+      "  runtimes                                          every retained runtime the store keeps",
+      "                                                   (the store never removes one: a proof",
+      "                                                   may still name its bytes)",
       "",
     ].join("\n"),
   );
@@ -95,6 +108,27 @@ function restartHint(env) {
   ].join(" ");
 }
 
+/**
+ * Bind a runtime to a release when the operator named one.
+ *
+ * The runtime is kept in the store's own area and bound to the commit, so the
+ * bytes a proof re-verifies survive a node upgrade on the machine.  Nothing
+ * is bound when no runtime is named: a release without a bound runtime is a
+ * release the probe will refuse to bind, and saying so is better than
+ * quietly binding the machine's node.
+ */
+async function bindRuntimeIfAsked({ commit, args, env }) {
+  // --source names the runtime to keep, exactly as it does for
+  // retain-runtime and bind-runtime, so an operator who passes it is never
+  // left believing a release is bound when nothing was bound.
+  const source = flag(args, "--runtime") ?? flag(args, "--source");
+  if (!source) return null;
+  const bound = await bindReleaseRuntime({ commit, source, env });
+  process.stdout.write(`runtime: ${bound.record.runtime.path}\n`);
+  process.stdout.write(`sha256:  ${bound.record.runtime.sha256}\n`);
+  return bound;
+}
+
 async function main() {
   const [command, ...args] = process.argv.slice(2);
   if (!command || command === "--help" || command === "-h") {
@@ -117,6 +151,8 @@ async function main() {
       const { isReleaseDirectory } = await import("./harness-release-store.mjs");
       const immutable = await isReleaseDirectory(physical);
       process.stdout.write(`shape:   ${immutable ? "immutable release" : "NOT a release (mutable tree)"}\n`);
+      const runtime = await releaseRuntime(commit ?? "", env);
+      process.stdout.write(`runtime: ${runtime ? runtime.path : "(none bound)"}\n`);
     }
     return 0;
   }
@@ -132,6 +168,26 @@ async function main() {
     const current = await currentCommit(env);
     for (const commit of releases) {
       process.stdout.write(`${commit === current ? "*" : " "} ${commit}  ${releasePath(commit, env)}\n`);
+    }
+    return 0;
+  }
+
+  if (command === "retain-runtime") {
+    const runtime = await retainRuntime({ source: flag(args, "--source"), env });
+    process.stdout.write(`runtime: ${runtime.path}\n`);
+    process.stdout.write(`sha256:  ${runtime.sha256}\n`);
+    process.stdout.write(`bytes:   ${runtime.bytes}\n`);
+    return 0;
+  }
+
+  if (command === "runtimes") {
+    const runtimes = await listRetainedRuntimes(env);
+    if (!runtimes.length) {
+      process.stdout.write("no retained runtimes in the store\n");
+      return 0;
+    }
+    for (const runtime of runtimes) {
+      process.stdout.write(`${runtime.sha256}  ${runtime.bytes}  ${runtime.path}\n`);
     }
     return 0;
   }
@@ -163,9 +219,18 @@ async function main() {
     return 0;
   }
 
+  if (command === "bind-runtime") {
+    const bound = await bindReleaseRuntime({ commit, source: flag(args, "--source"), env });
+    process.stdout.write(`bound:   ${bound.path}\n`);
+    process.stdout.write(`runtime: ${bound.record.runtime.path}\n`);
+    process.stdout.write(`sha256:  ${bound.record.runtime.sha256}\n`);
+    return 0;
+  }
+
   if (command === "promote") {
     const path = await promoteStaging({ commit, env, version: flag(args, "--version"), build: flag(args, "--build") });
     process.stdout.write(`promoted: ${path}\n`);
+    await bindRuntimeIfAsked({ commit, args, env });
     return 0;
   }
 
@@ -211,6 +276,7 @@ async function main() {
     });
     const path = await promoteStaging({ commit, env, version: flag(args, "--version"), build: flag(args, "--build") });
     process.stdout.write(`promoted: ${path}\n`);
+    await bindRuntimeIfAsked({ commit, args, env });
     const result = await swapCurrent({ commit, env });
     process.stdout.write(`current: ${releasePath(commit, env)}\n`);
     if (result.previous) process.stdout.write(`previous release kept: ${result.previous}\n`);

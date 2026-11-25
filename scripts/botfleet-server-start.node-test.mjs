@@ -7,9 +7,10 @@
 // scripts/botfleet-server-start.sh and docs/audits/2026-09-24-efficiency-audit.md OP10.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -1332,4 +1333,268 @@ test("without a store pointer the legacy checkout path still works", () => {
   assert.equal(result.status, 0, result.stderr);
   assert.ok(existsSync(join(serverRoot, "ran-here.txt")), "the harness must still run from the legacy checkout path");
   assert.equal(existsSync(join(dir, "ran-here.txt")), false, "the harness must not run from the fixture root");
+});
+// --- The bound runtime -------------------------------------------------------
+//
+// A release ships its tree and its node_modules and nothing else, so the
+// always-on harness would otherwise start under the MACHINE's node, and a
+// node upgrade then changes the bytes under a proof that was written against
+// them.  The store keeps the exact runtime bytes for a release and records
+// which ones in a binding record beside the release; the launcher starts the
+// release under those bytes when they are still usable.
+//
+// A binding that cannot be used must never stop the always-on service: the
+// machine's node stays in place and the reason is logged.
+
+const RUNTIME_COMMIT = "b".repeat(40);
+
+// A node stub that answers --version and either echoes its arguments on
+// stdout or records them in a file.
+//
+// The launcher asks a candidate runtime for its version before trusting it,
+// and the arguments are how a test proves WHICH runtime the harness was
+// started under: the configured node echoes them, while a bound runtime
+// records them in a file of its own, so the two can never be confused.
+function writeRuntimeStub(path, { version = "v22.14.0", record = null, executable = true } = {}) {
+  const lines = [
+    "#!/bin/sh",
+    `if [ "$1" = "--input-type=module" ]; then exec ${JSON.stringify(process.execPath)} "$@"; fi`,
+    `if [ "$1" = "--version" ]; then printf '%s\\n' ${JSON.stringify(version)}; exit 0; fi`,
+  ];
+  lines.push(record ? `printf '%s\\n' "$*" >> ${JSON.stringify(record)}` : `printf '%s\\n' "$*"`);
+  lines.push("exit 0");
+  writeFileSync(path, `${lines.join("\n")}\n`);
+  chmodSync(path, executable ? 0o755 : 0o644);
+  return path;
+}
+
+// A release in a store, with the configured node the launcher would otherwise
+// start it under.
+function makeRuntimeFixture() {
+  const dir = mkdtempSync(join(tmpdir(), "botfleet-server-start-runtime-"));
+  const storeRoot = join(dir, "store");
+  const serverRoot = join(storeRoot, "releases", RUNTIME_COMMIT);
+  mkdirSync(join(serverRoot, "server"), { recursive: true });
+  mkdirSync(join(serverRoot, "node_modules", "yaml"), { recursive: true });
+  writeFileSync(join(serverRoot, "server", "index.ts"), "// fake entry\n");
+  const dataDir = join(dir, "data");
+  mkdirSync(dataDir);
+  writeFileSync(join(dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
+  mkdirSync(join(dir, "home"));
+  return {
+    dir,
+    storeRoot,
+    serverRoot,
+    dataDir,
+    configured: writeRuntimeStub(join(dir, "configured-node"), { version: "v24.3.1" }),
+    ledger: join(dir, "ledger"),
+    port: 20000 + Math.floor(Math.random() * 20000),
+  };
+}
+
+// The retained bytes of a runtime, where the store keeps them: under the
+// store's own runtimes area, named by their digest.
+function installBoundRuntime(fixture, { version = "v22.14.0", executable = true } = {}) {
+  const dir = join(fixture.storeRoot, "runtimes");
+  mkdirSync(dir, { recursive: true });
+  const argsFile = join(fixture.dir, "bound-runtime-args");
+  // The store names a kept runtime by the digest of its own bytes, so the
+  // fixture has to do the same: the file's NAME is its digest.
+  const staging = join(fixture.dir, "bound-runtime-staging");
+  writeRuntimeStub(staging, { version, record: argsFile, executable });
+  const digest = createHash("sha256").update(readFileSync(staging)).digest("hex");
+  const path = join(dir, digest);
+  renameSync(staging, path);
+  return { path, argsFile, digest };
+}
+
+// The binding record the store writes beside a release.
+function writeBinding(fixture, runtimePath, { commit = RUNTIME_COMMIT, sha256 } = {}) {
+  const dir = join(fixture.storeRoot, "runtime-bindings");
+  mkdirSync(dir, { recursive: true });
+  const record = {
+    schemaVersion: 1,
+    commit,
+    runtime: { path: runtimePath, sha256: sha256 ?? basename(runtimePath), bytes: 12345, format: "elf" },
+    boundAt: "2026-11-25T12:00:00.000Z",
+  };
+  const path = join(dir, `${commit}.json`);
+  writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`);
+  return path;
+}
+
+function runRuntime(fixture) {
+  return spawnSync("bash", [SCRIPT], {
+    encoding: "utf8",
+    env: {
+      ...launcherEnv(fixture),
+      BOTFLEET_SERVER_ROOT: fixture.serverRoot,
+      BOTFLEET_PORT: String(fixture.port),
+      BOTFLEET_NODE: fixture.configured,
+      OMB_DATA_DIR: fixture.dataDir,
+      BOTFLEET_PNPM: join(fixture.dir, "pnpm-does-not-exist"),
+      BOTFLEET_HEAL_STAMP: join(fixture.dir, "heal-stamp"),
+      BOTFLEET_FAIL_LEDGER: fixture.ledger,
+      BOTFLEET_FAIL_STORM_THRESHOLD: "20",
+      BOTFLEET_FAIL_WINDOW_SECONDS: "3600",
+      BOTFLEET_SHUTDOWN_MARKER: join(fixture.dir, "stopped.marker"),
+      BOTFLEET_STARTUP_DISABLED_MARKER: join(fixture.dir, "startup-disabled.marker"),
+      BOTFLEET_STARTUP_ENABLED_MARKER: join(fixture.dir, "startup-enabled.marker"),
+      BOTFLEET_STARTUP_SESSION: join(fixture.dir, "startup-session"),
+      BOTFLEET_BOOT_SESSION_OVERRIDE: "fixture-boot",
+    },
+  });
+}
+
+test("a release with no runtime binding starts under the configured node", () => {
+  const fixture = makeRuntimeFixture();
+  try {
+    const result = runRuntime(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    // The configured node echoes the arguments the harness was started with.
+    assert.match(result.stdout, /--experimental-strip-types server\/index\.ts/);
+    assert.doesNotMatch(result.stdout, /is bound to runtime/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a release with a usable binding starts under the bound runtime", () => {
+  const fixture = makeRuntimeFixture();
+  const bound = installBoundRuntime(fixture, { version: "v22.14.0" });
+  writeBinding(fixture, bound.path);
+  try {
+    const result = runRuntime(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    // The log line names the runtime that was chosen.
+    assert.ok(result.stdout.includes(bound.path), "the launcher must name the bound runtime");
+    assert.match(result.stdout, /is bound to runtime/);
+    // The harness ran under the bound runtime, and not under the configured one.
+    assert.match(readFileSync(bound.argsFile, "utf8"), /server\/index\.ts/);
+    assert.doesNotMatch(result.stdout, /--experimental-strip-types server\/index\.ts/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a binding whose runtime is missing falls back to the configured node", () => {
+  const fixture = makeRuntimeFixture();
+  const missing = join(fixture.storeRoot, "runtimes", "d".repeat(64));
+  writeBinding(fixture, missing);
+  try {
+    const result = runRuntime(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    // The reason is a problem, so it is logged on stderr like every other
+    // problem this script reports.
+    const said = `${result.stdout || ""}${result.stderr || ""}`;
+    assert.match(said, /is missing at/);
+    assert.match(result.stdout, /--experimental-strip-types server\/index\.ts/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a binding whose runtime is too old falls back to the configured node", () => {
+  const fixture = makeRuntimeFixture();
+  const bound = installBoundRuntime(fixture, { version: "v20.11.0" });
+  writeBinding(fixture, bound.path);
+  try {
+    const result = runRuntime(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const said = `${result.stdout || ""}${result.stderr || ""}`;
+    assert.match(said, /too old for --experimental-strip-types/);
+    assert.match(result.stdout, /--experimental-strip-types server\/index\.ts/);
+    assert.equal(existsSync(bound.argsFile), false, "a too-old runtime must never run the harness");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a binding whose runtime is not executable falls back to the configured node", () => {
+  const fixture = makeRuntimeFixture();
+  const bound = installBoundRuntime(fixture, { executable: false });
+  writeBinding(fixture, bound.path);
+  try {
+    const result = runRuntime(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const said = `${result.stdout || ""}${result.stderr || ""}`;
+    assert.match(said, /is not executable at/);
+    assert.match(result.stdout, /--experimental-strip-types server\/index\.ts/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a binding record that is not valid JSON falls back to the configured node", () => {
+  const fixture = makeRuntimeFixture();
+  const dir = join(fixture.storeRoot, "runtime-bindings");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${RUNTIME_COMMIT}.json`), "{ not json");
+  try {
+    const result = runRuntime(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const said = `${result.stdout || ""}${result.stderr || ""}`;
+    assert.match(said, /not valid JSON/);
+    assert.match(result.stdout, /--experimental-strip-types server\/index\.ts/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a binding that names a runtime outside the store's runtimes area is refused", () => {
+  const fixture = makeRuntimeFixture();
+  // A perfectly good executable, and not one the store keeps.
+  const outside = join(fixture.dir, "outside-runtime");
+  writeRuntimeStub(outside, { version: "v22.14.0" });
+  writeBinding(fixture, outside, { sha256: "c".repeat(64) });
+  try {
+    const result = runRuntime(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const said = `${result.stdout || ""}${result.stderr || ""}`;
+    assert.match(said, /not in the store's runtimes area/);
+    assert.match(result.stdout, /--experimental-strip-types server\/index\.ts/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a kept runtime whose bytes no longer match the digest it is named by is refused", () => {
+  const fixture = makeRuntimeFixture();
+  const bound = installBoundRuntime(fixture);
+  writeBinding(fixture, bound.path);
+  // The file keeps its name, and its bytes change underneath it.
+  appendFileSync(bound.path, "one changed byte\n");
+  try {
+    const result = runRuntime(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const said = `${result.stdout || ""}${result.stderr || ""}`;
+    assert.match(said, /hashes to [a-f0-9]{64}, not the digest it is named by/);
+    assert.match(result.stdout, /--experimental-strip-types server\/index\.ts/);
+    assert.equal(existsSync(bound.argsFile), false, "a runtime that fails its digest must never run the harness");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a bound runtime that cannot report its version falls back instead of stopping the service", () => {
+  const fixture = makeRuntimeFixture();
+  const dir = join(fixture.storeRoot, "runtimes");
+  mkdirSync(dir, { recursive: true });
+  const staging = join(fixture.dir, "broken-runtime");
+  writeFileSync(staging, "#!/bin/sh\nexit 3\n");
+  chmodSync(staging, 0o755);
+  const digest = createHash("sha256").update(readFileSync(staging)).digest("hex");
+  const path = join(dir, digest);
+  renameSync(staging, path);
+  writeBinding(fixture, path);
+  try {
+    const result = runRuntime(fixture);
+    // The always-on service must not die because a probe failed.
+    assert.equal(result.status, 0, result.stderr);
+    const said = `${result.stdout || ""}${result.stderr || ""}`;
+    assert.match(said, /too old for --experimental-strip-types/);
+    assert.match(result.stdout, /--experimental-strip-types server\/index\.ts/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
 });

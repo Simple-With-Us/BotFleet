@@ -33,8 +33,8 @@
 
 import { execFile } from "node:child_process";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { chmod, link, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, sep } from "node:path";
 import { promisify } from "node:util";
 
@@ -70,6 +70,26 @@ const MANIFEST = ".botfleet-release.json";
 // re-verified.  Both records are keyed by the release commit.
 const HOLDS = "holds";
 const PROOFS = "proofs";
+// The RETAINED RUNTIME bytes live in the store's own area as well.  A release
+// ships its tree and its node_modules and nothing else: the manifest records
+// `node: process.version`, which is a version string and not bytes.  So the
+// only runtime an operator can name today is one that lives outside the
+// store -- the machine's own node -- and binding that proves the machine's
+// bytes rather than the candidate's.  A node upgrade then changes the bytes
+// under a proof that was written against them.
+//
+// A retained runtime is a COPY of the binary, stored under its own sha256, so
+// the bytes a proof re-verifies cannot change under it.  It is kept beside the
+// releases rather than inside one for the same reason the hold marker and the
+// proof record are: a release directory IS the tree the probe fingerprints and
+// the tree the store compares byte for byte with its commit, so a file written
+// into it would change the very bytes a proof is about.
+const RUNTIMES = "runtimes";
+// Which retained runtime a release runs under: one record per commit.  It is
+// a record beside the release rather than a field in the release manifest,
+// because the manifest is strict and an older strict reader rejects a field it
+// does not know.
+const RUNTIME_BINDINGS = "runtime-bindings";
 // A release is kept while something may still be running from it.  A harness
 // that has been restarted once since the swap has let go of the old tree.
 const MIN_RELEASES_KEPT = 2;
@@ -289,6 +309,310 @@ export function releaseProofPath(commit, env = process.env) {
     throw new Error(`Refusing to address a proof record by a non-commit value: ${commit}`);
   }
   return join(proofsRoot(env), `${commit}.json`);
+}
+
+/** Where the retained runtime bytes live: the store's own area, outside every release. */
+export function runtimesRoot(env = process.env) {
+  return join(storeRoot(env), RUNTIMES);
+}
+
+/** Where the per-commit runtime bindings live. */
+export function runtimeBindingsRoot(env = process.env) {
+  return join(storeRoot(env), RUNTIME_BINDINGS);
+}
+
+/** The retained runtime with one digest.  Its name IS its digest. */
+export function retainedRuntimePath(sha256, env = process.env) {
+  if (!/^[a-f0-9]{64}$/.test(sha256 || "")) {
+    throw new Error(`Refusing to address a retained runtime by a value that is not a sha256: ${sha256}`);
+  }
+  return join(runtimesRoot(env), sha256);
+}
+
+/** The runtime binding for one release commit. */
+export function releaseRuntimeBindingPath(commit, env = process.env) {
+  if (!FULL_COMMIT.test(commit || "")) {
+    throw new Error(`Refusing to address a runtime binding by a non-commit value: ${commit}`);
+  }
+  return join(runtimeBindingsRoot(env), `${commit}.json`);
+}
+
+/**
+ * The format of a native executable, from its first bytes.
+ *
+ * Only ELF and Mach-O are accepted.  An interpreter script is not the program
+ * that runs a release: binding the script would bind a few bytes of text while
+ * a different, unbound program named by its `#!` line actually ran.
+ */
+function runtimeFormat(head) {
+  if (head.length >= 4 && head[0] === 0x7f && head[1] === 0x45 && head[2] === 0x4c && head[3] === 0x46) {
+    return "elf";
+  }
+  if (head.length >= 4) {
+    const big = head.readUInt32BE(0);
+    const little = head.readUInt32LE(0);
+    for (const magic of [0xfeedface, 0xfeedfacf, 0xcafebabe]) {
+      if (big === magic || little === magic) return "mach-o";
+    }
+  }
+  return null;
+}
+
+/**
+ * The sha256 of a file, read through a handle that follows no link.
+ */
+async function digestFile(path) {
+  const noFollow = Number.isInteger(constants.O_NOFOLLOW) ? constants.O_NOFOLLOW : 0;
+  // The handle has to be the file that was LISTED.  O_NOFOLLOW refuses a
+  // link in the last component, but a link in a parent directory or a hard
+  // link can still answer with other bytes, so the opened handle is checked
+  // against the listing before a single byte is read.
+  const listed = await lstat(path);
+  if (listed.isSymbolicLink() || !listed.isFile() || listed.nlink !== 1) {
+    throw new ResolutionError(
+      `The file at ${path} is not a singly linked regular file`,
+      "runtime-not-stored",
+      { path },
+    );
+  }
+  const handle = await open(path, constants.O_RDONLY | noFollow);
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== listed.dev || opened.ino !== listed.ino) {
+      throw new ResolutionError(
+        `The file at ${path} is not the file that was listed`,
+        "runtime-not-stored",
+        { path },
+      );
+    }
+    const hash = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(1024 * 1024);
+    for (;;) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (bytesRead === 0) break;
+      hash.update(chunk.subarray(0, bytesRead));
+    }
+    return hash.digest("hex");
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Copy a runtime binary into the store and KEEP the copy.
+ *
+ * The copy is stored under its own sha256, so the bytes are named by their
+ * digest and a second retain of the same bytes is the same file.  The stored
+ * copy is never rewritten: an existing file with that name is kept exactly as
+ * it is, because a proof records the file's inode as well as its bytes and
+ * replacing the file would replace the very file a proof re-verifies.  The
+ * copy is linked into place rather than renamed over the target, so a second
+ * retain racing the first cannot replace it either.
+ *
+ * The source is read through a handle that follows no link, so a runtime
+ * swapped in after it was listed cannot be copied in its place.  A source that
+ * is a symlink, a directory, a file without an executable bit or an
+ * interpreter script is refused rather than stored.
+ */
+export async function retainRuntime({ source, env = process.env } = {}) {
+  const named = source ?? process.execPath;
+  if (!isAbsolute(named)) {
+    throw new ResolutionError(`A runtime source must be an absolute path: ${named}`, "runtime-path-invalid", { source: named });
+  }
+  let seen;
+  try {
+    seen = await lstat(named);
+  } catch (error) {
+    throw new ResolutionError(`The runtime at ${named} could not be read: ${error?.message || error}`, "runtime-unreadable", { source: named });
+  }
+  if (seen.isSymbolicLink()) {
+    throw new ResolutionError(`Refusing to retain the symbolic link at ${named}; name the physical runtime binary`, "runtime-symlink", { source: named });
+  }
+  if (!seen.isFile()) {
+    throw new ResolutionError(`The runtime at ${named} is not a regular file`, "runtime-not-file", { source: named });
+  }
+  if ((seen.mode & 0o111) === 0) {
+    throw new ResolutionError(`The runtime at ${named} has no executable bit`, "runtime-not-executable", { source: named });
+  }
+  const noFollow = Number.isInteger(constants.O_NOFOLLOW) ? constants.O_NOFOLLOW : 0;
+  let handle;
+  try {
+    handle = await open(named, constants.O_RDONLY | noFollow);
+  } catch (error) {
+    if (error?.code === "ELOOP") {
+      throw new ResolutionError(`Refusing to retain the symbolic link at ${named}; name the physical runtime binary`, "runtime-symlink", { source: named });
+    }
+    throw new ResolutionError(`The runtime at ${named} could not be opened: ${error?.message || error}`, "runtime-unreadable", { source: named });
+  }
+  const temporary = join(runtimesRoot(env), `.retain-${randomUUID()}`);
+  let digest = null;
+  let bytes = 0;
+  let format = null;
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.dev !== seen.dev || opened.ino !== seen.ino) {
+      throw new ResolutionError(`The runtime at ${named} changed while it was being opened`, "runtime-unreadable", { source: named });
+    }
+    await mkdir(runtimesRoot(env), { recursive: true, mode: 0o755 });
+    const out = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o555);
+    try {
+      const chunk = Buffer.allocUnsafe(1024 * 1024);
+      const hash = createHash("sha256");
+      for (;;) {
+        // filehandle.read answers an object, not a byte count.
+        const { bytesRead: read } = await handle.read(chunk, 0, chunk.length, null);
+        if (read === 0) break;
+        if (bytes === 0) {
+          format = runtimeFormat(chunk.subarray(0, read));
+          if (format === null) {
+            const script = read >= 2 && chunk[0] === 0x23 && chunk[1] === 0x21;
+            throw new ResolutionError(
+              `The runtime at ${named} is ${script ? "an interpreter script" : "not an ELF or Mach-O executable"}; the store keeps the bytes of the program that runs a release`,
+              "runtime-not-binary",
+              { source: named },
+            );
+          }
+        }
+        hash.update(chunk.subarray(0, read));
+        bytes += read;
+        await out.write(chunk.subarray(0, read), 0, read);
+      }
+      // An EMPTY file never reaches the format check above, because no chunk
+      // is ever read: the loop reads nothing and breaks.  It is not a
+      // runtime, and storing it would leave the store holding a kept "runtime"
+      // that is not a program.
+      if (bytes === 0 || format === null) {
+        throw new ResolutionError(
+          `The runtime at ${named} is empty; the store keeps the bytes of the program that runs a release`,
+          "runtime-not-binary",
+          { source: named },
+        );
+      }
+      digest = hash.digest("hex");
+      await out.chmod(0o555);
+    } finally {
+      await out.close();
+    }
+  } catch (error) {
+    await rm(temporary, { force: true });
+    if (error instanceof ResolutionError) throw error;
+    throw new ResolutionError(`The runtime at ${named} could not be copied into the store: ${error?.message || error}`, "runtime-unreadable", { source: named });
+  } finally {
+    await handle.close();
+  }
+  const path = retainedRuntimePath(digest, env);
+  try {
+    // link() and not rename(): rename over an existing file REPLACES it, and a
+    // replaced file is a different inode, which is exactly what a proof
+    // records about the runtime it proved.
+    await link(temporary, path);
+    await rm(temporary, { force: true });
+  } catch (error) {
+    await rm(temporary, { force: true });
+    if (error?.code !== "EEXIST") {
+      throw new ResolutionError(`The retained runtime could not be stored at ${path}: ${error?.message || error}`, "runtime-not-stored", { path });
+    }
+    // Another retain of the same bytes got there first.  Its file is kept:
+    // it is the same bytes under the same name -- but only if it IS those
+    // bytes.  A file that is already at that name and holds different bytes
+    // was planted or corrupted, and the kept runtime is named by its digest,
+    // so the bytes have to match the name before the file is trusted.
+    const existing = await lstat(path).catch(() => null);
+    if (!existing || !existing.isFile() || existing.isSymbolicLink()) {
+      throw new ResolutionError(`The retained runtime at ${path} is not a regular file`, "runtime-not-stored", { path });
+    }
+    let keptDigest = null;
+    try {
+      keptDigest = await digestFile(path);
+    } catch (error) {
+      throw new ResolutionError(
+        `The retained runtime at ${path} could not be read for checking: ${error?.message || error}`,
+        "runtime-not-stored",
+        { path },
+      );
+    }
+    if (keptDigest !== digest) {
+      throw new ResolutionError(
+        `The file at ${path} holds bytes that are not the digest it is named by (${digest})`,
+        "runtime-not-stored",
+        { path },
+      );
+    }
+  }
+  return { path, sha256: digest, bytes, format };
+}
+
+/**
+ * Bind a retained runtime to one release commit.
+ *
+ * The record names the digest and the path of the retained bytes and lives
+ * beside the release, never inside it.  The release manifest keeps exactly
+ * its seven fields: an older strict reader must not meet a field it does not
+ * know.
+ */
+export async function bindReleaseRuntime({ commit, source, env = process.env, boundAt = new Date().toISOString() } = {}) {
+  if (!FULL_COMMIT.test(commit || "")) {
+    throw new ResolutionError(`Refusing to bind a runtime to a non-commit value: ${commit}`, "not-a-commit");
+  }
+  const runtime = await retainRuntime({ source, env });
+  const record = { schemaVersion: 1, commit, runtime, boundAt };
+  await mkdir(runtimeBindingsRoot(env), { recursive: true, mode: 0o700 });
+  const path = releaseRuntimeBindingPath(commit, env);
+  await writePrivateFile(path, `${JSON.stringify(record, null, 2)}\n`);
+  return { path, record };
+}
+
+/**
+ * The retained runtime a release is bound to, or null when it has none.
+ *
+ * The record is the answer, and the file it names is checked to still be the
+ * regular file it was: a binding whose bytes have gone is not a binding.
+ */
+export async function releaseRuntime(commit, env = process.env) {
+  if (!FULL_COMMIT.test(commit || "")) return null;
+  let text;
+  try {
+    text = await readFile(releaseRuntimeBindingPath(commit, env), "utf8");
+  } catch {
+    return null;
+  }
+  let record;
+  try {
+    record = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  const runtime = record?.runtime;
+  if (!record || record.schemaVersion !== 1 || record.commit !== commit || !runtime) return null;
+  if (!/^[a-f0-9]{64}$/.test(runtime.sha256 || "")) return null;
+  if (!isAbsolute(runtime.path || "")) return null;
+  let seen;
+  try {
+    seen = await lstat(runtime.path);
+  } catch {
+    return null;
+  }
+  if (!seen.isFile() || seen.isSymbolicLink()) return null;
+  return { path: runtime.path, sha256: runtime.sha256, bytes: runtime.bytes, format: runtime.format };
+}
+
+/** Every retained runtime in the store, by digest. */
+export async function listRetainedRuntimes(env = process.env) {
+  let entries;
+  try {
+    entries = await readdir(runtimesRoot(env), { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const runtimes = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !/^[a-f0-9]{64}$/.test(entry.name)) continue;
+    const path = join(runtimesRoot(env), entry.name);
+    const seen = await lstat(path).catch(() => null);
+    if (!seen || !seen.isFile()) continue;
+    runtimes.push({ sha256: entry.name, path, bytes: seen.size });
+  }
+  return runtimes.sort((left, right) => (left.sha256 < right.sha256 ? -1 : 1));
 }
 
 /**
@@ -659,7 +983,7 @@ export async function promoteStaging({ commit, env = process.env, renameImpl = r
   } catch (error) {
     // Re-promoting a commit that is already a release is not a cross-device
     // problem, and telling an operator to move a directory they did not break
-    // sends them the wrong way. ENOTEMPTY/EEXIST means it is already there.
+    // sends them the wrong way.  ENOTEMPTY/EEXIST means it is already there.
     if (["ENOTEMPTY", "EEXIST", "EISDIR"].includes(error?.code)) {
       throw new ResolutionError(
         `Commit ${commit.slice(0, 12)} is already a release at ${to}; nothing to promote.`,

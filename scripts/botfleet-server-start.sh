@@ -397,6 +397,203 @@ manifest_commit() {
     "$ROOT/.botfleet-release.json" 2>/dev/null | /usr/bin/head -n 1
 }
 
+# The commit the release directory names, or nothing.
+#
+# The store names a release by the commit it holds, so the directory name IS
+# the commit -- but only when it is a full lowercase SHA.  Anything else is a
+# checkout, and a checkout carries no binding.
+release_commit() {
+  local name
+  name="$(basename "$ROOT")"
+  [ "${#name}" -eq 40 ] || return 1
+  case "$name" in
+    *[!0-9a-f]*) return 1 ;;
+  esac
+  printf '%s' "$name"
+}
+
+# The store the release directory belongs to, or nothing.
+#
+# A release lives at <store>/releases/<commit>, so the store is two levels up
+# -- and only when the level above really is `releases`.  A checkout in
+# ~/apps, or a test fixture, has no store and therefore no binding.
+release_store_root() {
+  local parent
+  parent="$(dirname "$ROOT")"
+  [ "$(basename "$parent")" = "releases" ] || return 1
+  dirname "$parent"
+}
+
+# The sha256 of a file, or nothing when no hasher is available.
+#
+# The bound runtime is checked against the digest the store recorded, so the
+# bytes that are about to run are the bytes the store kept.
+store_runtime_digest() {
+  local path="$1" output=""
+  if [ -x /usr/bin/shasum ]; then
+    output="$(/usr/bin/shasum -a 256 "$path" 2>/dev/null)" || return 1
+  elif command -v sha256sum >/dev/null 2>&1; then
+    output="$(sha256sum "$path" 2>/dev/null)" || return 1
+  else
+    return 1
+  fi
+  printf '%s' "${output%% *}"
+}
+
+# Whether a node version carries the harness's type-stripping support.
+#
+# Node strips types from 22.6 onwards, and the harness runs under
+# --experimental-strip-types, so an older runtime cannot run it at all.
+runtime_supports_strip_types() {
+  local version="$1" major minor
+  # A build may print its own name before the version ("node v22.14.0"), so
+  # the first number-looking token is the version and not the first word.
+  version="$(printf '%s' "$version" | /usr/bin/grep -oE '[0-9]+\.[0-9]+' | /usr/bin/head -n 1)"
+  case "$version" in
+    *.*) ;;
+    *) return 1 ;;
+  esac
+  major="${version%%.*}"
+  minor="${version#*.}"
+  minor="${minor%%.*}"
+  case "$major" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  case "$minor" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  if [ "$major" -gt 22 ]; then
+    return 0
+  fi
+  if [ "$major" -eq 22 ] && [ "$minor" -ge 6 ]; then
+    return 0
+  fi
+  return 1
+}
+
+# Start the release under the runtime it is bound to, when that runtime is
+# still usable.
+#
+# A release ships its tree and its node_modules and nothing else, so without
+# this the always-on harness starts under the MACHINE's node, and a node
+# upgrade then changes the bytes under a proof that was written against
+# them.  The store keeps the exact runtime bytes for a release and records
+# which ones in a binding record beside the release.
+#
+# A binding that cannot be used never stops the always-on service: the
+# machine's node stays in place and the reason is logged.
+prefer_bound_runtime() {
+  local commit store record readout candidate version
+  commit="$(release_commit)" || return 0
+  store="$(release_store_root)" || return 0
+  record="$store/runtime-bindings/$commit.json"
+  # A release with no binding is ordinary: it was promoted before runtimes
+  # were retained, or its binding was never written.  Nothing changes.
+  [ -f "$record" ] || return 0
+  readout="$("$NODE" --input-type=module -e '
+import fs from "node:fs";
+let fd;
+let text;
+try {
+  fd = fs.openSync(process.argv[1], fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  const stat = fs.fstatSync(fd);
+  if (!stat.isFile() || stat.size > 65536) process.exit(1);
+  text = fs.readFileSync(fd, "utf8");
+} catch {
+  process.exit(1);
+}
+let value;
+try {
+  value = JSON.parse(text);
+} catch {
+  process.stdout.write("reason: the record is not valid JSON\n");
+  process.exit(0);
+}
+if (!value || Array.isArray(value)) {
+  process.stdout.write("reason: the record is not an object\n");
+  process.exit(0);
+}
+if (value.schemaVersion !== 1) {
+  process.stdout.write("reason: the record has an unsupported version\n");
+  process.exit(0);
+}
+if (value.commit !== process.argv[2]) {
+  process.stdout.write("reason: the record names a different commit\n");
+  process.exit(0);
+}
+const runtime = value.runtime;
+if (!runtime || Array.isArray(runtime)) {
+  process.stdout.write("reason: the record names no runtime\n");
+  process.exit(0);
+}
+if (!/^\//.test(runtime.path)) {
+  process.stdout.write("reason: the record names no absolute runtime path\n");
+  process.exit(0);
+}
+if (!/^[a-f0-9]{64}$/.test(runtime.sha256 || "")) {
+  process.stdout.write("reason: the record names no runtime digest\n");
+  process.exit(0);
+}
+process.stdout.write(runtime.path + "\n");
+process.stdout.write(runtime.sha256 + "\n");
+' -- "$record" "$commit" 2>/dev/null || true)"
+  case "$readout" in
+    "")
+      log_err "the runtime binding for $commit could not be read; starting under $NODE instead"
+      return 0
+      ;;
+    reason:*)
+      log_err "the runtime binding for $commit is unusable: ${readout#reason: }; starting under $NODE instead"
+      return 0
+      ;;
+  esac
+  candidate="$(printf '%s\n' "$readout" | /usr/bin/head -n 1)"
+  expected_digest="$(printf '%s\n' "$readout" | /usr/bin/sed -n '2p')"
+  if [ ! -e "$candidate" ]; then
+    log_err "the runtime bound to $commit is missing at $candidate; starting under $NODE instead"
+    return 0
+  fi
+  if [ ! -f "$candidate" ]; then
+    log_err "the runtime bound to $commit is not a regular file at $candidate; starting under $NODE instead"
+    return 0
+  fi
+  if [ ! -x "$candidate" ]; then
+    log_err "the runtime bound to $commit is not executable at $candidate; starting under $NODE instead"
+    return 0
+  fi
+  # The bound runtime is the store's OWN kept bytes, so it has to be in the
+  # store's runtimes area, named by the digest the record carries, and still
+  # hold those bytes.  A record that names any other file names a program
+  # this launcher must not run.
+  if [ "$(/usr/bin/dirname "$candidate")" != "$store/runtimes" ]; then
+    log_err "the runtime bound to $commit is not in the store's runtimes area; starting under $NODE instead"
+    return 0
+  fi
+  if [ "$(/usr/bin/basename "$candidate")" != "$expected_digest" ]; then
+    log_err "the runtime bound to $commit is not named by the digest the record carries; starting under $NODE instead"
+    return 0
+  fi
+  actual_digest="$(store_runtime_digest "$candidate")" || actual_digest=""
+  if [ -z "$actual_digest" ]; then
+    log_err "the runtime bound to $commit could not be hashed; starting under $NODE instead"
+    return 0
+  fi
+  if [ "$actual_digest" != "$expected_digest" ]; then
+    log_err "the runtime bound to $commit hashes to $actual_digest, not the digest it is named by; starting under $NODE instead"
+    return 0
+  fi
+  # A runtime that cannot even report its version is not usable, and a probe
+  # that fails must not take the always-on service down with it.
+  version="$("$candidate" --version 2>/dev/null | /usr/bin/head -n 1)" || version=""
+  if ! runtime_supports_strip_types "$version"; then
+    log_err "the runtime bound to $commit reports version ${version:-unknown}, which is too old for --experimental-strip-types; starting under $NODE instead"
+    return 0
+  fi
+  NODE="$candidate"
+  log "release $commit is bound to runtime $candidate; starting the harness under it"
+  return 0
+}
+
 preflight() {
   if [ ! -f "$ROOT/server/index.ts" ]; then
     log_err "missing $ROOT/server/index.ts"
@@ -498,6 +695,9 @@ if [ -n "$ROOT_UNRESOLVED" ]; then
   echo "botfleet-server-start: fix the permissions or point BOTFLEET_SERVER_ROOT elsewhere." >&2
   fail_or_stop_storm
 fi
+# A release bound to a runtime starts under those bytes, so a node upgrade
+# on this machine cannot change what a proof was written against.
+prefer_bound_runtime
 preflight || fail_or_stop_storm
 maybe_heal_dependencies || fail_or_stop_storm
 

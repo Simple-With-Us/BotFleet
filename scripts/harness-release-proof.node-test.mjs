@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
-  chmodSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync,
+  chmodSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +15,7 @@ import {
   pruneReleases,
   releaseHold,
   releaseProofPath,
+  retainRuntime,
   stagingPath,
   swapCurrent,
   writeReleaseProof,
@@ -36,21 +37,19 @@ const C = "c".repeat(40);
 const D = "d".repeat(40);
 const BUILD = "202611240001";
 
-// The inspector refuses a runtime under a dot directory other than the
-// application's own (a Node under ~/.nvm, ~/.volta or ~/.asdf), so a host that
-// keeps its Node there runs these cases with a private copy of the same binary.
-function privateNodeCopy(path) {
-  const dir = mkdtempSync(join(tmpdir(), "bf-release-proof-node-"));
-  const copy = join(dir, "node");
-  copyFileSync(path, copy);
-  chmodSync(copy, 0o755);
-  process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
-  return copy;
+/**
+ * A runtime the store KEEPS: a small file whose first four bytes are the ELF
+ * magic and which carries the executable bit.  Nothing here starts a
+ * runtime, and the binding reads the magic and the bit of a runtime and
+ * nothing else, so this stands in for a real binary and costs a few dozen
+ * bytes instead of a copy of the host Node.
+ */
+function elfRuntime(root, name = "elf-runtime") {
+  const path = join(root, name);
+  writeFileSync(path, Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(60, 0x41)]));
+  chmodSync(path, 0o755);
+  return path;
 }
-const HOST_NODE = realpathSync(process.execPath);
-const NODE = HOST_NODE.split("/").some((part) => part.startsWith(".") && part.toLowerCase() !== ".botfleet")
-  ? privateNodeCopy(HOST_NODE)
-  : HOST_NODE;
 
 async function store(t) {
   const dir = mkdtempSync(join(tmpdir(), "botfleet-releases-"));
@@ -100,7 +99,10 @@ async function makeCandidate(t) {
   execFileSync("git", ["-C", repo, "archive", "--format=tar", "--output", join(root, "tree.tar"), commit]);
   execFileSync("tar", ["-xf", join(root, "tree.tar"), "-C", staging]);
   const releaseRoot = realpathSync(await promoteStaging({ commit, env, version: "0.1.0", build: BUILD }));
-  return { root, repo, commit, env, releaseRoot, build: BUILD };
+  // The runtime this store KEEPS, under its own digest: a candidate binds
+  // only a runtime the store that owns the release holds.
+  const runtime = await retainRuntime({ source: elfRuntime(root), env });
+  return { root, repo, commit, env, releaseRoot, build: BUILD, runtime: runtime.path };
 }
 
 /** The signed artifact: an ordinary file with ordinary bytes. */
@@ -118,7 +120,7 @@ test("a proof record and a hold marker live outside the promoted tree, and the t
     releaseRoot: fixture.releaseRoot,
     sourceCommit: fixture.commit,
     sourceRepo: fixture.repo,
-    runtimePath: NODE,
+    runtimePath: fixture.runtime,
     signedArtifact: artifact,
     signedArtifactProvenance: { commit: fixture.commit, build: fixture.build },
   });
@@ -213,7 +215,7 @@ test("the artifact digest, the tree fingerprint and the runtime digest are three
     releaseRoot: fixture.releaseRoot,
     sourceCommit: fixture.commit,
     sourceRepo: fixture.repo,
-    runtimePath: NODE,
+    runtimePath: fixture.runtime,
     signedArtifact: artifact,
     signedArtifactProvenance: { commit: fixture.commit, build: fixture.build },
   });
@@ -244,7 +246,7 @@ test("a candidate whose artifact does not hash to the expected digest is refused
     releaseRoot: fixture.releaseRoot,
     sourceCommit: fixture.commit,
     sourceRepo: fixture.repo,
-    runtimePath: NODE,
+    runtimePath: fixture.runtime,
     signedArtifact: artifact,
     signedArtifactSha256: "0".repeat(64),
     signedArtifactProvenance: { commit: fixture.commit, build: fixture.build },
@@ -261,7 +263,7 @@ test("a candidate that names a signed artifact without provenance is refused", a
     releaseRoot: fixture.releaseRoot,
     sourceCommit: fixture.commit,
     sourceRepo: fixture.repo,
-    runtimePath: NODE,
+    runtimePath: fixture.runtime,
     signedArtifact: artifact,
   });
   assert.equal(inspected.status, "blocked");
@@ -276,7 +278,7 @@ test("a candidate whose artifact was produced from another commit is refused", a
     releaseRoot: fixture.releaseRoot,
     sourceCommit: fixture.commit,
     sourceRepo: fixture.repo,
-    runtimePath: NODE,
+    runtimePath: fixture.runtime,
     signedArtifact: artifact,
     signedArtifactProvenance: { commit: B, build: fixture.build },
   });
@@ -292,7 +294,7 @@ test("a candidate whose artifact was produced from another build of this commit 
     releaseRoot: fixture.releaseRoot,
     sourceCommit: fixture.commit,
     sourceRepo: fixture.repo,
-    runtimePath: NODE,
+    runtimePath: fixture.runtime,
     signedArtifact: artifact,
     signedArtifactProvenance: { commit: fixture.commit, build: "202601010000" },
   });
@@ -309,7 +311,7 @@ async function proved(t) {
     releaseRoot: fixture.releaseRoot,
     sourceCommit: fixture.commit,
     sourceRepo: fixture.repo,
-    runtimePath: NODE,
+    runtimePath: fixture.runtime,
     signedArtifact: artifact,
     signedArtifactProvenance: { commit: fixture.commit, build: fixture.build },
   });
@@ -366,6 +368,21 @@ test("the recheck of a release with no proof names the reason", async (t) => {
   const recheck = await recheckPlacementRollbackCandidate({ releaseRoot: fixture.releaseRoot });
   assert.equal(recheck.valid, false);
   assert.ok(recheck.reasons.some((entry) => entry.code === "release-proof-missing"), JSON.stringify(recheck.reasons));
+});
+
+test("a candidate whose runtime is not kept by the store that owns the release is refused", async (t) => {
+  const fixture = await makeCandidate(t);
+  const outside = elfRuntime(fixture.root, "outside-the-store");
+  const inspected = await inspectPlacementRollbackCandidate({
+    kind: "release-store",
+    releaseRoot: fixture.releaseRoot,
+    sourceCommit: fixture.commit,
+    sourceRepo: fixture.repo,
+    runtimePath: outside,
+  });
+  assert.equal(inspected.status, "blocked");
+  assert.deepEqual(inspected.blockers.map((entry) => entry.code), ["runtime-not-retained"]);
+  assert.equal(inspected.binding, null);
 });
 
 test("a hold marker is the store's own record and never a file inside a release", async (t) => {
