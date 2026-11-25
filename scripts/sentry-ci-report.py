@@ -234,12 +234,16 @@ def find_cron_schedule_drift(known_names: set[str] | None) -> list[str]:
     if not known_names:
         return []
     folded = {name.casefold() for name in known_names}
-    unmonitored_folded = {name.casefold() for name in UNMONITORED_SCHEDULES}
-    # A name in both maps is drift as well: UNMONITORED_SCHEDULES wins, so its
-    # CRON_SCHEDULES entry would silently never check in.
-    overlap = {key for key in CRON_SCHEDULES if key.casefold() in unmonitored_folded}
+    # A name in both maps, in any casing, is drift as well: UNMONITORED_SCHEDULES
+    # wins, so its CRON_SCHEDULES entry would silently never check in.  Both
+    # spellings are reported, so neither half of the duplicate is hidden.
+    overlap = {key.casefold() for key in CRON_SCHEDULES} & {
+        name.casefold() for name in UNMONITORED_SCHEDULES
+    }
     configured = set(CRON_SCHEDULES) | set(UNMONITORED_SCHEDULES)
-    return sorted(key for key in configured if key.casefold() not in folded or key in overlap)
+    return sorted(
+        key for key in configured if key.casefold() not in folded or key.casefold() in overlap
+    )
 
 
 def parse_dsn(dsn: str) -> tuple[str, str, str]:
