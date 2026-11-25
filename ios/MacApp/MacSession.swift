@@ -314,9 +314,24 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
             let macRuntime = NativeMacCompanionRuntime(
                 database: database,
                 workspacesRoot: workspacesRoot,
-                processSupervisor: nativeProcessSupervisor
+                processSupervisor: nativeProcessSupervisor,
+                credentials: DatabaseCliLoginCredentials(database: database)
             )
             nativeRuntimeBox.store(macRuntime)
+            // BF-2689 composition: register every stored bot that derives
+            // a native profile, with its real driver, so satisfied waits
+            // dispatch instead of holding unclaimed.  Registration is
+            // best-effort per bot — a bot that cannot register stays
+            // admission-held and is named in the log, never substituted.
+            Task {
+                let report = await macRuntime.registerStoredBots()
+                if let loadFailure = report.loadFailure {
+                    NSLog("BF-2689: stored bots could not be loaded for native registration: %@", loadFailure)
+                }
+                for skip in report.skipped {
+                    NSLog("BF-2689: bot %@ not registered natively: %@", skip.botId, skip.reason)
+                }
+            }
             return NativeCompanionServer(
                 database: database,
                 deviceStoreURL: deviceStoreURL,

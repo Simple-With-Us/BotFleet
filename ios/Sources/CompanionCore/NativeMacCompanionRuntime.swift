@@ -207,6 +207,41 @@ public struct NativeMacCompanionRuntime: Sendable {
         }
     }
 
+    /// Registers every stored bot that derives a native profile, with its
+    /// real driver (`BF-2689`).  Bots that derive nothing — an undecodable
+    /// record, no thread, or an engine with no native driver — and bots
+    /// whose driver cannot be built on this host are named in the report
+    /// and stay admission-held; registration never substitutes a driver.
+    public func registerStoredBots() async -> MacBotRegistrationReport {
+        var report = MacBotRegistrationReport()
+        let records: [StoredBotRecord]
+        do {
+            records = try await database.loadBots()
+        } catch {
+            report.loadFailure = String(describing: error)
+            return report
+        }
+        for record in records {
+            guard let derived = MacBotProfileDerivation.derive(from: record) else {
+                report.skipped.append(MacBotRegistrationSkip(
+                    botId: record.id,
+                    reason: "no native profile derives from the stored record"
+                ))
+                continue
+            }
+            do {
+                try await registerBot(derived.profile, matrixEngine: derived.engine)
+                report.registered.append(record.id)
+            } catch {
+                report.skipped.append(MacBotRegistrationSkip(
+                    botId: record.id,
+                    reason: String(describing: error)
+                ))
+            }
+        }
+        return report
+    }
+
     /// The companion server carrying this runtime, so its wait routes are
     /// served instead of answering `no_route`.
     public func makeServer() -> NativeCompanionServer {
