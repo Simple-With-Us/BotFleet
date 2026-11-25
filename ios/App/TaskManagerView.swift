@@ -27,7 +27,7 @@ struct TaskManagerView: View {
                         BotAvatarWithProviderBadge(bot: current, size: 48, state: .idle, animated: false)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(current.name).font(.headline)
-                            Text(current.title.isEmpty ? "Agent tasks" : current.title)
+                            Text(current.title.isEmpty ? "Bot tasks" : current.title)
                                 .font(.subheadline).foregroundStyle(.secondary)
                         }
                     }

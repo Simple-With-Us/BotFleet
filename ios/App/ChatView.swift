@@ -1766,7 +1766,7 @@ struct ChatView: View {
                 .accessibilityHidden(true)
                 .frame(width: 34, height: 34)
                 .background(
-                    Circle().fill(canSend ? BubbleColor.mine : Color.secondary.opacity(0.18))
+                    Circle().fill(canSend ? BubbleColor.mineFilled : Color.secondary.opacity(0.18))
                 )
                 .contentShape(Circle())
         }
@@ -2612,6 +2612,15 @@ private struct ActivityShareSheet: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 
+/// The bubble fill that carries white.
+///
+/// White on the brand blue is 3.9:1, under WCAG AA for the body text the
+/// user's own bubble carries, so the blue that holds white text is the brand
+/// blue deepened a shade.  The hue does not move.
+private extension BubbleColor {
+    static let mineFilled = BotPalette.color("blue").mixed(with: .black, amount: 0.12)
+}
+
 struct TextBubble: View {
     let message: Message
     let chat: Chat
@@ -2749,7 +2758,9 @@ struct TextBubble: View {
                     ForEach(Array(split.files.enumerated()), id: \.offset) { _, path in
                         Label(ChatAttachments.attachmentBasename(path), systemImage: "doc")
                             .font(.footnote.weight(.medium))
-                            .foregroundStyle(mine ? BubbleColor.mineText.opacity(0.9) : Color.secondary)
+                            // Full white, not a faded one: the faded white sat
+                            // under 4.5:1 against the bubble fill.
+                            .foregroundStyle(mine ? BubbleColor.mineText : Color.secondary)
                     }
                 }
             }
@@ -2760,7 +2771,7 @@ struct TextBubble: View {
                 Group {
                     if !customCard {
                         SpeechBubble(tail: tailed ? (mine ? .trailing : .leading) : .none)
-                            .fill(mine ? BubbleColor.mine : BubbleColor.theirs)
+                            .fill(mine ? BubbleColor.mineFilled : BubbleColor.theirs)
                     }
                 }
             )

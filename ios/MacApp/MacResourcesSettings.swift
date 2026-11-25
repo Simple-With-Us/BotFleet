@@ -166,7 +166,7 @@ private struct ThresholdsCard: View {
                                 .frame(width: 120, alignment: .leading)
                             Text("Applied: \(row.applied)")
                                 .font(.callout)
-                                .foregroundStyle(row.mismatch != nil ? .orange : .primary)
+                                .foregroundStyle(row.mismatch != nil ? Color(.systemOrange) : Color.primary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         if let note = row.note {
@@ -177,7 +177,7 @@ private struct ThresholdsCard: View {
                         if let mismatch = row.mismatch {
                             Text("Saved \(row.saved) · \(mismatch)")
                                 .font(.caption.weight(.medium))
-                                .foregroundStyle(.orange)
+                                .foregroundStyle(Color(.systemOrange))
                         }
                         Divider()
                     }
