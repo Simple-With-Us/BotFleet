@@ -79,7 +79,6 @@ public enum FleetServiceRegistry {
         pm2("grok-leader", "Grok Leader"),
         pm2("grok-acp", "Grok ACP"),
         pm2("clutch-web", "Clutch Web"),
-        pm2("seat-mcp", "Seat MCP"),
     ]
 
     /// The descriptor with this id, when the registry knows it.

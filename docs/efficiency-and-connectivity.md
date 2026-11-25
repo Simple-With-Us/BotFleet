@@ -10,9 +10,9 @@ slim, ingress filter, trigger-gap fold, resume-cursor clear) and PR #533
 Prefer BotFleet native `modelSelection` engines for day-to-day bot work.  Each
 bot's configured engine is the default path for schedules, webhooks, and chat.
 
-`seat-mcp` (`grok`, `grok-tui`, `deepseek` only) is optional for rare Mac
-Grok/DeepSeek jobs — not a general spawn bus.  Composer and `cursor-agent` are
-not `seat-mcp` seats; do not route ordinary bot automation through them.
+Do not configure a legacy bridge as a new bot execution option. Use the bot’s
+configured native engine. For local existing Grok terminal chats, use the
+existing Grok leader integration rather than starting a second agent.
 
 ## Events Over Polls
 

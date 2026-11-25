@@ -13,7 +13,7 @@ description: Drive a live Mac Grok TUI session from any local agent (Claude, Cur
 
 
 The Mac Grok TUI joins `~/.grok/leader.sock`.  Any local agent can attach
-through `grok-drive.py` or seat-mcp.  Do **not** spawn a second `grok-acp`
+through `grok-drive.py`.  Do **not** spawn a second `grok-acp`
 on `:12419` to talk to those chats.
 
 ## CLI
@@ -34,15 +34,6 @@ python3 ~/apps/grok-acp-runtime/grok-drive.py cancel --session-id ID --cwd DIR
 - `prompt` returns `queued: true` as soon as the TUI accepts the message.  It does **not** wait for the turn.
 - `await` (or `--await-reply N` on prompt) polls disk until the turn is idle or needs-input.  That is how you read the reply.  Do not `--wait` on ACP.
 - Peek/tail/await never `session/load` a live chat (load hangs ~45s).
-
-## MCP (seat-mcp)
-
-Local stdio launcher: `sh ~/apps/mcp-servers/seat-mcp-launch.sh`
-(already in `~/.grok/config.toml`).  Tools: `grok_sessions_list`,
-`grok_session_peek`, `grok_session_tail`, `grok_session_prompt`,
-`grok_session_await`, `grok_session_cancel`.
-
-Flow: list → prompt `{sessionId, prompt, from}` → await `{sessionId}`.
 
 ## Do not
 
