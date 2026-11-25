@@ -11,7 +11,7 @@ import Testing
 /// quietly, and `list` answers from its own queue so a test can show the job
 /// appearing behind its label, or never appearing at all.
 private final class ScriptedLaunchctl: MacCommandRunning, @unchecked Sendable {
-    typealias Answer = (status: Int32, output: String, error: String)
+    typealias Answer = (status: Int32, output: String, error: String, complete: Bool)
 
     private let lock = NSLock()
     private var requests: [[String]] = []
@@ -23,9 +23,15 @@ private final class ScriptedLaunchctl: MacCommandRunning, @unchecked Sendable {
     private var silentVerbs: Set<String> = []
 
     /// The answer to one launchctl verb.
-    func answering(_ verb: String, status: Int32 = 0, output: String = "", error: String = "") -> ScriptedLaunchctl {
+    func answering(
+        _ verb: String,
+        status: Int32 = 0,
+        output: String = "",
+        error: String = "",
+        complete: Bool = true
+    ) -> ScriptedLaunchctl {
         lock.lock(); defer { lock.unlock() }
-        answers[verb] = (status, output, error)
+        answers[verb] = (status, output, error, complete)
         return self
     }
 
@@ -62,8 +68,13 @@ private final class ScriptedLaunchctl: MacCommandRunning, @unchecked Sendable {
                 let answer = listings.count > 1 ? listings.removeFirst() : listings[0]
                 return MacCommandOutcome(output: answer.output, status: answer.status)
             }
-            let answer = answers[verb] ?? (0, "", "")
-            return MacCommandOutcome(output: answer.output, status: answer.status, errorOutput: answer.error)
+            let answer = answers[verb] ?? (0, "", "", true)
+            return MacCommandOutcome(
+                output: answer.output,
+                status: answer.status,
+                errorOutput: answer.error,
+                complete: answer.complete
+            )
         }
     }
 
@@ -649,6 +660,83 @@ struct MacServerStartTests {
         #expect(launchctl.verbs.isEmpty)
         let untouched = try Data(contentsOf: elsewhere)
         #expect(untouched == Self.stoppedBytes)
+        #expect(!FileManager.default.fileExists(atPath: fixture.session.path))
+    }
+
+    // MARK: - The Session File Is The Owner's State
+
+    @Test("A session file that cannot be read safely refuses the start before launchctl")
+    func testAnUnreadableSessionFileRefusesTheStart() async throws {
+        let fixture = try makeFixture()
+        defer { remove(fixture) }
+        try Self.stoppedBytes.write(to: fixture.marker)
+        //  A folder where the file belongs is not a session this app can read,
+        //  so it cannot put back what it would have to change.
+        try FileManager.default.createDirectory(at: fixture.session, withIntermediateDirectories: false)
+        let launchctl = ScriptedLaunchctl()
+        let (controller, _) = makeController(fixture, launchctl: launchctl)
+
+        do {
+            _ = try await controller.startServer()
+            Issue.record("The start should have been refused.")
+        } catch let error as MacServerStartError {
+            #expect(error == .sessionFileUnreadable)
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+        #expect(launchctl.verbs.isEmpty)
+        //  Nothing was cleared, because nothing was started.
+        let markerNow = try Data(contentsOf: fixture.marker)
+        #expect(markerNow == Self.stoppedBytes)
+    }
+
+    @Test("A linked session file is refused and its target is never written")
+    func testALinkedSessionFileIsRefused() async throws {
+        let fixture = try makeFixture()
+        defer { remove(fixture) }
+        let elsewhere = fixture.root.appendingPathComponent("elsewhere-session.txt", isDirectory: false)
+        let prior = Data("prior session bytes\n".utf8)
+        try prior.write(to: elsewhere)
+        try FileManager.default.createSymbolicLink(at: fixture.session, withDestinationURL: elsewhere)
+        let launchctl = ScriptedLaunchctl()
+        let (controller, _) = makeController(fixture, launchctl: launchctl)
+
+        do {
+            _ = try await controller.startServer()
+            Issue.record("The start should have been refused.")
+        } catch let error as MacServerStartError {
+            #expect(error == .sessionFileUnreadable)
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+        #expect(launchctl.verbs.isEmpty)
+        let targetNow = try Data(contentsOf: elsewhere)
+        #expect(targetNow == prior)
+    }
+
+    @Test("A print reply cut off at the bound is not a not-loaded answer")
+    func testATruncatedPrintIsNotAnAnswer() async throws {
+        let fixture = try makeFixture()
+        defer { remove(fixture) }
+        let launchctl = ScriptedLaunchctl().answering(
+            "print",
+            status: 113,
+            error: "Could not find service",
+            complete: false
+        )
+        let (controller, _) = makeController(fixture, launchctl: launchctl)
+
+        do {
+            _ = try await controller.startServer()
+            Issue.record("The start should have been refused.")
+        } catch let error as MacServerStartError {
+            #expect(error == .launchdNotAsked(operation: "print"))
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+        //  A cut-off reply keeps its prefix from being read as an empty slot.
+        #expect(launchctl.verbs == ["enable", "print"])
+        //  The session this start recorded is rolled back with the marker.
         #expect(!FileManager.default.fileExists(atPath: fixture.session.path))
     }
 

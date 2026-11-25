@@ -1300,15 +1300,16 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         do {
             let outcome = try await serverLaunchController.startServerAndSettle()
             serverStartMessage = outcome.message
-            //  A start that did not take leaves the presence where it was, so
-            //  the outcome is tied to the read that follows rather than to the
-            //  one this start began under.
-            serverStartMessagePresence = controlPresence
-            installedServerState = await serverLaunchController.installedServerState()
             //  The status read follows the start itself:  a process behind the
             //  label proves launchd took the request, and only the harness
-            //  answering proves it is up.
+            //  answering proves it is up.  That read also asks launchd for the
+            //  installed state, so one start lists the label once.
             await refreshControlStatus()
+            //  The outcome is tied to the presence the reads above settled on:
+            //  a start that moved the port from refused to answering keeps the
+            //  sentence that says so, and a presence that moves later still
+            //  hides it.
+            serverStartMessagePresence = controlPresence
         } catch {
             serverStartMessage = error.localizedDescription
             installedServerState = await serverLaunchController.installedServerState()

@@ -302,6 +302,10 @@ public final class MacServerLaunchController: @unchecked Sendable {
     public static let settleInterval: TimeInterval = 0.25
     /// The largest deliberate-stop marker that is read rather than refused.
     public static let maximumStopMarkerBytes = 64 * 1024
+    /// The largest startup-session file that is read rather than refused.
+    /// It holds one UUID and a newline; anything larger is not one this app
+    /// wrote.
+    public static let maximumSessionFileBytes = 64 * 1024
     /// How much of launchctl's own explanation is shown.  The rest of a long
     /// one is not a sentence anyone can act on.
     public static let maximumExplanationLength = 280
@@ -418,7 +422,7 @@ public final class MacServerLaunchController: @unchecked Sendable {
         //  What it held before this start is kept, so a start launchd refuses
         //  cannot leave the wrapper told a deliberate start happened in this
         //  boot while the stop it was paired with is put back.
-        let priorSession = try? Data(contentsOf: store.sessionFile())
+        let priorSession = try readSessionFile(at: store.sessionFile())
         let boot = try recordedBootSession()
         try store.recordBootSession(boot)
         if markerContents != nil { try files.removeItem(at: marker) }
@@ -450,6 +454,12 @@ public final class MacServerLaunchController: @unchecked Sendable {
         //  second request on a job that may already be loaded, and the error
         //  the owner saw would be launchd's complaint about the second one.
         guard let printed = await commands.run(executable: launchctl, arguments: ["print", service]) else {
+            throw MacServerStartError.launchdNotAsked(operation: "print")
+        }
+        //  A reply cut off at the byte bound is not an answer.  Its prefix
+        //  could carry the not-loaded words while the rest says the job is
+        //  loaded, so it is treated as launchd not having been asked.
+        guard printed.complete else {
             throw MacServerStartError.launchdNotAsked(operation: "print")
         }
         if !printed.succeeded {
@@ -526,17 +536,94 @@ public final class MacServerLaunchController: @unchecked Sendable {
         return boot
     }
 
+    /// The session file's bytes, or nil when there is no session file.
+    ///
+    /// An unreadable file is not an absent one:  a start that cannot read the
+    /// bytes it would have to put back refuses instead of starting, because
+    /// its rollback could not restore what was there.  The read is judged the
+    /// way the marker's is — a plain single-link file, opened without
+    /// following a link, and the same device and inode the listing named.
+    private func readSessionFile(at url: URL) throws -> Data? {
+        var listed = stat()
+        if lstat(url.path, &listed) != 0 {
+            if errno == ENOENT { return nil }
+            throw MacServerStartError.sessionFileUnreadable
+        }
+        let largest = Int64(MacServerLaunchController.maximumSessionFileBytes)
+        guard listed.st_mode & S_IFMT == S_IFREG,
+              listed.st_nlink == 1,
+              listed.st_size >= 0,
+              listed.st_size <= largest else {
+            throw MacServerStartError.sessionFileUnreadable
+        }
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        guard descriptor >= 0 else { throw MacServerStartError.sessionFileUnreadable }
+        defer { close(descriptor) }
+        var opened = stat()
+        guard fstat(descriptor, &opened) == 0,
+              opened.st_mode & S_IFMT == S_IFREG,
+              opened.st_nlink == 1,
+              opened.st_dev == listed.st_dev,
+              opened.st_ino == listed.st_ino else {
+            throw MacServerStartError.sessionFileUnreadable
+        }
+        var data = Data(count: Int(opened.st_size))
+        let total = data.count
+        var offset = 0
+        while offset < total {
+            let chunk = data.withUnsafeMutableBytes { buffer -> Int in
+                guard let base = buffer.baseAddress else { return 0 }
+                return Darwin.read(descriptor, base.advanced(by: offset), total - offset)
+            }
+            if chunk < 0 { throw MacServerStartError.sessionFileUnreadable }
+            if chunk == 0 { break }
+            offset += chunk
+        }
+        return Data(data.prefix(offset))
+    }
+
     /// Puts the session file back to what a start found.
     ///
     /// A session file that was there is written back with its bytes; one that
     /// was not is removed, because a start that did not happen must not leave
     /// the record of one behind.
+    ///
+    /// This is the owner's state, and a rollback of this app's own write, so
+    /// the path is judged the same way the marker is:  a plain single-link
+    /// file, opened without following a link, and the same device and inode
+    /// the listing named.
     private func restoreSessionFile(_ prior: Data?) {
         let url = store.sessionFile()
-        if let prior = prior {
-            try? prior.write(to: url, options: .atomic)
-        } else {
-            try? files.removeItem(at: url)
+        var listed = stat()
+        let listedResult = lstat(url.path, &listed)
+        if listedResult == 0 {
+            guard listed.st_mode & S_IFMT == S_IFREG, listed.st_nlink == 1 else { return }
+        } else if errno != ENOENT {
+            return
+        }
+        guard let prior else {
+            if listedResult == 0 { unlink(url.path) }
+            return
+        }
+        let descriptor = open(url.path, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { return }
+        defer { close(descriptor) }
+        var opened = stat()
+        guard fstat(descriptor, &opened) == 0,
+              opened.st_mode & S_IFMT == S_IFREG,
+              opened.st_nlink == 1,
+              listedResult != 0 || (opened.st_dev == listed.st_dev && opened.st_ino == listed.st_ino) else {
+            return
+        }
+        guard ftruncate(descriptor, 0) == 0 else { return }
+        prior.withUnsafeBytes { buffer in
+            guard let base = buffer.baseAddress else { return }
+            var offset = 0
+            while offset < buffer.count {
+                let written = Darwin.write(descriptor, base.advanced(by: offset), buffer.count - offset)
+                if written <= 0 { break }
+                offset += written
+            }
         }
     }
 
@@ -602,6 +689,9 @@ public enum MacServerStartError: LocalizedError, Equatable, Sendable {
     case launchdRefused(operation: String, detail: String)
     /// launchctl could not be run or did not finish, so launchd was not asked.
     case launchdNotAsked(operation: String)
+    /// The session file is present but could not be read safely, so a start
+    /// could not be undone and was refused.
+    case sessionFileUnreadable
 
     /// launchctl's explanation, made one line and kept short enough to read.
     static func explanation(from detail: String) -> String {
@@ -633,6 +723,8 @@ public enum MacServerStartError: LocalizedError, Equatable, Sendable {
             return "macOS could not \(operation) the BotFleet Server LaunchAgent.\(gap)\(reason)"
         case .launchdNotAsked(let operation):
             return "macOS could not be asked to \(operation) the BotFleet Server LaunchAgent.\(gap)Try again."
+        case .sessionFileUnreadable:
+            return "The startup session file could not be read safely, so the server was not started.\(gap)Check the BotFleet data folder and try again."
         }
     }
 }
