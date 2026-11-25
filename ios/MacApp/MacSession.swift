@@ -88,6 +88,13 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     }
     @Published public var selectedThreadId: String?
     @Published public var isSending: Bool = false
+    /// True while the sidebar's add-a-bot action is waiting on the harness.
+    /// The button stays disabled for exactly this interval, so a slow create
+    /// cannot be double-submitted.
+    @Published public private(set) var isCreatingBot: Bool = false
+    /// The last fleet-action failure in the owner's words, shown in the
+    /// sidebar.  Nil after any successful fleet action.
+    @Published public var fleetActionErrorMessage: String?
     @Published public private(set) var host: String = "127.0.0.1"
     @Published public private(set) var port: Int = 8799
     public let servers: ServersCoordinator
@@ -1012,6 +1019,46 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
             print("Failed to send turn: \(error)")
             status = .failed("Send failed: \(error.localizedDescription)")
             return false
+        }
+    }
+
+    /// The active bot's main thread: the conversation the sidebar's Main
+    /// Thread row selects.  Nil when no bot is selected.
+    public var activeMainThreadId: String? {
+        activeBot?.threadId
+    }
+
+    /// Selects the active bot's main thread in the conversation list.
+    public func selectMainThread() {
+        selectedThreadId = activeMainThreadId
+    }
+
+    /// Creates a bot through the harness and selects it.  The harness picks
+    /// the name, colour and greeting, exactly as it does for the phone, so
+    /// a bot created here is indistinguishable from one created anywhere
+    /// else.  A failure is reported in `fleetActionErrorMessage` instead of
+    /// failing silently behind a button that looks live.
+    public func createBot() async {
+        guard let client = client else {
+            fleetActionErrorMessage = "Not connected, so a bot cannot be added yet."
+            return
+        }
+        guard !isCreatingBot else { return }
+        isCreatingBot = true
+        defer { isCreatingBot = false }
+        do {
+            let bot = try await client.createBot()
+            // The roster snapshot is the source of truth: refetch it so the
+            // new bot arrives with the same fields every other client sees,
+            // then select it and open its main thread.
+            if let fleet = try? await client.fleet() {
+                state.hydrate(fleet)
+            }
+            selection = .bot(bot.id)
+            selectedThreadId = bot.threadId
+            fleetActionErrorMessage = nil
+        } catch {
+            fleetActionErrorMessage = "Adding a bot failed: \(error.localizedDescription)"
         }
     }
 
