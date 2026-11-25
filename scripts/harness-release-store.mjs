@@ -363,8 +363,28 @@ function runtimeFormat(head) {
  */
 async function digestFile(path) {
   const noFollow = Number.isInteger(constants.O_NOFOLLOW) ? constants.O_NOFOLLOW : 0;
+  // The handle has to be the file that was LISTED.  O_NOFOLLOW refuses a
+  // link in the last component, but a link in a parent directory or a hard
+  // link can still answer with other bytes, so the opened handle is checked
+  // against the listing before a single byte is read.
+  const listed = await lstat(path);
+  if (listed.isSymbolicLink() || !listed.isFile() || listed.nlink !== 1) {
+    throw new ResolutionError(
+      `The file at ${path} is not a singly linked regular file`,
+      "runtime-not-stored",
+      { path },
+    );
+  }
   const handle = await open(path, constants.O_RDONLY | noFollow);
   try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== listed.dev || opened.ino !== listed.ino) {
+      throw new ResolutionError(
+        `The file at ${path} is not the file that was listed`,
+        "runtime-not-stored",
+        { path },
+      );
+    }
     const hash = createHash("sha256");
     const chunk = Buffer.allocUnsafe(1024 * 1024);
     for (;;) {
@@ -501,7 +521,16 @@ export async function retainRuntime({ source, env = process.env } = {}) {
     if (!existing || !existing.isFile() || existing.isSymbolicLink()) {
       throw new ResolutionError(`The retained runtime at ${path} is not a regular file`, "runtime-not-stored", { path });
     }
-    const keptDigest = await digestFile(path);
+    let keptDigest = null;
+    try {
+      keptDigest = await digestFile(path);
+    } catch (error) {
+      throw new ResolutionError(
+        `The retained runtime at ${path} could not be read for checking: ${error?.message || error}`,
+        "runtime-not-stored",
+        { path },
+      );
+    }
     if (keptDigest !== digest) {
       throw new ResolutionError(
         `The file at ${path} holds bytes that are not the digest it is named by (${digest})`,

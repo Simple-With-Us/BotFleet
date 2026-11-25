@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -65,6 +65,7 @@ async function fixture(t) {
   await chmod(source, 0o755);
   return { root, env, source };
 }
+
 
 /** The cause code of a refusal, so a case names the rule it is proving. */
 async function causeOf(action) {
@@ -193,6 +194,19 @@ test("an empty source is refused: the store keeps the bytes of a program", async
   await chmod(empty, 0o755);
   assert.equal(await causeOf(() => retainRuntime({ source: empty, env })), "runtime-not-binary");
   assert.deepEqual(await listRetainedRuntimes(env), []);
+});
+
+test("a file already at the kept path that has another name is refused", async (t) => {
+  const { root, env, source } = await fixture(t);
+  const first = await retainRuntime({ source, env });
+  // The file at the kept path has another name for the same bytes, so the
+  // handle the check opens is not a file with one name.
+  await rm(first.path, { force: true });
+  await writeFile(first.path, ELF_STUB);
+  await chmod(first.path, 0o555);
+  await link(first.path, join(root, "second-name-for-the-kept-runtime"));
+  const planted = await causeOf(() => retainRuntime({ source, env }));
+  assert.equal(planted, "runtime-not-stored");
 });
 
 test("a file already at the kept path whose bytes are not its digest is refused", async (t) => {
