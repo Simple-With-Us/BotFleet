@@ -227,18 +227,21 @@ the pm2 rows, the process and port monitor, and the remote VM providers.
 Linux stays optional.
 
 **Why Electron cannot be retired first.**  The `control-disposition` receipt
-needs three checks, and none of them can be produced while the control app
-is built and installed by the Electron bundle path:
+needs three checks, and `scripts/emit-control-disposition-receipt.mjs`
+writes the receipt only when all three hold:
 
 - `owner-decision` — the recorded Oct 29 split, which exists.
-- `landed-implementation` — the native app carrying those controls, which is
-  BF-2688's work and has not landed.
+- `landed-implementation` — the native app carrying those controls.
+  `scripts/check-control-disposition.mjs` measures this against the
+  candidate's commit.  On main at `43e8333168` six of the eight controls are
+  there; the start control (BF-2700) and the one-time import of the saved
+  servers (BF-2702) are not.
 - `muster-disposition` — the recorded disposition of the fleet-admin half,
-  which is a human attestation.
+  which is the acceptance owner's attestation, and is not recorded yet.
 
-The BF-2515 gate audit calls the decision unruled.  That wording is stale:
-the decision is recorded, and the open items are the implementation and the
-Muster disposition, not another ruling.
+The BF-2515 gate audit called the decision unruled when it was written.  That
+wording was stale: the decision is recorded, and the open items are the rest
+of the implementation and the Muster disposition, not another ruling.
 
 ## SHARED-SEQUENCE
 

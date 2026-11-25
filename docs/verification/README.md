@@ -34,6 +34,7 @@ Verification uses these isolated fixtures:
 - [Bot On/Off switch](bot-off.md) — an Off bot starts nothing new and finishes a running turn
 - [Named tunnel loopback Host](named-tunnel-loopback-host.md) — proves the Access tunnel reaches the harness with loopback Host and documents the mutation gate (BF-2129)
 - [Optional secret store fixture](optional-secret-store-fixture.md) — the fake-credential fixture and readback for the optional secret store: primary selection, independent read and write references, and mode isolation (BF-2622)
+- [Control disposition](control-disposition.md) — the receipt that lets Electron retire: the ruling and the landed controls measured against a commit, and the owner's Muster attestation
 
 ### Test Fixtures
 
@@ -50,6 +51,7 @@ Many recipes are codified as unit tests or integration tests:
 - **Staged candidate smoke:** `smokeStagedServer` boots a real signed bundle; see [staged-candidate-smoke.md](staged-candidate-smoke.md) for the recipe that runs it against the installed app.
 - **Connector grants:** `server/mcp-server.test.ts` and integration fixtures verify tool authorization per bot.
 - **Saved data faults:** `server/store-quarantine.test.ts`, `server/routines-quarantine.test.ts`, `server/config-salvage.test.ts` and `server/data-faults-boot.test.ts` cover each store and the real server; `tests/e2e/data-fault-banner.spec.ts` covers the bar.
+- **Control disposition:** `scripts/emit-control-disposition-receipt.node-test.mjs` proves the check against temporary repositories and the emitter's refusals; see [control-disposition.md](control-disposition.md) for the recipe.
 
 ## Evidence
 

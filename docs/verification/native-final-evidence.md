@@ -41,7 +41,7 @@ POSIX ownership is required; hosts unable to prove it refuse the final check.
 | `signed-release` | Signing, notarization, stapling, one installed native copy, exact Open on Mac target, companion operation without Electron, and an installed previous build updating through the native feed; bundle identifier, Team ID, designated requirement and distinct previous build are recorded. |
 | `linux-retention` | Pinned maintained and rollback source refs, a hashed closure manifest, clean-export build, install/start, update and rollback results. |
 | `process-inventory` | Mac harness absence, process/launchd/listener observations and updated process inventory. |
-| `control-disposition` | Owner disposition, landed implementation and Muster disposition. |
+| `control-disposition` | Owner disposition, landed implementation and Muster disposition; the first two are measured against the candidate's commit and the third is the acceptance owner's attestation. |
 | `change-plan` | Exact jobs, files and app copies to change, deletion diff, before/after plan, routine/webhook disposition and precise rollback. |
 | `server-writer-soak` | At least 24 hours of contiguous logged observation intervals with the Mac harness loaded but unused and the server selected as writer. |
 | `no-mac-node-soak` | A separate later interval of at least 24 hours with the Mac Node harness absent. |
@@ -152,6 +152,21 @@ The `listeners` check inherits the reboot check's rule as it stands.  That rule
 The producer cannot establish that the verdict was taken on the Mac the packet names, that it was taken after the retirement, or that the captured rows are every row the inventory holds.  A verdict a person typed has the same shape as one the check printed, and the inventory lives outside this repository, so the producer judges the rows it is given and nothing else.  Like the rest of this bundle, it checks consistency and does not authenticate.
 
 Its fixtures are synthetic and temporary, and they inject launchd's answers: the launchd domain probe has not been run on a Mac.  No production receipt was created by implementing it.
+
+## The Control Disposition Receipt Producer
+
+The `control-disposition` receipt has a producer too.   It is two scripts, because its three checks are not alike: two are facts about the tree and one is a person's attestation.   `scripts/check-control-disposition.mjs` is the measurement for the first two, and `scripts/emit-control-disposition-receipt.mjs` is the receipt. [Control disposition](control-disposition.md) says what each one holds a verdict and an attestation to.
+
+```sh
+node scripts/check-control-disposition.mjs --source <checkout> --commit <candidate sourceSha> \
+  --out control-disposition.verdict.json
+node scripts/emit-control-disposition-receipt.mjs --capture <private capture directory> \
+  --request <bundle request> --verdict control-disposition.verdict.json \
+  --attestation <muster attestation> --provenance-record <file in the capture> \
+  --provenance-source <https url> --provenance-by <who> --provenance-at <ISO 8601 instant>
+```
+
+Measured on main at `43e8333168`, Nov 24: the ruling is recorded, and six of the eight controls the ruling moved into the native app are there.   The start control and the one-time import of the saved servers are not, so the receipt cannot be produced yet, and the producer says so instead of writing one.
 
 ## Prepare A Private Packet
 
