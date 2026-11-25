@@ -135,7 +135,7 @@ private func makeTempDir() -> URL {
 
 /// This Mac, plus one remote host native already holds.
 private func existingNative() -> [HostRecord] {
-    [.thisMac, HostRecord(id: "existing-native", name: "Already Native",
+    [.thisMac, HostRecord(id: "6C2A4E5B-8D1F-4A3B-9C7E-2F5A8B0D1E44", name: "Already Native",
                           origin: try! HostOrigin("https://native.example.invalid"))]
 }
 
