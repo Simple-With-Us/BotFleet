@@ -6,10 +6,9 @@
 //
 //   - `hidden` is an archive.  It removes the bot from the roster, and a room
 //     calls it "archived".  Off keeps the bot, and its chat, fully visible.
-//   - the routine manager's `botSnoozes` entry is a "stop".  A stop halts
-//     automation but a person's own message wakes the bot and clears it
-//     (server/bot-stop-policy.ts).  Off must survive a message: only an
-//     explicit Turn On clears it.
+//   - Stop (server/bot-stop-policy.ts) cancels only the turn in flight and
+//     latches nothing: the next schedule, webhook or message runs as usual.
+//     Off must survive all of those: only an explicit Turn On clears it.
 //
 // The flag lives on the bot record (`off?: boolean`, absent means on), so it
 // persists with the roster across harness restarts and updates, and every

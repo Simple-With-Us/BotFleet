@@ -14,7 +14,7 @@ import {
 } from "../shared/bot-power.ts";
 import { routineFailurePhase, ROUTINE_ATTENTION_STATUSES, ROUTINE_OUTCOME_LABELS } from "../shared/routine-outcomes.ts";
 import { parseBotProfilePatch } from "./bot-profile.ts";
-import { botOffError, botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
+import { botOffError, isBotOffError } from "./bot-stop-policy.ts";
 import { _queuedRoomCount, _resetRoomQueue, queueRoomRound } from "./room-queue.ts";
 import {
   dropQueuedForOffBot,
@@ -95,26 +95,29 @@ describe("the Off refusal", () => {
     expect(error.message).toBe(BOT_OFF_REFUSAL);
   });
 
-  it("is a quiet refusal everywhere a stop is: boot recovery, card continuations and update resumes", () => {
-    // Those callers drop a stop as "a decision, not a fault"; an Off bot is
-    // the same decision, so retrying or remembering a failure would be wrong.
-    expect(isBotStoppedError(botOffError())).toBe(true);
-    expect(isBotStoppedError(Object.assign(new Error("stopped"), { code: "bot_stopped" }))).toBe(true);
-    expect(isBotStoppedError(new Error("the provider is out of credit"))).toBe(false);
+  it("is a quiet refusal everywhere a dispatch can fail: boot recovery, card continuations and update resumes", () => {
+    // Those callers drop an Off refusal as "a decision, not a fault";
+    // retrying or remembering a failure would be wrong.  A legacy
+    // bot_stopped error no longer gets that courtesy: Stop latches nothing,
+    // so the code means an ordinary failure now.
+    expect(isBotOffError(botOffError())).toBe(true);
+    expect(isBotOffError(Object.assign(new Error("stopped"), { code: "bot_stopped" }))).toBe(false);
+    expect(isBotOffError(new Error("the provider is out of credit"))).toBe(false);
   });
 
-  it("says which it is in the error's own message: turn it on, or start it again", () => {
+  it("says what it is in the error's own message: turn it on", () => {
     // The card-continuation resumes surface error.message, so the wording has to live there.
     expect(botOffError().message).toBe(BOT_OFF_REFUSAL);
-    expect(botOffError().message).not.toBe(botStopRefusalMessage());
     expect(botOffError().message).toMatch(/turn it on/i);
-    expect(botStopRefusalMessage()).toMatch(/start it again/i);
   });
 
-  it("is not something a person's own message can override, unlike a stop", () => {
-    // decideBotStop lets a person wake a stopped bot.  Off is refused before
-    // that policy runs (startTurn), so the policy must still say what it said.
-    expect(decideBotStop({ stopped: true, personInitiated: true })).toEqual({ action: "allow", clearsStop: true });
+  it("is not something a person's own message can override", () => {
+    // There is no stop state for a person's message to clear.  Off is
+    // refused in startTurn before anything else, person or system, and only
+    // an explicit Turn On lifts it (bot-off-wiring.test.ts pins the order).
+    const error = botOffError();
+    expect(error.status).toBe(409);
+    expect(isBotOffError(error)).toBe(true);
   });
 });
 
