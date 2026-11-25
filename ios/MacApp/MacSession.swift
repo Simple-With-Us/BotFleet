@@ -325,6 +325,9 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
             // admission-held and is named in the log, never substituted.
             Task {
                 let report = await macRuntime.registerStoredBots()
+                if let loadFailure = report.loadFailure {
+                    NSLog("BF-2689: stored bots could not be loaded for native registration: %@", loadFailure)
+                }
                 for skip in report.skipped {
                     NSLog("BF-2689: bot %@ not registered natively: %@", skip.botId, skip.reason)
                 }

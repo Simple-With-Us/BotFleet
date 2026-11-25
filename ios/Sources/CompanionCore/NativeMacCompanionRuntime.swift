@@ -214,7 +214,13 @@ public struct NativeMacCompanionRuntime: Sendable {
     /// and stay admission-held; registration never substitutes a driver.
     public func registerStoredBots() async -> MacBotRegistrationReport {
         var report = MacBotRegistrationReport()
-        let records = (try? await database.loadBots()) ?? []
+        let records: [StoredBotRecord]
+        do {
+            records = try await database.loadBots()
+        } catch {
+            report.loadFailure = String(describing: error)
+            return report
+        }
         for record in records {
             guard let derived = MacBotProfileDerivation.derive(from: record) else {
                 report.skipped.append(MacBotRegistrationSkip(

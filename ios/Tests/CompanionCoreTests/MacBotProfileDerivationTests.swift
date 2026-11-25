@@ -56,6 +56,12 @@ struct MacBotProfileDerivationTests {
         #expect(derived?.profile.threadId == "thread-record")
     }
 
+    @Test("A blank record thread falls back to the JSON thread")
+    func deriveBlankRecordThreadFallsBack() {
+        let derived = MacBotProfileDerivation.derive(from: record(recordThreadId: "  "))
+        #expect(derived?.profile.threadId == "thread-1")
+    }
+
     @Test("Unsupported instances and undecodable records derive nothing")
     func deriveRefusals() {
         #expect(MacBotProfileDerivation.derive(from: record(instanceId: "minimax-api")) == nil)
@@ -68,7 +74,16 @@ struct MacBotProfileDerivationTests {
         )) == nil)
     }
 
-    @Test("CLI-login bots resolve available with an empty environment; secret engines and unknown bots do not")
+    @Test("The explicit environment is only HOME, PATH and TMPDIR from the process environment")
+    func minimalEnvironmentShape() {
+        let environment = DatabaseCliLoginCredentials.minimalEnvironment(from: [
+            "HOME": "/Users/test", "PATH": "/usr/bin", "TMPDIR": "/tmp/x",
+            "INFISICAL_TOKEN": "must-not-pass", "EMPTY": "",
+        ])
+        #expect(environment == ["HOME": "/Users/test", "PATH": "/usr/bin", "TMPDIR": "/tmp/x"])
+    }
+
+    @Test("CLI-login bots resolve available with the minimal environment; secret engines and unknown bots do not")
     func cliLoginBoundary() async throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("botfleet-bf2689-creds-\(UUID().uuidString)", isDirectory: true)
@@ -86,7 +101,8 @@ struct MacBotProfileDerivationTests {
             Issue.record("CLI-login bot must resolve available")
             return
         }
-        #expect(environment.isEmpty)
+        #expect(Set(environment.keys).isSubset(of: ["HOME", "PATH", "TMPDIR"]))
+        #expect(environment["HOME"] == ProcessInfo.processInfo.environment["HOME"])
         let api = try await credentials.credentials(forBotId: "bot-api")
         guard case .unavailable = api else {
             Issue.record("secret-engine bot must resolve unavailable")

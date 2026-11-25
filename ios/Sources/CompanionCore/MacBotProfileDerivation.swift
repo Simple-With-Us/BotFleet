@@ -27,6 +27,10 @@ public struct MacBotRegistrationSkip: Equatable, Sendable {
 public struct MacBotRegistrationReport: Equatable, Sendable {
     public var registered: [String] = []
     public var skipped: [MacBotRegistrationSkip] = []
+    /// Why the bot table itself could not be loaded, when it could not:
+    /// distinct from per-bot skips so a startup storage failure is never
+    /// reported as a clean run that simply registered nothing.
+    public var loadFailure: String?
 
     public init() {}
 }
@@ -66,8 +70,12 @@ public enum MacBotProfileDerivation {
         guard let engine = matrixEngine(forInstanceId: bot.modelSelection.instanceId) else {
             return nil
         }
-        let threadId = (record.threadId ?? bot.threadId)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // A blank record thread counts as absent, like a missing one: the
+        // bot JSON thread is the fallback, not an empty string.
+        let recordThread = record.threadId?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let botThread = bot.threadId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let threadId = recordThread.isEmpty ? botThread : recordThread
         guard !threadId.isEmpty else { return nil }
         let model = bot.modelSelection.model.trimmingCharacters(in: .whitespacesAndNewlines)
         return DerivedMacBot(
@@ -85,9 +93,11 @@ public enum MacBotProfileDerivation {
 /// The interactive app's credential boundary (`BF-2689`): engines whose
 /// matrix row authenticates through their own CLI login need no secret
 /// from this app — the launched CLI reads its own login state, exactly as
-/// it does from a terminal — so they resolve as available with an empty
-/// explicit environment (the Mac supervisor already inherits the app's
-/// environment).  Engines that authenticate with an Infisical secret have
+/// it does from a terminal — so they resolve as available with the minimal
+/// explicit environment (HOME, PATH, TMPDIR) the CLI needs to find that
+/// login.  A CLI that is logged out fails its own turn honestly at spawn;
+/// this boundary does not invent a login probe the thirteen CLIs share no
+/// shape for.  Engines that authenticate with an Infisical secret have
 /// no interactive credential source here and stay unavailable, so their
 /// waits remain admission-held instead of dispatching without credentials.
 public final class DatabaseCliLoginCredentials: NativeServiceCredentialSource, @unchecked Sendable {
@@ -99,35 +109,56 @@ public final class DatabaseCliLoginCredentials: NativeServiceCredentialSource, @
     }
 
     public func credentials(forBotId botId: String) async throws -> NativeServiceCredentialResult {
-        let engine = try await cache.engine(forBotId: botId, load: {
-            guard let record = try await database.loadBots().first(where: { $0.id == botId }) else {
-                return nil
+        let engines = try await cache.engines(load: {
+            var map: [String: EngineMatrixID] = [:]
+            for record in try await database.loadBots() {
+                if let derived = MacBotProfileDerivation.derive(from: record) {
+                    map[record.id] = derived.engine
+                }
             }
-            return MacBotProfileDerivation.derive(from: record)?.engine
+            return map
         })
-        guard let engine else { return .unavailable }
+        guard let engine = engines[botId] else { return .unavailable }
         if case .cliManagedLogin = EngineMatrixRegistry.descriptor(for: engine).authRequirement {
-            return .available(environment: [:])
+            return .available(environment: Self.minimalEnvironment())
         }
         return .unavailable
     }
+
+    /// The only variables a CLI-login child is explicitly given: its login
+    /// state lives under HOME, its binary resolves through PATH, and its
+    /// scratch space is TMPDIR.  Anything else in the app process
+    /// environment reaches the child only through the supervisor overlay
+    /// the runners already strip credential keys from; naming the set here
+    /// keeps this boundary from silently widening.
+    static func minimalEnvironment(
+        from processEnvironment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String: String] {
+        var environment: [String: String] = [:]
+        for key in ["HOME", "PATH", "TMPDIR"] {
+            if let value = processEnvironment[key], !value.isEmpty {
+                environment[key] = value
+            }
+        }
+        return environment
+    }
 }
 
-/// Registered-engine lookup with the same lazy TTL shape as the workspace
-/// source's bot-id cache: the bot table has no change signal, so a fresh
-/// hit never touches the database and a miss reloads it once.
+/// Registered-engine map with the same lazy TTL shape as the workspace
+/// source's bot-id cache: the bot table has no change signal, so one load
+/// serves every bot until the entry expires, and a miss after expiry
+/// reloads the table once rather than scanning per bot.
 private actor CliLoginCredentialCache {
-    private var cachedEngine: [String: EngineMatrixID?] = [:]
+    private var cachedEngines: [String: EngineMatrixID]?
     private var loadedAt: Date?
     private let ttl: TimeInterval = 30
 
-    func engine(forBotId botId: String, load: @Sendable () async throws -> EngineMatrixID?) async throws -> EngineMatrixID? {
-        if let loadedAt, Date().timeIntervalSince(loadedAt) < ttl,
-           let cached = cachedEngine[botId] {
-            return cached
+    func engines(load: @Sendable () async throws -> [String: EngineMatrixID]) async throws -> [String: EngineMatrixID] {
+        if let cachedEngines, let loadedAt, Date().timeIntervalSince(loadedAt) < ttl {
+            return cachedEngines
         }
         let loaded = try await load()
-        cachedEngine[botId] = loaded
+        cachedEngines = loaded
         loadedAt = Date()
         return loaded
     }
