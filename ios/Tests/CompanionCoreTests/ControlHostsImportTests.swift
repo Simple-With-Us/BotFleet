@@ -22,6 +22,9 @@ private final class FakeEffects: ControlHostsImportEffects, @unchecked Sendable 
     /// When set, the enrollment at this one-based position fails, so a run
     /// can be broken after its earlier writes are already in flight.
     private var failOnEnrollmentNumber: Int?
+    /// Makes Control's rewrite fail, so the transaction's last step can be
+    /// broken after its earlier writes.
+    var failControlWrite = false
 
     init(native: [HostRecord] = [], controlFile: [ControlHostEntry] = [], failOnEnrollmentNumber: Int? = nil) {
         self.native = native
@@ -69,7 +72,9 @@ private final class FakeEffects: ControlHostsImportEffects, @unchecked Sendable 
     }
 
     func writeControlFile(_ entries: [ControlHostEntry]) throws {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
+        defer { lock.unlock() }
+        if failControlWrite { throw ControlHostsImportError.unreadableFile }
         controlFile = entries
         writes += 1
     }
@@ -242,18 +247,19 @@ struct ControlHostsImportTests {
             #expect(throws: Never.self) { try record.validate() }
         }
 
-        //  Control's file keeps every entry:  only the tokens that moved are
-        //  gone, and the anchor, the seed and the tokenless host are as they
-        //  were.
+        //  Control's file keeps every real entry:  only the tokens that moved
+        //  are gone, the anchor and the tokenless host are as they were, and
+        //  the synthetic seed is dropped, which is what the import step of the
+        //  ruling does.
         let after = effects.currentControlFile
         #expect(effects.writeCount == 1)
-        #expect(after.count == fixture.count)
-        #expect(after[0] == fixture[0])
-        #expect(after[1] == fixture[1])
-        #expect(after[2].authToken == nil)
-        #expect(after[3].authToken == nil)
-        #expect(after[4] == fixture[4])
-        #expect(after[5].authToken == nil)
+        #expect(after.count == fixture.count - 1, "the seed is dropped")
+        #expect(!after.contains(where: ControlHostsImport.isSyntheticSeed))
+        #expect(after[0] == fixture[0])                  //  the local anchor
+        #expect(after[1].id == "h1" && after[1].authToken == nil)
+        #expect(after[2].id == "h2" && after[2].authToken == nil)
+        #expect(after[3] == fixture[4])                  //  the tokenless host
+        #expect(after[4].id == "h4" && after[4].authToken == nil)
     }
 
     @Test("Existing saved hosts are preserved and never rewritten")
@@ -391,6 +397,83 @@ struct ControlHostsImportTests {
         #expect(effects.currentNative.count == 2)
         //  Its token was moved, so Control's copy is stripped.
         #expect(effects.currentControlFile[0].authToken == nil)
+    }
+
+    @Test("Two Control entries naming one origin become one record, not two")
+    func testDuplicateOriginsInOneFileBecomeOneRecord() async throws {
+        let duplicate = entry(id: "d1", name: "First Name", url: "https://dup.example.invalid", token: "tok-a")
+        let sameOrigin = entry(id: "d2", name: "Second Name", url: "https://dup.example.invalid", token: "tok-b")
+        let effects = FakeEffects(native: [.thisMac], controlFile: [duplicate, sameOrigin])
+
+        let summary = try await ControlHostsImport.run(entries: [duplicate, sameOrigin], effects: effects)
+
+        #expect(summary.toImport == 1, "only the first becomes a record")
+        #expect(effects.writtenIDs.count == 1)
+        let origins = originStrings(effects.currentNative)
+        #expect(Set(origins).count == origins.count, "one origin is one record")
+        //  The second entry's token is a second copy for one origin, so it is
+        //  reported and kept rather than dropped.
+        #expect(summary.credentialAlreadyNative == 1)
+        #expect(effects.currentControlFile.first { $0.id == "d2" }?.authToken == "tok-b")
+    }
+
+    @Test("The synthetic seed is dropped from Control's file")
+    func testTheSyntheticSeedIsDropped() async throws {
+        let seed = entry(id: "hetzner", name: "Hetzner Server", url: "https://hetzner.botfleet.app")
+        let effects = FakeEffects(native: [.thisMac], controlFile: [seed, entry(id: "a", name: "A", url: "https://a.example.invalid")])
+
+        _ = try await ControlHostsImport.run(entries: effects.currentControlFile, effects: effects)
+
+        #expect(!effects.currentControlFile.contains(where: ControlHostsImport.isSyntheticSeed))
+        #expect(effects.writeCount == 1, "dropping the seed alone is a rewrite")
+        //  A seed the owner gave a token is a real host and is imported.
+        let tokenSeed = entry(id: "hetzner", name: "Hetzner Server", url: "https://hetzner.botfleet.app", token: "t")
+        #expect(!ControlHostsImport.isSyntheticSeed(tokenSeed))
+    }
+
+    @Test("A Control file that cannot be rewritten undoes the records and credentials")
+    func testARewriteFailureRollsBack() async throws {
+        let fixture = fixtureEntries()
+        let effects = FakeEffects(native: existingNative(), controlFile: fixture)
+        effects.failControlWrite = true
+
+        do {
+            _ = try await ControlHostsImport.run(entries: fixture, effects: effects)
+            Issue.record("the run should have failed")
+        } catch {
+            //  Expected:  the Control file could not be rewritten.
+        }
+
+        //  Nothing is left half-migrated:  the store is what it was, no
+        //  credential survives, and Control's file still holds every token, so
+        //  a retry starts from the same place and strips them this time.
+        #expect(effects.currentNative == existingNative())
+        #expect(effects.credentialIDs.isEmpty)
+        #expect(effects.currentControlFile == fixture)
+
+        effects.failControlWrite = false
+        let retried = try await ControlHostsImport.run(entries: fixture, effects: effects)
+        #expect(retried.toImport == 2)
+        #expect(effects.currentControlFile.first { $0.id == "h1" }?.authToken == nil, "the retry strips the token")
+    }
+
+    @Test("A run that moved nothing reports empty, even when native already held a credential")
+    func testAlreadyNativeCredentialDoesNotCountAsMoved() async throws {
+        let host = HostRecord(id: "kept-native", name: "Kept",
+                              origin: try HostOrigin("https://kept.example.invalid"))
+        let effects = FakeEffects(
+            native: [.thisMac, host],
+            controlFile: [entry(id: "k1", name: "Kept", url: "https://kept.example.invalid", token: "x")]
+        )
+        try await effects.enroll("stored-earlier", for: host)
+
+        let summary = try await ControlHostsImport.run(entries: effects.currentControlFile, effects: effects)
+
+        #expect(summary.toImport == 0)
+        #expect(summary.credentialsForExisting == 0, "nothing moved")
+        #expect(summary.credentialAlreadyNative == 1)
+        #expect(summary.isEmpty, "a run that moved nothing is empty")
+        #expect(effects.writeCount == 0)
     }
 
     @Test("A credential native already holds is left in Control, not dropped")

@@ -150,27 +150,39 @@ public enum ControlHostsImport {
 
     /// The decision for every entry, computed from the file's contents and the
     /// native store's, and from nothing else.
+    /// Control's synthetic default, the one the ruling deletes.
+    ///
+    /// The plan document's import step drops it:  a product default must not
+    /// name the owner's server.  It is recognised by every field it was seeded
+    /// with, and a seed the owner has since given a token is a real host and
+    /// is imported like any other.
+    public static func isSyntheticSeed(_ entry: ControlHostEntry) -> Bool {
+        entry.id == "hetzner" && entry.name == "Hetzner Server"
+            && entry.baseURL.absoluteString == "https://hetzner.botfleet.app"
+            && entry.authToken == nil
+    }
+
     public static func plan(entries: [ControlHostEntry], existing: [HostRecord]) -> [ControlHostImportOutcome] {
-        // HostOrigin is Equatable but not Hashable, so the origins native
-        // holds are an array the decision walks; the list is a handful of
-        // hosts, never a hot path.
-        let existingOrigins = existing.map(\.origin)
+        // HostOrigin is Equatable but not Hashable, so the origins are an
+        // array the decision walks; the list is a handful of hosts.
+        //
+        // The list starts with what native holds and grows with each origin
+        // this plan already decided to import, so two entries in Control's own
+        // file that name one origin cannot both become new records.
+        var planned = existing.map(\.origin)
         return entries.map { entry in
             if entry.isLocal { return .leftInPlace(.localAnchor) }
-            if entry.id == "hetzner" && entry.name == "Hetzner Server"
-                && entry.baseURL.absoluteString == "https://hetzner.botfleet.app"
-                && entry.authToken == nil {
-                return .leftInPlace(.syntheticSeed)
-            }
+            if isSyntheticSeed(entry) { return .leftInPlace(.syntheticSeed) }
             guard !entry.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return .refused(.unnamed)
             }
             guard let origin = try? HostOrigin(entry.baseURL.absoluteString) else {
                 return .refused(.invalidOrigin)
             }
-            if existingOrigins.contains(origin) {
+            if planned.contains(origin) {
                 return .credentialForExisting(origin: origin, name: entry.name, hasToken: entry.authToken != nil)
             }
+            planned.append(origin)
             return .toImport(origin: origin, name: entry.name, hasToken: entry.authToken != nil)
         }
     }
@@ -191,19 +203,22 @@ public enum ControlHostsImport {
         effects: any ControlHostsImportEffects,
         makeRecordID: @escaping () -> String = { UUID().uuidString }
     ) async throws -> ControlHostsImportSummary {
-        let outcomes = plan(entries: entries, existing: try await effects.readNativeHosts())
+        // One snapshot of the native store, kept current as this run appends,
+        // so an import of any size costs one read rather than one per entry.
+        var known = try await effects.readNativeHosts()
+        let outcomes = plan(entries: entries, existing: known)
 
-        // Which entries lose their token, decided as the run goes rather than
-        // from the plan:  a token is only ever removed from Control when this
-        // run moved it somewhere that keeps it.  An entry whose credential
-        // native already holds is left as it is, because the two copies are
-        // not provably the same token and this run never reads one to compare.
+        // Which entries lose their token, decided as the run goes:  a token
+        // leaves Control only when this run moved it somewhere that keeps it.
         var stripToken = Array(repeating: false, count: entries.count)
         var credentialAlreadyNative = 0
 
-        // The written state, kept so a failure can be undone in reverse.
+        // What this run wrote, kept so a failure — including a failure to
+        // rewrite Control's file — can be undone in reverse.
         var createdRecords: [String] = []
-        var enrolledRecords: [String] = []
+        var enrolledNewRecords: [String] = []
+        var enrolledExistingRecords: [String] = []
+
         do {
             for (index, (entry, outcome)) in zip(entries, outcomes).enumerated() {
                 switch outcome {
@@ -213,22 +228,18 @@ public enum ControlHostsImport {
                     try record.validate()
                     if let token = entry.authToken, hasToken {
                         try await effects.enroll(token, for: record)
-                        enrolledRecords.append(id)
+                        enrolledNewRecords.append(id)
                         stripToken[index] = true
-                    } else if entry.authToken == nil {
-                        stripToken[index] = false
-                    } else {
-                        stripToken[index] = hasToken
                     }
                     try await effects.upsert(record)
                     createdRecords.append(id)
+                    known.append(record)
                 case .credentialForExisting(let origin, _, let hasToken):
                     guard let token = entry.authToken, hasToken else { continue }
-                    let existing = try await effects.readNativeHosts()
                     // Matched on the origin and never on the name:  two hosts
                     // can share a name, and the origin is what native's own
                     // records are keyed by.
-                    guard let record = existing.first(where: { $0.origin == origin && !$0.isLocal }) else { continue }
+                    guard let record = known.first(where: { $0.origin == origin && !$0.isLocal }) else { continue }
                     if try await effects.nativeHasCredential(for: record) {
                         // Native already holds a credential for this origin.
                         // Control's copy is a second one, and nothing proves
@@ -239,37 +250,79 @@ public enum ControlHostsImport {
                         continue
                     }
                     try await effects.enroll(token, for: record)
-                    enrolledRecords.append(record.id)
+                    enrolledExistingRecords.append(record.id)
                     stripToken[index] = true
                 case .leftInPlace, .refused:
                     continue
                 }
             }
+
+            // Control's file is part of the same transaction.  Rewriting it
+            // before the records and credentials are known to be written would
+            // drop tokens nothing had kept; rewriting it after them and treating
+            // its failure as harmless would leave the tokens in both stores for
+            // good, because a retry correctly sees native already holding them.
+            // So it is the last step, and a failure there undoes the rest.
+            let dropsSeed = entries.contains(where: ControlHostsImport.isSyntheticSeed)
+            if stripToken.contains(true) || dropsSeed {
+                let rewritten = zip(entries, stripToken).compactMap { entry, strip -> ControlHostEntry? in
+                    if ControlHostsImport.isSyntheticSeed(entry) { return nil }
+                    return strip ? entry.withoutToken : entry
+                }
+                try effects.writeControlFile(rewritten)
+            }
         } catch {
-            // Undo in reverse:  a record first, then the credential that was
-            // filed for it, so no record is left behind without its token and
-            // no token is left behind for a record that no longer exists.
-            for id in createdRecords.reversed() {
-                try? effects.removeRecord(id: id)
-            }
-            for id in enrolledRecords.reversed() {
-                effects.removeCredential(recordID: id)
-            }
+            rollBack(createdRecords: createdRecords,
+                     enrolledNewRecords: enrolledNewRecords,
+                     enrolledExistingRecords: enrolledExistingRecords,
+                     effects: effects)
             throw error
         }
 
-        // Only now does Control's file move:  the entries whose token this
-        // run put somewhere that keeps it lose it, and everything else —  the
-        // anchor, the seed, the refused, and any credential native already
-        // held —  stays byte for byte as it was.
-        if stripToken.contains(true) {
-            try effects.writeControlFile(zip(entries, stripToken).map { entry, strip in
-                strip ? entry.withoutToken : entry
-            })
+        // Only the credentials this run actually moved are counted as moved,
+        // so a run that moved nothing reports nothing and `isEmpty` is true
+        // for a repeat.
+        var movedCredentials = 0
+        for (outcome, strip) in zip(outcomes, stripToken) {
+            if case .credentialForExisting = outcome, strip { movedCredentials += 1 }
         }
-        var summary = self.summary(of: outcomes)
+        let base = self.summary(of: outcomes)
+        var summary = ControlHostsImportSummary(
+            toImport: base.toImport,
+            credentialsForExisting: movedCredentials,
+            leftInPlace: base.leftInPlace,
+            refused: base.refused
+        )
         summary.credentialAlreadyNative = credentialAlreadyNative
         return summary
+    }
+
+    /// Undoes what a failed run wrote, in reverse order.
+    ///
+    /// A record is removed before its credential, and its credential is
+    /// removed only when the record is really gone:  a credential whose record
+    /// survived belongs to that record, and deleting it would leave a host
+    /// with nothing to authenticate with.
+    private static func rollBack(
+        createdRecords: [String],
+        enrolledNewRecords: [String],
+        enrolledExistingRecords: [String],
+        effects: any ControlHostsImportEffects
+    ) {
+        for id in createdRecords.reversed() {
+            do {
+                try effects.removeRecord(id: id)
+                effects.removeCredential(recordID: id)
+            } catch {
+                // The record could not be removed, so it keeps its credential.
+            }
+        }
+        for id in enrolledExistingRecords.reversed() {
+            effects.removeCredential(recordID: id)
+        }
+        // New-record credentials whose records went are already gone above;
+        // the list is kept beside createdRecords so the pairing stays explicit.
+        _ = enrolledNewRecords
     }
 
     /// The counts a dry run and a completed run both report.
