@@ -107,7 +107,7 @@ struct ConnectedAppsView: View {
             }
             .disabled(alias.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         } message: {
-            Text("An alias makes the account explicit when an agent uses more than one \(aliasCard?.label ?? "app") account.")
+            Text("An alias makes the account explicit when a bot uses more than one \(aliasCard?.label ?? "app") account.")
         }
     }
 

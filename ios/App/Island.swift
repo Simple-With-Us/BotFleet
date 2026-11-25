@@ -131,7 +131,11 @@ struct NeedsYouIsland: View {
                                     } label: {
                                         Text(card.displayChoice(for: option))
                                             .font(.system(size: 15, weight: .semibold))
-                                            .foregroundStyle(CardStyle.isRefusal(option) ? .white : .white)
+                                            // The answer button sits on the bot's own
+                                            // colour, which runs light: white on it
+                                            // disappears, so the readable foreground
+                                            // is picked against that colour.
+                                            .foregroundStyle(CardStyle.isRefusal(option) ? .white : BotPalette.contrastingForeground(for: shown.chat.color))
                                             .frame(maxWidth: .infinity)
                                             .frame(height: 40)
                                             .background(

@@ -188,7 +188,7 @@ enum ChatFixture {
         // Leave it mid-turn, so one screenshot shows the live row, the caret
         // and the composer's Stop at the same time.
         setBusy(session, threadId: threadId, busy: true)
-        for token in ["I have the screenshots.  ", "The header, the code block, ",
+        for token in ["I have the screenshots.\u{00A0} ", "The header, the code block, ",
                       "and the composer with Stop showing — "] {
             apply(session, frame(["kind": "runtime", "event": [
                 "type": "content.delta", "threadId": threadId,

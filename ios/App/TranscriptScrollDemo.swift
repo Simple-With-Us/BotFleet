@@ -109,7 +109,7 @@ enum TranscriptScrollDemo {
     }
 
     private static func replyText(topic: String, index: Int) -> String {
-        var text = "Here is where \(topic) stands.  I read through the code and the open board rows before answering, so this reflects main as of this morning.\n\n"
+        var text = "Here is where \(topic) stands.\u{00A0} I read through the code and the open board rows before answering, so this reflects main as of this morning.\n\n"
         text += "- The happy path works end to end on the simulator.\n- One edge case still needs a decision from you.\n- Nothing here blocks the next TestFlight build.\n\n"
         if index % 4 == 2 {
             text += "```swift\nlet ready = checklist.allSatisfy(\\.done)\nprint(ready ? \"ship\" : \"wait\")\n```\n\n"
@@ -162,7 +162,7 @@ enum TranscriptScrollDemo {
 
         let followUpId = "demo-\(cycle)-followup"
         apply(session, message(threadId, followUpId, role: "bot", kind: "text", at: now + 200, parent: replyId,
-                               text: "Turn \(cycle + 1) is finished.  Ready for the next one."))
+                               text: "Turn \(cycle + 1) is finished.\u{00A0} Ready for the next one."))
         apply(session, frame(["kind": "runtime", "event": ["type": "turn.completed", "threadId": threadId]]))
         setBusy(session, threadId: threadId, busy: false)
         TranscriptScrollLog.note("demo: turn \(cycle) finished")
