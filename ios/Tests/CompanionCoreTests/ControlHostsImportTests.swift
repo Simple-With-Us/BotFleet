@@ -171,12 +171,12 @@ struct ControlHostsImportTests {
         let outcomes = ControlHostsImport.plan(entries: fixtureEntries(), existing: existingNative())
         #expect(outcomes.count == fixtureEntries().count)
 
-        guard case .leftInPlace(.localAnchor) = outcomes[0] else { return Issue.record("the anchor moved") }
-        guard case .leftInPlace(.syntheticSeed) = outcomes[1] else { return Issue.record("the seed moved") }
-        guard case .toImport(_, "Production Server", true) = outcomes[2] else { return Issue.record("h1") }
-        guard case .toImport(_, "Staging Server", true) = outcomes[3] else { return Issue.record("h2") }
-        guard case .toImport(_, "No Token Server", false) = outcomes[4] else { return Issue.record("h3") }
-        guard case .credentialForExisting(_, "Already Native", true) = outcomes[5] else { return Issue.record("h4") }
+        guard case .leftInPlace(.localAnchor) = outcomes[0] else { Issue.record("the anchor moved"); return }
+        guard case .leftInPlace(.syntheticSeed) = outcomes[1] else { Issue.record("the seed moved"); return }
+        guard case .toImport(_, "Production Server", true) = outcomes[2] else { Issue.record("h1"); return }
+        guard case .toImport(_, "Staging Server", true) = outcomes[3] else { Issue.record("h2"); return }
+        guard case .toImport(_, "No Token Server", false) = outcomes[4] else { Issue.record("h3"); return }
+        guard case .credentialForExisting(_, "Already Native", true) = outcomes[5] else { Issue.record("h4"); return }
     }
 
     @Test("An entry native would refuse is refused, and keeps its token in Control")
@@ -199,7 +199,7 @@ struct ControlHostsImportTests {
             entries: [entry(id: "loop", name: "Loopback", url: "http://127.0.0.1:9101")],
             existing: []
         )
-        guard case .toImport = loopback[0] else { return Issue.record("loopback HTTP was refused") }
+        guard case .toImport = loopback[0] else { Issue.record("loopback HTTP was refused"); return }
     }
 
     @Test("A malformed, oversized or linked Control file is refused whole")
