@@ -12,35 +12,57 @@
  *   node scripts/benchmark-tts-post-processor.mjs --minimax   # Only test MiniMax models
  */
 
-import { execFileSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
 
-// 1. Keys come from the environment first, then from `fleet-secrets get NAME`
-//    (Mac, Infisical Fleet-OPS).  The value is captured and never printed; a
-//    missing helper or an absent key just means "not set".
-function fleetSecret(name) {
-  try {
-    return execFileSync("fleet-secrets", ["get", name], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 20_000,
-    }).trim();
-  } catch {
-    return "";
-  }
+import { readFleetSecret } from "./lib/fleet-infisical-read.mjs";
+
+// 1. Keys come from the shared scoped reader (Mac, Infisical Fleet-OPS).  The
+//    store is the only source (owner ruling, November 22, 2026:  every
+//    secret resolves from the store, and the environment carries no copy of
+//    a value).  A missing reader, an absent name or a missing grant just
+//    means "not set":  the benchmark reports the model as unavailable
+//    instead of falling back to an ambient value.
+//
+//    The account is the consumer's own read-only service token, and a grant
+//    covers exactly one folder.  It is read at call time, not at import, so a
+//    caller that sets it after the module loads still gets its own grant.
+const API_KEYS_FOLDER = "/global-api-keys";
+
+function scopedSecret(name) {
+  const account = process.env.FLEET_INFISICAL_GLOBAL_API_KEYS_ACCOUNT || "";
+  const got = readFleetSecret(name, API_KEYS_FOLDER, account);
+  return got.code === 0 && got.value !== null ? got.value.trim() : "";
 }
 
-function secret(...names) {
+/**
+ * One key, resolved from the store only.
+ *
+ * The names are the store's own names for the key, and `envName` is the name
+ * the client below reads.  The value the store answered is exported under
+ * that name for this process, because the client below reads it from there;
+ * a value the environment already held is never used.
+ *
+ * @param {string} envName the name the client reads
+ * @param {...string} names the store's names for the key, in order
+ * @returns {string | undefined}
+ */
+function secret(envName, ...names) {
   for (const name of names) {
-    const value = process.env[name] || fleetSecret(name);
-    if (value) return value;
+    const value = scopedSecret(name);
+    if (value) {
+      process.env[envName] = value;
+      return value;
+    }
   }
+  // A value the environment already carries is not a source:  it is cleared
+  // so the client below cannot pick it up, and the key is simply not set.
+  delete process.env[envName];
   return undefined;
 }
 
-const MINIMAX_API_KEY = secret("MINIMAX_API_KEY");
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || secret("DEEPSEEK_API_KEY_AGENT_BAR", "SHELLULAR2_DEEPSEEK_API_KEY");
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || secret("CT_OPENROUTER_API_KEY");
+const MINIMAX_API_KEY = secret("MINIMAX_API_KEY", "MINIMAX_API_KEY");
+const DEEPSEEK_API_KEY = secret("DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY_AGENT_BAR", "SHELLULAR2_DEEPSEEK_API_KEY");
+const OPENROUTER_API_KEY = secret("OPENROUTER_API_KEY", "CT_OPENROUTER_API_KEY");
 
 // 2. Standard Test Fixture (Realistic technical PR merge output)
 const SAMPLE_INPUT = `What I merged this run

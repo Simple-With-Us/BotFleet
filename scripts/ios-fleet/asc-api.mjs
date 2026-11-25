@@ -3,22 +3,25 @@
  * Minimal App Store Connect API client. No dependencies beyond Node's
  * built-in crypto (ES256 JWT signing) and fetch (Node 18+).
  *
- * Auth: resolves the App Store Connect credential from the first source that
- * is actually present (never prints values):
- *   1. APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_P8_BASE64
- *      (the names BotFleet's ios-ship.yml exports from Infisical; the p8 is
- *      base64, so it is decoded into a 0600 temp file and removed on exit)
- *   2. ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 in the environment (the form
- *      the shell layer hands the key over in)
- *   3. Infisical Fleet-OPS through `fleet-secrets` (the Mac): /asc holds
- *      ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8 (the PEM), kept in memory
- *      only (AFC-359: the retired secrets folder is never read)
+ * Auth: the App Store Connect credential comes from the store and from
+ * nowhere else (never prints values):
+ *   1. Infisical Fleet-OPS through the shared scoped reader, with this
+ *      client's own read-only service token account:  /asc holds
+ *      ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8, and the APPLE_API_* names
+ *      are the alternates the release tooling stores.  The value is kept in
+ *      memory only (AFC-359: the retired secrets folder is never read).
+ *
+ * The environment is NOT a credential source (owner ruling, November 22,
+ * 2026:  every secret resolves from the store, and the environment carries
+ * no copy of a value).  APPLE_API_KEY_ID, APPLE_API_ISSUER_ID,
+ * APPLE_API_KEY_P8_BASE64, ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8 are
+ * ignored here, and a hand-set value can never replace the reviewed grant.
  *
  * ASC_KEY_PATH IS NOT A CREDENTIAL SOURCE (AFC-459, Kody rule 42 on the
  * CodeCaps PR #271 review):  a path on disk is not an approved secret
  * source, so this client never reads one.  The shell layer that owns the
  * credential writes a short-lived mode-600 copy for the Apple tools that
- * need a key on disk and hands the key over in the environment.
+ * need a key on disk.
  *
  * Usage:
  *   node asc-api.mjs GET /v1/apps
@@ -37,14 +40,15 @@
  * echoing anything secret-shaped from the response (ASC responses don't
  * carry credentials, only app metadata, so this is safe to print as-is).
  */
-import { readFileSync, writeFileSync, mkdtempSync, rmSync, chmodSync, realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash, createSign } from "node:crypto";
-import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { normalizePrivateKey } from "./asc-key.mjs";
+import { listSecretsRaw } from "../infisical-fetch.mjs";
+import { readFleetSecret } from "../lib/fleet-infisical-read.mjs";
+import { normalizePrivateKey, writePrivateKeyFile } from "./asc-key.mjs";
 import { nextSharedBuild } from "./shared-build.mjs";
 import {
   buildFloor,
@@ -54,19 +58,218 @@ import {
   parsePatch
 } from "./version-plan.mjs";
 
-// Reads one value from Infisical Fleet-OPS through fleet-secrets.  Returns ""
-// when absent or unreadable;  never prints the value or the tool's stderr.
-// FLEET_SECRETS_BIN is the test seam.
-function fleetSecretsGet(name, folder) {
-  const bin = process.env.FLEET_SECRETS_BIN || join(homedir(), ".local", "bin", "fleet-secrets");
-  try {
-    return execFileSync(bin, ["get", name, "--path", folder], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).replace(/\n$/, "");
-  } catch {
-    return "";
+// The App Store Connect credential's own read-only service token, and the
+// folder its names live in.  A grant covers exactly one folder, so both are
+// named here rather than guessed at runtime.
+const ASC_SECRET_FOLDER = "/asc";
+const ASC_SECRET_ACCOUNT = process.env.FLEET_INFISICAL_ASC_ACCOUNT || "fleet-tools-mm-asc-ro";
+
+// The shape of an App Store Connect key id.  It is the one label that
+// becomes part of a file path, so a value that is not a key id is refused
+// before it can name anything on disk.
+export function isKeyId(value) {
+  return /^[A-Za-z0-9]{1,64}$/.test(String(value || ""));
+}
+
+// The parts of the credential, and the names each part may live under.
+// Every group is one value:  the first name that answers is the value.
+const ASC_STORE_GROUPS = [
+  ["ASC_KEY_ID", "APPLE_API_KEY_ID"],
+  ["ASC_ISSUER_ID", "APPLE_API_ISSUER_ID"],
+  ["ASC_KEY_P8", "APPLE_API_KEY_P8", "APPLE_API_KEY_P8_BASE64"],
+];
+
+// The two public labels on their own:  a diagnostic reads these and never
+// the material.
+const ASC_LABEL_GROUPS = [
+  ["ASC_KEY_ID", "APPLE_API_KEY_ID"],
+  ["ASC_ISSUER_ID", "APPLE_API_ISSUER_ID"],
+];
+
+// The consumer's own read-only service token, when the host binds one.
+//
+// This is the bootstrap binding, not a copy of a value:  the token reaches
+// Infisical and the VALUE comes back from the store into this process.  The
+// environment never holds the credential, so a hosted runner needs nothing
+// but this binding to resolve it.
+//
+// A hosted runner has no scoped reader, so this is the only way it can reach
+// the store at all.  There is no machine identity here and no shared
+// account:  the token is this consumer's own read-only grant.
+const ASC_STORE_TOKEN = (process.env.INFISICAL_TOKEN || "").trim();
+const ASC_STORE_PROJECT_ID = (process.env.INFISICAL_PROJECT_ID || "").trim();
+const ASC_STORE_ENVIRONMENT = (process.env.INFISICAL_ENVIRONMENT || "prod").trim();
+const ASC_STORE_SITE_URL = (process.env.INFISICAL_SITE_URL || "https://app.infisical.com").trim();
+
+// The folders this consumer's names may live in:  its own folder first, then
+// the folder the hosted store reader is pointed at.  A grant covers one
+// folder, so the read that a token is allowed to make is the one that
+// answers.
+const ASC_STORE_PATHS = [...new Set([
+  ASC_SECRET_FOLDER,
+  (process.env.INFISICAL_SECRET_PATH || "/").trim() || "/",
+])];
+
+// Reads one value from Infisical Fleet-OPS through the shared scoped reader.
+// Returns "" when absent or unreadable;  never prints the value or the
+// reader's stderr.  FLEET_INFISICAL_READER is the test seam.
+//
+// Every read spawns the reader, and a credential resolution asks for the same
+// names more than once, so an answer is kept for the life of the process.  The
+// cache holds what the reader said:  a name is read once, and a second ask
+// gets that answer rather than a second trip to the vault.
+//
+// Only a read that answered is kept.  A read that did not answer is asked
+// again on the next ask, because a refusal can be a hiccup or a grant that is
+// provisioned after the first read, and a cached empty answer would leave the
+// credential missing for the rest of the process.
+const SCOPED_READ_CACHE = new Map();
+
+function scopedRead(name, folder, account) {
+  const key = `${folder}\u0000${account}\u0000${name}`;
+  const cached = SCOPED_READ_CACHE.get(key);
+  if (cached !== undefined) return cached;
+  const got = readFleetSecret(name, folder, account);
+  if (got.code !== 0) return "";
+  const value = got.value === null ? "" : got.value;
+  SCOPED_READ_CACHE.set(key, value);
+  return value;
+}
+
+// The provenance of a resolved credential:  it names the folder that
+// answered and the grant that read it.  It never names a value.
+export function credentialSource(folder, kind) {
+  return kind === "token"
+    ? `Infisical ${folder} (service token binding)`
+    : `Infisical ${folder} (scoped reader, account ${ASC_SECRET_ACCOUNT})`;
+}
+
+// The credential's parts, taken whole from one source.
+//
+// A value that is only whitespace is not a value.  The parts of one
+// credential belong to one source:  the reader's triple when it answered
+// with all three, and otherwise the token's complete set from one folder,
+// which replaces the reader's partial one instead of filling it.
+export function credentialParts(reader, stored) {
+  const readerKeyId = String((reader && reader.keyId) || "").trim();
+  const readerIssuerId = String((reader && reader.issuerId) || "").trim();
+  const readerMaterial = String((reader && reader.material) || "").trim();
+  if (readerKeyId && readerIssuerId && readerMaterial) {
+    return { keyId: readerKeyId, issuerId: readerIssuerId, material: readerMaterial };
   }
+  const values = (stored && stored.values) || new Map();
+  return {
+    keyId: String(values.get("ASC_KEY_ID") || values.get("APPLE_API_KEY_ID") || "").trim(),
+    issuerId: String(values.get("ASC_ISSUER_ID") || values.get("APPLE_API_ISSUER_ID") || "").trim(),
+    material: String(values.get("ASC_KEY_P8") || values.get("APPLE_API_KEY_P8") || values.get("APPLE_API_KEY_P8_BASE64") || "").trim(),
+  };
+}
+
+// The two public labels, taken as one pair from one source.  A key id from
+// one folder and an issuer id from another is a pair that was never issued.
+export function labelPair(reader, stored) {
+  const readerKeyId = String((reader && reader.keyId) || "").trim();
+  const readerIssuerId = String((reader && reader.issuerId) || "").trim();
+  if (readerKeyId && readerIssuerId) {
+    return { keyId: readerKeyId, issuerId: readerIssuerId };
+  }
+  const values = (stored && stored.values) || new Map();
+  return {
+    keyId: String(values.get("ASC_KEY_ID") || values.get("APPLE_API_KEY_ID") || "").trim(),
+    issuerId: String(values.get("ASC_ISSUER_ID") || values.get("APPLE_API_ISSUER_ID") || "").trim(),
+  };
+}
+
+// The public labels the store holds for this consumer's key.
+//
+// The key id and the issuer id are labels that travel in every request
+// header, and a diagnostic must never cause a secret read:  the material is
+// not asked for here.
+async function resolveCredentialLabels() {
+  const folder = ASC_SECRET_FOLDER;
+  const account = ASC_SECRET_ACCOUNT;
+  const reader = {
+    keyId: scopedRead("ASC_KEY_ID", folder, account) || scopedRead("APPLE_API_KEY_ID", folder, account),
+    issuerId: scopedRead("ASC_ISSUER_ID", folder, account) || scopedRead("APPLE_API_ISSUER_ID", folder, account),
+  };
+  // THE TWO LABELS ARE ONE PAIR.  A key id from one folder and an issuer id
+  // from another is a pair that was never issued, so the pair is taken whole
+  // from one source:  the reader's pair when it answered with both, and
+  // otherwise the token's complete pair, which replaces the reader's partial
+  // one instead of filling it.  A label that is only whitespace is not a
+  // label, and it does not keep the token's pair from being used.
+  const readerIsWhole = Boolean(
+    String(reader.keyId || "").trim() && String(reader.issuerId || "").trim()
+  );
+  const stored = readerIsWhole ? null : await storeRead(ASC_LABEL_GROUPS);
+  return labelPair(reader, stored);
+}
+
+// The store read for a host that binds a service token.
+//
+// One call reads every name this consumer may need, and the values stay in
+// this process:  the environment holds the token, which is a reader and
+// never a copy of the credential.
+//
+// A folder this token may not read is not an error here:  the read moves on
+// to the next folder, and the reason never names a value.  A folder that
+// answers with none of the parts is not the folder that holds them, so the
+// read moves on as well.
+//
+// THE PARTS OF ONE CREDENTIAL BELONG TOGETHER.  A key id from one folder and
+// the material from another is a triple that fails authentication as the
+// wrong key, so the answer is the FIRST folder that holds a complete set,
+// and the folder that answered travels with the values so the caller can
+// name the grant that read them.
+//
+// The fetch is injectable so a test can drive the folder walk without a
+// network, and the defaults are the host's own binding.
+export async function readStoreSecrets(groups, {
+  fetchImpl = fetch,
+  siteUrl = ASC_STORE_SITE_URL,
+  token = ASC_STORE_TOKEN,
+  projectId = ASC_STORE_PROJECT_ID,
+  environment = ASC_STORE_ENVIRONMENT,
+  paths = ASC_STORE_PATHS,
+} = {}) {
+  const empty = { values: new Map(), folder: null };
+  if (!token || !projectId) return empty;
+  const names = groups.flat();
+  for (const secretPath of paths) {
+    let values;
+    try {
+      values = await listSecretsRaw({
+        siteUrl,
+        token,
+        projectId,
+        environment,
+        secretPath,
+        names,
+        fetchImpl,
+      });
+    } catch {
+      // This folder is not one the token may read, or the store did not
+      // answer.  The next folder is tried, and nothing is printed.
+      continue;
+    }
+    const complete = groups.every((group) => group.some((name) => values.has(name)));
+    if (!complete) continue;
+    const chosen = new Map();
+    for (const group of groups) {
+      for (const name of group) {
+        if (values.has(name)) {
+          chosen.set(name, values.get(name));
+          break;
+        }
+      }
+    }
+    return { values: chosen, folder: secretPath };
+  }
+  return empty;
+}
+
+async function storeRead(groups) {
+  return readStoreSecrets(groups);
 }
 
 function base64url(input) {
@@ -78,7 +281,7 @@ function base64url(input) {
 // ---------------------------------------------------------------------------
 // WHY THERE ARE SEVERAL SOURCES (fixed 2026-10-02):
 // .github/workflows/ios-ship.yml runs on a GitHub-hosted macos-latest runner,
-// which has no Infisical machine identity or fleet-secrets.  The credential reaches that
+// which has no Infisical machine identity or scoped reader.  The credential reaches that
 // runner as THREE ENVIRONMENT VARIABLES -- APPLE_API_KEY_ID,
 // APPLE_API_ISSUER_ID and APPLE_API_KEY_P8_BASE64 -- exported into $GITHUB_ENV
 // by .github/actions/infisical-secrets.  Reading only the file meant the key
@@ -89,16 +292,6 @@ function base64url(input) {
 // APPLE_API_KEY_P8_BASE64 is base64, so it is decoded into a 0600 file inside a
 // 0700 temp directory and unlinked on exit.  Values are never printed; only the
 // source and the key-id LENGTH are logged.
-const TEMP_KEY_DIRS = [];
-
-function cleanupTempKeys() {
-  while (TEMP_KEY_DIRS.length) {
-    const dir = TEMP_KEY_DIRS.pop();
-    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
-  }
-}
-process.on("exit", cleanupTempKeys);
-
 // Accepts either a raw PEM (some callers store the .p8 body verbatim) or the
 // base64 encoding GitHub Actions + Infisical use. Returns null when the input
 // cannot be turned into a PEM, so the caller can fail with a real reason.
@@ -115,93 +308,83 @@ function decodeP8(b64) {
   return pem.includes("-----BEGIN ") ? pem : null;
 }
 
-function materializeP8(pem) {
-  const dir = mkdtempSync(join(tmpdir(), "asc-key-"));
-  try { chmodSync(dir, 0o700); } catch { /* best effort */ }
-  const p = join(dir, "AuthKey.p8");
-  writeFileSync(p, pem, { mode: 0o600 });
-  TEMP_KEY_DIRS.push(dir);
-  return p;
-}
-
 // Why a source could not be used.  A failed lookup is never swallowed:  it is
 // recorded here with the reason, and the notes are printed on every path, so
 // a broken secret read is diagnosable instead of reporting a bare "no
-// credential found" -- and a source that was skipped (a partial environment,
-// a value that is not a key) stays visible even when another source resolves.
+// credential found".
 const RESOLUTION_NOTES = [];
 
-// Returns { keyId, issuerId, privateKeyPem, source } or { error } or { error: null }.
+// Returns { keyId, issuerId, privateKeyPem, source } or { error: null }.
 //
-// The order is the rule:  the environment beats the network, and a file is not
-// a source at all.  A path on disk is not an approved secret source, so
-// ASC_KEY_PATH is never read here (AFC-459, Kody rule 42 on the CodeCaps PR
-// #271 review):  the shell layer that owns the credential writes a staged key
-// and hands it over in the environment as ASC_KEY_P8.
+// The store is the only source.  The account is this consumer's own
+// read-only service token, and a grant covers exactly one folder, so the
+// folder and the account are named here rather than guessed at runtime.
 //
-// Every environment-sourced PEM is parsed before it is accepted:  a truncated
-// key, an armored block and a mangled export all carry the envelope and still
-// fail to parse, and an unparsable key that reaches the signer comes back as a
-// raw stack trace instead of a credential error.  normalizePrivateKey lives in
-// asc-key.mjs, which the shell layer uses as well, so both sides of the
-// handoff accept exactly the same keys.
+// The names the store may hold for the one key:  ASC_KEY_ID and
+// ASC_KEY_P8, with the APPLE_API_* names as the alternates the release
+// tooling stores.  The material is a PEM or the base64 of one;  both are
+// parsed before they are accepted, because a truncated key, an armored
+// block and a mangled export all carry the envelope and still fail to
+// parse, and an unparsable key that reaches the signer comes back as a raw
+// stack trace instead of a credential error.  normalizePrivateKey lives in
+// asc-key.mjs, which the shell layer uses as well, so both sides accept
+// exactly the same keys.
 //
-// A source that is present but unusable is skipped, not fatal:  the shell
-// layer ignores the same value and carries on, and the credential it resolved
-// is in the environment as ASC_KEY_P8.  The reason is kept for the message.
-function resolveCredential() {
-  const envKeyId = String(process.env.ASC_KEY_ID || "").trim();
-  const envIssuer = String(process.env.ASC_ISSUER_ID || "").trim();
-  const envKeyPem = String(process.env.ASC_KEY_P8 || "").trim();
-
-  // 1) The APPLE_API_* trio the ship workflow exports from Infisical.  The key
-  //    itself is in the environment, so it wins over every other source.
-  const keyId = String(process.env.APPLE_API_KEY_ID || "").trim();
-  const issuerId = String(process.env.APPLE_API_ISSUER_ID || "").trim();
-  if (keyId && issuerId && process.env.APPLE_API_KEY_P8_BASE64) {
-    const pem = normalizePrivateKey(decodeP8(process.env.APPLE_API_KEY_P8_BASE64));
-    if (!pem) {
-      RESOLUTION_NOTES.push("APPLE_API_KEY_P8_BASE64 is set but did not decode to a PEM private key");
-    } else {
-      materializeP8(pem);
-      return { keyId, issuerId, privateKeyPem: pem, source: "APPLE_API_* environment (base64 p8)" };
-    }
+// Nothing else is a source:  not the environment (owner ruling, November
+// 22, 2026), and not a path on disk (AFC-459, Kody rule 42 on the CodeCaps
+// PR #271 review).
+async function resolveCredential() {
+  const folder = ASC_SECRET_FOLDER;
+  const account = ASC_SECRET_ACCOUNT;
+  const reader = {
+    keyId: scopedRead("ASC_KEY_ID", folder, account) || scopedRead("APPLE_API_KEY_ID", folder, account),
+    issuerId: scopedRead("ASC_ISSUER_ID", folder, account) || scopedRead("APPLE_API_ISSUER_ID", folder, account),
+    material: scopedRead("ASC_KEY_P8", folder, account)
+      || scopedRead("APPLE_API_KEY_P8", folder, account)
+      || scopedRead("APPLE_API_KEY_P8_BASE64", folder, account),
+  };
+  // A host with no scoped reader reaches the store through its own service
+  // token instead.  Both are the same store and the same names;  neither
+  // puts a copy of the credential in the environment.
+  //
+  // THE CREDENTIAL IS WHOLE.  A reader that answered with only some of the
+  // parts is not a credential, and the token's answer is a complete set from
+  // one folder, so the token's answer REPLACES the reader's partial one
+  // instead of filling it:  a key id from one folder and the material from
+  // another is a triple that fails authentication as the wrong key.
+  const readerIsWhole = Boolean(
+    String(reader.keyId || "").trim()
+    && String(reader.issuerId || "").trim()
+    && String(reader.material || "").trim()
+  );
+  const stored = readerIsWhole ? null : await storeRead(ASC_STORE_GROUPS);
+  const parts = credentialParts(reader, stored);
+  const keyId = parts.keyId;
+  const issuerId = parts.issuerId;
+  const material = parts.material;
+  const source = readerIsWhole
+    ? credentialSource(folder, "reader")
+    : (stored && stored.folder ? credentialSource(stored.folder, "token") : credentialSource(folder, "reader"));
+  if (!keyId) RESOLUTION_NOTES.push(`no key id in ${folder} for account ${account}`);
+  if (!issuerId) RESOLUTION_NOTES.push(`no issuer id in ${folder} for account ${account}`);
+  if (!material) RESOLUTION_NOTES.push(`no key material in ${folder} for account ${account}`);
+  if (!keyId || !issuerId || !material) return { reason: "missing" };
+  const trimmedKeyId = keyId.trim();
+  if (!isKeyId(trimmedKeyId)) {
+    RESOLUTION_NOTES.push(`the key id in ${folder} is not a key id`);
+    return { reason: "credential" };
   }
-
-  // 2) The same secret as a plain environment variable.  This is the form
-  //    fleet-secrets hands out, and the form the shell layer uses when it
-  //    hands a staged key to this client.
-  if (envKeyId && envIssuer && envKeyPem) {
-    const pem = normalizePrivateKey(envKeyPem);
-    if (!pem) {
-      RESOLUTION_NOTES.push("ASC_KEY_P8 is set but is not a PEM private key");
-    } else {
-      return { keyId: envKeyId, issuerId: envIssuer, privateKeyPem: pem, source: "ASC_KEY_P8 environment" };
-    }
+  const pem = normalizePrivateKey(decodeP8(material));
+  if (!pem) {
+    RESOLUTION_NOTES.push(`the key material in ${folder} is not a PEM private key`);
+    return { reason: "credential" };
   }
-
-  // 3) No file is read here (AFC-359, and AFC-459 / Kody rule 42):  a path on
-  //    disk is not an approved secret source, so ASC_KEY_PATH is not a
-  //    credential source here:  the shell layer that owns the credential
-  //    writes a staged key and exports it as ASC_KEY_P8.  Step 4 reads
-  //    Infisical directly, so a local operator needs nothing exported at all.
-
-  // 4) The Mac: Infisical Fleet-OPS through fleet-secrets, in memory only.
-  //    A hosted runner has no fleet-secrets, so this finds nothing there and
-  //    falls through to the "tried" message.
-  const ascKid = fleetSecretsGet("ASC_KEY_ID", "/asc");
-  const kid = envKeyId || ascKid;
-  const iss = envIssuer || fleetSecretsGet("ASC_ISSUER_ID", "/asc");
-  if (kid && iss) {
-    // /asc holds one key.  An environment key id that differs from it has no
-    // Infisical copy, so it falls through to the "tried" message.
-    const pem = kid === ascKid ? normalizePrivateKey(fleetSecretsGet("ASC_KEY_P8", "/asc")) : null;
-    if (pem) {
-      return { keyId: kid.trim(), issuerId: iss.trim(), privateKeyPem: pem, source: "Infisical (fleet-secrets)" };
-    }
-  }
-
-  return { error: null };
+  return {
+    keyId: trimmedKeyId,
+    issuerId: issuerId.trim(),
+    privateKeyPem: pem,
+    source
+  };
 }
 
 function signJwt({ keyId, issuerId, privateKeyPem }) {
@@ -457,9 +640,8 @@ export function ascErrorText(res) {
 // same api(method, path, jsonBody) shape the helpers above take.  Nothing here
 // changes the CLI:  main() keeps its own client.  Key material and the token
 // stay inside the closure and are never returned or printed.
-export function createAscApi({ fetchImpl = fetch } = {}) {
-  const cred = resolveCredential();
-  if (cred.error) return { ok: false, error: cred.error };
+export async function createAscApi({ fetchImpl = fetch } = {}) {
+  const cred = await resolveCredential();
   if (!cred.privateKeyPem) {
     const notes = RESOLUTION_NOTES.length ? ` Skipped: ${RESOLUTION_NOTES.join("; ")}.` : "";
     return { ok: false, error: `no App Store Connect credential found.${notes}` };
@@ -923,19 +1105,60 @@ async function main() {
       process.exit(2);
     }
   }
-  const cred = resolveCredential();
-  if (cred.error) {
-    console.error(`asc-auth: ${cred.error}`);
-    process.exit(1);
+  //  The public labels the store holds for this consumer's key:  the key id
+  //  and the issuer id.  The material is not read for a diagnostic, so this
+  //  command is answered BEFORE the credential is resolved:  a diagnostic
+  //  never causes a secret read.
+  if (method === "credential-labels") {
+    const labels = await resolveCredentialLabels();
+    if (!labels.keyId || !labels.issuerId) {
+      console.error("asc-auth: the store holds no key id and issuer id for this consumer");
+      process.exit(1);
+    }
+    console.log([labels.keyId, labels.issuerId].join("\t"));
+    return;
+  }
+  const cred = await resolveCredential();
+  if (method === "stage-key") {
+    //  The Apple tools need a key on disk.  The credential comes from the
+    //  store and is written straight to the staging file, so the material
+    //  never enters the environment and never travels through a shell
+    //  variable.  Only the public labels are printed:  the key id, the
+    //  issuer id and the path that was written.
+    if (!cred.privateKeyPem) {
+      console.error(
+        cred.reason === "credential"
+          ? "asc-auth: the store holds a key that is not a PEM private key; nothing was staged"
+          : "asc-auth: no App Store Connect credential found in the store; nothing was staged",
+      );
+      process.exit(cred.reason === "credential" ? 3 : 1);
+    }
+    const dir = String(path || "").trim();
+    if (!dir) {
+      console.error("asc-auth: stage-key needs the staging directory");
+      process.exit(2);
+    }
+    const target = join(dir, `AuthKey_${cred.keyId}.p8`);
+    const written = writePrivateKeyFile(target, cred.privateKeyPem);
+    if (written.error) {
+      console.error(`asc-auth: ${written.error}`);
+      process.exit(written.reason === "staging" ? 2 : 3);
+    }
+    console.log([cred.keyId, cred.issuerId, target].join("\t"));
+    return;
   }
   if (!cred.privateKeyPem) {
     console.error(
-      "asc-auth: no App Store Connect credential found. Tried, in order:\n" +
-      "  1) APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_P8_BASE64 in the environment\n" +
-      "  2) ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 in the environment\n" +
-      "  3) Infisical /asc (fleet-secrets)\n" +
-      "  A path in ASC_KEY_PATH is not a credential source:  the shell layer that owns the\n" +
-      "  credential hands the key over in ASC_KEY_P8." +
+      `asc-auth: no App Store Connect credential found. The store is the only source:\n` +
+      `  Infisical ${ASC_SECRET_FOLDER} for account ${ASC_SECRET_ACCOUNT}\n` +
+      (ASC_STORE_TOKEN
+        ? `  Infisical project ${ASC_STORE_PROJECT_ID} environment ${ASC_STORE_ENVIRONMENT} with the bound service token\n`
+        : "") +
+      "  names: ASC_KEY_ID or APPLE_API_KEY_ID, ASC_ISSUER_ID or APPLE_API_ISSUER_ID,\n" +
+      "         ASC_KEY_P8 or APPLE_API_KEY_P8 (or APPLE_API_KEY_P8_BASE64)\n" +
+      "  The environment carries no copy of the credential, and a path in ASC_KEY_PATH is not\n" +
+      "  a credential source either:  the shell layer that owns the credential stages a\n" +
+      "  short-lived copy for the Apple tools that need a key on disk." +
       (RESOLUTION_NOTES.length
         ? `\n  Skipped, with the reason:\n${RESOLUTION_NOTES.map((note) => `    - ${note}`).join("\n")}`
         : "")

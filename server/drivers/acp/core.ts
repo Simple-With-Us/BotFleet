@@ -14,7 +14,9 @@
 // session/update notifications, so updates are double-gated: nothing emits
 // before the prompt is sent, and `_meta.isReplay` updates are dropped.
 import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
 import { homedir } from "node:os";
+import { delimiter, isAbsolute, join } from "node:path";
 
 import { z } from "zod";
 
@@ -83,7 +85,7 @@ import type {
   ProviderErrorCode,
 } from "../../contracts.ts";
 import { newEventId, newId } from "../../contracts.ts";
-import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../../cli-logins.ts";
+import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials, seatCredentialsReady } from "../../child-credentials.ts";
 import { hostToolPrefix, turnComputerMounts } from "../../computer-grants.ts";
 import { augmentedPath } from "../../env-path.ts";
 
@@ -914,6 +916,62 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       // Expires KNOWN_VERSION_MAX_AGE_MS after the CLI last answered, so a
       // CLI that wedges for good settles as "did not answer in time".
       const lastKnownVersion = new LastKnownAnswer<string>();
+      /** Identity of the binary the remembered version came from: its
+       *  resolved path, mtime and size.  The cli string alone is not an
+       *  identity — the same bare name can resolve to a different file
+       *  after a PATH change, and an in-place upgrade keeps the name while
+       *  changing the binary.  Either change must re-probe. */
+      let lastProbedKey: string | null = null;
+      /** Start order of the probe that supplied `lastProbedKey`, mirroring
+       *  LastKnownAnswer's own ordering so a slow older probe cannot claim
+       *  a newer probe's remembered version for a different binary. */
+      let lastProbedOrder = 0;
+      /** Resolved binary path per cli string for the current augmented
+       *  PATH value.  Walking every PATH entry with synchronous stats on
+       *  every dispatch would stall the event loop in proportion to PATH
+       *  size; remembering where each name resolved leaves one stat per
+       *  dispatch (the mtime/size read that detects an in-place upgrade).
+       *  A remembered path that stops answering falls back to the walk. */
+      let identityPathCache = { pathValue: "", byCli: new Map<string, string>() };
+      /** One candidate's identity, or null when the spawn would not run
+       *  it: execvp skips non-executable files, so accepting one as the
+       *  identity could key the memory on a file the probe never ran. */
+      const identityOf = (candidate: string): string | null => {
+        try {
+          const stat = statSync(candidate);
+          if (!stat.isFile()) return null;
+          if (process.platform !== "win32" && (stat.mode & 0o111) === 0) return null;
+          return `${candidate}:${stat.mtimeMs}:${stat.size}`;
+        } catch {
+          return null;
+        }
+      };
+      /** The identity above for one cli string, resolved the way the probe
+       *  spawn resolves it (augmented PATH), or null when no file answers —
+       *  an unresolvable binary is never answered from memory. */
+      const cliIdentityKey = (cli: string): string | null => {
+        if (isAbsolute(cli) || cli.includes("/")) return identityOf(cli);
+        const pathValue = augmentedPath();
+        if (pathValue !== identityPathCache.pathValue) {
+          identityPathCache = { pathValue, byCli: new Map() };
+        }
+        const remembered = identityPathCache.byCli.get(cli);
+        if (remembered) {
+          const identity = identityOf(remembered);
+          if (identity) return identity;
+          // The remembered file is gone or stopped being executable; walk again.
+          identityPathCache.byCli.delete(cli);
+        }
+        for (const dir of pathValue.split(delimiter).filter(Boolean)) {
+          const candidate = join(dir, cli);
+          const identity = identityOf(candidate);
+          if (identity) {
+            identityPathCache.byCli.set(cli, candidate);
+            return identity;
+          }
+        }
+        return null;
+      };
       /** One `--version` probe, with what went wrong when it produced no
        * version — so a timeout can be told apart from a missing binary. */
       const probeCliVersion = (effective: AcpConfig, env: Record<string, string | undefined>) =>
@@ -921,11 +979,16 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           // Its place among overlapping probes: taken before the process starts,
           // so a slow older probe cannot replace what a newer one remembered.
           const order = lastKnownVersion.begin();
+          const identityKey = cliIdentityKey(effective.cli);
           const startedAt = Date.now();
           execCli(effective.cli, ["--version"], { timeout: 20000, env: cliProbeEnvironment(env) }, (err, stdout) => {
             const trimmed = err ? null : stdout.trim();
             const elapsedMs = Date.now() - startedAt;
             if (trimmed) {
+              if (order >= lastProbedOrder) {
+                lastProbedOrder = order;
+                lastProbedKey = identityKey;
+              }
               lastKnownVersion.record(trimmed, order);
               resolve({ version: trimmed, error: null, elapsedMs });
             } else {
@@ -945,8 +1008,19 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
           });
         });
-      const cliVersion = async (effective: AcpConfig, env: Record<string, string | undefined>) =>
-        (await probeCliVersion(effective, env)).version;
+      /** The dispatch gate's version: one the same binary answered inside
+       *  the remembered window stands without spawning `--version` again on
+       *  every turn (BF-2468).  `snapshot()` deliberately still probes
+       *  fresh, so a binary that breaks retires there instead of living on
+       *  its last answer; the turn spawn itself remains the final check. */
+      const cliVersion = async (effective: AcpConfig, env: Record<string, string | undefined>) => {
+        const identityKey = cliIdentityKey(effective.cli);
+        if (identityKey !== null && identityKey === lastProbedKey) {
+          const cached = lastKnownVersion.get();
+          if (cached !== null) return cached;
+        }
+        return (await probeCliVersion(effective, env)).version;
+      };
       const base = (threadId: string, turnId: string) => ({
         eventId: newEventId(),
         provider: DRIVER_KIND,
@@ -993,7 +1067,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // that follows it have to stay free of `await`, or a second turn on
         // this thread would walk through the guard the first one already
         // passed.
-        primeCliLogin(turn.launchIdentity?.seat);
+        primeSeatCredentials(turn.launchIdentity?.seat);
+      // The seat's credential read is started here, before the guard, so
+      // it may still be in flight.  Waiting for it before the guard
+      // keeps the slot free while the vault answers and leaves the
+      // guard and the registration that follows it atomic.
+      if (!seatCredentialsReady(turn.launchIdentity?.seat)) await awaitSeatCredentials(turn.launchIdentity?.seat);
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
         const turnId = newId();
         // Carried across a relaunch (see maybeRetry): `attempt` is how many
@@ -1118,10 +1197,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           };
           // Last, over the instance's env and a wrapper's additions alike:
           // the launch identity is this bot's and this turn's.
-          launchEnv = launchedChildEnvironment(
+          launchEnv = launchedChildCredentials(
             spawned.env ? { ...env, ...spawned.env } : env,
             turn.launchIdentity,
-            cliLoginEnvironment(turn.launchIdentity?.seat),
+            turn.launchIdentity?.seat,
           );
           child = spawnCli(spawned.cli, spawned.args, {
             cwd,
@@ -2907,6 +2986,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             composioMcp: mountsMcpServers,
             phoneMcp: mountsMcpServers,
             qdrantMcp: mountsMcpServers,
+            customMcp: mountsMcpServers,
             images: acceptsImages,
             effortLevels: support.effortLevels,
             localComputerMcp: mountsMcpServers,

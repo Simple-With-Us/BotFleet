@@ -264,8 +264,8 @@ interface RoutineFile {
   runs: RoutineRun[];
   /** Durable commit receipts for cross-file confirmation recovery. */
   routineRequestReceipts?: RoutineRequestReceipt[];
-  /** Manual bot snoozes, keyed by bot id.  `null` is an indefinite snooze
-   * (Infinity is not valid JSON); a number is the epoch-ms expiry. */
+  /** Legacy Stop latch from an older build, keyed by bot id.  Read and
+   * dropped: never restored, never written (BF-2453). */
   botSnoozes?: Record<string, number | null>;
 }
 
@@ -703,18 +703,11 @@ export class RoutineManager {
           Number.isFinite(receipt?.appliedAt)
         )
       : [];
-    // Manual snoozes survive restarts: a crash or relaunch must not clear
-    // a user's explicit stop and let the next schedule or webhook restart
-    // the bot.  Expired finite snoozes are dropped, not revived.
-    if (disk.botSnoozes) {
-      for (const [botId, until] of Object.entries(disk.botSnoozes)) {
-        if (until === null) {
-          this.botSnoozeUntil.set(botId, Infinity);
-        } else if (typeof until === "number" && Number.isFinite(until) && until > this.now()) {
-          this.botSnoozeUntil.set(botId, until);
-        }
-      }
-    }
+    // Legacy `botSnoozes` (the old Stop latch) are deliberately not restored:
+    // Stop is scoped to the turn it interrupts (server/bot-stop-policy.ts),
+    // so an update or relaunch unlatches every install by itself.  The save
+    // path no longer writes the field either, so it ages out of routines.json
+    // on the next flush.
     if (this.passive) {
       this.writesRefused = true;
       return;
@@ -834,9 +827,10 @@ export class RoutineManager {
     return run ? { ...run } : null;
   }
 
-  /** Pause webhook, resource, and schedule dispatch for this bot.  Default
-   *  duration is until a person wakes the bot (a message, respond, or Run
-   *  now clears the snooze via `clearBotSnooze`). */
+  /** Pause webhook, resource, and schedule dispatch for this bot, in memory
+   *  only: nothing is written to routines.json or restored from it, so the
+   *  hold ends with the process.  Stop no longer sets one (BF-2453); a
+   *  person's message, respond, or Run now clears it via `clearBotSnooze`. */
   snoozeBot(botId: string, durationMs = Infinity): void {
     if (this.passive) return;
     this.botSnoozeUntil.set(botId, durationMs === Infinity ? Infinity : this.now() + durationMs);
@@ -2421,23 +2415,11 @@ export class RoutineManager {
       return;
     }
     mkdirSync(dirname(this.file), { recursive: true });
-    const now = this.now();
-    const botSnoozes: Record<string, number | null> = {};
-    for (const [botId, until] of this.botSnoozeUntil) {
-      if (until === Infinity) {
-        botSnoozes[botId] = null;
-      } else if (until > now) {
-        botSnoozes[botId] = until;
-      } else {
-        this.botSnoozeUntil.delete(botId);
-      }
-    }
     writeFileAtomic(this.file, JSON.stringify({
       version: 1,
       routines: this.routines,
       runs: this.runs,
       routineRequestReceipts: this.routineRequestReceipts,
-      ...(Object.keys(botSnoozes).length > 0 ? { botSnoozes } : {}),
     } satisfies RoutineFile));
     // Cleared only after the write lands: a failed write throws (so
     // commitMutation can roll back) with the pending state still marked.

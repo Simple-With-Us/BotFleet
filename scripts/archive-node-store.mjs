@@ -1,3 +1,5 @@
+/* oxlint-disable eslint/no-irregular-whitespace -- Owner-required NBSP sentence gaps occur only in the prose comments of this module. */
+
 // Archive the Node store read-only, then rehearse its restore (BF-2515).
 //
 // The Phase 6 decommission gate asks for `final-import-parity`:  the final
@@ -71,6 +73,18 @@
 // The read-only proof only means something for an account that is not root.
 // A root account writes through a read-only bit, so this script refuses to
 // run as root rather than report a read-only archive it did not have.
+//
+// The capture ceilings.  The producer refuses rather than filling a disk:  a
+// store above the file-count ceiling is refused before a byte is copied, and
+// a store above the byte ceiling is refused before the capture directory exists
+// as well, so a refusal leaves nothing behind.  The copy measures the bytes
+// it actually wrote too, because a store that grows while it is being copied
+// slips past an estimate taken before the copy began.  The ordinary defaults
+// are sized for an ordinary store:  200,000 files and 8 GiB.  The owner's
+// measured store is larger than that, so capturing it is an explicit act:  the
+// operator names the ceiling on the command line, up to an absolute ceiling of
+// 500,000 files and 32 GiB, and a request above that absolute ceiling is
+// refused with both numbers named rather than being clamped.
 import { createHash } from "node:crypto";
 import {
   chmodSync, closeSync, copyFileSync, existsSync, mkdirSync,
@@ -96,11 +110,53 @@ export const CHECK_NAMES = {
   rollback: ["restore-rehearsal", "restored-health"],
 };
 
-/** The default capture ceiling: refuse rather than fill a disk. */
+/**
+ * The default capture ceiling on bytes: 8 GiB.
+ *
+ * The ceiling exists so the producer refuses rather than filling a disk, and
+ * this default is deliberately sized for an ordinary store rather than for the
+ * largest store this producer might meet.  The owner's measured store is
+ * larger than that:  the capture that succeeded on 2026-11-22 was 286,257
+ * files and 12,200,859,045 bytes, so the plain command refuses that store, and
+ * the refusal is the intended behaviour rather than a fault.  Capturing a
+ * store of that size is an explicit act:  the operator names the ceiling on
+ * the command line, up to the absolute ceiling of 32 GiB, which still covers
+ * the measured store.
+ */
 export const DEFAULT_MAX_BYTES = 8 * 1024 * 1024 * 1024;
 
-/** The default capture ceiling on file count. */
+/**
+ * The default capture ceiling on file count: 200,000 files.
+ *
+ * The same store holds 286,388 files, so the ordinary default does not cover
+ * it either and the plain command refuses it before it writes anything.  An
+ * operator who names --max-files raises the ceiling up to the absolute
+ * ceiling of 500,000 files, which does cover the measured store, and a
+ * request above that absolute ceiling is refused with both numbers named
+ * rather than being clamped or silently replaced.
+ */
 export const DEFAULT_MAX_FILES = 200_000;
+
+/**
+ * The absolute ceiling on bytes an operator may name: 32 GiB.
+ *
+ * This is the bound on the opt-in and not the default.  It exists so that a
+ * raised ceiling stays a ceiling somebody chose:  a request above this number
+ * is refused, naming both the request and this number, and nothing is
+ * clamped and nothing is silently replaced.  The measured store is
+ * 12,200,859,045 bytes, so this bound covers it with room to grow.
+ */
+export const ABSOLUTE_MAX_BYTES = 32 * 1024 * 1024 * 1024;
+
+/**
+ * The absolute ceiling on file count an operator may name: 500,000 files.
+ *
+ * The measured store holds 286,388 files and the capture that succeeded was
+ * 286,257 files, so this bound covers the measured store with room to grow,
+ * and it is the largest file ceiling this producer accepts on the command
+ * line.
+ */
+export const ABSOLUTE_MAX_FILES = 500_000;
 
 /**
  * The largest file the evidence bundle will accept.  The bundle's reader
@@ -271,6 +327,50 @@ export function listStoreFiles(root) {
   files.sort();
   skipped.sort((a, b) => a.path.localeCompare(b.path));
   return { files, skipped };
+}
+
+/**
+ * Whether a WAL or shared-memory sibling is superseded by the snapshot of the
+ * database it sits beside.
+ *
+ * The capture leaves such a sibling out, because the snapshot of the database
+ * replaces it, and a size estimate that counted it would overstate what the
+ * capture copies.  The database is recognized by its own magic, which is the
+ * same test the capture uses, so the estimate and the copy agree.
+ */
+function supersedesSnapshotSibling(storeRelative, knownFiles, source) {
+  const withoutSuffix = storeRelative.replace(/-(wal|shm)$/, "");
+  if (withoutSuffix === storeRelative) return false;
+  if (!knownFiles.has(withoutSuffix)) return false;
+  return readHeader(join(source, withoutSuffix), SQLITE_MAGIC.length).equals(SQLITE_MAGIC);
+}
+
+/**
+ * The bytes a capture of this store would copy, measured before anything is
+ * written.
+ *
+ * The byte ceiling has to be refused BEFORE the capture starts, because a
+ * refusal that arrives half way through leaves a half-copied tree behind, and
+ * a half-copied tree is not evidence of anything.  So the sizes are taken
+ * from the listing and added up before the capture directory exists.
+ *
+ * The number is an estimate rather than a promise.  A redacted text file is
+ * not exactly the size of its source, and a database snapshot is not the size
+ * of the live database, so the copy measures the bytes it actually wrote and
+ * refuses there as well.  The estimate catches the ordinary case before any
+ * output exists;  the in-copy check catches a store that grew underneath it.
+ */
+export function estimateCaptureBytes(source, files) {
+  const knownFiles = new Set(files);
+  let bytes = 0;
+  let counted = 0;
+  for (const storeRelative of files) {
+    if (exclusionReason(storeRelative)) continue;
+    if (supersedesSnapshotSibling(storeRelative, knownFiles, source)) continue;
+    bytes += statSync(join(source, storeRelative)).size;
+    counted += 1;
+  }
+  return { bytes, files: counted };
 }
 
 /** A directory that may hold evidence: 0700, owned by this account. */
@@ -643,101 +743,148 @@ export async function archiveStore({ storeRoot, outDir, maxBytes = DEFAULT_MAX_B
   const { files, skipped } = listStoreFiles(source);
   if (files.length > maxFiles) throw new Error(`store holds ${files.length} files, above the ${maxFiles} ceiling`);
 
-  mkdirSync(target, { mode: 0o700 });
-  const tree = join(target, "tree");
-  mkdirSync(tree, { mode: 0o700 });
+  // The byte ceiling is refused before the capture directory exists, so a
+  // refusal leaves nothing behind at all.  The copy measures the bytes it
+  // actually wrote as well, because a store that grows while it is being
+  // copied slips past an estimate taken before the copy began.
+  const estimate = estimateCaptureBytes(source, files);
+  if (estimate.bytes > maxBytes) throw new Error(`store holds ${estimate.bytes} bytes, above the ${maxBytes} byte ceiling`);
 
-  const manifestFiles = [];
-  const excluded = skipped.map((entry) => ({ ...entry, bytes: 0 }));
-  const snapshotOf = new Set();
-  let totalBytes = 0;
-  for (const storeRelative of files) {
-    if (exclusionReason(storeRelative)) {
-      const stat = statSync(join(source, storeRelative));
-      excluded.push({ path: storeRelative, reason: exclusionReason(storeRelative), bytes: stat.size });
-      continue;
-    }
-    // A WAL or shared-memory sibling of a database that was snapshotted is
-    // superseded by the snapshot, and copying it would restore a journal
-    // that belongs to a different snapshot.
-    const withoutSuffix = storeRelative.replace(/-(wal|shm)$/, "");
-    if (withoutSuffix !== storeRelative && snapshotOf.has(withoutSuffix)) {
-      excluded.push({ path: storeRelative, reason: "superseded-by-snapshot", bytes: 0 });
-      continue;
-    }
-    const destination = join(tree, ...storeRelative.split("/"));
-    mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
-    const row = await captureFile(join(source, storeRelative), destination, storeRelative, { readOnly: true });
-    if (row.excluded) {
-      rmQuietly(destination);
-      excluded.push({ path: row.path, reason: row.reason, bytes: row.bytes });
-      continue;
-    }
-    if (row.kind === "sqlite-snapshot") snapshotOf.add(storeRelative);
-    totalBytes += row.bytes;
-    if (totalBytes > maxBytes) throw new Error(`archive exceeded the ${maxBytes} byte ceiling`);
-    manifestFiles.push(row);
-  }
-  excluded.sort((a, b) => a.path.localeCompare(b.path));
+  try {
+    mkdirSync(target, { mode: 0o700 });
+    const tree = join(target, "tree");
+    mkdirSync(tree, { mode: 0o700 });
 
-  // Make the tree read-only from the deepest directory upwards, so the
-  // directories are sealed after their contents are in place.
-  const directories = [];
-  const collectDirectories = (directory) => {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      if (entry.isDirectory()) {
-        const child = join(directory, entry.name);
-        collectDirectories(child);
-        directories.push(child);
+    const manifestFiles = [];
+    const excluded = skipped.map((entry) => ({ ...entry, bytes: 0 }));
+    const snapshotOf = new Set();
+    let totalBytes = 0;
+    for (const storeRelative of files) {
+      if (exclusionReason(storeRelative)) {
+        const stat = statSync(join(source, storeRelative));
+        excluded.push({ path: storeRelative, reason: exclusionReason(storeRelative), bytes: stat.size });
+        continue;
       }
+      // A WAL or shared-memory sibling of a database that was snapshotted is
+      // superseded by the snapshot, and copying it would restore a journal
+      // that belongs to a different snapshot.
+      const withoutSuffix = storeRelative.replace(/-(wal|shm)$/, "");
+      if (withoutSuffix !== storeRelative && snapshotOf.has(withoutSuffix)) {
+        excluded.push({ path: storeRelative, reason: "superseded-by-snapshot", bytes: 0 });
+        continue;
+      }
+      const destination = join(tree, ...storeRelative.split("/"));
+      mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+      const row = await captureFile(join(source, storeRelative), destination, storeRelative, { readOnly: true });
+      if (row.excluded) {
+        rmQuietly(destination);
+        excluded.push({ path: row.path, reason: row.reason, bytes: row.bytes });
+        continue;
+      }
+      if (row.kind === "sqlite-snapshot") snapshotOf.add(storeRelative);
+      totalBytes += row.bytes;
+      if (totalBytes > maxBytes) throw new Error(`archive reached ${totalBytes} bytes, above the ${maxBytes} byte ceiling`);
+      manifestFiles.push(row);
+    }
+    excluded.sort((a, b) => a.path.localeCompare(b.path));
+
+    // Make the tree read-only from the deepest directory upwards, so the
+    // directories are sealed after their contents are in place.
+    const directories = [];
+    const collectDirectories = (directory) => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          const child = join(directory, entry.name);
+          collectDirectories(child);
+          directories.push(child);
+        }
+      }
+    };
+    collectDirectories(tree);
+    directories.push(tree);
+    for (const directory of directories) chmodSync(directory, ARCHIVE_DIR_MODE);
+
+    const probe = manifestFiles.length ? proveReadOnly(join(tree, ...manifestFiles[0].path.split("/"))) : { ok: false, reason: "empty-archive" };
+
+    const redactionFailures = manifestFiles.reduce((sum, row) => sum + (row.redactionFailures ?? 0), 0);
+    const redactionFailedFiles = manifestFiles.filter((row) => (row.redactionFailures ?? 0) > 0).length;
+    const manifest = {
+      marker: ARCHIVE_MARKER,
+      version: ARCHIVE_VERSION,
+      capturedAt,
+      source,
+      readOnlyProved: probe.ok,
+      totals: { files: manifestFiles.length, bytes: totalBytes, excluded: excluded.length, redactionFailures },
+      files: manifestFiles,
+      excluded,
+    };
+    const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    if (redactSecretsInText(manifestBytes.toString("utf8")) !== manifestBytes.toString("utf8")) {
+      throw new Error("refusing to write a manifest that carries a credential shape");
+    }
+    writeFileSync(join(target, "manifest.json"), manifestBytes, { mode: 0o600 });
+    // The report is what travels in the packet.  The manifest itself names
+    // every file, and a store with eighteen thousand files produces a manifest
+    // far larger than the bundle will carry, so the report summarizes the
+    // archive and binds the manifest by hash.
+    const report = {
+      marker: "botfleet-node-store-archive-report",
+      version: ARCHIVE_VERSION,
+      capturedAt,
+      source,
+      readOnlyProved: manifest.readOnlyProved,
+      totals: manifest.totals,
+      manifestSha256: sha256(manifestBytes),
+      manifestBytes: manifestBytes.length,
+      excluded: manifest.excluded.slice(0, MAX_REPORT_ROWS),
+      excludedCount: manifest.excluded.length,
+      excludedTruncated: manifest.excluded.length > MAX_REPORT_ROWS,
+      credentialMatches: manifest.files.reduce((sum, row) => sum + (row.credentialMatches ?? 0), 0),
+      redactionFailures,
+      redactionFailedFiles,
+      scope: "The archive is a private copy of the owner's own store, and it holds what the store holds.  The text in it is redacted;  a database snapshot is copied whole and the credential shapes it holds are counted here.  A file the redactor could not parse is counted as a redaction failure here rather than kept quietly, and the capture does not certify itself clean while that count is above zero.  This report travels in the packet;  the archive itself does not.",
+    };
+    writeBoundedReport(join(target, "archive-report.json"), report);
+    return { manifest, report, outDir: target };
+  } catch (error) {
+    // A refusal leaves nothing behind:  no capture directory, no partial tree,
+    // no manifest, no report.
+    removeCaptureDirectory(target);
+    throw error;
+  }
+}
+
+/**
+ * Remove a capture directory that a refusal left behind.
+ *
+ * A refusal must leave nothing:  no capture directory, no partial tree, no
+ * manifest, no report.  The tree's directories are sealed read-only before
+ * the manifest is written, so they are unlocked first, because a read-only
+ * directory cannot have its contents removed by the account that owns it.
+ */
+function removeCaptureDirectory(target) {
+  const unlock = (directory) => {
+    let entries;
+    try {
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) unlock(join(directory, entry.name));
+    }
+    try {
+      chmodSync(directory, 0o700);
+    } catch {
+      /* the directory is already gone */
     }
   };
-  collectDirectories(tree);
-  directories.push(tree);
-  for (const directory of directories) chmodSync(directory, ARCHIVE_DIR_MODE);
-
-  const probe = manifestFiles.length ? proveReadOnly(join(tree, ...manifestFiles[0].path.split("/"))) : { ok: false, reason: "empty-archive" };
-
-  const redactionFailures = manifestFiles.reduce((sum, row) => sum + (row.redactionFailures ?? 0), 0);
-  const redactionFailedFiles = manifestFiles.filter((row) => (row.redactionFailures ?? 0) > 0).length;
-  const manifest = {
-    marker: ARCHIVE_MARKER,
-    version: ARCHIVE_VERSION,
-    capturedAt,
-    source,
-    readOnlyProved: probe.ok,
-    totals: { files: manifestFiles.length, bytes: totalBytes, excluded: excluded.length, redactionFailures },
-    files: manifestFiles,
-    excluded,
-  };
-  const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-  if (redactSecretsInText(manifestBytes.toString("utf8")) !== manifestBytes.toString("utf8")) {
-    throw new Error("refusing to write a manifest that carries a credential shape");
+  unlock(target);
+  try {
+    rmSync(target, { recursive: true, force: true });
+  } catch {
+    /* the directory is already gone */
   }
-  writeFileSync(join(target, "manifest.json"), manifestBytes, { mode: 0o600 });
-  // The report is what travels in the packet.  The manifest itself names
-  // every file, and a store with eighteen thousand files produces a manifest
-  // far larger than the bundle will carry, so the report summarizes the
-  // archive and binds the manifest by hash.
-  const report = {
-    marker: "botfleet-node-store-archive-report",
-    version: ARCHIVE_VERSION,
-    capturedAt,
-    source,
-    readOnlyProved: manifest.readOnlyProved,
-    totals: manifest.totals,
-    manifestSha256: sha256(manifestBytes),
-    manifestBytes: manifestBytes.length,
-    excluded: manifest.excluded.slice(0, MAX_REPORT_ROWS),
-    excludedCount: manifest.excluded.length,
-    excludedTruncated: manifest.excluded.length > MAX_REPORT_ROWS,
-    credentialMatches: manifest.files.reduce((sum, row) => sum + (row.credentialMatches ?? 0), 0),
-    redactionFailures,
-    redactionFailedFiles,
-    scope: "The archive is a private copy of the owner's own store, and it holds what the store holds.  The text in it is redacted;  a database snapshot is copied whole and the credential shapes it holds are counted here.  A file the redactor could not parse is counted as a redaction failure here rather than kept quietly, and the capture does not certify itself clean while that count is above zero.  This report travels in the packet;  the archive itself does not.",
-  };
-  writeBoundedReport(join(target, "archive-report.json"), report);
-  return { manifest, report, outDir: target };
 }
 
 /** Remove a path, ignoring the failure that matters when it is already gone. */
@@ -845,6 +992,139 @@ export function restoreArchive({ archiveDir, intoDir, restoredAt = new Date().to
     mismatchesTruncated: rehearsal.mismatches.length > MAX_REPORT_ROWS,
   });
   return rehearsal;
+}
+
+/**
+ * Check a capture where it lies, without restoring it.
+ *
+ * The manifest comparison lived inside the restore, so the only way to ask
+ * whether a capture was intact was to write a copy of it out first.  This
+ * reads the manifest and the tree and writes nothing:  a check that is not a
+ * restore cannot become one, and a capture is never disturbed to be judged.
+ *
+ * Three kinds of disagreement are kept apart, because they answer different
+ * questions.  A file the manifest names and the tree does not hold, a file
+ * the tree holds and the manifest does not name, and a manifest whose own
+ * totals disagree with its own file list are three findings, and the file
+ * count only moves for the first of them.
+ */
+export function verifyArchive({ captureDir }) {
+  const archive = resolve(captureDir);
+  const manifest = JSON.parse(readFileSync(join(archive, "manifest.json"), "utf8"));
+  if (manifest.marker !== ARCHIVE_MARKER) throw new Error("not an archive manifest");
+  const tree = join(archive, "tree");
+
+  // A corrupt manifest has to finish and say so rather than crash, so a
+  // manifest without a file list is a finding and not a thrown error.
+  if (!Array.isArray(manifest.files)) {
+    return {
+      marker: "botfleet-node-store-verify-report",
+      version: ARCHIVE_VERSION,
+      capture: archive,
+      expectedFiles: 0,
+      verifiedFiles: 0,
+      mismatches: [{ path: "manifest.json", reason: "manifest-files-missing" }],
+      ok: false,
+    };
+  }
+
+  const fileMismatches = [];
+  const treeMismatches = [];
+  const manifestMismatches = [];
+
+  const named = new Set();
+  for (const row of manifest.files) {
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- a manifest row is untyped JSON, so the path it names has to be checked before it is used.
+    if (!row || typeof row.path !== "string") {
+      fileMismatches.push({ path: "manifest.json", reason: "malformed-manifest-row" });
+      continue;
+    }
+    named.add(row.path);
+    // A manifest names paths, and a tampered one names a path that leaves the
+    // tree, so every path is resolved and refused when it escapes.
+    const from = resolveInside(tree, row.path);
+    if (!from) {
+      fileMismatches.push({ path: row.path, reason: "unsafe-manifest-path" });
+      continue;
+    }
+    let archivedHash;
+    try {
+      archivedHash = hashFile(from);
+    } catch (error) {
+      // A missing or unreadable file is a mismatch, not a crash:  the check
+      // has to finish and say so.
+      fileMismatches.push({ path: row.path, reason: "archive-hash-mismatch", detail: error.code ?? "unreadable" });
+      continue;
+    }
+    if (archivedHash !== row.sha256) {
+      fileMismatches.push({ path: row.path, reason: "archive-hash-mismatch" });
+    }
+  }
+
+  // The tree is read rather than trusted, because a capture that was added to
+  // after it was written still carries a manifest that hashes every file it
+  // names:  only the tree itself shows the extra file.
+  let treeEntries = null;
+  try {
+    treeEntries = listTreeEntries(tree);
+  } catch (error) {
+    treeMismatches.push({ path: "tree", reason: "tree-unreadable", detail: error.code ?? "unreadable" });
+  }
+  if (treeEntries) {
+    for (const entry of treeEntries.files) {
+      if (!named.has(entry)) treeMismatches.push({ path: entry, reason: "unlisted-tree-file" });
+    }
+    for (const entry of treeEntries.skipped) {
+      treeMismatches.push({ path: entry.path, reason: "tree-entry-not-a-regular-file", detail: entry.reason });
+    }
+  }
+
+  // A manifest whose own totals disagree with its own file list is a manifest
+  // finding, and it does not move the file count:  the files it names were
+  // each checked on their own.
+  if (manifest.totals && manifest.totals.files !== manifest.files.length) {
+    manifestMismatches.push({ path: "manifest.json", reason: "totals-mismatch" });
+  }
+
+  const mismatches = [...fileMismatches, ...treeMismatches, ...manifestMismatches];
+  return {
+    marker: "botfleet-node-store-verify-report",
+    version: ARCHIVE_VERSION,
+    capture: archive,
+    expectedFiles: manifest.files.length,
+    verifiedFiles: manifest.files.length - fileMismatches.length,
+    mismatches,
+    ok: mismatches.length === 0,
+  };
+}
+
+/**
+ * Every entry a captured tree holds, named the way the manifest names them.
+ *
+ * A tree entry that is not a regular file is reported rather than skipped, so
+ * a symlink planted in a capture is a finding and not a silent pass.
+ */
+function listTreeEntries(root) {
+  const files = [];
+  const skipped = [];
+  const walk = (directory, prefix) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        walk(join(directory, entry.name), relative);
+        continue;
+      }
+      if (entry.isFile()) {
+        files.push(relative);
+        continue;
+      }
+      skipped.push({ path: relative, reason: entry.isSymbolicLink() ? "symbolic-link" : "not-a-regular-file" });
+    }
+  };
+  walk(root, "");
+  files.sort();
+  skipped.sort((a, b) => a.path.localeCompare(b.path));
+  return { files, skipped };
 }
 
 /**
@@ -1257,6 +1537,90 @@ function flagValue(args, flag) {
   return index === -1 ? undefined : args[index + 1];
 }
 
+/**
+ * The raw value a ceiling flag carries, or null when the flag was not given.
+ *
+ * The flag may be written `--max-files 250000` or `--max-files=250000`. 
+ * flag that is present but carries no value at all comes back as the empty
+ * string rather than as null, because a ceiling the operator named and did
+ * not fill in is a refusal and not a default.
+ */
+function ceilingArg(args, flag) {
+  const index = args.indexOf(flag);
+  if (index !== -1) {
+    const next = args[index + 1];
+    return next === undefined ? "" : next;
+  }
+  const prefix = `${flag}=`;
+  const inline = args.find((arg) => arg.startsWith(prefix));
+  return inline === undefined ? null : inline.slice(prefix.length);
+}
+
+/**
+ * The absolute ceiling that bounds one ceiling flag, or undefined for a flag
+ * this module does not name.
+ *
+ * The ceiling is a module constant, so it is applied whether or not a caller
+ * passes it.  A caller that omits the bound gets the same refusal a caller
+ * that names it gets, which is what keeps one function from holding two
+ * contracts.
+ */
+function absoluteCeilingFor(flag) {
+  if (flag === "--max-files") return ABSOLUTE_MAX_FILES;
+  if (flag === "--max-bytes") return ABSOLUTE_MAX_BYTES;
+  return undefined;
+}
+
+/**
+ * A capture ceiling named on the command line, as a positive whole number.
+ *
+ * The value has to be a positive whole number:  zero, a negative number, a
+ * fraction or a value that is not a number at all is a usage refusal rather
+ * than a silent fall back to the default, because a ceiling the operator did
+ * not choose is a ceiling the operator did not set.  An absent flag comes
+ * back as undefined, which is how the caller tells "not named" from "named
+ * and wrong".
+ *
+ * When an absolute ceiling is given, a request above it is refused as well,
+ * and the refusal names the value that was asked for and the ceiling that
+ * bounds it.  The request is not clamped and not replaced by the ceiling:  a
+ * ceiling the operator did not get is a ceiling the operator did not choose.
+ *
+ * The ceiling this flag carries is the module's own constant unless a caller
+ * names another one, so the bound cannot be skipped by leaving the argument
+ * out.
+ */
+export function parseCeilingFlag(args, flag, absoluteCeiling = absoluteCeilingFor(flag)) {
+  const raw = ceilingArg(args, flag);
+  if (raw === null) return undefined;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`${flag} <count> must be a positive whole number`);
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${flag} <count> must be a positive whole number`);
+  }
+  if (absoluteCeiling !== undefined && value > absoluteCeiling) {
+    throw new Error(`${flag} ${value} is above the absolute ceiling of ${absoluteCeiling}`);
+  }
+  return value;
+}
+
+/**
+ * Where the pair of ceilings in force came from.
+ *
+ * "default" is the plain command, "explicit" is an operator who named both
+ * ceilings, and "mixed" is an operator who named one of them and left the
+ * other at its default.  The output says which, because a capture under an
+ * ordinary default and a capture under an opt-in are different claims and a
+ * reader of the JSON has to be able to tell them apart.
+ */
+export function ceilingSource(namedMaxFiles, namedMaxBytes) {
+  if (namedMaxFiles === undefined && namedMaxBytes === undefined) return "default";
+  if (namedMaxFiles !== undefined && namedMaxBytes !== undefined) return "explicit";
+  return "mixed";
+}
+
 let isEntry = false;
 try {
   isEntry = realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
@@ -1275,7 +1639,17 @@ if (isEntry) {
       const storeRoot = flagValue(args, "--store") ?? resolveStoreRoot();
       const outDir = flagValue(args, "--out");
       if (!outDir) throw new Error("--out <capture-directory> is required");
-      const { manifest } = await archiveStore({ storeRoot, outDir });
+      // The ceilings are the operator's to raise, up to the absolute
+      // ceiling and no further.  A value that is not a positive whole
+      // number, and a value above the absolute ceiling, are both refused
+      // here, where the reason can be said, rather than being silently
+      // replaced by the default or clamped down to the ceiling.
+      const namedMaxFiles = parseCeilingFlag(args, "--max-files", ABSOLUTE_MAX_FILES);
+      const namedMaxBytes = parseCeilingFlag(args, "--max-bytes", ABSOLUTE_MAX_BYTES);
+      const maxFiles = namedMaxFiles ?? DEFAULT_MAX_FILES;
+      const maxBytes = namedMaxBytes ?? DEFAULT_MAX_BYTES;
+      const source = ceilingSource(namedMaxFiles, namedMaxBytes);
+      const { manifest } = await archiveStore({ storeRoot, outDir, maxFiles, maxBytes });
       console.log(JSON.stringify({
         archived: true,
         outDir: resolve(outDir),
@@ -1283,6 +1657,9 @@ if (isEntry) {
         bytes: manifest.totals.bytes,
         excluded: manifest.totals.excluded,
         readOnlyProved: manifest.readOnlyProved,
+        maxFiles,
+        maxBytes,
+        ceilingSource: source,
       }));
     } else if (command === "restore") {
       const archiveDir = flagValue(args, "--archive");
@@ -1299,6 +1676,17 @@ if (isEntry) {
         healthOk: health.ok,
       }));
       if (!rehearsal.ok || !health.ok) process.exitCode = 1;
+    } else if (command === "verify") {
+      const captureDir = flagValue(args, "--capture");
+      if (!captureDir) throw new Error("--capture <capture-directory> is required");
+      const verdict = verifyArchive({ captureDir });
+      console.log(JSON.stringify({
+        verified: verdict.ok,
+        expectedFiles: verdict.expectedFiles,
+        verifiedFiles: verdict.verifiedFiles,
+        mismatches: verdict.mismatches.length,
+      }));
+      if (!verdict.ok) process.exitCode = 1;
     } else if (command === "receipt") {
       const captureDir = flagValue(args, "--capture");
       const requestPath = flagValue(args, "--request");
@@ -1323,8 +1711,9 @@ if (isEntry) {
       });
       console.log(JSON.stringify({ emitted: Object.keys(emitted) }));
     } else {
-      console.error("usage: node scripts/archive-node-store.mjs archive --store <root> --out <dir>");
+      console.error(`usage: node scripts/archive-node-store.mjs archive --store <root> --out <dir> [--max-files <count, at most ${ABSOLUTE_MAX_FILES}>] [--max-bytes <bytes, at most ${ABSOLUTE_MAX_BYTES}>]`);
       console.error("       node scripts/archive-node-store.mjs restore --archive <dir> --into <scratch-root>");
+      console.error("       node scripts/archive-node-store.mjs verify --capture <dir>");
       console.error("       node scripts/archive-node-store.mjs receipt --capture <dir> --request <request.json> --provenance-record <file> --provenance-source <https-url> --provenance-by <who> [--parity-report <file>]");
       process.exitCode = 2;
     }
@@ -1332,3 +1721,5 @@ if (isEntry) {
     fail(error.message);
   }
 }
+
+/* oxlint-enable eslint/no-irregular-whitespace */

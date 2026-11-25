@@ -51,7 +51,8 @@ export { STATIC_CLAUDE_MODELS };
 import { computerProxyEnv } from "../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
+import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials, seatCredentialsReady } from "../child-credentials.ts";
+import { CLI_LOGIN_ENV_NAMES, FLEET_BEARER_ENV_NAME } from "../secret-map.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import {
   applyClaudeInject,
@@ -74,6 +75,7 @@ import {
   type PromptSplitReceipt,
 } from "./prompt-split.ts";
 import type { ReviewPrompt } from "../../shared/auto-review.ts";
+import { mcpStdioServer } from "../mcp-gate-config.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 
 /** How the volatile half of the system prompt (memory, mentions) reaches a
@@ -1163,13 +1165,28 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // here, before the guard:  the guard and the registration that follows it
       // have to stay free of `await`, or a second turn on this thread would walk
       // through the guard the first one already passed.
-      primeCliLogin(turn.launchIdentity?.seat);
+      primeSeatCredentials(turn.launchIdentity?.seat);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
       let preflightCancelled = false;
       let preflightError: unknown;
       const preflight = { turnId, stop: () => { preflightCancelled = true; } };
       active.set(threadId, preflight);
+      // The seat's credential read is started before the guard, so it may
+      // still be in flight here.  Waiting for it here — after the
+      // registration, which must stay synchronous with the guard — means
+      // the child is spawned with the credential rather than without it.
+      if (!seatCredentialsReady(turn.launchIdentity?.seat)) {
+        try {
+          await awaitSeatCredentials(turn.launchIdentity?.seat);
+        } catch (error) {
+          // The slot is claimed but no child exists yet:  a failed credential
+          // read must release the claim before the failure propagates, or
+          // every later turn on this thread is refused as already running.
+          if (active.get(threadId) === preflight) active.delete(threadId);
+          throw error;
+        }
+      }
       try {
         await requireStrictMcp();
       } catch (error) {
@@ -1332,6 +1349,17 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         };
         allowed.push("mcp__dweb");
       }
+      // The person's own MCP servers:  the ones the workspace shares and
+      // the ones this bot owns.  A URL server rides BotFleet's remote
+      // proxy (mcpStdioServer), so it reaches the engine over stdio with
+      // the same handshake the harness uses, and a credential in its
+      // headers travels in the 0600 config file below rather than on argv.
+      for (const [name, server] of Object.entries(turn.integrations?.custom ?? {})) {
+        if (mcpServers[name]) continue;
+        const stdio = mcpStdioServer(server, { nodeEnv: { ELECTRON_RUN_AS_NODE: "1" } });
+        if (!stdio) continue;
+        mcpServers[name] = { command: stdio.command, args: stdio.args ?? [], env: stdio.env ?? {} };
+      }
       // permission broker: anything acceptEdits would silently deny becomes
       // an Allow/Deny card in chat, and the agent gets ask_user. Skipped in
       // bypassPermissions (fullAuto) — nothing would ever ask.
@@ -1369,10 +1397,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // The launch identity is per bot and per turn (`turnEnvironment` is the
       // instance's), and a retained process keeps the env it was spawned with,
       // so it is part of the contract key below.
-      const env = launchedChildEnvironment(
+      const env = launchedChildCredentials(
         claudeEnvironment(turnModel, turnEnvironment),
         turn.launchIdentity,
-        cliLoginEnvironment(turn.launchIdentity?.seat),
+        turn.launchIdentity?.seat,
       );
       const cwd = turn.cwd ?? homedir();
       // everything that shapes the process, minus session/turn specifics
@@ -1389,6 +1417,16 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         // write into the process spawned for the first one's seat.
         seat: env.AGENT_LAUNCH_SEAT ?? null,
         session: env.AGENT_SESSION ?? null,
+        // Whether the seat's fleet bearer was present when this process was
+        // spawned.  The credential itself never enters the key — only
+        // whether it was there — so a retained process that was spawned
+        // before the read landed is replaced by one that carries it,
+        // instead of holding no bearer for every later turn.
+        hasFleetBearer: env[FLEET_BEARER_ENV_NAME] !== undefined,
+        // The same for the seat's CLI login:  a process spawned before that
+        // read landed was retained without it, and the contract is what
+        // decides whether a process is reused.
+        hasCliLogin: Object.keys(env).some((name) => CLI_LOGIN_ENV_NAMES.includes(name)),
       });
 
       // What the user turn carries besides its text.  The volatile half rides
@@ -2441,6 +2479,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           effortLevels: ["low", "medium", "high", "xhigh", "max"],
           queueing: true,
           qdrantMcp: true,
+          customMcp: true,
           // Offered in every mode: a bypass instance runs a host-control turn
           // through the broker (see sendTurn), so the asks still reach a person.
           localComputerMcp: true,

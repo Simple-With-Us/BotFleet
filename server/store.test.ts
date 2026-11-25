@@ -1180,6 +1180,10 @@ describe("Store task working folder", () => {
     expect(rolled.threadId).not.toBe(first.threadId);
     expect(rolled.automationKey).toBe("webhook:wh_compile");
     expect(store.taskByThread(bot.id, first.threadId)?.automationKey).toBeUndefined();
+    // BF-2556: the retired task is renamed so the list never shows two
+    // threads with the live title; the replacement holds it alone.
+    expect(rolled.title).toBe("Compile gates");
+    expect(store.taskByThread(bot.id, first.threadId)?.title).toMatch(/^Compile gates \(archived \d{4}-\d{2}-\d{2}\)$/);
     expect(store.taskByAutomationKey(bot.id, "webhook:wh_compile")?.threadId).toBe(rolled.threadId);
     // Old history stays put.
     expect(store.messagesFor(first.threadId).some((m) => m.text === "old wake")).toBe(true);
@@ -1188,10 +1192,23 @@ describe("Store task working folder", () => {
     expect(seed).toHaveLength(1);
     expect(seed[0]?.role).toBe("system");
     expect(seed[0]?.text).toContain(first.threadId);
+    expect(seed[0]?.text).toContain("Compile gates (archived");
     expect(seed[0]?.text).not.toContain("old wake");
     // createTask still reunites on the NEW owner.
     const again = store.createTask(bot.id, "Compile gates", false, "webhook:wh_compile")!;
     expect(again.threadId).toBe(rolled.threadId);
+
+    // A second rollover the same day disambiguates its archived name instead
+    // of recreating BF-2556's duplicate-title pair one rename later.
+    const rolledAgain = store.rolloverAutomationTask(bot.id, "webhook:wh_compile", {
+      title: "Compile gates",
+      activate: false,
+    })!;
+    const firstTitle = store.taskByThread(bot.id, first.threadId)?.title;
+    const secondTitle = store.taskByThread(bot.id, rolled.threadId)?.title;
+    expect(rolledAgain.title).toBe("Compile gates");
+    expect(secondTitle).toMatch(/^Compile gates \(archived \d{4}-\d{2}-\d{2}\) \(2\)$/);
+    expect(secondTitle).not.toBe(firstTitle);
   });
 
   it("rolloverAutomationTask clears the key from aliases so lookup cannot stick on a merged source", () => {

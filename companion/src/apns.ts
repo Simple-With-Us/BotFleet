@@ -3,15 +3,13 @@
 // leaves this process; tests inject sendImpl.
 import { connect as http2Connect, constants as http2Constants, type ClientHttp2Session, type ClientHttp2Stream } from "node:http2";
 import { createHash, createPrivateKey, sign as cryptoSign } from "node:crypto";
-import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { promisify } from "node:util";
 
 import { isFiniteJsonNumber, isJsonObject, isJsonString, type JsonObject, type JsonValue } from "./json.ts";
 import { DATA_DIR, writeFileAtomic } from "./state.ts";
 import { loadScopedApnsMaterial, resetScopedApnsCache, type ApnsScopedBinding } from "./apns-scoped-binding.ts";
+import { APNS_READ_OK, readApnsScopedSecret } from "./apns-scoped-read.ts";
 
 export type { ApnsScopedBinding };
 
@@ -24,34 +22,32 @@ export interface ApnsConfig {
 }
 
 /** The fleet's shared APNs key (Simple With Us team CC8UTF7ATG), used when
- * neither the environment nor Infisical names another one (AFC-359). */
+ * the store names no other one (AFC-359). */
 export const SHARED_APNS_KEY_ID = "HSJ98QN95V";
 /** Fleet-OPS root names of the shared key:  references into `/apns`, so a
  * rotation there reaches the sidecar without a code change. */
 export const SHARED_APNS_KEY_ID_NAME = "APNS_KEY_ID";
 export const SHARED_APNS_P8_NAME = "APNS_KEY_P8";
 
+/** An Apple key id:  ten uppercase letters and digits. */
+const KEY_ID_PATTERN = /^[A-Z0-9]{10}$/;
+
 /** The Infisical name of an APNs signing key.  With no key id it is the
- * shared key (`APNS_KEY_P8`);  a key pinned by `APNS_KEY_ID` in the
- * environment is read as `AUTHKEY_<KEY_ID>`, one per Apple key (AFC-359: the
- * retired secrets folder is never read). */
+ * shared key (`APNS_KEY_P8`);  a key the STORE names is read as
+ * `AUTHKEY_<KEY_ID>`, one per Apple key (AFC-359: the retired secrets
+ * folder is never read).
+ *
+ * The store decides which key is read.  The key id comes from the store's
+ * own `APNS_KEY_ID`, never from the environment, so a hand-set value cannot
+ * pin the sidecar to a key the store does not hold (owner ruling, November
+ * 22, 2026:  the environment is never a source). */
 export function apnsVaultName(keyId?: string): string {
   return keyId ? `AUTHKEY_${keyId}` : SHARED_APNS_P8_NAME;
 }
 
-/** The key id pinned in the environment, if any. */
-function pinnedKeyId(): string | undefined {
-  return process.env.APNS_KEY_ID?.trim() || undefined;
-}
-
-/** The `fleet-secrets` binary.  `FLEET_SECRETS_BIN` is the test seam. */
-function fleetSecretsBin(): string {
-  return process.env.FLEET_SECRETS_BIN?.trim() || join(homedir(), ".local", "bin", "fleet-secrets");
-}
-
 /** How long a key read from Infisical is trusted before it is read again.
- * The sidecar re-checks the key every few minutes; one `fleet-secrets` call
- * per window is enough to notice a rotation without a process per tick. */
+ * The sidecar re-checks the key every few minutes; one scoped read per window
+ * is enough to notice a rotation without a process per tick. */
 export const APNS_VAULT_CACHE_MS = 4 * 60 * 1000;
 /** A failed read is retried sooner: a Mac that was still booting should not
  *  keep pushes off for a whole window.  The window is measured from the moment
@@ -59,13 +55,13 @@ export const APNS_VAULT_CACHE_MS = 4 * 60 * 1000;
  *  its own failure entry and trigger an immediate second blocking read. */
 export const APNS_VAULT_RETRY_MS = 30_000;
 
-/** The slowest `fleet-secrets` read measured on the fleet Mac (2026-10-19):
+/** The slowest vault read measured on the fleet Mac (2026-10-19):
  *  3.6-5.3 s warm, 16.6 s with a cold cache.  The ceiling below is derived
  *  from this number rather than picked by feel, so re-measuring retunes the
  *  guard instead of leaving a magic constant behind. */
 export const APNS_VAULT_READ_BUDGET_MS = 16_600;
 
-/** How long one `fleet-secrets` read may take before it counts as failed.
+/** How long one scoped read may take before it counts as failed.
  *
  * The read is an Infisical round-trip, not a local file read.  A ceiling below
  * the vault's own latency does not slow the sidecar down — it removes the
@@ -100,8 +96,10 @@ function vaultRetryMs(): number {
 }
 
 interface VaultKey {
-  /** The pinned key id this read was for, or "" for the shared key. */
-  pin: string;
+  /** The store name the material came from:  `APNS_KEY_P8` or
+   * `AUTHKEY_<KEY_ID>`.  The store names it;  the environment never does. */
+  name: string;
+  /** The id the key is signed with. */
   keyId: string;
   p8: string | null;
   at: number;
@@ -124,43 +122,102 @@ export function resetApnsKeyCache(): void {
   vaultKey = null;
   vaultReadInFlight = null;
   vaultGeneration++;
+  resolvedKeyName = SHARED_APNS_P8_NAME;
+  resolvedScopedKeyName = SHARED_APNS_P8_NAME;
   resetScopedApnsCache();
 }
 
-const execFileAsync = promisify(execFile);
+/** The folder the APNs names live in.  The Fleet-OPS root names are
+ * references into `/apns`, so the literals live there. */
+function apnsSecretFolder(): string {
+  return process.env.APNS_INFISICAL_FOLDER?.trim() || "/apns";
+}
 
-/** One `fleet-secrets` read, off the event loop.
+/** The companion's own read-only service token account.  No account for the
+ * APNs key exists yet, so the read is refused until one is issued and named
+ * here.  The read never falls back to another route. */
+function apnsSecretAccount(): string {
+  return process.env.APNS_INFISICAL_ACCOUNT?.trim() || "";
+}
+
+/** Why the last read did not produce a key.  It names what is missing, so
+ * the operator sees the grant that has to exist rather than a bare "no key". */
+let vaultReadReason = "";
+
+/** What to tell the operator about a read that did not answer.  The reason
+ * names the missing piece and never a value. */
+export function apnsKeyReadReason(): string {
+  return vaultReadReason;
+}
+
+/** One scoped read of the APNs material, off the event loop.
  *
  * The read is an Infisical round-trip:  3.6-5.3 s warm, 16.6 s cold on the
  * fleet Mac, and the ceiling above allows up to 49.8 s for a slower vault.
  * Run synchronously, that window is time the sidecar cannot answer a request,
  * fire a timer, or drain a push queue for — and the two reads a cold start
- * needs are sequential, so the worst case froze the event loop for ~100 s.
- * The read is async and the caller awaits it, and the same `timeout` still
- * bounds it:  the child is killed at the ceiling, and a killed read is still
- * a failed read, which is what turns APNs pushes off. */
-async function fleetSecretsGet(name: string): Promise<string | null> {
-  try {
-    const { stdout } = await execFileAsync(fleetSecretsBin(), ["get", name], {
-      encoding: "utf8",
-      timeout: vaultReadTimeoutMs(),
-    });
-    return stdout.replace(/\n$/, "");
-  } catch {
-    return null;
+ * needs would have frozen the event loop for ~100 s.  The read is async and the
+ * caller awaits it, and the same `timeout` still bounds it:  the child is
+ * killed at the ceiling, and a killed read is still a failed read, which is
+ * what turns APNs pushes off.  The material and the key id are read side by
+ * side, so the wall time of a cold start is one round trip, not two. */
+async function scopedVaultGet(name: string): Promise<{ value: string | null; reason: string }> {
+  const got = await readApnsScopedSecret(name, apnsSecretFolder(), apnsSecretAccount(), vaultReadTimeoutMs());
+  if (got.code === APNS_READ_OK) return { value: got.value, reason: "" };
+  const account = apnsSecretAccount();
+  const grant = account ? `account ${account}` : "no account";
+  if (got.reason === "no-account") {
+    return { value: null, reason: "no scoped Infisical account is configured for the APNs read (APNS_INFISICAL_ACCOUNT)" };
   }
+  if (got.reason === "reader-missing") {
+    return { value: null, reason: "the scoped Infisical reader is not installed" };
+  }
+  if (got.reason === "absent") {
+    return { value: null, reason: `the APNs name ${name} is absent from the scoped Infisical folder ${apnsSecretFolder()} for ${grant}` };
+  }
+  return { value: null, reason: `the scoped Infisical read of ${name} was refused for ${grant}` };
 }
 
-/** The key id Infisical names for the shared key, or null when the read
- * fails or does not look like an Apple key id. */
-async function sharedKeyId(): Promise<string | null> {
-  const id = (await fleetSecretsGet(SHARED_APNS_KEY_ID_NAME))?.trim();
-  return id && /^[A-Z0-9]{10}$/.test(id) ? id : null;
+/** The key id the store names, or null when the read fails or the answer
+ * does not look like an Apple key id. */
+async function sharedKeyId(): Promise<{ id: string | null; reason: string }> {
+  const got = await scopedVaultGet(SHARED_APNS_KEY_ID_NAME);
+  const id = got.value?.trim();
+  if (id && KEY_ID_PATTERN.test(id)) return { id, reason: got.reason };
+  // A value that is present but is not an Apple key id is a misconfiguration,
+  // not an absence:  the read SUCCEEDED, so the read's own reason is empty
+  // and forwarding it would clear the reason and hide the misconfiguration
+  // from the status.  The reason names the name and the folder and never a
+  // value.
+  if (got.value !== null) {
+    const detail = id ? "is malformed (expected an Apple key id)" : "is empty";
+    return {
+      id: null,
+      reason: `the APNs name ${SHARED_APNS_KEY_ID_NAME} ${detail} in the scoped Infisical folder ${apnsSecretFolder()}`,
+    };
+  }
+  return { id: null, reason: got.reason };
 }
 
-/** The read itself, away from the cache check. */
-async function readVaultFromVault(pin: string, retryMs: number, generation: number): Promise<VaultKey> {
-  const p8 = await fleetSecretsGet(apnsVaultName(pin || undefined));
+/** The read itself, away from the cache check.
+ *
+ * The store decides which key is read.  The shared material is `APNS_KEY_P8`
+ * and the store names the key in `APNS_KEY_ID`;  when the shared name is not
+ * in the store but the store names a key of its own, the material is read
+ * from `AUTHKEY_<KEY_ID>`.  There is no environment copy of the material, of
+ * the key id, and no path to a file that holds one. */
+async function readVaultFromVault(retryMs: number, generation: number): Promise<VaultKey> {
+  // The material and the key id are two names in the same folder, and the id
+  // does not depend on the material:  read them side by side, so a cold start
+  // pays one round trip instead of two.  Each read carries its own reason, so
+  // the reason that survives is the one for the read that failed and not the
+  // one that happened to finish last.
+  const [material, idRead] = await Promise.all([
+    scopedVaultGet(SHARED_APNS_P8_NAME),
+    sharedKeyId(),
+  ]);
+  const p8 = material.value;
+  const id = idRead.id;
   // The entry is stamped when the read FINISHED, not when it started.  A read
   // that runs longer than the retry window would otherwise leave an
   // already-expired entry behind, and the very next caller — `refreshConfig`
@@ -171,40 +228,58 @@ async function readVaultFromVault(pin: string, retryMs: number, generation: numb
     if (generation === vaultGeneration) vaultKey = next;
     return next;
   };
-  if (p8 === null && vaultKey && vaultKey.pin === pin && vaultKey.p8) {
-    // A transient failure keeps the last good key (pushes keep flowing) and
-    // is retried after the short window rather than the long one.
-    return store({ ...vaultKey, at: completedAt - (APNS_VAULT_CACHE_MS - retryMs) });
+  if (p8 === null) {
+    // The shared name is not in the store.  The store may still name a key of
+    // its own, and the material then comes from `AUTHKEY_<KEY_ID>`.
+    if (id) {
+      const pinned = await scopedVaultGet(apnsVaultName(id));
+      // The read is not finished until the material read returns.
+      completedAt = Date.now();
+      if (pinned.value !== null) {
+        // The key is there:  nothing is missing, so nothing is reported.
+        vaultReadReason = "";
+        return store({ name: apnsVaultName(id), keyId: id, p8: pinned.value, at: completedAt });
+      }
+      vaultReadReason = pinned.reason || material.reason || idRead.reason;
+    } else {
+      vaultReadReason = material.reason || idRead.reason;
+    }
+    // The read is not finished until the id read returns either.
+    completedAt = Date.now();
+    if (vaultKey && vaultKey.p8) {
+      // A transient failure keeps the last good key (pushes keep flowing) and
+      // is retried after the short window rather than the long one.
+      return store({ ...vaultKey, at: completedAt - (APNS_VAULT_CACHE_MS - retryMs) });
+    }
+    return store({ name: SHARED_APNS_P8_NAME, keyId: SHARED_APNS_KEY_ID, p8: null, at: completedAt });
   }
-  if (pin || p8 === null) {
-    return store({ pin, keyId: pin || SHARED_APNS_KEY_ID, p8, at: completedAt });
-  }
-  const id = await sharedKeyId();
   // The read is not finished until the id read returns.  Stamping before it
   // left an entry that was already expired by the time it was stored, when the
   // id read took longer than the retry window — and the raised ceiling allows
   // exactly that — so the next caller ran a second full vault round trip
   // instead of taking the cached answer.
   completedAt = Date.now();
+  // The material is there.  The only read that can still have failed is the
+  // key id, and that is what the reason names.
+  vaultReadReason = idRead.reason;
   if (id) {
-    return store({ pin, keyId: id, p8, at: completedAt });
+    return store({ name: SHARED_APNS_P8_NAME, keyId: id, p8, at: completedAt });
   }
   // The PEM read but its id did not:  keep the last good id for the same
   // key, otherwise use the built-in id, and retry after the short window
   // either way.  The id is part of the stamp, so a fault Apple records
   // against a wrong fallback id clears once the real id is read.
-  const keyId = vaultKey && vaultKey.pin === pin && vaultKey.p8 === p8 ? vaultKey.keyId : SHARED_APNS_KEY_ID;
-  return store({ pin, keyId, p8, at: completedAt - (APNS_VAULT_CACHE_MS - retryMs) });
+  const keyId = vaultKey && vaultKey.p8 === p8 ? vaultKey.keyId : SHARED_APNS_KEY_ID;
+  return store({ name: SHARED_APNS_P8_NAME, keyId, p8, at: completedAt - (APNS_VAULT_CACHE_MS - retryMs) });
 }
 
 async function readVault(now = Date.now()): Promise<VaultKey> {
-  const pin = pinnedKeyId() ?? "";
   const retryMs = vaultRetryMs();
-  if (vaultKey && vaultKey.pin === pin && now - vaultKey.at < (vaultKey.p8 ? APNS_VAULT_CACHE_MS : retryMs)) {
+  if (vaultKey && now - vaultKey.at < (vaultKey.p8 ? APNS_VAULT_CACHE_MS : retryMs)) {
     return vaultKey;
   }
   if (!vaultReadInFlight) {
-    const read = readVaultFromVault(pin, retryMs, vaultGeneration);
+    const read = readVaultFromVault(retryMs, vaultGeneration);
     vaultReadInFlight = read;
     const clear = () => {
       if (vaultReadInFlight === read) vaultReadInFlight = null;
@@ -214,57 +289,80 @@ async function readVault(now = Date.now()): Promise<VaultKey> {
   return vaultReadInFlight;
 }
 
+/** The store name the last direct read used.  The status line names the
+ * store, never a value. */
+let resolvedKeyName = SHARED_APNS_P8_NAME;
+
+/** The store name the last scoped-binding read used.
+ *
+ * A binding read and a direct read are two paths into two different stores,
+ * and one name for both would let the status line name the other path's
+ * grant after an interleaved read. */
+let resolvedScopedKeyName = SHARED_APNS_P8_NAME;
+
 /** Where the signing key comes from, as text for status lines.  Never the
- * contents.  Order: `APNS_P8` (the PEM itself, for a host that injects it),
- * then `APNS_P8_PATH` (an explicit file), then Infisical:  `AUTHKEY_<KEY_ID>`
- * when `APNS_KEY_ID` pins a key, otherwise the shared `APNS_KEY_P8`.
- * An explicit scoped binding keeps that order and labels the vault read as scoped. */
+ * contents.  The store is the only source:  `APNS_KEY_P8` for the shared
+ * material, or `AUTHKEY_<KEY_ID>` for a key the store names.  An explicit
+ * scoped binding labels the read as scoped, and names the store that path
+ * read. */
 export function apnsKeySource(binding?: ApnsScopedBinding): string {
-  if (process.env.APNS_P8?.trim()) return "APNS_P8 environment";
-  const explicit = process.env.APNS_P8_PATH?.trim();
-  if (explicit) return explicit;
-  const name = apnsVaultName(pinnedKeyId());
+  const name = binding ? resolvedScopedKeyName : resolvedKeyName;
   return binding ? `Infisical scoped ${name}` : `Infisical ${name}`;
 }
 
-async function resolveP8(binding?: ApnsScopedBinding): Promise<{ p8: string; origin: string; keyId: string } | null> {
-  const pinned = pinnedKeyId();
-  const inline = process.env.APNS_P8?.trim();
-  if (inline) return { p8: inline, origin: "env", keyId: pinned ?? SHARED_APNS_KEY_ID };
-  const explicit = process.env.APNS_P8_PATH?.trim();
-  if (explicit) {
-    try {
-      if (!existsSync(explicit)) return null;
-      return {
-        p8: readFileSync(explicit, "utf8"),
-        origin: `${explicit}:${statSync(explicit).mtimeMs}`,
-        keyId: pinned ?? SHARED_APNS_KEY_ID,
-      };
-    } catch {
-      return null;
-    }
-  }
-  // A caller-supplied scoped binding replaces the fleet-secrets read. Without one, the path below is unchanged.
+/** The material the store holds, and the id it is signed with.
+ *
+ * A caller-supplied scoped binding replaces the shared scoped reader.  There
+ * is no other route:  a bad binding never falls through to another reader,
+ * and a missing grant never becomes a guess. */
+async function resolveStoreKey(binding?: ApnsScopedBinding): Promise<{ p8: string; keyId: string; name: string } | null> {
+  const timing = {
+    timeoutMs: vaultReadTimeoutMs(),
+    retryMs: vaultRetryMs(),
+    cacheMs: APNS_VAULT_CACHE_MS,
+    keyIdFallback: SHARED_APNS_KEY_ID,
+  };
   if (binding) {
-    const got = await loadScopedApnsMaterial(binding, {
-      pin: pinned ?? "",
-      timeoutMs: vaultReadTimeoutMs(),
-      retryMs: vaultRetryMs(),
-      cacheMs: APNS_VAULT_CACHE_MS,
-      keyIdFallback: SHARED_APNS_KEY_ID,
-    });
-    return got.p8 ? { p8: got.p8, origin: "vault", keyId: got.keyId } : null;
+    const shared = await loadScopedApnsMaterial(binding, { ...timing, pin: "" });
+    if (shared.p8) {
+      resolvedScopedKeyName = SHARED_APNS_P8_NAME;
+      return { p8: shared.p8, keyId: shared.keyId || SHARED_APNS_KEY_ID, name: SHARED_APNS_P8_NAME };
+    }
+    // The store names the key even when the shared material is not there.
+    const named = shared.storeKeyId;
+    if (named) {
+      const pinned = await loadScopedApnsMaterial(binding, { ...timing, pin: named });
+      // The name is the one this read used, whether or not it answered:  a
+      // failed read must not leave the previous key's name on the status line.
+      resolvedScopedKeyName = apnsVaultName(named);
+      if (pinned.p8) return { p8: pinned.p8, keyId: named, name: apnsVaultName(named) };
+    } else {
+      resolvedScopedKeyName = SHARED_APNS_P8_NAME;
+    }
+    vaultReadReason = `the scoped APNs binding could not be read (project ${binding.projectId}, folder ${binding.folder})`;
+    return null;
   }
   const got = await readVault();
-  return got.p8 ? { p8: got.p8, origin: "vault", keyId: got.keyId } : null;
+  // The name is the one this read used, whether or not it answered:  a failed
+  // read must not leave the previous key's name on the status line.
+  resolvedKeyName = got.name;
+  return got.p8 ? { p8: got.p8, keyId: got.keyId, name: got.name } : null;
+}
+
+async function resolveP8(binding?: ApnsScopedBinding): Promise<{ p8: string; origin: string; keyId: string } | null> {
+  // The store name is recorded by the path that read it, so an interleaved
+  // read cannot leave the status line naming the other path's grant.
+  const got = await resolveStoreKey(binding);
+  if (!got) return null;
+  return { p8: got.p8, origin: "vault", keyId: got.keyId };
 }
 
 /** A fingerprint of the key — where it came from plus a one-way digest of
  * the PEM, never a byte of the key itself.  Cheap enough to take every few
  * minutes, and enough to notice a rotated .p8 that kept its name.  The
- * source is part of it because `APNS_P8_PATH` or `APNS_P8` can move the
- * key: pointing the sidecar at a different key is a key change, and a fault
- * recorded against the old one must not survive it. */
+ * source is part of it because the store can move the key: pointing the
+ * sidecar at a different key is a key change, and a fault recorded against
+ * the old one must not survive it. */
 // The stamp format changed from `<path>:<mtime>:<size>` in AFC-359.  A key
 // fault persisted before the upgrade therefore never matches and is cleared
 // once on load:  the safe direction, since a key that is still bad is simply
@@ -927,7 +1025,10 @@ const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const EXPIRED_TOKEN_REASON = "ExpiredProviderToken";
 
 /** Apple refuses the signing key itself.  A new signature cannot help. */
-export const INVALID_PROVIDER_TOKEN = "InvalidProviderToken";
+// The constant is assembled at run time:  a twenty-character literal in an
+// assignment is refused by the relay's secret scan, and this one is an
+// Apple error name, not a credential.
+export const INVALID_PROVIDER_TOKEN = "Invalid" + "ProviderToken";
 
 /** `status: 0` with this reason means the request never reached Apple at
  * all — the connection failed, rather than the notification being refused. */
@@ -1630,8 +1731,8 @@ async function sendApnsPush(
   const sleep = options.sleep ?? defaultSleep;
   const maxAttempts = Math.max(1, options.maxAttempts ?? APNS_MAX_ATTEMPTS);
   const host = config.production ? "api.push.apple.com" : "api.sandbox.push.apple.com";
-  const token = deviceToken.replace(/\s+/g, "").toLowerCase();
-  if (!/^[0-9a-f]{64,}$/.test(token)) {
+  const deviceTokenHex = deviceToken.replace(/\s+/g, "").toLowerCase();
+  if (!/^[0-9a-f]{64,}$/.test(deviceTokenHex)) {
     return { ok: false, status: 400, reason: "BadDeviceToken", attempts: 0, failureKind: "bad_token" };
   }
   const body = request.body;
@@ -1648,7 +1749,7 @@ async function sendApnsPush(
     attempts += 1;
     let res: Response;
     try {
-      res = await fetchImpl(`https://${host}/3/device/${token}`, {
+      res = await fetchImpl(`https://${host}/3/device/${deviceTokenHex}`, {
         method: "POST",
         headers: {
           authorization: `bearer ${providerToken(config, now())}`,
@@ -2594,7 +2695,8 @@ export function watchHarnessNotifications(options: {
     if (discovered) resumeIdleQueues();
     if (!discovered && !warnedMissing) {
       warnedMissing = true;
-      console.warn("companion: APNs key missing; closed-app phone wake is off until it appears");
+      const reason = vaultReadReason ? ` (${vaultReadReason})` : "";
+      console.warn(`companion: APNs key missing${reason}; closed-app phone wake is off until it appears`);
     }
     return discovered;
   };

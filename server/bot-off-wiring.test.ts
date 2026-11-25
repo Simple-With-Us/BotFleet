@@ -41,12 +41,14 @@ function routeBody(matcher: string): string {
 describe("startTurn", () => {
   const body = functionBody("async function startTurn(");
 
-  it("refuses an Off bot before the stop decision, so a refused message cannot clear a stop", () => {
+  it("refuses an Off bot before anything else, and no stop decision follows it", () => {
     const gate = body.indexOf("if (botIsOff(bot)) throw botOffError();");
-    const decision = body.indexOf("decideBotStop(");
     expect(gate).toBeGreaterThan(-1);
-    expect(decision).toBeGreaterThan(gate);
-    expect(body.indexOf("clearBotSnooze(")).toBeGreaterThan(gate);
+    // The stop latch is gone by ruling (BF-2453): no decision, refusal or
+    // clear may come back after the Off gate.
+    expect(body).not.toContain("decideBotStop(");
+    expect(body).not.toContain("clearBotSnooze(");
+    expect(body).not.toContain("isBotSnoozed(");
   });
 
   it("does not let a person-initiated turn through the Off gate", () => {

@@ -52,7 +52,7 @@ None of the items above are "done."  Treat them as a testing list.
 
 ## Engines
 
-`server/drivers/builtIn.ts` currently registers **18 engines**.  The table below is the real list — it is generated from that registry, not from a hand-kept marketing list, so if you add a driver this section is the thing to update.
+`server/drivers/builtIn.ts` currently registers **22 engines**.  The table below is the real list — it is generated from that registry, not from a hand-kept marketing list, so if you add a driver this section is the thing to update.
 
 | Engine | Driver | Talks to |
 |---|---|---|
@@ -69,11 +69,15 @@ None of the items above are "done."  Treat them as a testing list.
 | OpenCode | `drivers/acp/opencode-go.ts` | Agent Client Protocol |
 | Qwen | `drivers/acp/qwen.ts` | Agent Client Protocol |
 | Hermes | `drivers/acp/hermes.ts` | Agent Client Protocol |
+| Muse Code | `drivers/acp/muse.ts` | Agent Client Protocol |
 | pi | `drivers/pi.ts` | local agent runtime |
+| ZCode | `drivers/zcode.ts` | local `zcode` CLI headless mode, GLM Coding Plan login |
+| ZCode (ACP) | `drivers/acp/zcode.ts` | Agent Client Protocol |
 | Antigravity | `drivers/antigravity.ts` | Antigravity — **also serves the Gemini 3.7/3.8 Flash models** |
 | MiniMax | `drivers/minimax.ts` | MiniMax API (`MINIMAX_API_KEY`) |
 | OpenAI-compatible | `drivers/openai-compat.ts` | any endpoint you point it at |
 | Box | `drivers/boxagent.ts` | ascii.dev cloud computer |
+| Generic CLI Wrapper | `drivers/cli-wrapper.ts` | any local command you configure |
 
 Two things worth knowing before you read a model picker:
 
@@ -104,7 +108,7 @@ When we forked, that project already shipped the core app this repo still runs o
 - **Streaming tool-run chips**, native macOS dictation from the composer mic, cursor mascots, and screenshots of the bot's work folded into the transcript.
 - **MCP control plane** — a stdio MCP server for Claude Desktop / Cursor to inspect bots and channels, page transcripts, create work, wait, switch models, and interrupt.  It does not expose approval grants, deletion, arbitrary settings, credentials, or computer lifecycle.
 - **Routines and webhooks** — one-shot or weekday schedules, plus a dedicated webhook receiver on `127.0.0.1:8800`.
-- **Desktop shells** — packaged macOS, Windows, and Ubuntu 24.04 apps with an embedded harness.
+- **Desktop shells** — a packaged macOS app with an embedded harness; the Windows and Ubuntu 24.04 shells build from source only, with no published packages (BF-2500).
 
 See the [OpenMausBot repository](https://github.com/milind-soni/OpenMausBot) for the current upstream project, including later changes this fork has not pulled.
 
@@ -210,7 +214,7 @@ See [MCP server setup and tool reference](docs/mcp-server.md) for the stdio cont
 
 Early but real — the loop works end to end: message → bot → streamed reply → tools → approvals → computer use.
 
-- **macOS is the only released platform.**  The published build is **v0.1.38** (Apple Silicon and Intel DMGs).  Windows and Ubuntu packages are produced by CI but **no Windows or Ubuntu build has ever shipped** — see the download table above.
+- **macOS is the only released platform.**  The published build is **v0.1.38** (Apple Silicon and Intel DMGs).  CI and the release workflow no longer build Windows or Ubuntu packages (BF-2500) — see the download table above.
 - **Ubuntu is beta**, with the capability limits in the table earlier in this file.
 - **Hosted/mobile connectivity is still being built.**  The iOS companion is on public TestFlight.
 - **Voice** uses an xAI, Azure Speech, or MiniMax key for spoken replies (or macOS system voices / Apple Personal Voice). Calls work on macOS with Apple dictation, and on any desktop with an xAI or AssemblyAI key — see [`docs/voice-mode.md`](docs/voice-mode.md).

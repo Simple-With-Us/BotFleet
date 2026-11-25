@@ -39,6 +39,7 @@ import {
   logProbeFailure,
   spawnCli,
 } from "../procs.ts";
+import { mcpStdioServer } from "../mcp-gate-config.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { STDERR_EXCERPT_HEAD, STDERR_EXCERPT_TAIL, stderrExcerpt } from "../stderr-excerpt.ts";
 import { readHostLoad, resolveInitDeadline } from "./acp/init-deadline.ts";
@@ -55,7 +56,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { EFFORT_LEVELS, newEventId, newId } from "../contracts.ts";
-import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
+import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials, seatCredentialsReady } from "../child-credentials.ts";
 import {
   decodeInjectId,
   encodeInjectId,
@@ -116,6 +117,17 @@ export function buildMcpServers(turn: SendTurnInput): Record<string, unknown> | 
       args: [SPAWNED_PROXIES.dweb],
       env: { ...NODE_ENV_FLAG, DWEB_URL: turn.integrations.dweb.url },
     };
+  }
+  // The person's own MCP servers:  the ones the workspace shares and the
+  // ones this bot owns.  A URL server rides BotFleet's remote proxy, so it
+  // reaches the engine over stdio the same way every other server here
+  // does, and a credential in its headers travels in the 0600 mcp.json
+  // rather than on argv.
+  for (const [name, server] of Object.entries(turn.integrations?.custom ?? {})) {
+    if (servers[name]) continue;
+    const stdio = mcpStdioServer(server, { nodeEnv: { ELECTRON_RUN_AS_NODE: "1" } });
+    if (!stdio) continue;
+    servers[name] = { command: stdio.command, args: stdio.args ?? [], env: stdio.env ?? {} };
   }
   return Object.keys(servers).length ? servers : null;
 }
@@ -526,7 +538,12 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       // here, before the guard:  the guard and the registration that follows it
       // have to stay free of `await`, or a second turn on this thread would walk
       // through the guard the first one already passed.
-      primeCliLogin(turn.launchIdentity?.seat);
+      primeSeatCredentials(turn.launchIdentity?.seat);
+      // The seat's credential read is started here, before the guard, so
+      // it may still be in flight.  Waiting for it before the guard
+      // keeps the slot free while the vault answers and leaves the
+      // guard and the registration that follows it atomic.
+      if (!seatCredentialsReady(turn.launchIdentity?.seat)) await awaitSeatCredentials(turn.launchIdentity?.seat);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       // Host control always routes through the permission card: the
       // pi-mcp-extension gates every `local-computer` scoped call behind
@@ -577,14 +594,14 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           return spawnCli(config.cli, childArgs, {
             stdio: ["pipe", "pipe", "pipe"],
             cwd: turn.cwd,
-            env: launchedChildEnvironment(
+            env: launchedChildCredentials(
               piEnvironment({
                 ...process.env,
                 ...input.environment,
                 ...(mcpServers && mcpTempDir ? { OMB_MCP_CONFIG: join(mcpTempDir, "mcp.json") } : {}),
               }),
               turn.launchIdentity,
-              cliLoginEnvironment(turn.launchIdentity?.seat),
+              turn.launchIdentity?.seat,
             ),
           });
         } catch (err) {
@@ -1055,6 +1072,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           // Shared memory (recall) mounts through the same extension, so the
           // dispatcher may hand this engine the proxy.
           qdrantMcp: true,
+          customMcp: true,
           // Host control (the user's real Mac) rides the pi-native permission
           // card (`ctx.ui.confirm` → extension_ui_request) gated in the
           // extension regardless of fullAuto, so it is offered in every mode

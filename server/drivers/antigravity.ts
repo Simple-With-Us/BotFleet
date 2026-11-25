@@ -61,6 +61,7 @@ import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
 import { captureInput, captureOutput } from "../../shared/item-io.ts";
+import { mcpStdioServer } from "../mcp-gate-config.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { injectedApiModel, mergeLocalInject } from "./local-inject.ts";
 
@@ -75,7 +76,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
+import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials, seatCredentialsReady } from "../child-credentials.ts";
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "antigravityAgent";
@@ -384,6 +385,17 @@ export function antigravityMcpServers(
       continue;
     }
     servers[`botfleet-${name}`] = { command: (def as any).command, args: (def as any).args, env: { ...(def as any).env } };
+  }
+  // The person's own MCP servers ride the same path, under their own
+  // names.  A URL server becomes BotFleet's remote proxy here too, so it
+  // reaches the engine over stdio the same way every other server does,
+  // and a credential in its headers stays in the config file's env rather
+  // than on argv.
+  for (const [name, server] of Object.entries(integrations.custom ?? {})) {
+    if (servers[name]) continue;
+    const stdio = mcpStdioServer(server, { nodeEnv: { ELECTRON_RUN_AS_NODE: "1" } });
+    if (!stdio) continue;
+    servers[name] = { command: stdio.command, args: stdio.args ?? [], env: { ...stdio.env } };
   }
   return servers;
 }
@@ -739,9 +751,24 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       // here, before the guard:  the guard and the registration that follows it
       // have to stay free of `await`, or a second turn on this thread would walk
       // through the guard the first one already passed.
-      primeCliLogin(turn.launchIdentity?.seat);
+      primeSeatCredentials(turn.launchIdentity?.seat);
       if (active.has(threadId) || pending.has(threadId)) throw new Error("a turn is already running on this thread");
       pending.add(threadId);
+      // The seat's credential read is started before the guard, so it may
+      // still be in flight here.  Waiting for it after the registration —
+      // which must stay synchronous with the guard — means the child is
+      // spawned with the credential rather than without it.
+      if (!seatCredentialsReady(turn.launchIdentity?.seat)) {
+        try {
+          await awaitSeatCredentials(turn.launchIdentity?.seat);
+        } catch (error) {
+          // Release the pending claim before the failure propagates:  no
+          // child exists yet, and a stale entry would refuse every later
+          // turn on this thread as already running.
+          pending.delete(threadId);
+          throw error;
+        }
+      }
       const turnId = newId();
       // Carried across a relaunch (see maybeRetry): `attempt` counts the
       // transient failures this logical turn has already absorbed, and
@@ -947,7 +974,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           cwd,
           // `env` is built once per instance and shared by every turn; the
           // launch identity is this bot's and this turn's, applied to a copy.
-          env: launchedChildEnvironment(env, turn.launchIdentity, cliLoginEnvironment(turn.launchIdentity?.seat)),
+          env: launchedChildCredentials(env, turn.launchIdentity, turn.launchIdentity?.seat),
           stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
         });
         if (useStdin && child.stdin) {
@@ -1596,6 +1623,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           composioMcp: true,
           phoneMcp: true,
           qdrantMcp: true,
+          customMcp: true,
           // Jobs matrix: BotFleet jobs are gated until their fixtures pass
           // (P2b).  `invoke_subagent` is the tool name on the row, and the
           // chat draws that row as a named helper card (jobs P3).

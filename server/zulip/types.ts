@@ -61,6 +61,9 @@ export interface ZulipWorkUnit {
   /** The peer-budget refusal holding this unit (topic_budget or
    *  peer_budget); its wake is charged when it actually dispatches. */
   held?: string;
+  /** The bot-stopped hold has been logged once (BF-2454): retries while the
+   *  stop latch holds stay silent instead of logging every attempt. */
+  stopLogged?: boolean;
   /** Items dropped at the queue cap before any turn saw them. */
   dropped?: number;
 }

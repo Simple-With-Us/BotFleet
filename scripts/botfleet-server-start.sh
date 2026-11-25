@@ -119,6 +119,10 @@ SHUTDOWN_MARKER="${BOTFLEET_SHUTDOWN_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/st
 STARTUP_DISABLED_MARKER="${BOTFLEET_STARTUP_DISABLED_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/startup-disabled.marker}"
 STARTUP_ENABLED_MARKER="${BOTFLEET_STARTUP_ENABLED_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/startup-enabled.marker}"
 STARTUP_SESSION="${BOTFLEET_STARTUP_SESSION:-${OMB_DATA_DIR:-$HOME/.botfleet}/startup-session}"
+# Written by whichever harness owns the data dir (electron/harness-ownership.mjs).
+# That owner may serve on a port other than $PORT -- the desktop app does --
+# so a failed :$PORT health probe does not mean no harness is running (BF-2465).
+HARNESS_OWNER_FILE="${BOTFLEET_HARNESS_OWNER_FILE:-${OMB_DATA_DIR:-$HOME/.botfleet}/harness-owner.json}"
 LAUNCHD_SERVICE_NAME="${XPC_SERVICE_NAME:-}"
 
 boot_session() {
@@ -196,6 +200,54 @@ EOF
 
 health() {
   /usr/bin/curl -sf -m 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1
+}
+
+# Prints "<pid> <record mtime, epoch seconds>" from harness-owner.json, or
+# fails when there is no readable record.  Both values come from the one
+# O_NOFOLLOW descriptor (fstat beside the read), so a replace or symlink
+# swap between two path lookups can never mix generations.  The record is
+# validated with the same shape rules as readRecord in
+# electron/harness-ownership.mjs (version, port, nonce), so a truncated or
+# foreign file never suppresses startup.  An unreadable or malformed record
+# falls through to the normal start, where the server's own ownership check
+# refuses it by name; guessing here would only hide that.
+live_harness_owner_record() {
+  [ -f "$HARNESS_OWNER_FILE" ] || return 1
+  "$NODE" --input-type=module -e '
+import fs from "node:fs";
+let fd;
+try {
+  fd = fs.openSync(process.argv[1], fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  const stat = fs.fstatSync(fd);
+  if (!stat.isFile() || stat.size > 4096) process.exit(1);
+  const value = JSON.parse(fs.readFileSync(fd, "utf8"));
+  if (value === null || typeof value !== "object" || Array.isArray(value) ||
+      value.version !== 1 || !Number.isInteger(value.pid) || value.pid <= 0 ||
+      !Number.isInteger(value.port) || value.port < 1 || value.port > 65535 ||
+      typeof value.nonce !== "string" || !/^[a-f0-9]{64}$/.test(value.nonce)) process.exit(1);
+  process.stdout.write(value.pid + " " + Math.floor(stat.mtimeMs / 1000));
+} catch { process.exitCode = 1; }
+finally { if (fd !== undefined) fs.closeSync(fd); }
+' -- "$HARNESS_OWNER_FILE" 2>/dev/null
+}
+
+# True when the owner record predates this boot.  kill -0 alone cannot tell
+# the record's owner from an unrelated process that recycled its pid after a
+# reboot; the record file's mtime can, because the owner writes it while
+# acquiring.  A record older than kern.boottime names a dead boot's harness
+# whatever lives at that pid now.  Unreadable clocks answer "not stale" so a
+# probe failure never starts a second harness beside a live owner.
+harness_owner_predates_boot() {
+  local mtime="$1" boot
+  boot="$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null | /usr/bin/sed -n 's/^{ sec = \([0-9]*\).*/\1/p')"
+  # Linux has no kern.boottime; /proc/stat carries the same epoch as btime.
+  # Production is macOS-only, but the launcher tests also run on Linux CI.
+  if [ -z "$boot" ] && [ -r /proc/stat ]; then
+    boot="$(/usr/bin/awk '/^btime/ { print $2 }' /proc/stat 2>/dev/null)"
+  fi
+  case "$mtime" in '' | *[!0-9]*) return 1 ;; esac
+  case "$boot" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$mtime" -lt "$boot" ]
 }
 
 log() {
@@ -461,6 +513,21 @@ if health; then
   exit 0
 fi
 
+# BF-2465: the data dir may be owned by a live harness serving on another
+# port (the desktop app on 18799 while this job probes 8799).  Exec'ing node
+# anyway throws the ownership error uncaught, and because the ledger reset
+# below runs before exec, the storm stop never engages: 3,892 identical
+# crashes in 7 hours, one launchd relaunch every few seconds.  A live owner
+# is the same quiet state as a healthy port, so leave it alone the same way.
+OWNER_RECORD="$(live_harness_owner_record)" || OWNER_RECORD=""
+OWNER_PID="${OWNER_RECORD%% *}"
+OWNER_MTIME="${OWNER_RECORD##* }"
+if [ -n "$OWNER_PID" ] && [ "$OWNER_PID" != "$OWNER_RECORD" ] && kill -0 "$OWNER_PID" 2>/dev/null && ! harness_owner_predates_boot "$OWNER_MTIME"; then
+  log "harness-owner.json names live pid ${OWNER_PID}; another harness owns the data dir; not starting a second harness"
+  reset_fail_ledger
+  exit 0
+fi
+
 if needs_module_heal; then
   log_err "node_modules still missing after self-heal attempt"
   fail_or_stop_storm
@@ -475,7 +542,13 @@ reset_fail_ledger
 rotate_log_if_large
 
 # --- the Infisical service tokens ----------------------------------------
-# Recovered through `fleet-secrets get`, and nothing else out of it.
+# Recovered through the scoped reader, and nothing else out of it.
+#
+# The shared reader helper lives in scripts/lib in the checkout.  The
+# installed copy of this wrapper runs from ~/apps, so the helper is looked for
+# next to it as well:  the installed wrapper needs
+# scripts/lib/fleet-infisical-read.sh copied beside it, or
+# FLEET_INFISICAL_READ_HELPER pointing at it.
 #
 # The helper's own approved bootstrap is managed separately from these app
 # credentials.  Its replacement access must be verified before rollout;
@@ -487,14 +560,42 @@ rotate_log_if_large
 # It never provisions or borrows a machine identity.  Explicit product machine
 # identity settings remain the backend's responsibility; inherited values are
 # left untouched and cannot activate that option implicitly.
-# A missing helper or token does not prevent an optional Infisical install
+# A missing reader or token does not prevent an optional Infisical install
 # from starting; writes still require their separate write credential.
+#
+# The account is the harness's own read-only service token, and the folder is
+# the Fleet-OPS root where the harness identity names live.  A grant covers
+# exactly one folder, so a token scoped to the root does not reach a
+# subfolder.
+FLEET_SECRET_FOLDER="/"
+FLEET_SECRET_ACCOUNT="${FLEET_INFISICAL_BOTFLEET_SERVER_ACCOUNT:-botfleet-server-ro}"
+
+# The shared reader helper, and the sourced function it defines.
+FLEET_INFISICAL_HELPER=""
+for _fleet_helper_candidate in \
+  "${FLEET_INFISICAL_READ_HELPER:-}" \
+  "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/lib/fleet-infisical-read.sh" \
+  "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/fleet-infisical-read.sh"
+do
+  if [ -n "$_fleet_helper_candidate" ] && [ -f "$_fleet_helper_candidate" ]; then
+    FLEET_INFISICAL_HELPER="$_fleet_helper_candidate"
+    break
+  fi
+done
+if [ -n "$FLEET_INFISICAL_HELPER" ]; then
+  # shellcheck source=/dev/null
+  . "$FLEET_INFISICAL_HELPER"
+fi
+
 fleet_secret() {
-  local name="$1" bin="$HOME/.local/bin/fleet-secrets"
-  # A missing executable helper leaves optional vault access unconfigured.
-  [ -f "$bin" ] && [ -x "$bin" ] || return 0
-  # The value goes to stdout only; errors are dropped so no fragment is shown.
-  "$bin" get "$name" 2>/dev/null | tr -d '\r' || true
+  local name="$1" value=""
+  # A missing helper leaves optional vault access unconfigured.
+  if [ -n "${FLEET_INFISICAL_HELPER:-}" ]; then
+    # The value goes to stdout only; the reason is dropped so no fragment of a
+    # refused read reaches the launch log.
+    value="$(fleet_secret_get "$name" "$FLEET_SECRET_FOLDER" "$FLEET_SECRET_ACCOUNT" 2>/dev/null || true)"
+  fi
+  printf '%s' "$value"
   return 0
 }
 
@@ -545,7 +646,7 @@ startup_data_dir() {
 #   * The marker file <data dir>/startup-infisical.opt-in, which opts this
 #     Mac in to the Infisical bootstrap.
 #
-# A helper binary's presence is NOT an answer: fleet-secrets is installed on
+# A reader's presence is NOT an answer: the scoped reader is installed on
 # every fleet Mac, so inferring the choice from it answered remote for every
 # Mac, which is the opposite of what the startup choice is for (BF-2636).
 #

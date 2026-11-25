@@ -194,7 +194,11 @@ function scrubDesktopSentryRequest(event) {
 
 function initDesktopSentry() {
   if (process.env.VITEST === "true" || process.env.NODE_ENV === "test") return;
-  const dsn = String(process.env.SENTRY_DSN || process.env.VITE_SENTRY_DSN || "").trim();
+  //  The DSN comes from the app's own settings, which the store fills in
+  //  when one is configured.  The environment carries no copy of a value
+  //  (owner ruling, November 22, 2026), so an inherited DSN is not read
+  //  here:  without one the optional reporting stays off.
+  const dsn = String(readConfigFile(desktopConfigPath())?.observability?.sentryDsn || "").trim();
   if (!dsn) return;
   try {
     const Sentry = require("@sentry/electron/main");

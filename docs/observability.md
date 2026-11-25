@@ -31,15 +31,20 @@ reaches it — there is no shipped default, and none has ever been in source.
 
 The Mac harness resolves, in order:
 
-1. `process.env.SENTRY_DSN` or `process.env.BOTFLEET_SENTRY_DSN` — source
-   `env`.  An operator (CI, a LaunchAgent `EnvironmentVariables` block) can
-   pin a value this way; Settings shows the DSN field disabled with "Set by
-   the environment on this computer" and the source reads "Environment".
-2. `~/.botfleet/config.json` `observability.sentryDsn` — source `config`.
-   This is the normal path: set it once from Settings → Observability.
-3. Nothing configured — source `none`.  The boot log prints
+1. The store, through `~/.botfleet/config.json` `observability.sentryDsn`
+   — source `config`.  This is the normal path: set it once from Settings →
+   Observability, or in the store.
+2. Nothing configured — source `none`.  The boot log prints
    `[sentry] disabled: no DSN configured (set one in Settings > Observability)`
    and nothing is sent.
+
+The environment is not a source.  `process.env.SENTRY_DSN` and
+`process.env.BOTFLEET_SENTRY_DSN` are never read, and the desktop's
+`process.env.VITE_SENTRY_DSN` is never read either: the owner's ruling of
+November 22, 2026 says every secret resolves from Infisical and the
+environment carries no copy of a value.  A CI workflow that exports the DSN
+into a step's environment is a workflow residue, tracked in OPS-1108; the
+runtime does not read it.
 
 The kill switch is explicit, not implicit.  A DSN being present is not enough
 to silently start reporting forever, and it is not enough to silently stop
@@ -188,12 +193,15 @@ the field leaves the stored value untouched).
    other install.  A total resolution failure warns and continues — it never
    fails the build.
 5. **Local desktop packaging.**  `scripts/with-sentry-dsn.sh` wraps a local
-   `pnpm package:mac:local` (or any other `package:*` script) with the same
-   three-tier resolution — already-exported environment, then
-   `fleet-secrets get NAME --path /botfleet-sentry` (Infisical Fleet-OPS),
-   then the `infisical` CLI (only if already logged in; this script never
-   calls `infisical login`) — and exports both `SENTRY_DSN` and
-   `VITE_SENTRY_DSN` before executing the wrapped command.  It turns xtrace
+   `pnpm package:mac:local` (or any other `package:*` script) with the
+   store — the shared scoped reader at `/botfleet-sentry` (Infisical
+   Fleet-OPS), then the `infisical` CLI (only if already logged in; this
+   script never calls `infisical login`) — and exports both `SENTRY_DSN` and
+   `VITE_SENTRY_DSN` before executing the wrapped command.  The
+   already-exported environment was the first tier and is gone (OPS-1108):
+   the environment is not a source, so an inherited DSN no longer displaces
+   the store's answer.  A missing DSN is still not an error: the package
+   ships with Sentry inert.  It turns xtrace
    off before it reads anything, so neither `bash -x` nor an inherited
    `SHELLOPTS` can echo a resolved value, and it never prints one in any
    branch.  Usage:

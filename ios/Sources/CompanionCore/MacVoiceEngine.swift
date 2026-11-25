@@ -83,30 +83,31 @@ public enum MacVoiceFailure: Equatable, Sendable {
 
     public static let openSettingsActionTitle = "Open Settings"
 
-    /// Exact human-facing copy for the failure banner.  Two spaces separate
-    /// sentences per the fleet copy standard.
+    /// Exact human-facing copy for the failure banner.  Sentences are
+    /// separated by a no-break space and a normal space, per the fleet copy
+    /// standard, so the gap survives the renderer.
     public var message: String {
         switch self {
         case .microphoneRefused(let isCall):
             if isCall {
-                return "Calls need Microphone access.  Enable it in System Settings, then try again."
+                return "Calls need Microphone access.\u{00A0} Enable it in System Settings, then try again."
             }
-            return "Dictation needs Microphone access.  Enable it in System Settings, then try again."
+            return "Dictation needs Microphone access.\u{00A0} Enable it in System Settings, then try again."
         case .speechRecognitionRefused(let isCall):
             if isCall {
-                return "Calls need Speech Recognition access.  Enable it in System Settings, then try again."
+                return "Calls need Speech Recognition access.\u{00A0} Enable it in System Settings, then try again."
             }
-            return "Dictation needs Speech Recognition access.  Enable it in System Settings, then try again."
+            return "Dictation needs Speech Recognition access.\u{00A0} Enable it in System Settings, then try again."
         case .noMicrophoneAvailable:
-            return "No microphone found.  Connect a microphone, then try again."
+            return "No microphone found.\u{00A0} Connect a microphone, then try again."
         case .languageNotSupported:
-            return "Dictation isn't available for this language.  Choose a different language in Settings."
+            return "Dictation isn't available for this language.\u{00A0} Choose a different language in Settings."
         case .microphoneBusy:
-            return "Couldn't start the microphone.  Check that no other app is using it, then try again."
+            return "Couldn't start the microphone.\u{00A0} Check that no other app is using it, then try again."
         case .recognitionFailedMidSession:
-            return "Couldn't transcribe that.  Your draft is unchanged."
+            return "Couldn't transcribe that.\u{00A0} Your draft is unchanged."
         case .playbackFailed:
-            return "Couldn't play the voice.  The reply is shown as text instead."
+            return "Couldn't play the voice.\u{00A0} The reply is shown as text instead."
         }
     }
 
@@ -149,7 +150,7 @@ public enum MacVoiceCaptureState: Equatable, Sendable {
     case failed(MacVoiceFailure)
 
     /// Exact product copy when capture is paused.
-    public static let pausedBannerCopy = "Listening paused.  Tap to resume when you're ready."
+    public static let pausedBannerCopy = "Listening paused.\u{00A0} Select to resume when you're ready."
 
     /// VoiceOver accessibility label for the current capture state.
     public var accessibilityLabel: String {
@@ -519,7 +520,7 @@ public final class MacVoiceEngine: @unchecked Sendable {
     // MARK: - Pause, Interruption & Mid-Session Failure
 
     /// Pauses listening with the exact product copy:
-    /// `"Listening paused.  Tap to resume when you're ready."`
+    /// `"Listening paused.\u{00A0} Select to resume when you're ready."`
     public func pauseCapture() {
         activeStartAttemptId = nil
         isMicrophoneHardwareOpen = false
@@ -621,7 +622,7 @@ public final class MacVoiceEngine: @unchecked Sendable {
     }
 
     /// Handles a TTS synthesis or audio playback failure by surfacing
-    /// `"Couldn't play the voice.  The reply is shown as text instead."` and
+    /// `"Couldn't play the voice.\u{00A0} The reply is shown as text instead."` and
     /// recording the message ID so the transcript shows the text reply.
     ///
     /// A playback failure during an active capture NEVER clobbers the capture

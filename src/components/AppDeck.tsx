@@ -22,6 +22,16 @@ import {
 /** Bots the deck may treat as belonging to an app.
  *  Membership is `memberIds` only.  Section labels are mutable and must
  *  not invent an assignment (see computeRoomAttentionIndex). */
+/** The folder tag beside an app chip's name, or null when the tag would
+ *  only repeat the name (BF-2554): a room named after its folder otherwise
+ *  shows the same word twice and wastes deck width. */
+export function folderTagFor(name: string, cwd?: string | null): string | null {
+  if (!cwd) return null;
+  const parts = cwd.split(/[/\\]/).filter(Boolean);
+  const folder = parts[parts.length - 1] || cwd;
+  return folder.trim().toLowerCase() === name.trim().toLowerCase() ? null : folder;
+}
+
 export function memberAssignedBots<T extends { id: string; hidden?: boolean }>(
   memberIds: readonly string[] | null | undefined,
   bots: readonly T[],
@@ -89,12 +99,6 @@ export function AppDeck({
     if (!activeGroup) return [];
     return memberAssignedBots(activeGroup.memberIds, state.bots);
   }, [activeGroup, state.bots]);
-
-  const cwdBasename = (cwd?: string | null) => {
-    if (!cwd) return null;
-    const parts = cwd.split(/[/\\]/).filter(Boolean);
-    return parts[parts.length - 1] || cwd;
-  };
 
   return (
     <header
@@ -168,7 +172,7 @@ export function AppDeck({
         {nonDmGroups.map((group) => {
           const attention = attentionMap.get(group.id);
           const isSelected = activeAppId === group.id;
-          const folderName = cwdBasename(group.cwd);
+          const folderName = folderTagFor(group.name, group.cwd);
 
           const errorTooltip = attention?.errors.bots.length
             ? `Errors: ${attention.errors.bots.map((b) => b.botName).join(", ")}`

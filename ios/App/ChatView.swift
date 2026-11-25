@@ -819,7 +819,7 @@ struct ChatView: View {
                     Button { dismiss() } label: {
                         HStack(spacing: 4) {
                             Image(systemName: "chevron.left")
-                                .font(.system(size: 17, weight: .semibold))
+                                .font(.scaled(17, weight: .semibold, relativeTo: .body))
                                 .accessibilityHidden(true)
                             if unreadElsewhere > 0 {
                                 Text("\(unreadElsewhere)")
@@ -926,13 +926,13 @@ struct ChatView: View {
             VStack(spacing: 8) {
                 HStack(spacing: 6) {
                     Image(systemName: "eye")
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.scaled(12, weight: .semibold, relativeTo: .caption))
                         .foregroundStyle(Color.secondary)
                         .accessibilityHidden(true)
                     Text(
                         "Viewing “\(viewedTask.title.isEmpty ? "Untitled Thread" : viewedTask.title)”\(loading ? " — loading…" : "")"
                     )
-                    .font(.system(size: 13))
+                    .font(.scaled(13, relativeTo: .footnote))
                     .foregroundStyle(Color.secondary)
                     .lineLimit(2)
                     Spacer(minLength: 0)
@@ -942,7 +942,7 @@ struct ChatView: View {
                         ? "\(bot.name) is working in “\(activeTitle?.isEmpty == false ? activeTitle! : "Untitled Thread")”."
                         : "The active thread is “\(activeTitle?.isEmpty == false ? activeTitle! : "Untitled Thread")”."
                 )
-                .font(.system(size: 12))
+                .font(.scaled(12, relativeTo: .caption))
                 .foregroundStyle(Color.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 HStack(spacing: 8) {
@@ -950,7 +950,7 @@ struct ChatView: View {
                         Task { await session.switchTask(viewedTask, for: bot) }
                     }
                     .buttonStyle(.plain)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.scaled(13, weight: .semibold, relativeTo: .footnote))
                     .foregroundStyle(bot.busy == true ? Color.secondary.opacity(0.5) : Color.accentColor)
                     .disabled(bot.busy == true)
                     .accessibilityHint(bot.busy == true ? "Let this turn finish first" : "Make this the active thread")
@@ -959,7 +959,7 @@ struct ChatView: View {
                         session.showActiveThread(for: bot)
                     }
                     .buttonStyle(.plain)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.scaled(13, weight: .semibold, relativeTo: .footnote))
                     .foregroundStyle(Color.accentColor)
                 }
             }
@@ -991,7 +991,7 @@ struct ChatView: View {
                             } label: {
                                 HStack(spacing: 16) {
                                     Image(systemName: action.systemImage)
-                                        .font(.system(size: 20, weight: .medium))
+                                        .font(.scaled(20, weight: .medium, relativeTo: .title3))
                                         .foregroundStyle(action.destructive ? Color.red : Color.primary)
                                         .frame(width: 44, height: 44)
                                         .background(Circle().fill(Color.primary.opacity(0.10)))
@@ -1006,7 +1006,9 @@ struct ChatView: View {
                                     Spacer(minLength: 0)
                                 }
                                 .padding(.horizontal, 18)
-                                .frame(height: 64)
+                                // A floor, not a lid: the fixed height clipped the
+                                // title and subtitle once the text grew.
+                                .frame(minHeight: 64)
                                 .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
@@ -1408,7 +1410,7 @@ struct ChatView: View {
                 draft = ComposerSendRecovery.slashCommandDraft(from: draft)
             } label: {
                 Image(systemName: "command")
-                    .font(.system(size: 16, weight: .medium))
+                    .font(.scaled(16, weight: .medium, relativeTo: .callout))
                     .foregroundStyle(Color.secondary)
                     .accessibilityHidden(true)
                     .padding(.horizontal, 10)
@@ -1513,7 +1515,7 @@ struct ChatView: View {
                     ForEach(queuedSends, id: \.queueId) { item in
                         HStack(spacing: 8) {
                             Image(systemName: "bubble.left")
-                                .font(.system(size: 13, weight: .medium))
+                                .font(.scaled(13, weight: .medium, relativeTo: .footnote))
                                 .foregroundStyle(Color.secondary)
                                 .accessibilityHidden(true)
                             Text(item.text)
@@ -1533,7 +1535,7 @@ struct ChatView: View {
                                 steerNow()
                             } label: {
                                 Text("Steer")
-                                    .font(.system(size: 12, weight: .semibold))
+                                    .font(.scaled(12, weight: .semibold, relativeTo: .caption))
                                     .foregroundStyle(BubbleColor.mine)
                                     .padding(.horizontal, 10)
                                     .frame(height: 28)
@@ -1548,7 +1550,7 @@ struct ChatView: View {
                                 editQueuedMessage(item)
                             } label: {
                                 Text("Edit")
-                                    .font(.system(size: 12, weight: .semibold))
+                                    .font(.scaled(12, weight: .semibold, relativeTo: .caption))
                                     .foregroundStyle(Color.secondary)
                                     .padding(.horizontal, 10)
                                     .frame(height: 28)
@@ -1563,7 +1565,7 @@ struct ChatView: View {
                                 cancelQueuedMessage(item.queueId)
                             } label: {
                                 Text("Cancel")
-                                    .font(.system(size: 12, weight: .semibold))
+                                    .font(.scaled(12, weight: .semibold, relativeTo: .caption))
                                     .foregroundStyle(Color.red.opacity(0.85))
                                     .padding(.horizontal, 10)
                                     .frame(height: 28)
@@ -1629,7 +1631,7 @@ struct ChatView: View {
                         withAnimation(reduceMotion ? nil : .snappy(duration: 0.28)) { showingPlus.toggle() }
                     } label: {
                         Image(systemName: "plus")
-                            .font(.system(size: 20, weight: .medium))
+                            .font(.scaled(20, weight: .medium, relativeTo: .title3))
                             .foregroundStyle(showingPlus ? Color(uiColor: .systemBackground) : Color.primary)
                             .accessibilityHidden(true)
                             .rotationEffect(.degrees(showingPlus ? 45 : 0))
@@ -1708,7 +1710,7 @@ struct ChatView: View {
             Haptics.selection()
         } label: {
             Image(systemName: dictation.isListening ? "mic.fill" : "mic")
-                .font(.system(size: 16, weight: .semibold))
+                .font(.scaled(16, weight: .semibold, relativeTo: .callout))
                 .foregroundStyle(dictation.isListening ? Color.red : Color.secondary)
                 .accessibilityHidden(true)
                 .frame(width: 34, height: 34)
@@ -1741,7 +1743,7 @@ struct ChatView: View {
             Haptics.impact(.medium)
         } label: {
             Image(systemName: "stop.fill")
-                .font(.system(size: 13, weight: .bold))
+                .font(.scaled(13, weight: .bold, relativeTo: .footnote))
                 .foregroundStyle(Color(uiColor: .systemBackground))
                 .accessibilityHidden(true)
                 .frame(width: 34, height: 34)
@@ -1759,7 +1761,7 @@ struct ChatView: View {
     private var composerSendButton: some View {
         Button { submit() } label: {
             Image(systemName: "arrow.up")
-                .font(.system(size: 15, weight: .bold))
+                .font(.scaled(15, weight: .bold, relativeTo: .subheadline))
                 .foregroundStyle(canSend ? Color.white : Color.secondary)
                 .accessibilityHidden(true)
                 .frame(width: 34, height: 34)
@@ -1797,7 +1799,7 @@ struct ChatView: View {
     private func offComposer(for bot: Bot) -> some View {
         HStack(spacing: 12) {
             Image(systemName: "power")
-                .font(.system(size: 15, weight: .semibold))
+                .font(.scaled(15, weight: .semibold, relativeTo: .subheadline))
                 .foregroundStyle(Color.secondary)
                 .accessibilityHidden(true)
             Text("This bot is off.\u{00A0} Turn it on to chat.")
@@ -1813,7 +1815,7 @@ struct ChatView: View {
                 withAnimation(reduceMotion ? nil : .snappy(duration: 0.28)) { showingPlus.toggle() }
             } label: {
                 Image(systemName: "plus")
-                    .font(.system(size: 17, weight: .semibold))
+                    .font(.scaled(17, weight: .semibold, relativeTo: .body))
                     .foregroundStyle(Color.secondary)
                     .accessibilityHidden(true)
                     .frame(width: 32, height: 32)
@@ -1831,10 +1833,15 @@ struct ChatView: View {
             } label: {
                 Text("Turn On")
                     .font(.footnote.weight(.semibold))
-                    .foregroundStyle(.white)
+                    // White on the brand blue is 3.9:1, under WCAG AA, and the
+                    // blue does not change with the appearance.  A tinted
+                    // capsule keeps the brand colour and lets the semantic
+                    // primary colour carry the text, which clears AA in light
+                    // and in dark alike.
+                    .foregroundStyle(Color.primary)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 8)
-                    .background(Capsule().fill(BubbleColor.mine))
+                    .background(Capsule().fill(BubbleColor.mine.opacity(0.15)))
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Turn on \(bot.name)")
@@ -2047,7 +2054,7 @@ private struct PendingAttachmentGlyph: View {
                     .accessibilityHidden(true)
             } else {
                 Image(systemName: item.kind == .image ? "photo" : "doc")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.scaled(13, weight: .semibold, relativeTo: .footnote))
                     .frame(width: 36, height: 36)
                     .accessibilityHidden(true)
             }
@@ -2247,11 +2254,11 @@ struct MessageRow: View {
             if let comm = message.comm {
                 if message.automationSource == "delegation" {
                     Label("From @\(comm.withName)", systemImage: "arrow.down.left.bubble")
-                        .font(.system(size: 12))
+                        .font(.scaled(12, relativeTo: .caption))
                         .foregroundStyle(Color.secondary)
                 } else {
                     Label("Messaged \(comm.withName)", systemImage: "arrow.up.right.bubble")
-                        .font(.system(size: 12))
+                        .font(.scaled(12, relativeTo: .caption))
                         .foregroundStyle(Color.secondary)
                 }
             }
@@ -2315,7 +2322,7 @@ struct MessageRow: View {
                     Label(session.speakingMessageId == message.id ? "Stop Voice" : (message.audio?.isEmpty == false ? "Replay Voice" : "Read Aloud"),
                           systemImage: session.speakingMessageId == message.id ? "stop.fill" : "speaker.wave.2")
                 }
-                .font(.system(size: 12, weight: .medium))
+                .font(.scaled(12, weight: .medium, relativeTo: .caption))
                 .buttonStyle(.bordered)
                 .buttonBorderShape(.capsule)
             }
@@ -2332,7 +2339,7 @@ struct MessageRow: View {
                             guard !readOnly else { return }
                             Task { await session.react(to: message, in: tid, emoji: group.emoji) }
                         }
-                        .font(.system(size: 13))
+                        .font(.scaled(13, relativeTo: .footnote))
                         .buttonStyle(.bordered)
                         .buttonBorderShape(.capsule)
                         .tint(group.mine ? Color.accentColor : Color.secondary)
@@ -2362,7 +2369,7 @@ struct MessageRow: View {
                     .disabled(index + 1 >= versions.count || bot.busy == true)
                     .accessibilityLabel("Next Version")
                 }
-                .font(.system(size: 12, weight: .medium))
+                .font(.scaled(12, weight: .medium, relativeTo: .caption))
                 .foregroundStyle(Color.secondary)
             }
         }
@@ -2880,7 +2887,7 @@ struct ChannelEventCard: View {
                     .fill(Color.secondary.opacity(0.12))
                     .frame(width: 26, height: 26)
                 Image(systemName: systemImage)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.scaled(12, weight: .semibold, relativeTo: .caption))
                     .foregroundStyle(Color.secondary)
                     .accessibilityHidden(true)
             }
@@ -2908,7 +2915,7 @@ struct ChannelEventCard: View {
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(Color.accentColor)
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 10, weight: .bold))
+                        .font(.scaled(10, weight: .bold, relativeTo: .caption2))
                         .foregroundStyle(Color.accentColor)
                         .accessibilityHidden(true)
                 }
@@ -3283,7 +3290,7 @@ struct CardView: View {
             VStack(alignment: .leading, spacing: 10) {
                 if card.isPending {
                     Label("\(chat.name) is waiting on you", systemImage: "hand.raised.fill")
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.scaled(13, weight: .semibold, relativeTo: .footnote))
                         .foregroundStyle(tint)
                 }
                 Text(card.title)
@@ -3300,7 +3307,7 @@ struct CardView: View {
 
                 if let held = card.held {
                     Label(held, systemImage: "exclamationmark.shield")
-                        .font(.system(size: 13))
+                        .font(.scaled(13, relativeTo: .footnote))
                         .foregroundStyle(.orange)
                 }
 
@@ -3336,7 +3343,7 @@ struct CardView: View {
                     }
                 } else if let answered = card.answered {
                     Label(answered, systemImage: "checkmark.circle")
-                        .font(.system(size: 14))
+                        .font(.scaled(14, relativeTo: .footnote))
                         .foregroundStyle(Color.secondary)
                 }
             }
@@ -3475,7 +3482,7 @@ struct LiveReplyRow: View {
                     Button {} label: {
                         Label("Read Aloud", systemImage: "speaker.wave.2")
                     }
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.scaled(12, weight: .medium, relativeTo: .caption))
                     .buttonStyle(.bordered)
                     .buttonBorderShape(.capsule)
                     .hidden()

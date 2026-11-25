@@ -549,8 +549,40 @@ public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identif
     case shortcuts
     case lifecycle
     case permissions
+    case phone
 
     public var id: String { rawValue }
+
+    /// Whether this section has a screen behind it today.
+    ///
+    /// A section that renders nothing but the version stamp reads as a live
+    /// control and is not one, so the app says plainly that it is not
+    /// available yet instead of showing a stamp in its place.
+    public var isImplemented: Bool {
+        switch self {
+        // BF-2688 gave `.lifecycle` a screen:  the harness status, the Local
+        // VM controls and the startup policy, the product half of the
+        // Decision 1 Option C split.
+        case .general, .servers, .resources, .secrets, .permissions, .phone, .lifecycle:
+            return true
+        case .models, .voice, .shortcuts:
+            return false
+        }
+    }
+
+    /// The honest copy for a section with no screen behind it yet.
+    ///
+    /// It names the section and says the truth.  It is not placeholder
+    /// content and it does not promise a date.
+    public var unavailableCopy: String {
+        switch self {
+        case .models: return "Model settings are not available yet."
+        case .voice: return "Voice settings are not available yet."
+        case .shortcuts: return "Shortcuts are not available yet."
+        case .general, .servers, .resources, .secrets, .permissions, .phone, .lifecycle:
+            return ""
+        }
+    }
 
     public var displayTitle: String {
         switch self {
@@ -563,6 +595,7 @@ public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identif
         case .shortcuts: return "Shortcuts"
         case .lifecycle: return "Lifecycle"
         case .permissions: return "Permissions"
+        case .phone: return "Phone"
         }
     }
 
@@ -577,6 +610,7 @@ public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identif
         case .shortcuts: return "command"
         case .lifecycle: return "bolt.horizontal.circle"
         case .permissions: return "lock.shield"
+        case .phone: return "iphone"
         }
     }
 }

@@ -72,25 +72,6 @@ public final class DatabaseBotWorkspaceSource: NativeEventWaitWorkspaceSource {
     }
 }
 
-/// Admission for the production Mac graph, which has no engine drivers
-/// yet: every satisfied wait is held here, before any dispatch claim, as
-/// typed unclaimed work that `resumeCapabilityHeldWaits` can later
-/// resume.  The headless host can register production drivers because its
-/// bootstrap decodes a per-bot `NativeHostBotConfiguration` (including
-/// the engine executable) from each bot's stored JSON, resolves service
-/// credentials, and switches the bot to native ownership
-/// (`NativeHeadlessHost.registerBot`).  Mac listener bots carry Node
-/// `bots.json` records with none of that configuration, and the
-/// interactive app has no service credential source, so claiming a wait
-/// here could only fail inside driver dispatch.  Holding at admission is
-/// the honest state until the Mac composition supplies an execution
-/// context (and with it, registered drivers).
-private struct UnavailableMacExecutionContext: NativeExecutionContextSource {
-    func resolve(wait: NativeEventWait) async throws -> NativeExecutionAdmission {
-        .held(.credentialsUnavailable)
-    }
-}
-
 #if !os(macOS)
 /// No Mac engine processes can be launched off macOS, so no owned process
 /// can ever have finished; this fails closed rather than probing PIDs.
@@ -102,16 +83,32 @@ private struct NoOwnedProcessSource: NativeEventWaitProcessOwnershipSource {
 /// The Mac app companion listener's native runtime graph, mirroring the
 /// headless host's composition (`NativeHeadlessHost.start`) for the
 /// interactive app: the listener's own database, a durable turn dispatcher,
-/// the reused owned-process ledger over a real process supervisor, and a
-/// workspace source confined under the listener's data directory.
+/// the reused owned-process ledger over a real process supervisor, a
+/// workspace source confined under the listener's data directory, and
+/// `MacExecutionContext` plus `CostLedgerService`, `NativeFaultBannerStore`,
+/// `PluginSandboxHost`, `NativeRecallClient`, and optional `ZulipEventActor`
+/// (`BF-2689`).
 /// Construction starts nothing: the server activates the runtime (and its
 /// polling) only from `startListening`, and `stopListening` stays
-/// socket-only, exactly as before this injection.  Unless the caller
-/// supplies an execution context, satisfied waits are admission-held
-/// unclaimed (see `UnavailableMacExecutionContext`): this graph serves
-/// and probes waits, but dispatches no turns.
-public struct NativeMacCompanionRuntime {
+/// socket-only, exactly as before this injection.  Until a bot profile,
+/// credential source, and engine driver are registered, `MacExecutionContext`
+/// fails closed and holds waits unclaimed as `.credentialsUnavailable`.
+public struct NativeMacCompanionRuntime: Sendable {
     public let runtime: NativeRuntimeServices
+    /// Interactive Mac execution context resolving ready turns when profiles,
+    /// workspaces, and credentials are registered (`BF-2689`).
+    public let macExecutionContext: MacExecutionContext
+    private let usesExternalExecutionContext: Bool
+    /// Spend and quota ledger (`BF-2619`).
+    public let costLedger: CostLedgerService
+    /// Redacted runtime fault banner store (`BF-2618`).
+    public let faultBanners: NativeFaultBannerStore
+    /// Plugin sandbox confinement and environment scrubbing host (`BF-2620`).
+    public let pluginSandbox: PluginSandboxHost
+    /// Preflight secret-scanning Fleet Recall client (`BF-2620`).
+    public let recallClient: NativeRecallClient
+    /// Optional Zulip event queue actor (`BF-2512`).
+    public let zulipActor: ZulipEventActor?
     /// The launcher engine drivers must use for their processes to be
     /// visible to `processFinished` waits.  Nil off macOS.
     public let ownedProcessLauncher: (any EngineProcessLauncher)?
@@ -121,19 +118,49 @@ public struct NativeMacCompanionRuntime {
     /// Nil off macOS, where no owned process can run.
     private let processSupervisor: ProcessSupervisorActor?
 
+    /// Creates the Mac companion runtime graph.
+    /// When `executionContext` is supplied, it takes precedence over `credentials`
+    /// (which configures the default `MacExecutionContext` only when `executionContext` is `nil`).
     public init(
         database: DatabaseService,
         workspacesRoot: URL,
         engineCoordinator: EngineCoordinatorActor? = nil,
         engineSwitch: BotNativeEngineSwitchActor? = nil,
         executionContext: (any NativeExecutionContextSource)? = nil,
-        processSupervisor: ProcessSupervisorActor? = nil
+        processSupervisor: ProcessSupervisorActor? = nil,
+        credentials: (any NativeServiceCredentialSource)? = nil,
+        costLedger: CostLedgerService? = nil,
+        faultBanners: NativeFaultBannerStore? = nil,
+        pluginSandbox: PluginSandboxHost? = nil,
+        recallClient: NativeRecallClient? = nil,
+        zulipActor: ZulipEventActor? = nil
     ) {
         self.database = database
         let coordinator = engineCoordinator ?? EngineCoordinatorActor(
             dispatcher: TurnDispatcherActor(database: database, maxRetriesPerEngine: 0, requiresDurablePersistence: true)
         )
         let engineSwitch = engineSwitch ?? BotNativeEngineSwitchActor(database: database)
+        let workspaceSource = DatabaseBotWorkspaceSource(database: database, workspacesRoot: workspacesRoot)
+        assert(
+            executionContext == nil || credentials == nil,
+            "credentials cannot be combined with an injected executionContext; supply credentials directly to the injected context."
+        )
+        if let injectedMacContext = executionContext as? MacExecutionContext {
+            self.macExecutionContext = injectedMacContext
+            self.usesExternalExecutionContext = false
+        } else {
+            self.macExecutionContext = MacExecutionContext(
+                workspaceSource: workspaceSource,
+                credentials: credentials ?? UnavailableNativeServiceCredentials()
+            )
+            self.usesExternalExecutionContext = (executionContext != nil)
+        }
+        self.costLedger = costLedger ?? CostLedgerService()
+        self.faultBanners = faultBanners ?? NativeFaultBannerStore()
+        let defaultPluginRoot = workspacesRoot.deletingLastPathComponent().appendingPathComponent("plugins", isDirectory: true)
+        self.pluginSandbox = pluginSandbox ?? PluginSandboxHost(policy: PluginSandboxPolicy(sandboxRoot: defaultPluginRoot))
+        self.recallClient = recallClient ?? NativeRecallClient()
+        self.zulipActor = zulipActor
         #if os(macOS)
         // The interactive app's supervisor inherits the app process
         // environment (the default), unlike the headless service, whose
@@ -151,15 +178,33 @@ public struct NativeMacCompanionRuntime {
         let processSource: any NativeEventWaitProcessOwnershipSource = NoOwnedProcessSource()
         #endif
         let resolvedExecutionContext: any NativeExecutionContextSource =
-            executionContext ?? UnavailableMacExecutionContext()
+            executionContext ?? self.macExecutionContext
         self.runtime = NativeRuntimeServices(
             database: database,
             engineCoordinator: coordinator,
             engineSwitch: engineSwitch,
-            workspaceSource: DatabaseBotWorkspaceSource(database: database, workspacesRoot: workspacesRoot),
+            workspaceSource: workspaceSource,
             processOwnershipSource: processSource,
             executionContext: resolvedExecutionContext
         )
+    }
+
+    /// Registers an interactive Mac bot profile and optional engine driver on
+    /// the runtime's execution context and engine coordinator (`BF-2689`).
+    /// Fails closed with `MacExecutionContextError.externalExecutionContextActive`
+    /// if the runtime was constructed with a non-`MacExecutionContext` override.
+    public func registerBot(
+        _ profile: MacBotExecutionProfile,
+        driver: (any EngineDriver)? = nil
+    ) async throws {
+        guard !usesExternalExecutionContext else {
+            throw MacExecutionContextError.externalExecutionContextActive
+        }
+        try await macExecutionContext.register(profile)
+        if let driver {
+            await runtime.engineCoordinator.registerDriver(driver)
+            await runtime.engineCoordinator.setFallbackChain(forBot: profile.id, engineIds: [profile.engineId])
+        }
     }
 
     /// The companion server carrying this runtime, so its wait routes are

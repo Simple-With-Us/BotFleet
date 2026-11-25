@@ -15,20 +15,24 @@
 # lengths and appcast are all produced after stapling, never before.
 #
 # Signing material is never read from this repo and never printed.  The Apple
-# notarization credentials are resolved in the fleet's approved order: the
-# environment first, then Infisical through `fleet-secrets get`, and only then
-# this machine's own notarytool keychain profile, which is a bootstrap
-# identity rather than a shared secret store:
+# notarization credentials come from the store and from nowhere else (owner
+# ruling, November 22, 2026:  the environment carries no copy of a value):
+# Infisical through the scoped reader, with this consumer's own read-only
+# account.  An inherited value is cleared before the read, so a hand-set one
+# can never displace the reviewed grant:
 #   APPLE_API_KEY_P8   App Store Connect API private key (PEM)
 #   APPLE_API_KEY_ID   the key's id, and APPLE_API_ISSUER_ID its issuer
-#   NOTARY_PROFILE     notarytool keychain profile (default: AC_PASSWORD)
+#   NOTARY_PROFILE     notarytool keychain profile, named by the store;  the
+#                       machine's own keychain holds the credential, and the
+#                       store names which profile it is.  There is no
+#                       default profile and no ambient fallback:  without the
+#                       store's answer the build stops here.
 #   MAC_SIGN_IDENTITY  Keychain identity (default: Developer ID Application)
 #   SPARKLE_EDDSA_KEY  sign_update private key file; required with
 #                       sign_update on PATH for distributable packaging
-#   SENTRY_DSN         native Sentry DSN (BF-2541); environment first, then
-#                       Infisical through `fleet-secrets get`, never printed.
-#                       Empty is fine: the package ships with Sentry inert,
-#                       exactly like the release workflow.
+#   SENTRY_DSN         native Sentry DSN (BF-2541); the scoped reader only,
+#                       never printed.  Empty is fine:  the package ships
+#                       with Sentry inert, exactly like the release workflow.
 #
 # The API key never reaches argv and never stays at a path: it is written to
 # a private temporary file, that file is opened on a file descriptor and
@@ -43,6 +47,33 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/release-native"
+
+# The shared scoped reader helper.  It resolves the reader, names the
+# consumer's own account and fails closed when there is no reader or no
+# grant:  the value reaches stdout and nothing else does.  A helper that is
+# not there refuses the read rather than stopping the packaging run.
+FLEET_INFISICAL_HELPER="$ROOT/scripts/lib/fleet-infisical-read.sh"
+if [ -f "$FLEET_INFISICAL_HELPER" ]; then
+  . "$FLEET_INFISICAL_HELPER"
+else
+  fleet_secret_get() {
+    echo "the scoped reader helper is not installed at ${FLEET_INFISICAL_HELPER}" >&2
+    return 4
+  }
+fi
+
+# Where the notarization credentials live, and which account reads them.
+# They are the App Store Connect key, so they live in the fleet's App Store
+# Connect folder, and the account is that consumer's own read-only service
+# token:  a grant covers exactly one folder, so it is named here rather than
+# guessed at runtime.
+NOTARY_SECRET_FOLDER="/asc"
+NOTARY_SECRET_ACCOUNT="${FLEET_INFISICAL_ASC_ACCOUNT:-fleet-tools-mm-asc-ro}"
+# The Sentry DSN is a fleet-wide key, so it lives in the global keys folder
+# with its own account.  An account that is not provisioned is a refused read:
+# it never falls back to another consumer's grant.
+SENTRY_SECRET_FOLDER="/global-api-keys"
+SENTRY_SECRET_ACCOUNT="${FLEET_INFISICAL_SENTRY_ACCOUNT:-}"
 SKIP_NOTARIZE=0
 # The native assets live on their own release tag, exactly as the workflow
 # does: release.yml owns the v<version> release, verifies that its asset set
@@ -78,19 +109,41 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Resolve the Apple notarization credentials in the approved order.  The
-# environment wins; Infisical is the next source; the keychain profile below
-# is the machine-identity bootstrap and the last resort.  Nothing is printed.
+# Resolve the Apple notarization credentials.  Nothing is printed.
+#
+# The store is the only source.  The environment is not a second source and
+# not a fallback (owner ruling, November 22, 2026):  the inherited names are
+# cleared before the read, so a hand-set value cannot displace the reviewed
+# grant, and nothing that was inherited is used when the store has nothing.
+#
+# The folder holds the key under the ASC spelling the fleet's own reader uses
+# and under the Apple spelling the workflows use.  Both name the same
+# credential, so both are tried and the first answer wins.  The notarytool
+# keychain profile is named by the store too:  the machine's keychain holds
+# the credential, and the store says which profile it is.
 resolve_notary_credentials() {
-  if [ -z "${APPLE_API_KEY_P8:-}" ] && command -v fleet-secrets >/dev/null 2>&1; then
-    APPLE_API_KEY_P8="$(fleet-secrets get APPLE_API_KEY_P8 2>/dev/null || true)"
-  fi
-  if [ -z "${APPLE_API_KEY_ID:-}" ] && command -v fleet-secrets >/dev/null 2>&1; then
-    APPLE_API_KEY_ID="$(fleet-secrets get APPLE_API_KEY_ID 2>/dev/null || true)"
-  fi
-  if [ -z "${APPLE_API_ISSUER_ID:-}" ] && command -v fleet-secrets >/dev/null 2>&1; then
-    APPLE_API_ISSUER_ID="$(fleet-secrets get APPLE_API_ISSUER_ID 2>/dev/null || true)"
-  fi
+  local value
+  # An inherited copy of any of these names is cleared before the store is
+  # asked, so it can never be used as a credential.
+  unset APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER_ID
+  unset ASC_KEY_P8 ASC_KEY_ID ASC_ISSUER_ID
+  unset NOTARY_PROFILE
+  value="$(fleet_secret_get ASC_KEY_P8 "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  [ -n "$value" ] || value="$(fleet_secret_get APPLE_API_KEY_P8 "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  if [ -n "$value" ]; then APPLE_API_KEY_P8="$value"; fi
+  value="$(fleet_secret_get ASC_KEY_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  [ -n "$value" ] || value="$(fleet_secret_get APPLE_API_KEY_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  if [ -n "$value" ]; then APPLE_API_KEY_ID="$value"; fi
+  value="$(fleet_secret_get ASC_ISSUER_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  [ -n "$value" ] || value="$(fleet_secret_get APPLE_API_ISSUER_ID "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  if [ -n "$value" ]; then APPLE_API_ISSUER_ID="$value"; fi
+  # The keychain profile is the store's answer as well:  without it there is
+  # no identity to notarize with, and the run stops with a reason that names
+  # the folder and the account it needed.
+  NOTARY_PROFILE=""
+  value="$(fleet_secret_get NOTARY_PROFILE "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  [ -n "$value" ] || value="$(fleet_secret_get NOTARY_KEYCHAIN_PROFILE "$NOTARY_SECRET_FOLDER" "$NOTARY_SECRET_ACCOUNT" 2>/dev/null || true)"
+  if [ -n "$value" ]; then NOTARY_PROFILE="$value"; fi
 }
 
 # Open the API key on a file descriptor and unlink it at once, so the key is
@@ -136,16 +189,18 @@ if ! command -v xcodegen >/dev/null; then
 fi
 (cd "$ROOT/ios" && xcodegen generate)
 
-# Native Sentry (BF-2541): same stamping as native-mac-release.yml.  The DSN
-# resolves environment-first, then Infisical, and is never printed; an empty
-# DSN packages with Sentry inert rather than failing the build.
-if [ -z "${SENTRY_DSN:-}" ] && command -v fleet-secrets >/dev/null 2>&1; then
-  SENTRY_DSN="$(fleet-secrets get SENTRY_DSN 2>/dev/null || true)"
-fi
+# Native Sentry (BF-2541): same stamping as native-mac-release.yml.  The
+# store is the only source for the DSN, and an inherited copy is cleared
+# before the read (owner ruling, November 22, 2026).  The DSN is never
+# printed, and an empty DSN packages with Sentry inert rather than failing
+# the build.
+unset SENTRY_DSN
+SENTRY_DSN_VALUE="$(fleet_secret_get SENTRY_DSN "$SENTRY_SECRET_FOLDER" "$SENTRY_SECRET_ACCOUNT" 2>/dev/null || true)"
+if [ -n "$SENTRY_DSN_VALUE" ]; then SENTRY_DSN="$SENTRY_DSN_VALUE"; fi
 SENTRY_DSN="${SENTRY_DSN:-}"
 SOURCE_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 if [ -z "$SENTRY_DSN" ]; then
-  echo "note: SENTRY_DSN unset in env and Infisical; package ships with Sentry inert"
+  echo "note: no SENTRY_DSN in the scoped reader at $SENTRY_SECRET_FOLDER; package ships with Sentry inert"
 fi
 
 mkdir -p "$OUT"
@@ -180,7 +235,15 @@ TEAM="$(codesign -dv --verbose=4 "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
 [ "$TEAM" = "CC8UTF7ATG" ] || { echo "app is signed by team '${TEAM:-none}', not CC8UTF7ATG" >&2; exit 69; }
 echo "ok: signature verifies (team $TEAM)"
 
-resolve_notary_credentials
+# The notarization credentials are resolved only on the path that notarizes.  A
+# --skip-notarize build is a developer build:  it submits nothing to
+# Apple, it writes to an UNSIGNED/ directory and it is labelled NOT
+# DISTRIBUTABLE, so reading the API key and the notarytool profile would be a
+# secret lookup for a step that never runs.  The reads live inside
+# resolve_notary_credentials, so guarding the call guards the reads.
+if [ "$SKIP_NOTARIZE" -eq 0 ]; then
+  resolve_notary_credentials
+fi
 
 notarize() {
   # $1 = file to submit.  Requires an "Accepted" result; a rejection stops
@@ -204,8 +267,17 @@ notarize() {
       exit 69
     }
   else
+    # No App Store Connect key in the store:  the keychain profile it names
+    # is the identity.  There is no default profile and no ambient fallback,
+    # so without the store's answer the run stops here and says what it
+    # needed.  The name of a profile is a grant name, not a secret, and no
+    # value is printed.
+    if [ -z "${NOTARY_PROFILE:-}" ]; then
+      echo "no notarization identity in the store: read NOTARY_PROFILE (or APPLE_API_KEY_P8, APPLE_API_KEY_ID and APPLE_API_ISSUER_ID) from Infisical ${NOTARY_SECRET_FOLDER} for account ${NOTARY_SECRET_ACCOUNT}" >&2
+      exit 69
+    fi
     out="$(xcrun notarytool submit "$file" \
-      --keychain-profile "${NOTARY_PROFILE:-AC_PASSWORD}" --wait 2>&1)" || {
+      --keychain-profile "$NOTARY_PROFILE" --wait 2>&1)" || {
       echo "$out"
       echo "notarization failed for $file" >&2
       exit 69

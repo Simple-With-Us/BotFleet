@@ -688,6 +688,12 @@ export interface ProviderAdapter {
     phoneMcp?: boolean;
     /** True when the driver mounts turn.integrations.qdrant (Agent RAG). */
     qdrantMcp?: boolean;
+    /** True when the driver mounts turn.integrations.custom — the user's own
+     * MCP servers, shared or the bot's alone.  Same rule as the others:  a
+     * configured server is one the person has, not one this engine can
+     * reach, and a bot told it has a server its driver cannot mount burns
+     * the turn hunting for tools that are not there. */
+    customMcp?: boolean;
     /** True when this engine accepts images in the prompt — gates image
      * paste in the composer. Same rule as computerMcp: never offer an
      * attachment an engine cannot open (a bot told it has an image it

@@ -50,6 +50,26 @@ public enum CompanionListenerState: Equatable, Sendable {
     }
 }
 
+/// The owner-side desktop-launch wiring a listener's server is built with
+/// (BF-2690): the gate `POST /api/desktop/open` keeps after its loopback
+/// check, and the action it runs once both BF-2489 gates pass.
+public struct CompanionDesktopLaunchWiring: Sendable {
+    /// Whether `POST /api/desktop/open` may pass its setting gate.  Closed by
+    /// default, like the server's own.
+    public var allowRemoteDesktopLaunch: Bool
+    /// The action the route runs once both gates pass; nil leaves the route
+    /// answering `501`.
+    public var onDesktopOpen: (@Sendable () async throws -> Void)?
+
+    public init(
+        allowRemoteDesktopLaunch: Bool = false,
+        onDesktopOpen: (@Sendable () async throws -> Void)? = nil
+    ) {
+        self.allowRemoteDesktopLaunch = allowRemoteDesktopLaunch
+        self.onDesktopOpen = onDesktopOpen
+    }
+}
+
 /// How the listener announces itself on the local network, so the phone's
 /// Bonjour browser (`ios/App/Discovery.swift`) finds it by name.
 public struct CompanionListenerAdvertisement: Equatable, Sendable {
@@ -277,22 +297,30 @@ public final class CompanionListenerController {
 public actor NativeCompanionListenerBackend: CompanionListenerBackend {
     private let port: UInt16
     private let options: NativeCompanionServer.ListenerOptions
-    private let makeServer: @Sendable () throws -> NativeCompanionServer
+    private let makeServer: @Sendable (CompanionDesktopLaunchWiring) throws -> NativeCompanionServer
     private var server: NativeCompanionServer?
+    /// Held here, so a server built on a later start is built with it.  The
+    /// owner-side setters below also tell a server that is already up.
+    private var desktopLaunch: CompanionDesktopLaunchWiring
 
     /// - Parameters:
     ///   - port: the port to bind; 0 lets the system pick one.
     ///   - options: the bind address and LAN opt-in; the advertisement name is
     ///     filled in per start.
-    ///   - makeServer: builds the server on first use, so the app opens no
-    ///     store until the listener is actually turned on.
+    ///   - desktopLaunch: the owner-side desktop-launch wiring the server is
+    ///     built with.
+    ///   - makeServer: builds the server on first use with the wiring handed
+    ///     to it, so the app opens no store until the listener is actually
+    ///     turned on.
     public init(
         port: UInt16 = 0,
         options: NativeCompanionServer.ListenerOptions = NativeCompanionServer.ListenerOptions(),
-        makeServer: @escaping @Sendable () throws -> NativeCompanionServer
+        desktopLaunch: CompanionDesktopLaunchWiring = CompanionDesktopLaunchWiring(),
+        makeServer: @escaping @Sendable (CompanionDesktopLaunchWiring) throws -> NativeCompanionServer
     ) {
         self.port = port
         self.options = options
+        self.desktopLaunch = desktopLaunch
         self.makeServer = makeServer
     }
 
@@ -304,7 +332,9 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
         if let existing = self.server {
             server = existing
         } else {
-            server = try makeServer()
+            // Built with the owner's desktop-launch wiring in the same step,
+            // so the socket only ever opens on a server that carries it.
+            server = try makeServer(desktopLaunch)
             self.server = server
         }
         var options = self.options
@@ -318,6 +348,31 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
     public func stop() async {
         guard let server else { return }
         await server.stopListening()
+        // The server keeps its last advertisement across a socket stop, so
+        // clearing only the backend cache would leave a stop/start cycle
+        // serving stale routes while the tab reports none.  Both sides are
+        // cleared together: a restart serves nothing until fresh routes are
+        // set, and the tab agrees with `GET /api/companion/endpoints`.
+        await server.setEndpointAdvertisement(CompanionEndpointAdvertisement())
+        lastAdvertisement = CompanionEndpointAdvertisement()
+    }
+
+    /// Sets the gate `POST /api/desktop/open` keeps after its loopback check.
+    /// A server built later is built with it, and a server that is already up
+    /// is told now.  Owner-side only, like the server's own setter: the
+    /// phone's `PUT /api/config` is refused for this key.
+    public func setAllowRemoteDesktopLaunch(_ allowed: Bool) async {
+        desktopLaunch.allowRemoteDesktopLaunch = allowed
+        guard let server else { return }
+        await server.setAllowRemoteDesktopLaunch(allowed)
+    }
+
+    /// Installs or removes the action `POST /api/desktop/open` runs once both
+    /// gates pass.  Owner-side only.
+    public func setDesktopOpenAction(_ action: (@Sendable () async throws -> Void)?) async {
+        desktopLaunch.onDesktopOpen = action
+        guard let server else { return }
+        await server.setDesktopOpenAction(action)
     }
 
     public func openPairingWindow() async -> NativePairingWindow? {
@@ -345,9 +400,20 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
         return await server.revokeDevice(id: id)
     }
 
+    /// The last advertisement this backend was asked to serve. Empty until
+    /// something sets one, so the Phone tab honestly reads "no routes
+    /// advertised yet" — and lights up as soon as the bridge slice wires
+    /// real advertisements through here.
+    private var lastAdvertisement = CompanionEndpointAdvertisement()
+
     public func setEndpointAdvertisement(_ advertisement: CompanionEndpointAdvertisement) async {
         guard let server else { return }
         await server.setEndpointAdvertisement(advertisement)
+        lastAdvertisement = advertisement
+    }
+
+    public func currentAdvertisement() -> CompanionEndpointAdvertisement {
+        lastAdvertisement
     }
 }
 #endif

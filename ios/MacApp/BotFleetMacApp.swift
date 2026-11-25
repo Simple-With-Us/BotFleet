@@ -150,12 +150,28 @@ struct BotFleetMacApp: App {
                 }
                 .disabled(session.isShuttingDownServer)
 
+                Button("Start Shared VM") {
+                    Task { await session.startSharedVM() }
+                }
+                .disabled(!(session.controlStatus?.canStartSharedVM ?? false) || session.isControllingVM)
+
+                Button("Stop Local VMs") {
+                    Task { await session.stopLocalVMs() }
+                }
+                //  The stop route stops every VM the harness manages, so the
+                //  row is gated on any of them running, not on the shared one.
+                .disabled((session.controlStatus?.runningVMCount ?? 0) == 0 || session.isControllingVM)
+
                 Divider()
 
                 Menu("Settings Section") {
                     ForEach(MacSettingsSection.allCases) { section in
                         Button(section.displayTitle) {
                             session.activeSettingsSection = section
+                            //  Picking the section is not enough:  the
+                            //  Settings window has to open, or the item does
+                            //  nothing.
+                            session.presentSettingsScene()
                         }
                     }
                 }
@@ -233,6 +249,8 @@ struct BotFleetMacApp: App {
                             }
                         } else if section == .servers {
                             MacServersSettings(coordinator: session.servers) { session.connect(host: $0) }
+                        } else if section == .lifecycle {
+                            MacLifecycleSettingsView(session: session)
                         } else if section == .resources {
                             MacResourcesSettings(coordinator: session.resources)
                         } else if section == .secrets {
@@ -242,9 +260,18 @@ struct BotFleetMacApp: App {
                             Text(banner)
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
-                        } else {
+                        } else if section == .phone {
+                            MacPhoneSettings(session: session)
+                        } else if section.isImplemented {
                             Text(session.capabilities.versionStamp)
                                 .font(.caption)
+                                .foregroundColor(.secondary)
+                        } else {
+                            //  A section with no screen behind it says so.
+                            //  The version stamp stood in for the screen and
+                            //  read like one.
+                            Text(section.unavailableCopy)
+                                .font(.callout)
                                 .foregroundColor(.secondary)
                         }
 

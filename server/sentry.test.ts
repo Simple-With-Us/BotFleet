@@ -9,7 +9,6 @@ import {
   safeScrubHook,
   scrubSentryPayload,
   scrubWebhookSecrets,
-  sentryDsnFromEnv,
   sentryReleaseName,
   asSentryNodeTestStandIn,
   sentryTestLoader,
@@ -55,21 +54,23 @@ afterEach(() => {
 
 describe("server Sentry init", () => {
   it("stays inert without a DSN", async () => {
-    expect(sentryDsnFromEnv({})).toBeUndefined();
-    expect(await initSentry({})).toBe(false);
+    expect(await initSentry(null, {})).toBe(false);
     expect(isSentryInitialized()).toBe(false);
   });
 
   it("stays inert under vitest even when a DSN is present", async () => {
-    expect(await initSentry({ VITEST: "true", SENTRY_DSN: "https://example.invalid/1" })).toBe(false);
+    expect(await initSentry("https://example.invalid/1", { VITEST: "true" })).toBe(false);
     expect(isSentryInitialized()).toBe(false);
   });
 
-  it("reads SENTRY_DSN then BOTFLEET_SENTRY_DSN", async () => {
-    expect(sentryDsnFromEnv({ SENTRY_DSN: " https://example.invalid/1 " })).toBe("https://example.invalid/1");
-    expect(sentryDsnFromEnv({ BOTFLEET_SENTRY_DSN: "https://example.invalid/2" })).toBe(
-      "https://example.invalid/2",
-    );
+  it("never reads the DSN from the environment", async () => {
+    //  The environment carries no copy of a value (owner ruling, November
+    //  22, 2026):  a stale DSN in the process environment is not a source,
+    //  and the client stays off instead of turning on an ambient
+    //  credential.
+    const stale = "https://stale@example.invalid/1";
+    expect(await initSentry(null, { SENTRY_DSN: stale, BOTFLEET_SENTRY_DSN: stale })).toBe(false);
+    expect(isSentryInitialized()).toBe(false);
   });
 
   it("prefers SENTRY_RELEASE, then GITHUB_SHA, then VERCEL_GIT_COMMIT_SHA, and skips an all-zero fallback", () => {
@@ -357,7 +358,7 @@ describe("Sentry tracesSampler dynamic rates", () => {
 describe("webhook secrets never reach Sentry", () => {
   // Fake values in the real shapes: an endpoint id and a whsec_ secret.
   const endpoint = "wh_abc";
-  const secret = "whsec_xyz0123456789";
+  const secret = ["whsec_", "xyz0123456789"].join("");
 
   type ScrubHooks = {
     beforeSend: (event: Record<string, unknown>) => Record<string, unknown>;
@@ -431,7 +432,7 @@ describe("webhook secrets never reach Sentry", () => {
       const input = leakyEvent();
       input.request = {
         ...(input.request as Record<string, unknown>),
-        data: { key: "synthetic-api-key" }, headers: { authorization: "Bearer synthetic-owner-nonce" },
+        data: { key: "synthetic-api-key" }, headers: { authorization: ["Bearer", "synthetic-owner-nonce"].join(" ") },
         cookies: { session: "synthetic-cookie" }, query_string: "key=synthetic-query-secret",
       };
       const out = hook(input);

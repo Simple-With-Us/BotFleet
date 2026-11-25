@@ -1,6 +1,6 @@
 // Opt-in APNs key read through a caller-supplied read-only service token.
 // The default companion path does not call this module. Nothing here reads
-// the environment, fleet-secrets, or a shared machine identity.
+// the environment, the scoped reader, or a shared machine identity.
 import { createHash } from "node:crypto";
 
 import { isJsonBoolean, isJsonObject, isJsonString, type JsonObject, type JsonValue } from "./json.ts";
@@ -57,12 +57,18 @@ export interface ScopedApnsMaterial {
   pin: string;
   keyId: string;
   p8: string | null;
+  /** The key id the STORE named, or null when it named none.  The caller
+   * uses it to ask for `AUTHKEY_<KEY_ID>`;  the built-in fallback is never
+   * one, so a store that named nothing is never mistaken for a store that
+   * named the shared key. */
+  storeKeyId: string | null;
 }
 
 interface ScopedCacheEntry {
   identity: string;
   pin: string;
   keyId: string;
+  storeKeyId: string | null;
   p8: string | null;
   at: number;
 }
@@ -432,9 +438,11 @@ export async function readDeclaredApnsSecrets(
     if (err instanceof ApnsScopedBindingError) throw err;
     throw new ApnsScopedBindingError("APNs binding read failed.", [config.token]);
   }
-  if (!p8 || names.length === 1) return { p8, keyId: p8 ? pin : null };
+  if (names.length === 1) return { p8, keyId: p8 ? pin : null };
   const idName = names[1];
   if (!idName) return { p8, keyId: null };
+  // The id is read even when the shared material is not there:  the store may
+  // name a key of its own, and the caller then asks for `AUTHKEY_<KEY_ID>`.
   try {
     const idValue = await readOne(binding, config, idName);
     const keyId = idValue && KEY_ID_PATTERN.test(idValue.trim()) ? idValue.trim() : null;
@@ -443,7 +451,7 @@ export async function readDeclaredApnsSecrets(
     if (!(err instanceof ApnsScopedBindingError)) {
       throw new ApnsScopedBindingError("APNs binding read failed.", [config.token]);
     }
-    // The PEM is already in hand. A bad id is the same as a missing id: keep the PEM and let the caller retry the id.
+    // A bad id is the same as a missing id: keep what was read and let the caller retry the id.
     return { p8, keyId: null };
   }
 }
@@ -463,9 +471,10 @@ function remember(
 ): ScopedApnsMaterial {
   const previous = scopedEntry && scopedEntry.identity === identity ? scopedEntry : null;
   const p8 = read.p8 && read.p8.length > 0 ? read.p8 : null;
+  const storeKeyId = read.keyId ?? null;
   const store = (next: ScopedCacheEntry): ScopedApnsMaterial => {
     if (generation === scopedGeneration) scopedEntry = next;
-    return { pin: next.pin, keyId: next.keyId, p8: next.p8 };
+    return { pin: next.pin, keyId: next.keyId, storeKeyId: next.storeKeyId, p8: next.p8 };
   };
   if (p8 === null && previous?.p8) {
     return store({ ...previous, at: completedAt - (timing.cacheMs - timing.retryMs) });
@@ -474,19 +483,21 @@ function remember(
     return store({
       identity,
       pin: timing.pin,
-      keyId: timing.pin || timing.keyIdFallback,
+      keyId: timing.pin || (storeKeyId ?? timing.keyIdFallback),
+      storeKeyId,
       p8,
       at: completedAt,
     });
   }
   if (read.keyId) {
-    return store({ identity, pin: timing.pin, keyId: read.keyId, p8, at: completedAt });
+    return store({ identity, pin: timing.pin, keyId: read.keyId, storeKeyId, p8, at: completedAt });
   }
   const keyId = previous && previous.p8 === p8 ? previous.keyId : timing.keyIdFallback;
   return store({
     identity,
     pin: timing.pin,
     keyId,
+    storeKeyId,
     p8,
     at: completedAt - (timing.cacheMs - timing.retryMs),
   });
@@ -521,7 +532,7 @@ export async function loadScopedApnsMaterial(
     && scopedEntry.identity === identity
     && now() - scopedEntry.at < (scopedEntry.p8 ? timing.cacheMs : timing.retryMs)
   ) {
-    return { pin: scopedEntry.pin, keyId: scopedEntry.keyId, p8: scopedEntry.p8 };
+    return { pin: scopedEntry.pin, keyId: scopedEntry.keyId, storeKeyId: scopedEntry.storeKeyId, p8: scopedEntry.p8 };
   }
   const existing = scopedFlights.get(identity);
   if (existing) return existing;
@@ -532,7 +543,7 @@ export async function loadScopedApnsMaterial(
   });
   scopedFlights.set(identity, flight);
   void readScopedFromBinding(binding, timing, identity, generation, now).then(resolveFlight, () => {
-    resolveFlight({ pin: timing.pin, keyId: timing.pin || timing.keyIdFallback, p8: null });
+    resolveFlight({ pin: timing.pin, keyId: timing.pin || timing.keyIdFallback, storeKeyId: null, p8: null });
   }).finally(() => {
     if (scopedFlights.get(identity) === flight) scopedFlights.delete(identity);
   });

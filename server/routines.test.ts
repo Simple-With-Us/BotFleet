@@ -262,7 +262,9 @@ it("coalesces a burst of saves into one write, and stop() flushes a pending save
 
   expect(existsSync(h.options.file!)).toBe(true);
   const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
-  expect(disk.botSnoozes).toMatchObject({ "bot-a": null, "bot-b": null, "bot-c": null });
+  // Snoozes are memory-only now (BF-2453): the flush still lands, but
+  // no latch is written for a restart to restore.
+  expect(disk.botSnoozes).toBeUndefined();
 });
 
 it("saves through the atomic writer: unindented JSON and no stray temp file left behind", () => {
@@ -1945,7 +1947,7 @@ describe("RoutineManager", () => {
       expect(h.manager.listRuns()[0]).toMatchObject({
         status: "missed",
         outcomeCode: "bot_stopped",
-        error: "Automations paused because this bot is stopped",
+        error: "Automations paused for this bot.  A person's message or Run now resumes them.",
         scheduledFor: nextBefore,
       });
       expect(h.manager.listRoutines()[0]!.nextRunAt).toBeGreaterThan(nextBefore);
@@ -1973,7 +1975,7 @@ describe("RoutineManager", () => {
       expect(h.manager.listRuns()[0]).toMatchObject({
         status: "missed",
         outcomeCode: "bot_stopped",
-        error: "Automations paused because this bot is stopped",
+        error: "Automations paused for this bot.  A person's message or Run now resumes them.",
       });
       expect(h.manager.listRuns()[0]?.error).not.toMatch(/offline/i);
       expect(h.started).toHaveLength(0);
@@ -2146,23 +2148,29 @@ describe("RoutineManager", () => {
       expect(h.manager.requeueRun(run.id)).toBe(false);
     });
 
-    it("persists bot snoozes across manager restarts", () => {
+    it("drops legacy saved snoozes on load: an update unlatches every install", () => {
       const h = harness();
-      h.manager.snoozeBot("compiler-bot");
-      h.manager.snoozeBot("finite-bot", 60_000);
+      h.manager.create({ name: "Fixture", prompt: "Check", botId: "compiler-bot", schedule: { type: "daily", time: "09:00", weekdays: [1] } });
       h.manager.flushNow();
-      const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
-      expect(disk.botSnoozes).toMatchObject({ "compiler-bot": null, "finite-bot": expect.any(Number) });
+      // An older build's routines.json carried the Stop latch as botSnoozes
+      // (null = indefinite).  Stop is turn-scoped now (BF-2453), so a new
+      // build must not restore it.
+      const seeded = JSON.parse(readFileSync(h.options.file!, "utf8"));
+      seeded.botSnoozes = { "compiler-bot": null };
+      writeFileSync(h.options.file!, JSON.stringify(seeded));
 
       const restarted = new RoutineManager(h.options);
-      expect(restarted.isBotSnoozed("compiler-bot")).toBe(true);
-      expect(restarted.isBotSnoozed("finite-bot")).toBe(true);
+      expect(restarted.isBotSnoozed("compiler-bot")).toBe(false);
 
-      // An expired finite snooze does not revive after a restart.
-      h.setNow(h.options.now!() + 61_000);
-      const later = new RoutineManager(h.options);
-      expect(later.isBotSnoozed("finite-bot")).toBe(false);
-      expect(later.isBotSnoozed("compiler-bot")).toBe(true);
+      // The field is never written back, so it ages out on the next flush.
+      // flushNow is a no-op unless the manager is dirty, so touch the
+      // in-memory snooze map (set, then clear) to force the write that ages
+      // the legacy field out.
+      restarted.snoozeBot("compiler-bot");
+      restarted.clearBotSnooze("compiler-bot");
+      restarted.flushNow();
+      const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
+      expect(disk.botSnoozes).toBeUndefined();
     });
 
     it("drops a persisted snooze once it is cleared", () => {

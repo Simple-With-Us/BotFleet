@@ -14,7 +14,7 @@ import {
 } from "../shared/bot-power.ts";
 import { routineFailurePhase, ROUTINE_ATTENTION_STATUSES, ROUTINE_OUTCOME_LABELS } from "../shared/routine-outcomes.ts";
 import { parseBotProfilePatch } from "./bot-profile.ts";
-import { botOffError, botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
+import { botOffError, isBotOffError } from "./bot-stop-policy.ts";
 import { _queuedRoomCount, _resetRoomQueue, queueRoomRound } from "./room-queue.ts";
 import {
   dropQueuedForOffBot,
@@ -98,23 +98,15 @@ describe("the Off refusal", () => {
   it("is a quiet refusal everywhere a stop is: boot recovery, card continuations and update resumes", () => {
     // Those callers drop a stop as "a decision, not a fault"; an Off bot is
     // the same decision, so retrying or remembering a failure would be wrong.
-    expect(isBotStoppedError(botOffError())).toBe(true);
-    expect(isBotStoppedError(Object.assign(new Error("stopped"), { code: "bot_stopped" }))).toBe(true);
-    expect(isBotStoppedError(new Error("the provider is out of credit"))).toBe(false);
+    expect(isBotOffError(botOffError())).toBe(true);
+    expect(isBotOffError(Object.assign(new Error("stopped"), { code: "bot_stopped" }))).toBe(true);
+    expect(isBotOffError(new Error("the provider is out of credit"))).toBe(false);
   });
 
-  it("says which it is in the error's own message: turn it on, or start it again", () => {
+  it("says how to undo it in the error's own message", () => {
     // The card-continuation resumes surface error.message, so the wording has to live there.
     expect(botOffError().message).toBe(BOT_OFF_REFUSAL);
-    expect(botOffError().message).not.toBe(botStopRefusalMessage());
     expect(botOffError().message).toMatch(/turn it on/i);
-    expect(botStopRefusalMessage()).toMatch(/start it again/i);
-  });
-
-  it("is not something a person's own message can override, unlike a stop", () => {
-    // decideBotStop lets a person wake a stopped bot.  Off is refused before
-    // that policy runs (startTurn), so the policy must still say what it said.
-    expect(decideBotStop({ stopped: true, personInitiated: true })).toEqual({ action: "allow", clearsStop: true });
   });
 });
 

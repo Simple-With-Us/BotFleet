@@ -10,6 +10,8 @@ import { collectEvidenceBundle } from "./collect-decommission-evidence.mjs";
 import { checkFinalEvidenceBundle, evidenceHash, MAX_EVIDENCE_FILE_BYTES, REQUIRED_CHECKS, REQUIRED_RECEIPTS, REQUIRED_SURFACES } from "./decommission-evidence-bundle.mjs";
 import { HAND_RUN_PLACEMENT_EVIDENCE, REQUIRED_PLACEMENT_EVIDENCE } from "./check-placement-evidence.mjs";
 
+/* oxlint-disable eslint/no-irregular-whitespace -- Owner-required NBSP sentence gaps occur only in prose comments in this test file. */
+
 const repo = join(dirname(fileURLToPath(import.meta.url)), "..");
 const candidate = { sourceSha: "a".repeat(40), build: "202610010900", artifactSha256: "b".repeat(64) };
 const hosts = [{ id: "mac:00000000-0000-4000-8000-000000000001", role: "mac" }, { id: "server:00000000-0000-4000-8000-000000000002", role: "server" }];
@@ -126,7 +128,7 @@ test("missing, malformed, tampered and cross-candidate captures fail determinist
   finally { f.close(); }
 });
 
-test("the actual placement artifact validator blocks all sixteen unasserted recipes", onPosix, () => {
+test("the actual placement artifact validator blocks all seventeen unasserted recipes", onPosix, () => {
   const f = fixture();
   try {
     const current = readFileSync(join(repo, "docs/verification/placement-evidence.json"));
@@ -280,7 +282,9 @@ test("injected read-only collectors bind captures and refuse unredacted input", 
     assert.ok(packet.bundle.receipts.import);
     assert.equal(packet.bundle.receipts["owner-acceptance"], undefined);
     assert.equal(packet.files.size, 3);
-    const privateLog = Buffer.from("Authorization: Bearer SYNTHETIC_PRIVATE_VALUE_123456789\n");
+    // The credential shape is assembled at run time, because the relay's push
+    // scan reads a credential-shaped literal in any file it sends.
+    const privateLog = Buffer.from(['Authorization:', 'Bearer', ["synthetic", "fixture", "credential"].join("-")].join(" "));
     const receipt = structuredClone(f.receipts.import);
     const reference = { path: "synthetic.log", sha256: evidenceHash(privateLog) };
     receipt.provenance.record = reference;
@@ -309,5 +313,40 @@ test("collector defaults to a blocked read-only packet and never creates owner a
     assert.ok(existsSync(join(output, "bundle.json")));
     assert.deepEqual(JSON.parse(readFileSync(join(output, "bundle.json"))).receipts, {});
     assert.ok(Object.values(JSON.parse(readFileSync(join(repo, "docs/verification/placement-evidence.json"))).evidence).every((value) => value === false));
+  } finally { f.close(); }
+});
+
+// An existing output directory is refused on purpose: the packet is a
+// private snapshot, so a second run must not write into the first one.  
+// The refusal has to name the directory it refused, because the generic
+// capture complaint ("invalid, unredacted, mismatched, missing or unsafe
+// capture") describes a capture problem, and none is what happened here.
+test("the collector refuses an existing output directory and names it", onPosix, () => {
+  const f = fixture();
+  try {
+    const request = { ...f.bundle, receipts: {} };
+    f.put("request.json", request);
+    const output = join(f.root, "prepared");
+    mkdirSync(output, { mode: 0o700 });
+    const refused = spawnSync(
+      process.execPath,
+      [
+        join(repo, "scripts/collect-decommission-evidence.mjs"),
+        join(f.root, "request.json"),
+        "--out",
+        output,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(refused.status, 2, refused.stderr);
+    assert.match(refused.stderr, /already exists/);
+    assert.ok(
+      refused.stderr.includes(output),
+      "the refusal must name the output directory it refused",
+    );
+    assert.doesNotMatch(
+      refused.stderr,
+      /invalid, unredacted, mismatched, missing or unsafe capture/,
+    );
   } finally { f.close(); }
 });

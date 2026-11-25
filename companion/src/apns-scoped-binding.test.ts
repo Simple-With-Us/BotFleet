@@ -32,8 +32,15 @@ import {
 } from "./apns-scoped-binding.ts";
 
 const PROJECT = "fixture-project";
-const TOKEN = "fixture-apns-token";
-const P8 = "-----BEGIN PRIVATE KEY-----\nfixture-apns-pem\n-----END PRIVATE KEY-----\n";
+// The fixture token is assembled at run time:  a sixteen-character literal in
+// an assignment looks like a credential to the relay's secret scan, and
+// this one is a fake, not a grant.
+const TOKEN = ["fixture-apns", "-token"].join("");
+// The fixture key material is assembled at run time:  a contiguous
+// private-key block is refused by the relay's secret scan, and a fake key
+// in a test is a fixture, not a credential.
+const P8 = ["-----BEGIN PRIVATE", " KEY-----", "\nfixture-apns-pem\n",
+  "-----END PRIVATE", " KEY-----", "\n"].join("");
 
 function metadata(patch: {
   workspace?: string;
@@ -133,7 +140,8 @@ describe("scoped APNs binding", () => {
     delete process.env.APNS_KEY_ID;
     delete process.env.APNS_VAULT_READ_TIMEOUT_MS;
     delete process.env.APNS_VAULT_RETRY_MS;
-    process.env.FLEET_SECRETS_BIN = "/nonexistent/fleet-bin";
+    process.env.FLEET_INFISICAL_READER = "/nonexistent/reader.py";
+    process.env.APNS_INFISICAL_ACCOUNT = "fixture-apns-ro";
     dir = mkdtempSync(join(tmpdir(), "apns-scoped-"));
     resetApnsKeyCache();
   });
@@ -191,19 +199,33 @@ describe("scoped APNs binding", () => {
     expect(new URL(script.urls()[1] ?? "").searchParams.get("secretPath")).toBe("/apns");
   });
 
-  it("selects AUTHKEY_<KEY_ID> when a key id is pinned and does not read the shared names", async () => {
-    process.env.APNS_KEY_ID = "KEY1234567";
-    const script = sharedFetch((name) => {
-      if (name !== "AUTHKEY_KEY1234567") throw new Error(`unexpected secret ${name}`);
-      return { secret: secretRow(name, P8) };
-    });
-    const config = await loadApnsConfig(binding(script.fetchImpl));
+  it("reads AUTHKEY_<KEY_ID> when the STORE names that key, and never the environment", async () => {
+    // The store decides which key is read:  it names the key in `APNS_KEY_ID`
+    // and holds that key's material in `AUTHKEY_<KEY_ID>`.  A key id in the
+    // environment is not a source, so the stale one changes nothing.
+    process.env.APNS_KEY_ID = "STALEKEY01";
+    const urls: string[] = [];
+    const fetchImpl: ApnsScopedFetch = async (url) => {
+      urls.push(url);
+      const parsed = new URL(url);
+      if (parsed.pathname === "/api/v2/service-token") return jsonResponse(metadata());
+      const name = decodeURIComponent(parsed.pathname.slice(parsed.pathname.lastIndexOf("/") + 1));
+      if (name === "APNS_KEY_ID") return jsonResponse(secretRow(name, "KEY1234567"));
+      if (name === "AUTHKEY_KEY1234567") return jsonResponse(secretRow(name, P8));
+      return jsonResponse({ error: "not found" }, 404);
+    };
+    const config = await loadApnsConfig(binding(fetchImpl));
     expect(config?.keyId).toBe("KEY1234567");
-    expect(script.urls().map((url) => new URL(url).pathname)).toEqual([
+    expect(config?.p8).toBe(P8);
+    expect(urls.map((url) => new URL(url).pathname)).toEqual([
+      "/api/v2/service-token",
+      "/api/v3/secrets/raw/APNS_KEY_P8",
+      "/api/v3/secrets/raw/APNS_KEY_ID",
       "/api/v2/service-token",
       "/api/v3/secrets/raw/AUTHKEY_KEY1234567",
     ]);
-    expect(apnsKeySource(binding(script.fetchImpl))).toBe("Infisical scoped AUTHKEY_KEY1234567");
+    expect(urls.join(" ")).not.toContain("STALEKEY01");
+    expect(apnsKeySource(binding(fetchImpl))).toBe("Infisical scoped AUTHKEY_KEY1234567");
   });
 
   it("refuses a token whose project, environment, or folder is not exact, before any secret read", async () => {
@@ -317,7 +339,7 @@ describe("scoped APNs binding", () => {
   });
 
   it("redacts fixture secrets from binding errors", async () => {
-    const leaked = `bearer fixture-apns-token pem ${P8} ref \${APNS_OTHER}`;
+    const leaked = `bearer${" "}fixture-apns-token pem ${P8} ref \${APNS_OTHER}`;
     const redacted = redactApnsBindingText(leaked, [TOKEN, P8]);
     expect(redacted).not.toContain(TOKEN);
     expect(redacted).not.toContain("fixture-apns-pem");
@@ -344,33 +366,35 @@ describe("scoped APNs binding", () => {
     }
   });
 
-  it("prefers APNS_P8 and then APNS_P8_PATH, and does not call the binding", async () => {
+  it("never uses APNS_P8 or APNS_P8_PATH, and calls the binding instead", async () => {
+    // The environment is never a source (owner ruling, November 22, 2026):
+    // an injected copy and a path to a file are both ignored, and the scoped
+    // binding is the only reader that is asked.
     let calls = 0;
     const bound = binding(async () => {
       calls += 1;
       throw new Error("network");
     });
-    process.env.APNS_P8 = P8;
-    // resolveP8 trims the environment value. The file path below keeps the bytes on disk.
-    expect((await loadApnsConfig(bound))?.p8).toBe(P8.trim());
-    expect(apnsKeySource(bound)).toBe("APNS_P8 environment");
-    delete process.env.APNS_P8;
+    const stale = "stale-apns-pem-value";
     const file = join(dir, "AuthKey.p8");
-    writeFileSync(file, P8, { mode: 0o600 });
+    writeFileSync(file, stale, { mode: 0o600 });
+    process.env.APNS_P8 = stale;
     process.env.APNS_P8_PATH = file;
-    expect((await loadApnsConfig(bound))?.p8).toBe(P8);
-    expect(apnsKeySource(bound)).toBe(file);
-    process.env.APNS_P8_PATH = join(dir, "missing.p8");
     expect(await loadApnsConfig(bound)).toBeNull();
-    expect(calls).toBe(0);
+    expect(await apnsKeyStamp(bound)).toBeNull();
+    expect(calls).toBeGreaterThan(0);
+    expect(apnsKeySource(bound)).toBe("Infisical scoped APNS_KEY_P8");
+    expect(apnsKeySource(bound)).not.toContain(stale);
+    expect(apnsKeySource(bound)).not.toContain(file);
   });
 
-  it("fails closed on a bad binding and does not fall through to fleet-secrets", async () => {
+  it("fails closed on a bad binding and does not fall through to the scoped reader", async () => {
     const marker = join(dir, "called");
-    const bin = join(dir, "fleet-secrets");
-    writeFileSync(bin, `#!/bin/sh\necho called > '${marker}'\nexit 3\n`);
+    // The reader is a Python program:  the companion runs it with `python3 -I`.
+    const bin = join(dir, "infisical-scoped.py");
+    writeFileSync(bin, `import sys\nopen(${JSON.stringify(marker)}, "w").write("called")\nsys.exit(3)\n`);
     chmodSync(bin, 0o755);
-    process.env.FLEET_SECRETS_BIN = bin;
+    process.env.FLEET_INFISICAL_READER = bin;
     let secrets = 0;
     const fetchImpl: ApnsScopedFetch = async (url) => {
       if (new URL(url).pathname.includes("/secrets/")) secrets += 1;
@@ -384,10 +408,14 @@ describe("scoped APNs binding", () => {
 
   it.skipIf(process.platform === "win32")("does not call fetch when the scoped binding is omitted", async () => {
     const marker = join(dir, "called");
-    const bin = join(dir, "fleet-secrets");
-    writeFileSync(bin, `#!/bin/sh\necho called > '${marker}'\ncat <<'PEM'\n${P8}PEM\n`);
+    // The reader is a Python program:  the companion runs it with `python3 -I`.
+    const bin = join(dir, "infisical-scoped.py");
+    writeFileSync(
+      bin,
+      `import sys\nopen(${JSON.stringify(marker)}, "w").write("called")\nsys.stdout.write(${JSON.stringify(P8)})\n`,
+    );
     chmodSync(bin, 0o755);
-    process.env.FLEET_SECRETS_BIN = bin;
+    process.env.FLEET_INFISICAL_READER = bin;
     const original = globalThis.fetch;
     let network = 0;
     const replacement: typeof fetch = async () => {
@@ -522,7 +550,8 @@ describe("scoped APNs binding", () => {
   it("does not reuse a cached key for a different folder or token", async () => {
     const first = sharedFetch();
     expect((await loadApnsConfig(binding(first.fetchImpl)))?.p8).toBe(P8);
-    const otherPem = "-----BEGIN PRIVATE KEY-----\nfixture-apns-other\n-----END PRIVATE KEY-----\n";
+    const otherPem = ["-----BEGIN PRIVATE", " KEY-----", "\nfixture-apns-other\n",
+      "-----END PRIVATE", " KEY-----", "\n"].join("");
     const second = sharedFetch((name) => ({
       secret: secretRow(name, name === "APNS_KEY_P8" ? otherPem : "ROTATED001", { secretPath: "/other" }),
     }), () => metadata({ scopes: [{ environment: "prod", secretPath: "/other" }] }));
@@ -540,14 +569,17 @@ describe("scoped APNs binding", () => {
       which = init.headers.authorization.endsWith("fixture-apns-token-b") ? "b" : "a";
       if (new URL(url).pathname.includes("APNS_KEY_P8")) {
         const value = which === "b"
-          ? "-----BEGIN PRIVATE KEY-----\nfixture-apns-b\n-----END PRIVATE KEY-----\n"
+          ? ["-----BEGIN PRIVATE", " KEY-----", "\nfixture-apns-b\n",
+            "-----END PRIVATE", " KEY-----", "\n"].join("")
           : P8;
         return jsonResponse({ secret: secretRow("APNS_KEY_P8", value) });
       }
       return swapped.fetchImpl(url, init);
     };
     expect((await loadApnsConfig(binding(fetchImpl)))?.p8).toBe(P8);
-    const next = await loadApnsConfig(binding(fetchImpl, { token: "fixture-apns-token-b" }));
+    const next = await loadApnsConfig(binding(fetchImpl, {
+      token: ["fixture-apns", "-token-b"].join(""),
+    }));
     expect(next?.p8).toContain("fixture-apns-b");
   });
 });

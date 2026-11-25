@@ -38,7 +38,7 @@
 #
 # THE TOKEN:  the publish needs a credential with write access to
 # AI-Fleet-Coordinator.  The ship workflow passes the fleet's GH_PAT secret
-# as GH_TOKEN; a hand run reads GH_PAT through fleet-secrets.  A bare gh login
+# as GH_TOKEN; a hand run reads GH_PAT through the scoped reader.  A bare gh login
 # is never used.  The
 # workflow's own GITHUB_TOKEN is read-only by declaration and cannot write to
 # another repository, so it is never used for this and never arms auto-merge.
@@ -54,6 +54,25 @@ set -euo pipefail
 
 FLEET_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOCAL_JSON="${FLEET_DIR}/ios-app-versions.json"
+
+# The shared scoped reader helper.  It resolves the reader, names the
+# consumer's own account and fails closed when there is no reader or no
+# grant:  the value reaches stdout and nothing else does.  A helper that is
+# not there refuses the read rather than stopping the caller.
+FLEET_INFISICAL_HELPER="${FLEET_DIR}/../lib/fleet-infisical-read.sh"
+if [ -f "$FLEET_INFISICAL_HELPER" ]; then
+  . "$FLEET_INFISICAL_HELPER"
+else
+  fleet_secret_get() {
+    echo "the scoped reader helper is not installed at ${FLEET_INFISICAL_HELPER}" >&2
+    return 4
+  }
+fi
+
+# The fleet's write-capable GitHub credential lives in its own folder, and
+# the account that reads it is the consumer's own read-only service token.
+GITHUB_SECRET_FOLDER="/github"
+GITHUB_SECRET_ACCOUNT="${FLEET_INFISICAL_GITHUB_ACCOUNT:-github-pat-ro}"
 REPO="${AFC_MANIFEST_REPO:-Simple-With-Us/AI-Fleet-Coordinator}"
 REMOTE_PATH="site/ios-versions.json"
 BASE_BRANCH="${AFC_MANIFEST_BRANCH:-main}"
@@ -117,15 +136,13 @@ resolve_token() {
   # No token in the environment:  read the fleet GH_PAT.  A bare gh login is
   # not used, because it may be a personal or read-only credential.
   local pat=""
-  if command -v fleet-secrets >/dev/null 2>&1; then
-    pat="$(fleet-secrets get GH_PAT 2>/dev/null || true)"
-  fi
+  pat="$(fleet_secret_get GH_PAT "$GITHUB_SECRET_FOLDER" "$GITHUB_SECRET_ACCOUNT" 2>/dev/null || true)"
   if [[ -z "$pat" ]]; then
-    echo "error: no GH_TOKEN and fleet-secrets could not return GH_PAT; cannot publish the manifest" >&2
+    echo "error: no GH_TOKEN and the scoped reader could not return GH_PAT; cannot publish the manifest" >&2
     return 1
   fi
   TOKEN="$pat"
-  TOKEN_SOURCE="fleet-secrets"
+  TOKEN_SOURCE="scoped reader"
 }
 
 # Read the manifest at a ref (branch or commit) into a file.  Sets FETCHED_SHA

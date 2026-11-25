@@ -12,7 +12,14 @@ import type { InstanceConfig, InstanceConfigMap } from "./contracts.ts";
 import { dataDir } from "./data-dir.ts";
 import { clearDataFault, findSetAsideFiles, recordDataFault, type SetAsideFile } from "./data-faults.ts";
 import { isJsonObject, isJsonString, parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
-import { infisicalSnapshot, resolveSecretFields, stripVaultManagedValues } from "./secret-map.ts";
+import {
+  fileSecretValues,
+  infisicalSnapshot,
+  mappedEnvNames,
+  ownCredentialStoreEnvNames,
+  resolveSecretFields,
+  stripVaultManagedValues,
+} from "./secret-map.ts";
 import { resolveKnobFields, stripVaultManagedKnobs } from "./knob-map.ts";
 import { CONTROL_ACT_WITHIN_MS, CONTROL_WAIT_MS } from "./control-client.ts";
 import { describeDsn } from "./sentry.ts";
@@ -2164,32 +2171,74 @@ export function loadConfig(): AppConfig {
   // step (syncCredentialEnv below), or the value injected at boot would
   // shadow the save until the next launch.
   //
-  // This overlay is unchanged, and deliberately so.  `server/secret-map.ts`
-  // sits ABOVE it rather than replacing it: for the names an external secret
-  // store holds, the store wins; for every other name the ordering below —
-  // env over file here, file over env in the per-call readers — is exactly
-  // what it has always been.
+  // `server/secret-map.ts` sits ABOVE this overlay rather than replacing it:
+  // for the names an external secret store holds, the store wins; for every
+  // other name the ordering below — env over file here, file over env in the
+  // per-call readers — is exactly what it has always been.
+  //
+  // One change, and it is the owner's ruling of November 22, 2026:  the
+  // environment carries no copy of a value, so a name the secret map manages
+  // is not read from the environment once a store is configured.  The store
+  // owns those names, and a hand-set value can never replace the reviewed
+  // grant.  A host with no store configured has no store to own the name, so
+  // the overlay still applies there.
+  //
+  // The one exception is the app's own credential store, marked in the app's
+  // own configuration:  the desktop shell's encrypted store, handed to the
+  // server it spawns.  The ruling preserves the app's own configuration for
+  // a name the fleet store does not hold, and the keychain value is exactly
+  // that -- the app's own store, never a copy of a fleet grant.  The fleet
+  // store still outranks it, and the environment copy of any other name
+  // stays out of the way.
+  // The names the secret map manages, and the store that owns them.
+  const mappedEnv = mappedEnvNames();
+  const storeConfigured = infisicalSnapshot() !== null;
+  // The app's own credential store:  the desktop shell keeps those values
+  // OS-encrypted and hands them to the server it spawns, so they arrive out
+  // of the environment, and the app's own configuration says so with the
+  // `credentialStorage: "external"` marker.  That is the app's own store --
+  // the same class as the file -- and not an ambient environment copy:  the
+  // fleet store still outranks it above, and an environment value with no
+  // marker stays out of the way entirely.
+  const ownStoreEnv = ownCredentialStoreEnvNames(cfg);
+  // The values the app's own file holds, captured before the overlay can put
+  // the app's own credential store's value in their place, so the provenance
+  // the vault check reports is about the file and not about the handoff.
+  const fileValues = fileSecretValues(cfg);
+  const envCopy = (name: string): string | undefined => {
+    if (storeConfigured && mappedEnv.has(name) && !ownStoreEnv.has(name)) return undefined;
+    return process.env[name];
+  };
   cfg.githubRequestLog = { ...cfg.githubRequestLog };
-  if (process.env.GITHUB_REQUEST_LOG_WEBHOOK_SECRET !== undefined) cfg.githubRequestLog.webhookSecret = process.env.GITHUB_REQUEST_LOG_WEBHOOK_SECRET;
+  const webhookSecret = envCopy("GITHUB_REQUEST_LOG_WEBHOOK_SECRET");
+  if (webhookSecret !== undefined) cfg.githubRequestLog.webhookSecret = webhookSecret;
   cfg.xai = { ...cfg.xai };
-  if (process.env.XAI_API_KEY !== undefined) cfg.xai.key = process.env.XAI_API_KEY;
+  const xaiKey = envCopy("XAI_API_KEY");
+  if (xaiKey !== undefined) cfg.xai.key = xaiKey;
   cfg.openaiCompat = { ...cfg.openaiCompat };
-  if (process.env.OPENAI_COMPAT_API_KEY !== undefined) cfg.openaiCompat.key = process.env.OPENAI_COMPAT_API_KEY;
-  if (process.env.OPENAI_COMPAT_URL !== undefined) cfg.openaiCompat.url = process.env.OPENAI_COMPAT_URL;
+  const openaiCompatKey = envCopy("OPENAI_COMPAT_API_KEY");
+  if (openaiCompatKey !== undefined) cfg.openaiCompat.key = openaiCompatKey;
+  const openaiCompatUrl = envCopy("OPENAI_COMPAT_URL");
+  if (openaiCompatUrl !== undefined) cfg.openaiCompat.url = openaiCompatUrl;
   // Mirrors openaiCompat: the MiniMax driver reads `MINIMAX_API_KEY` and
   // `MINIMAX_BASE_URL` from the environment on its own, so without this
   // overlay a key exported in the shell would be invisible to the Settings
   // card that reports where the value came from — the driver would work and
   // the app would still say "not configured".
   cfg.minimax = { ...cfg.minimax };
-  if (process.env.MINIMAX_API_KEY !== undefined) cfg.minimax.key = process.env.MINIMAX_API_KEY;
-  if (process.env.MINIMAX_BASE_URL !== undefined) cfg.minimax.url = process.env.MINIMAX_BASE_URL;
+  const minimaxKey = envCopy("MINIMAX_API_KEY");
+  if (minimaxKey !== undefined) cfg.minimax.key = minimaxKey;
+  const minimaxUrl = envCopy("MINIMAX_BASE_URL");
+  if (minimaxUrl !== undefined) cfg.minimax.url = minimaxUrl;
   cfg.composio = { ...cfg.composio };
-  if (process.env.COMPOSIO_API_KEY !== undefined) cfg.composio.apiKey = process.env.COMPOSIO_API_KEY;
+  const composioKey = envCopy("COMPOSIO_API_KEY");
+  if (composioKey !== undefined) cfg.composio.apiKey = composioKey;
   cfg.box = { ...cfg.box };
-  if (process.env.BOX_TOKEN !== undefined) cfg.box.token = process.env.BOX_TOKEN;
+  const boxToken = envCopy("BOX_TOKEN");
+  if (boxToken !== undefined) cfg.box.token = boxToken;
   cfg.opencodeGo = { ...cfg.opencodeGo };
-  if (process.env.OPENCODE_API_KEY !== undefined) cfg.opencodeGo.apiKey = process.env.OPENCODE_API_KEY;
+  const opencodeKey = envCopy("OPENCODE_API_KEY");
+  if (opencodeKey !== undefined) cfg.opencodeGo.apiKey = opencodeKey;
   // Mirrors openaiCompat above: the desktop shell moves the key into
   // credentials.bin and hands it back as DEEPSEEK_API_KEY at spawn, so this
   // is the one place a packaged-app save becomes visible again. Without it
@@ -2197,21 +2246,30 @@ export function loadConfig(): AppConfig {
   // read the env var back, so configStatus.deepseek.configured stayed false
   // forever after a save.
   cfg.deepseek = { ...cfg.deepseek };
-  if (process.env.DEEPSEEK_API_KEY !== undefined) cfg.deepseek.key = process.env.DEEPSEEK_API_KEY;
-  if (process.env.DEEPSEEK_URL !== undefined) cfg.deepseek.url = process.env.DEEPSEEK_URL;
+  const deepseekKey = envCopy("DEEPSEEK_API_KEY");
+  if (deepseekKey !== undefined) cfg.deepseek.key = deepseekKey;
+  const deepseekUrl = envCopy("DEEPSEEK_URL");
+  if (deepseekUrl !== undefined) cfg.deepseek.url = deepseekUrl;
   cfg.tts = { ...cfg.tts };
-  if (process.env.OMB_TTS_KEY !== undefined) cfg.tts.key = process.env.OMB_TTS_KEY;
+  const ttsKey = envCopy("OMB_TTS_KEY");
+  if (ttsKey !== undefined) cfg.tts.key = ttsKey;
   cfg.azureSpeech = { ...cfg.azureSpeech };
-  if (process.env.AZURE_SPEECH_KEY !== undefined) cfg.azureSpeech.key = process.env.AZURE_SPEECH_KEY;
-  if (process.env.AZURE_SPEECH_REGION !== undefined) cfg.azureSpeech.region = process.env.AZURE_SPEECH_REGION;
+  const azureSpeechKey = envCopy("AZURE_SPEECH_KEY");
+  if (azureSpeechKey !== undefined) cfg.azureSpeech.key = azureSpeechKey;
+  const azureSpeechRegion = envCopy("AZURE_SPEECH_REGION");
+  if (azureSpeechRegion !== undefined) cfg.azureSpeech.region = azureSpeechRegion;
   cfg.metaSpeech = { ...cfg.metaSpeech };
-  if (process.env.META_SPEECH_API_KEY !== undefined) cfg.metaSpeech.key = process.env.META_SPEECH_API_KEY;
+  const metaSpeechKey = envCopy("META_SPEECH_API_KEY");
+  if (metaSpeechKey !== undefined) cfg.metaSpeech.key = metaSpeechKey;
   cfg.groq = { ...cfg.groq };
-  if (process.env.GROQ_API_KEY !== undefined) cfg.groq.key = process.env.GROQ_API_KEY;
+  const groqKey = envCopy("GROQ_API_KEY");
+  if (groqKey !== undefined) cfg.groq.key = groqKey;
   cfg.assemblyai = { ...cfg.assemblyai };
-  if (process.env.ASSEMBLYAI_API_KEY !== undefined) cfg.assemblyai.key = process.env.ASSEMBLYAI_API_KEY;
+  const assemblyaiKey = envCopy("ASSEMBLYAI_API_KEY");
+  if (assemblyaiKey !== undefined) cfg.assemblyai.key = assemblyaiKey;
   cfg.imageGen = { ...cfg.imageGen };
-  if (process.env.OMB_OPENAI_IMAGE_KEY !== undefined) cfg.imageGen.key = process.env.OMB_OPENAI_IMAGE_KEY;
+  const imageGenKey = envCopy("OMB_OPENAI_IMAGE_KEY");
+  if (imageGenKey !== undefined) cfg.imageGen.key = imageGenKey;
   // Bootstrap env beats disk; an inherited machine identity still requires explicit selection.
   cfg.infisical = overlayInfisicalBootstrap(cfg.infisical);
   cfg.agentProxy = { ...cfg.agentProxy };
@@ -2234,7 +2292,7 @@ export function loadConfig(): AppConfig {
   // overwrites what env and file just agreed on, and the provenance of every
   // mapped field is recorded for the Secrets card.  With no store configured
   // the snapshot is null and this is a no-op.
-  resolveSecretFields(cfg, process.env, infisicalSnapshot());
+  resolveSecretFields(cfg, process.env, infisicalSnapshot(), fileValues);
   // The tunable-knob twin of the line above, from `server/knob-map.ts`: for
   // a knob name the vault holds, the vault wins over the file.  Runs after
   // the credential overlay so both layers read the same snapshot, and both

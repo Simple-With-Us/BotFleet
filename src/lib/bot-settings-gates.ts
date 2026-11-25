@@ -78,6 +78,8 @@ export interface CapabilityGates {
   canAutoReview: boolean;
   /** Can this engine mount Composio? */
   canUseConnectedApps: boolean;
+  /** Can this engine mount the person's own MCP servers? */
+  canUseMcpServers: boolean;
   /** Can this engine be given a VPS at all? */
   canUseVps: boolean;
   /** Runs the harness HTTP tool loop. */
@@ -244,6 +246,7 @@ export function botCapabilityGates(
     canCoordinate: capabilities?.agentsMcp === true,
     canAutoReview: capabilities?.approvalReview === true,
     canUseConnectedApps: capabilities?.composioMcp === true,
+    canUseMcpServers: capabilities?.customMcp === true,
     canUseVps: capabilities?.computerMcp === true && engine?.driverKind !== "boxAgent",
     toolLoop: capabilities?.toolLoop === true,
   };

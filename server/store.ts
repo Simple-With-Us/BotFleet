@@ -16,6 +16,7 @@ import type { JsonValue } from "./schema.ts";
 import { interpretRecordList, loadGuarded, logRefusedSave } from "./store-guard.ts";
 import { workspaceDir } from "./workspace.ts";
 import { newId, type CloudBackend, type ModelSelection, type ThreadId, type TurnBillingMode } from "./contracts.ts";
+import type { StoredMcpServer } from "./mcp-registry.ts";
 import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { botAvatarProfile, type BotAvatarCrop, type BotAvatarRecolorable } from "../shared/bot-avatar.ts";
@@ -744,8 +745,17 @@ export interface BotRecord {
   /** Tools this bot may always use without asking, even outside auto mode
    * (set by "Always allow" on an approval card). */
   alwaysAllow?: string[];
-  /** Optional subset of config `mcpServers` this bot may mount; absent = all enabled. */
+  /** Optional subset of the workspace's shared `mcpServers` this bot may
+   * mount; absent = all enabled. */
   mcpServers?: string[];
+  /** MCP servers that belong to this bot alone, by name.  A name here
+   * mounts for this bot and for no other, and a name here wins over a
+   * shared server of the same name.
+   *
+   * The shape is the registry's own, so the writer and the reader agree
+   * on one definition of a server:  a command with its args and env, or
+   * a url with its headers, and the switch that says whether it is on. */
+  ownMcpServers?: Record<string, StoredMcpServer>;
   /** Ceiling on model→tool rounds for HTTP toolLoop engines (MiniMax / Grok
    * HTTP / openai-compat). Unset = DEFAULT_MAX_TOOL_ROUNDS (shared/bot-profile.ts),
    * which DEFAULT_TURN_LOOP_BUDGET.maxRounds is derived from.
@@ -2785,8 +2795,22 @@ export class Store {
     const previousThreadId = previous?.threadId ?? opts?.previousThreadId;
     const turns = previous?.usage?.turns ?? 0;
     const messages = previousThreadId ? this.messageCountFor(previousThreadId) : 0;
-    this.clearAutomationKey(botId, automationKey);
     const title = opts?.title?.trim() || previous?.title || "Automation";
+    // BF-2556: the replacement takes the live title, so a predecessor that
+    // still carries it would leave the task list holding two threads with
+    // the exact same name.  Retire the old one under a dated archived name,
+    // disambiguated when a same-day predecessor already took that name.
+    // createTask below persists the rename with the new task.
+    if (previous && previous.title === title) {
+      const baseArchivedTitle = `${title} (archived ${new Date().toISOString().slice(0, 10)})`;
+      const takenTitles = new Set((bot.tasks ?? []).filter((task) => task !== previous).map((task) => task.title));
+      let archivedTitle = baseArchivedTitle;
+      for (let n = 2; takenTitles.has(archivedTitle); n += 1) {
+        archivedTitle = `${baseArchivedTitle} (${n})`;
+      }
+      previous.title = archivedTitle;
+    }
+    this.clearAutomationKey(botId, automationKey);
     const activate = opts?.activate ?? true;
     // createTask reunites on a matching key — we already cleared it.
     const neu = this.createTask(botId, title, activate, automationKey, previous?.workspaceContext);

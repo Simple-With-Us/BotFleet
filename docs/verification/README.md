@@ -25,7 +25,7 @@ Verification uses these isolated fixtures:
 - [Model fallback on quota chips](quota-fallback.md) — provider failover when quota is exhausted
 - [Mac updater transaction](mac-updater.md) — signed update delivery and application
 - [Independent server controls](server-controls.md) — native menu bar controls, startup policy and protected VM shutdown
-- [Placement and ownership](placement.md) — shared job contract, local identity and sixteen required multi-host acceptance recipes
+- [Placement and ownership](placement.md) — shared job contract, local identity and seventeen required multi-host acceptance recipes
 - [Host headroom](headroom.md) — inventory, honest enforcement, pressure, storage isolation and authorized server fixture evidence
 - [Native host package smoke](native-host-package.md) — the real packager, the real archive and the packaged executable's own identity
 - [Staged candidate smoke test](staged-candidate-smoke.md) — the pre-activation probe that runs a candidate before anything live is touched
@@ -33,6 +33,7 @@ Verification uses these isolated fixtures:
 - [Saved data faults](saved-data.md) — unreadable bots, rooms, routines and settings files are set aside, never deleted
 - [Bot On/Off switch](bot-off.md) — an Off bot starts nothing new and finishes a running turn
 - [Named tunnel loopback Host](named-tunnel-loopback-host.md) — proves the Access tunnel reaches the harness with loopback Host and documents the mutation gate (BF-2129)
+- [Optional secret store fixture](optional-secret-store-fixture.md) — the fake-credential fixture and readback for the optional secret store: primary selection, independent read and write references, and mode isolation (BF-2622)
 
 ### Test Fixtures
 

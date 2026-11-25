@@ -1,66 +1,51 @@
 import { describe, expect, it } from "vitest";
 
-import { botAutomationsPausedMessage, botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
+import { BOT_OFF_CODE, BOT_OFF_REFUSAL } from "../shared/bot-power.ts";
+import { botAutomationsPausedMessage, botOffError, botStopErrorCode, isBotOffError } from "./bot-stop-policy.ts";
 
-// The rule under test, in one sentence: a bot a person stopped stays stopped
-// until a person asks for it again.  The regression this file exists for is
-// the update/boot resume clearing that stop and re-dispatching the bot by
-// itself — which is what "the bot I stopped restarted on its own" was.
-describe("decideBotStop", () => {
-  it("refuses a system-initiated dispatch to a stopped bot", () => {
-    expect(decideBotStop({ stopped: true, personInitiated: false })).toEqual({
-      action: "refuse",
-      reason: "bot-stopped",
-    });
-  });
-
-  it("lets a person's own turn through and lifts the stop", () => {
-    // Typing into a stopped bot is how you start it again.  Nothing here may
-    // regress: a stop that also blocked the owner would be unusable.
-    expect(decideBotStop({ stopped: true, personInitiated: true })).toEqual({
-      action: "allow",
-      clearsStop: true,
-    });
-  });
-
-  it("allows system work on a bot that is not stopped, without clearing anything", () => {
-    expect(decideBotStop({ stopped: false, personInitiated: false })).toEqual({
-      action: "allow",
-      clearsStop: false,
-    });
-  });
-
-  it("never lets a system dispatch clear a stop, whatever it is handed", () => {
-    // The original bug was a resume carrying a person's OLD prompt.  Whether
-    // the bot is stopped or not, a system turn must not touch the flag; the
-    // stopped case is the one that has to refuse rather than proceed.
-    for (const stopped of [true, false]) {
-      const decision = decideBotStop({ stopped, personInitiated: false });
-      expect(decision.action === "allow" ? decision.clearsStop : false).toBe(false);
-    }
+// Stop is this turn; Off is the only hold (owner ruling, BF-2453).  The old
+// stop latch — decideBotStop, the bot_stopped refusal, the snooze a Stop
+// wrote — is gone from the dispatch path, so what this file pins is what
+// remains: the Off refusal error, the predicate retrying callers use to tell
+// a deliberate refusal from a provider failure, and the snooze skip receipt.
+describe("botOffError", () => {
+  it("is a 409 with the Off code and the Off refusal wording", () => {
+    const error = botOffError();
+    expect(error.status).toBe(409);
+    expect(error.code).toBe(BOT_OFF_CODE);
+    expect(error.code).not.toBe("bot_stopped");
+    expect(error.message).toBe(BOT_OFF_REFUSAL);
+    expect(error.message).toMatch(/turn it on/i);
   });
 });
 
-describe("isBotStoppedError", () => {
-  it("recognises only this policy's refusal, not a real dispatch failure", () => {
-    // Callers retry on failure, so mistaking a provider error for a stop (or
-    // the reverse) would either spin or silently drop real work.
-    expect(isBotStoppedError(Object.assign(new Error("stopped"), { code: "bot_stopped" }))).toBe(true);
-    expect(isBotStoppedError(new Error("the provider is out of credit"))).toBe(false);
-    expect(isBotStoppedError(undefined)).toBe(false);
-    expect(isBotStoppedError("bot_stopped")).toBe(false);
+describe("isBotOffError", () => {
+  it("recognises a deliberate refusal, including the legacy stop code", () => {
+    // Callers retry on failure, so mistaking a provider error for a refusal
+    // (or the reverse) would either spin or silently drop real work.  The
+    // legacy bot_stopped code still arrives from turns refused by a build
+    // from before Stop became turn-scoped, and it was the same decision.
+    expect(isBotOffError(botOffError())).toBe(true);
+    expect(isBotOffError(Object.assign(new Error("stopped"), { code: "bot_stopped" }))).toBe(true);
+    expect(isBotOffError(new Error("the provider is out of credit"))).toBe(false);
+    expect(isBotOffError(undefined)).toBe(false);
+    expect(isBotOffError("bot_off")).toBe(false);
   });
 });
 
-describe("botStopRefusalMessage", () => {
-  it("tells the person how to undo it", () => {
-    expect(botStopRefusalMessage()).toMatch(/stopped/i);
-    expect(botStopRefusalMessage()).toMatch(/start it again/i);
+describe("botStopErrorCode", () => {
+  it("classifies both refusal codes and nothing else", () => {
+    // server/jobs/wake.ts (BF-2454) parks differently per code, so the read
+    // must stay exact: bot_off, the legacy bot_stopped, or undefined.
+    expect(botStopErrorCode(botOffError())).toBe(BOT_OFF_CODE);
+    expect(botStopErrorCode(Object.assign(new Error("stopped"), { code: "bot_stopped" }))).toBe("bot_stopped");
+    expect(botStopErrorCode(new Error("the provider is out of credit"))).toBeUndefined();
+    expect(botStopErrorCode(undefined)).toBeUndefined();
   });
 });
 
 describe("botAutomationsPausedMessage", () => {
-  it("names a stop, not an offline harness", () => {
+  it("names a pause, not an offline harness", () => {
     expect(botAutomationsPausedMessage()).toMatch(/Automations paused/i);
     expect(botAutomationsPausedMessage()).not.toMatch(/offline/i);
   });

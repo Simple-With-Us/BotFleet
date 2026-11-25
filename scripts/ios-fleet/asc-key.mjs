@@ -1,12 +1,13 @@
 // The App Store Connect private key:  how it is validated, how it is staged
 // for the Apple tools, and how the client takes it.
 //
-// The private key is a secret, and the approved secret sources are the
-// process environment, a captured `fleet-secrets get NAME` and bootstrap-only
-// Keychain credentials.  A path on disk is not one of them, so the node client
-// never reads a key file.  This module is the part of that handoff the shell
-// layer needs:  it validates a PEM and it stages the key for the Apple tools
-// that have no other way to take one.
+// The private key is a secret, and the store is its only source (owner ruling,
+// November 22, 2026):  the client resolves it through this consumer's own
+// named account or through the read-only service token a host binds.  The
+// environment is not a source, and a path on disk is not one either, so the
+// node client never reads a key file.  This module is the part of that
+// handoff the shell layer needs:  it validates a PEM and it stages the key
+// for the Apple tools that have no other way to take one.
 //
 // THE STAGED COPY IS THE ONE FILE THAT MAY EXIST, and it is deliberately
 // narrow.  `altool` and `xcodebuild -authenticationKeyPath` take a key file
@@ -17,14 +18,15 @@
 //   - owner-only:  the file is mode 600, and the writer refuses a target whose
 //     parent directory is not owner-only, so a credential can never land in a
 //     shared or durable place;
-//   - never read back as a credential:  the credential comes from the
-//     environment or from fleet-secrets, and the staged file is a
-//     materialisation for the Apple tools, nothing more.
+//   - never read back as a credential:  the credential comes from the store,
+//     and the staged file is a materialisation for the Apple tools, nothing
+//     more.
 //
 // A key on stdout is a key in a log, in a CI transcript and in whatever
 // captures that output next.  So `validate` reports the STATUS of a key and
-// never the key itself, and the key reaches a consumer through the process
-// environment:  never in an argument, never on stdout, never in a log line.
+// never the key itself, and the key reaches a consumer through a file the
+// client writes itself:  never in an argument, never on stdout, never in a
+// log line, and never in the environment.
 //
 // WHAT THE ENVIRONMENT IS NOT (2026-10-21, audit on PR #271):
 // The key is not in argv, not on stdout and not in a log line, and a child
@@ -255,8 +257,9 @@ export function writePrivateKeyFile(keyPath, value) {
 // wholesale copy hands every credential on the operator's machine to the
 // child, including the ones that have nothing to do with App Store Connect.
 // These are the variables the client reads (see resolveCredential in
-// asc-api.mjs), plus PATH and HOME, which it needs to find fleet-secrets and
-// to reach the bootstrap Keychain.
+// asc-api.mjs) -- the store binding and the reader it falls back to -- plus
+// PATH and HOME, which it needs to find the scoped reader and to reach the
+// bootstrap Keychain.
 export const CLIENT_ENV_ALLOWLIST = [
   "PATH",
   "HOME",
@@ -265,13 +268,19 @@ export const CLIENT_ENV_ALLOWLIST = [
   "LC_ALL",
   "ASC_API_BASE",
   "ASC_REQUEST_TIMEOUT_MS",
-  "ASC_KEY_ID",
-  "ASC_ISSUER_ID",
-  "APPLE_API_KEY_ID",
-  "APPLE_API_ISSUER_ID",
-  "APPLE_API_KEY_P8_BASE64",
-  "FLEET_SECRETS_BIN",
-  "FLEET_SECRETS"
+  //  The store binding, and nothing else:  the credential names are gone
+  //  because the environment carries no copy of the credential (owner
+  //  ruling, November 22, 2026).  INFISICAL_TOKEN is this consumer's own
+  //  read-only service token -- a reader that reaches the store, not a copy
+  //  of a value -- and the rest are the non-secret identifiers that name
+  //  the project, the environment, the site and the folder.
+  "INFISICAL_TOKEN",
+  "INFISICAL_PROJECT_ID",
+  "INFISICAL_ENVIRONMENT",
+  "INFISICAL_SITE_URL",
+  "INFISICAL_SECRET_PATH",
+  "FLEET_INFISICAL_READER",
+  "FLEET_INFISICAL_ASC_ACCOUNT"
 ];
 
 // Builds the environment a child of the key handoff runs with.

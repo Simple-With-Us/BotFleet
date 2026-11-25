@@ -22,6 +22,7 @@ import type { ComputerReach } from "../../server/computer-capability.ts";
 import type { BotColor, BotMotion } from "@/lib/mascot";
 import type { BotAvatarCrop, BotAvatarRecolorable } from "../../shared/bot-avatar";
 import type { ConnectorToolGrant } from "../../shared/connector-tools";
+import type { McpServerEntry } from "../../shared/mcp-servers";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
 import type { Attachment } from "@/lib/composer-attachments";
 import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
@@ -463,6 +464,14 @@ export interface Bot {
    * only what it names. A PATCH may send `null` to clear back to legacy,
    * mirroring avatarUrl. */
   connectorTools?: Record<string, ConnectorToolGrant> | null;
+  /** The workspace's shared MCP servers this bot may mount.  Unset — or
+   * null — means every enabled shared server;  a list narrows it to those
+   * names.  Null is the clear the panel sends, the way a cleared
+   * connectorTools grant is. */
+  mcpServers?: string[] | null;
+  /** The MCP servers that belong to this bot alone, by name.  A name here
+   * wins over a shared server of the same name. */
+  ownMcpServers?: Record<string, McpServerEntry>;
   messages: Message[];
   /** The hydrate said the server holds messages older than the first one it
    * sent.  Read once into `hasMore` and not kept on the conversation, so
@@ -898,6 +907,8 @@ export interface InstanceInfo {
     computerMcp?: boolean;
     agentsMcp?: boolean;
     composioMcp?: boolean;
+    /** This engine mounts the person's own MCP servers. */
+    customMcp?: boolean;
     images?: boolean;
     effortLevels?: readonly EffortLevel[];
     /** the engine keeps a live session and takes a message mid-turn */
