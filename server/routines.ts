@@ -26,7 +26,6 @@ import {
 } from "../shared/conversation-mode.ts";
 import { foldPrompts, gapEndsAt, withinGap } from "./trigger-gap.ts";
 import { routineFailureCode, routineFailurePhase, type RoutineOutcomeCode, type RoutineFailurePhase } from "../shared/routine-outcomes.ts";
-import { botAutomationsPausedMessage } from "./bot-stop-policy.ts";
 import { BOT_OFF_SKIPPED } from "../shared/bot-power.ts";
 import { canonicalTimeZone, nextZonedOccurrence } from "../shared/time-zone.ts";
 import { normalizeRunOn, type RoutineRunOn } from "../shared/run-on.ts";
@@ -264,8 +263,9 @@ interface RoutineFile {
   runs: RoutineRun[];
   /** Durable commit receipts for cross-file confirmation recovery. */
   routineRequestReceipts?: RoutineRequestReceipt[];
-  /** Manual bot snoozes, keyed by bot id.  `null` is an indefinite snooze
-   * (Infinity is not valid JSON); a number is the epoch-ms expiry. */
+  /** Legacy manual bot snoozes written by builds before Stop became
+   * turn-scoped (docs/decisions/2026-11-23-stop-is-this-turn.md).  Read so an
+   * old file still parses; never restored and never written. */
   botSnoozes?: Record<string, number | null>;
 }
 
@@ -589,17 +589,14 @@ export class RoutineManager {
    * during the quiet period does not sit until the next periodic tick. */
   private gapWake: ReturnType<typeof setTimeout> | null = null;
   private gapWakeAt = 0;
-  /** When a user manually interrupts/stops a bot, automated runs for that bot
-   * are snoozed so background webhooks and routines do not restart it. */
-  private readonly botSnoozeUntil = new Map<string, number>();
   /** Coarse hold-reason signatures already persisted and broadcast. */
   private readonly publishedHoldBuckets = new Map<string, string>();
-  /** Deliveries dropped because the bot was snoozed/off (BF-2462). In-memory
+  /** Deliveries dropped because the bot was off (BF-2462). In-memory
    * only: counting them must not rewrite routines.json. */
   private skippedDeliveryTotal = 0;
   private readonly skippedDeliveriesByTrigger = new Map<string, number>();
 
-  /** BF-2462: a webhook/resource delivery for a snoozed/off bot will never
+  /** BF-2462: a webhook/resource delivery for an Off bot will never
    * run, so do not persist a run (or its prompt copy) for it. Persisting
    * ~1,970 instant cancelled rows rewrote all of routines.json with fsync
    * per delivery and evicted real history. Return a transient receipt so
@@ -703,18 +700,9 @@ export class RoutineManager {
           Number.isFinite(receipt?.appliedAt)
         )
       : [];
-    // Manual snoozes survive restarts: a crash or relaunch must not clear
-    // a user's explicit stop and let the next schedule or webhook restart
-    // the bot.  Expired finite snoozes are dropped, not revived.
-    if (disk.botSnoozes) {
-      for (const [botId, until] of Object.entries(disk.botSnoozes)) {
-        if (until === null) {
-          this.botSnoozeUntil.set(botId, Infinity);
-        } else if (typeof until === "number" && Number.isFinite(until) && until > this.now()) {
-          this.botSnoozeUntil.set(botId, until);
-        }
-      }
-    }
+    // Legacy botSnoozes from a pre-turn-scoped-Stop build are deliberately
+    // NOT restored: Stop no longer latches the bot, so upgrading unlatches
+    // every install by itself (docs/decisions/2026-11-23-stop-is-this-turn.md).
     if (this.passive) {
       this.writesRefused = true;
       return;
@@ -832,38 +820,6 @@ export class RoutineManager {
       (candidate) => !candidate.coalescedInto && candidate.botId === botId && ["running", "waiting"].includes(candidate.status),
     );
     return run ? { ...run } : null;
-  }
-
-  /** Pause webhook, resource, and schedule dispatch for this bot.  Default
-   *  duration is until a person wakes the bot (a message, respond, or Run
-   *  now clears the snooze via `clearBotSnooze`). */
-  snoozeBot(botId: string, durationMs = Infinity): void {
-    if (this.passive) return;
-    this.botSnoozeUntil.set(botId, durationMs === Infinity ? Infinity : this.now() + durationMs);
-    this.save();
-  }
-
-  clearBotSnooze(botId: string): void {
-    if (this.passive) return;
-    if (this.botSnoozeUntil.delete(botId)) this.save();
-  }
-
-  clearAllBotSnoozes(): void {
-    if (this.passive) return;
-    if (this.botSnoozeUntil.size > 0) {
-      this.botSnoozeUntil.clear();
-      this.save();
-    }
-  }
-
-  isBotSnoozed(botId: string): boolean {
-    const until = this.botSnoozeUntil.get(botId);
-    if (!until) return false;
-    if (until !== Infinity && this.now() >= until) {
-      if (!this.passive) this.botSnoozeUntil.delete(botId);
-      return false;
-    }
-    return true;
   }
 
   /** Put a run an update cancelled back in the queue.  Only a `cancelled`
@@ -1163,10 +1119,9 @@ export class RoutineManager {
     const routine = this.routines.find((r) => r.id === id);
     if (!routine) return null;
     // Off outranks "Run now": a person pressing it is asking, but the bot is
-    // off, so the run is recorded as skipped and nothing is dispatched.  The
-    // stop is left in place — only Turn On lifts Off.
+    // off, so the run is recorded as skipped and nothing is dispatched.
+    // Only Turn On lifts Off.
     const off = this.botIsOff(routine.botId);
-    if (!off) this.clearBotSnooze(routine.botId);
     let run!: RoutineRun;
     this.commitMutation(() => {
       run = this.newRun(routine, this.now(), true);
@@ -1216,7 +1171,7 @@ export class RoutineManager {
   canCoalesceWebhook(webhookId: string, botId: string): boolean {
     if (this.passive) return false;
     if (this.options.botState(botId) !== "busy") return false;
-    if (this.botIsOff(botId) || this.isBotSnoozed(botId)) return false;
+    if (this.botIsOff(botId)) return false;
     const key = automationThreadKey({
       routineId: webhookId,
       webhookId,
@@ -1254,8 +1209,7 @@ export class RoutineManager {
     // folds the delivery into a receipt that runs when the current turn ends,
     // which would start new work on a bot that is switched Off.
     const off = this.botIsOff(input.botId);
-    const snoozed = off || this.isBotSnoozed(input.botId);
-    if (!snoozed) {
+    if (!off) {
       const deferred = this.coalesceIntoBusyDefer({
         botId: input.botId,
         key: automationThreadKey({
@@ -1269,7 +1223,7 @@ export class RoutineManager {
       });
       if (deferred) return deferred;
     }
-    if (snoozed) {
+    if (off) {
       return this.skippedDelivery({
         routineId: input.webhookId,
         routineName: input.webhookName,
@@ -1323,8 +1277,7 @@ export class RoutineManager {
     // folds the delivery into a receipt that runs when the current turn ends,
     // which would start new work on a bot that is switched Off.
     const off = this.botIsOff(input.botId);
-    const snoozed = off || this.isBotSnoozed(input.botId);
-    if (!snoozed) {
+    if (!off) {
       const deferred = this.coalesceIntoBusyDefer({
         botId: input.botId,
         key: automationThreadKey({
@@ -1338,7 +1291,7 @@ export class RoutineManager {
       });
       if (deferred) return deferred;
     }
-    if (snoozed) {
+    if (off) {
       return this.skippedDelivery({
         routineId: input.triggerId,
         routineName: input.triggerName,
@@ -1516,7 +1469,6 @@ export class RoutineManager {
         const scheduledFor = routine.nextRunAt;
         const late = now - scheduledFor;
         const off = this.botIsOff(routine.botId);
-        const snoozed = this.isBotSnoozed(routine.botId);
         if (off) {
           // The schedule still advances (below), so turning the bot back on
           // resumes at the next occurrence instead of replaying the backlog.
@@ -1531,20 +1483,6 @@ export class RoutineManager {
           const skipped = this.newRun(routine, scheduledFor, false);
           this.skipForOff(skipped);
           skipped.sentryCheckInId = this.options.checkInStart?.(skipped, routine);
-          if (skipped.sentryCheckInId) this.closeCheckIn(skipped, skipped.sentryCheckInId, false);
-        } else if (snoozed) {
-          const skipped = this.newRun(routine, scheduledFor, false);
-          skipped.status = "missed";
-          skipped.finishedAt = now;
-          skipped.error = botAutomationsPausedMessage();
-          skipped.outcomeCode = "bot_stopped";
-          skipped.failurePhase = "lifecycle";
-          skipped.sentryCheckInId = this.options.checkInStart?.(skipped, routine);
-          this.emitRun(skipped);
-          // Same explicit-pause reporting as above (BF-2476): a stopped bot
-          // is a deliberate pause, not a success — the check-in opens and
-          // closes non-ok, because the only statuses Sentry offers are `ok`
-          // and `error` and emitting nothing would synthesize `missed`.
           if (skipped.sentryCheckInId) this.closeCheckIn(skipped, skipped.sentryCheckInId, false);
         } else if (late > CATCH_UP_MS) {
           const missed = this.newRun(routine, scheduledFor, false);
@@ -1595,17 +1533,10 @@ export class RoutineManager {
           continue;
         }
         // `holdReason` is a cached verdict from the last time canStart ran, and
-        // the gates below can `continue` without ever re-deriving it. A manual
-        // snooze can outlast the engine coming back, leaving a receipt that
-        // claims it is waiting on a dead engine when it is not. Clearing on
-        // every skip keeps the field meaning "verified on the most recent
+        // the gates below can `continue` without ever re-deriving it. Clearing
+        // on every skip keeps the field meaning "verified on the most recent
         // attempt" rather than "true at some point in the past"; the next tick
         // that reaches canStart sets it again if it still holds.
-        if (this.isBotSnoozed(run.botId)) {
-          this.clearHoldReason(run);
-          run.hotDeferredAt = undefined;
-          continue;
-        }
         const state = this.options.botState(run.botId);
         if (state === "busy") {
           this.clearHoldReason(run);
@@ -2421,23 +2352,11 @@ export class RoutineManager {
       return;
     }
     mkdirSync(dirname(this.file), { recursive: true });
-    const now = this.now();
-    const botSnoozes: Record<string, number | null> = {};
-    for (const [botId, until] of this.botSnoozeUntil) {
-      if (until === Infinity) {
-        botSnoozes[botId] = null;
-      } else if (until > now) {
-        botSnoozes[botId] = until;
-      } else {
-        this.botSnoozeUntil.delete(botId);
-      }
-    }
     writeFileAtomic(this.file, JSON.stringify({
       version: 1,
       routines: this.routines,
       runs: this.runs,
       routineRequestReceipts: this.routineRequestReceipts,
-      ...(Object.keys(botSnoozes).length > 0 ? { botSnoozes } : {}),
     } satisfies RoutineFile));
     // Cleared only after the write lands: a failed write throws (so
     // commitMutation can roll back) with the pending state still marked.

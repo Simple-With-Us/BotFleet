@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -247,22 +247,25 @@ it("retains the exact result of an unsettled run-now confirmation until its card
 
 it("coalesces a burst of saves into one write, and stop() flushes a pending save", () => {
   const h = harness();
-  // snoozeBot/clearBotSnooze go through the plain debounced save() path, not
+  // disableForBot goes through the plain debounced save() path, not
   // commitMutation (create/update/etc. carry confirmation receipts and stay
   // synchronous — see the "rolls back an uncommitted confirmation" test).
-  h.manager.snoozeBot("bot-a");
+  for (const botId of ["bot-a", "bot-b", "bot-c"]) {
+    h.manager.create({ name: `Fixture ${botId}`, prompt: "Check", botId, schedule: { type: "daily", time: "09:00", weekdays: [1] } });
+  }
+  h.manager.flushNow();
+  const before = readFileSync(h.options.file!, "utf8");
+  h.manager.disableForBot("bot-a");
+  h.manager.disableForBot("bot-b");
+  h.manager.disableForBot("bot-c");
   // The debounced save has not landed yet — proves this burst does not each
   // write synchronously the way the pre-fix save() did.
-  expect(existsSync(h.options.file!)).toBe(false);
-  h.manager.snoozeBot("bot-b");
-  h.manager.snoozeBot("bot-c");
-  expect(existsSync(h.options.file!)).toBe(false);
+  expect(readFileSync(h.options.file!, "utf8")).toBe(before);
 
   h.manager.stop();
 
-  expect(existsSync(h.options.file!)).toBe(true);
   const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
-  expect(disk.botSnoozes).toMatchObject({ "bot-a": null, "bot-b": null, "bot-c": null });
+  expect(disk.routines.map((routine: { enabled: boolean }) => routine.enabled)).toEqual([false, false, false]);
 });
 
 it("saves through the atomic writer: unindented JSON and no stray temp file left behind", () => {
@@ -1925,8 +1928,12 @@ describe("RoutineManager", () => {
     expect(h.manager.listRuns()[0]).toMatchObject({ status: "running", scheduledFor: lateAt });
   });
 
-  describe("bot snooze and cancellation", () => {
-    it("snoozes a bot and prevents routine dispatch while snoozed", async () => {
+  describe("turn-scoped Stop and cancellation", () => {
+    it("drops a legacy botSnoozes latch on upgrade: the file loads, the schedule runs, and the field is never written again", async () => {
+      // Stop used to persist a bot-wide latch here.  The settled contract
+      // (docs/decisions/2026-11-23-stop-is-this-turn.md) is that Stop latches
+      // nothing, so an install carrying the old field must unlatch itself:
+      // the saved entry is ignored and the next save drops it.
       const h = harness();
       const routine = h.manager.create({
         name: "Compiler check",
@@ -1934,70 +1941,22 @@ describe("RoutineManager", () => {
         botId: "compiler-bot",
         schedule: { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
       });
-      const nextBefore = routine.nextRunAt!;
-      h.manager.snoozeBot("compiler-bot");
-      expect(h.manager.isBotSnoozed("compiler-bot")).toBe(true);
+      h.manager.flushNow();
+      const legacy = JSON.parse(readFileSync(h.options.file!, "utf8"));
+      legacy.botSnoozes = { "compiler-bot": null, "gone-bot": 9999999999999 };
+      writeFileSync(h.options.file!, JSON.stringify(legacy));
 
-      h.setNow(nextBefore + 1000);
-      await h.manager.tick();
-      expect(h.started).toHaveLength(0);
-      expect(h.manager.listRuns()).toHaveLength(1);
-      expect(h.manager.listRuns()[0]).toMatchObject({
-        status: "missed",
-        outcomeCode: "bot_stopped",
-        error: "Automations paused because this bot is stopped",
-        scheduledFor: nextBefore,
-      });
-      expect(h.manager.listRoutines()[0]!.nextRunAt).toBeGreaterThan(nextBefore);
-
-      h.manager.clearBotSnooze("compiler-bot");
-      expect(h.manager.isBotSnoozed("compiler-bot")).toBe(false);
-      const nextAfterSkip = h.manager.listRoutines()[0]!.nextRunAt!;
-      h.setNow(nextAfterSkip + 1000);
-      await h.manager.tick();
+      const upgraded = new RoutineManager(h.options);
+      const due = routine.nextRunAt!;
+      h.setNow(due + 1000);
+      await upgraded.tick();
+      // The latch the old build saved holds nothing: the schedule dispatches.
       expect(h.started).toHaveLength(1);
-      expect(h.manager.listRuns().filter((r) => r.status === "running")).toHaveLength(1);
-    });
+      expect(upgraded.listRuns()[0]).toMatchObject({ status: "running", scheduledFor: due });
 
-    it("records a stopped-bot receipt (not offline) when a snoozed schedule is far past due", async () => {
-      const h = harness();
-      const routine = h.manager.create({
-        name: "Compiler check",
-        prompt: "Check compiler status",
-        botId: "compiler-bot",
-        schedule: { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
-      });
-      h.manager.snoozeBot("compiler-bot");
-      h.setNow(routine.nextRunAt! + 13 * 60 * 60_000);
-      await h.manager.tick();
-      expect(h.manager.listRuns()[0]).toMatchObject({
-        status: "missed",
-        outcomeCode: "bot_stopped",
-        error: "Automations paused because this bot is stopped",
-      });
-      expect(h.manager.listRuns()[0]?.error).not.toMatch(/offline/i);
-      expect(h.started).toHaveLength(0);
-    });
-
-    it("opens and closes the Sentry check-in non-ok when a scheduled run is skipped because the bot is stopped (BF-2476)", async () => {
-      const h = harness();
-      const routine = h.manager.create({
-        name: "Housekeeper sweep",
-        prompt: "check disk",
-        botId: "compiler-bot",
-        schedule: { type: "daily", time: "09:00", weekdays: [1] },
-      });
-      h.manager.snoozeBot("compiler-bot");
-      h.setNow(routine.nextRunAt!);
-      await h.manager.tick();
-      // A stopped bot is a deliberate pause, never a success: the check-in
-      // opens and closes non-ok (BF-2476).  Emitting nothing would let Sentry
-      // synthesize a `missed` check-in at the deadline with no context.
-      expect(h.checkInStarts).toHaveLength(1);
-      expect(h.checkInFinishes).toHaveLength(1);
-      expect(h.checkInFinishes[0]).toMatchObject({ ok: false });
-      expect(h.started).toHaveLength(0);
-      expect(h.manager.listRuns()[0]).toMatchObject({ outcomeCode: "bot_stopped" });
+      upgraded.flushNow();
+      const saved = readFileSync(h.options.file!, "utf8");
+      expect(saved).not.toContain("botSnoozes");
     });
 
     it("cancels all queued, running, and waiting runs for a bot", async () => {
@@ -2040,62 +1999,7 @@ describe("RoutineManager", () => {
       expect(h.manager.listRuns().find((r) => r.id === rOther.id)?.status).not.toBe("cancelled");
     });
 
-    it("marks newly incoming webhooks and resource triggers as cancelled if bot is snoozed", () => {
-      const h = harness();
-      h.manager.snoozeBot("compiler-bot");
-
-      const webhookRun = h.manager.enqueueWebhook({
-        webhookId: "wh-1",
-        webhookName: "Hook 1",
-        prompt: "Run while snoozed",
-        botId: "compiler-bot",
-        runOn: "bot",
-        deliveryId: "del-1",
-        receivedAt: Date.now(),
-      });
-      expect(webhookRun.status).toBe("cancelled");
-      expect(webhookRun.outcomeCode).toBe("cancelled");
-      // BF-2462: never persisted — no run row, no prompt copy.
-      expect(webhookRun.prompt).toBe("");
-      expect(h.manager.listRuns()).toHaveLength(0);
-      expect(h.manager.skippedDeliveryCount()).toBe(1);
-
-      const resourceRun = h.manager.enqueueResource({
-        triggerId: "res-1",
-        triggerName: "Res 1",
-        prompt: "Resource alert",
-        botId: "compiler-bot",
-        runOn: "bot",
-        deliveryId: "del-2",
-        receivedAt: Date.now(),
-      });
-      expect(resourceRun.status).toBe("cancelled");
-      expect(h.manager.listRuns()).toHaveLength(0);
-      expect(h.manager.skippedDeliveryCount()).toBe(2);
-      h.manager.flushNow();
-      expect(readFileSync(h.options.file!, "utf8")).not.toContain("Run while snoozed");
-    });
-
-    it("does not persist or rewrite routines.json for repeated snoozed webhooks (BF-2462)", () => {
-      const h = harness();
-      h.manager.snoozeBot("compiler-bot");
-      h.manager.flushNow();
-      const before = readFileSync(h.options.file!, "utf8");
-      for (let i = 0; i < 5; i++) {
-        h.manager.enqueueWebhook({
-          webhookId: "wh-1", webhookName: "Hook 1", prompt: `secret-prompt-${i}`,
-          botId: "compiler-bot", runOn: "bot", deliveryId: `d-${i}`, receivedAt: Date.now(),
-        });
-      }
-      expect(h.manager.listRuns()).toHaveLength(0);
-      expect(h.manager.skippedDeliveryCount("wh-1", "webhook")).toBe(5);
-      h.manager.flushNow();
-      const after = readFileSync(h.options.file!, "utf8");
-      expect(after).toBe(before);
-      expect(after).not.toContain("secret-prompt");
-    });
-
-    it("requeues cancelled runs and clears snooze on runNow", async () => {
+    it("requeues cancelled runs after a manual runNow", async () => {
       const h = harness();
       const routine = h.manager.create({
         name: "Build",
@@ -2103,11 +2007,9 @@ describe("RoutineManager", () => {
         botId: "compiler-bot",
         schedule: { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
       });
-      h.manager.snoozeBot("compiler-bot");
 
       const run = h.manager.runNow(routine.id);
       expect(run).not.toBeNull();
-      expect(h.manager.isBotSnoozed("compiler-bot")).toBe(false);
 
       const cancelled = await h.manager.cancelAllRunsForBot("compiler-bot");
       expect(cancelled).toHaveLength(1);
@@ -2146,35 +2048,6 @@ describe("RoutineManager", () => {
       expect(h.manager.requeueRun(run.id)).toBe(false);
     });
 
-    it("persists bot snoozes across manager restarts", () => {
-      const h = harness();
-      h.manager.snoozeBot("compiler-bot");
-      h.manager.snoozeBot("finite-bot", 60_000);
-      h.manager.flushNow();
-      const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
-      expect(disk.botSnoozes).toMatchObject({ "compiler-bot": null, "finite-bot": expect.any(Number) });
-
-      const restarted = new RoutineManager(h.options);
-      expect(restarted.isBotSnoozed("compiler-bot")).toBe(true);
-      expect(restarted.isBotSnoozed("finite-bot")).toBe(true);
-
-      // An expired finite snooze does not revive after a restart.
-      h.setNow(h.options.now!() + 61_000);
-      const later = new RoutineManager(h.options);
-      expect(later.isBotSnoozed("finite-bot")).toBe(false);
-      expect(later.isBotSnoozed("compiler-bot")).toBe(true);
-    });
-
-    it("drops a persisted snooze once it is cleared", () => {
-      const h = harness();
-      h.manager.snoozeBot("compiler-bot");
-      h.manager.clearBotSnooze("compiler-bot");
-      h.manager.flushNow();
-      const restarted = new RoutineManager(h.options);
-      expect(restarted.isBotSnoozed("compiler-bot")).toBe(false);
-      const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
-      expect(disk.botSnoozes ?? {}).not.toHaveProperty("compiler-bot");
-    });
   });
 });
 
@@ -3264,17 +3137,14 @@ describe("bot on/off switch", () => {
     expect(byId.get(otherBot.id)?.status).toBe("queued");
   });
 
-  it("refuses Run now: the run is recorded as skipped, nothing starts, and a stop is not cleared", async () => {
+  it("refuses Run now: the run is recorded as skipped and nothing starts", async () => {
     const h = harness();
     const routine = h.manager.create({ name: "Build", prompt: "build", botId: "builder", schedule: daily });
-    h.manager.snoozeBot("builder");
     h.setBot("off");
     const run = h.manager.runNow(routine.id);
     expect(run).toMatchObject({ status: "cancelled", outcomeCode: "bot_off", error: BOT_OFF_SKIPPED, manual: true });
     await h.manager.tick();
     expect(h.started).toHaveLength(0);
-    // Off outranks Run now, and it does not quietly lift the separate stop.
-    expect(h.manager.isBotSnoozed("builder")).toBe(true);
   });
 
   it("dispatches normally again once the bot is on", async () => {

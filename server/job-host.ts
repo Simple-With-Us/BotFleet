@@ -94,7 +94,6 @@ export interface JobHostDeps {
     },
   ): Promise<void>;
   subscribe(listener: (event: { type: string; threadId?: string; text?: string; ok?: boolean; itemType?: string }) => void): () => void;
-  snoozed(botId: string): boolean;
   /** True when the caller is unattended, so the peer turn is too. */
   unattended(botId: string | undefined): boolean;
   /** Remember this peer turn so a reload or a stall can mirror how it ended. */
@@ -166,7 +165,6 @@ export function createJobHost(deps: JobHostDeps): JobHost {
       if (!target) return `Bot ${assignment.assignee.botId} no longer exists`;
       if (target.hidden) return `${target.name} is hidden`;
       if (botIsOff(target)) return botOffPeerRefusal(target.name);
-      if (deps.snoozed(target.id)) return "that bot was stopped";
       const requesterId = assignment.requester.botId;
       const requester = requesterId ? deps.store.bot(requesterId) : undefined;
       if (requester && sectionKey(requester.section) !== sectionKey(target.section)) {

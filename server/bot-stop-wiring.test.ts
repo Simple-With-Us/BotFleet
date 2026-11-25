@@ -1,151 +1,108 @@
-// A stop is only as good as the call sites that honor it.
+// Stop is this turn — and this file pins the WIRING that keeps it that way.
 //
-// `server/bot-stop-policy.test.ts` pins the decision.  This file pins the
-// WIRING, which is where the actual bug lived: `startTurn` used to clear a
-// stop on any dispatch without an `automationSource`, and every system resume
-// re-dispatched through it — so the update's own pause-and-install, its
-// rollback, and boot recovery each woke a bot the owner had stopped.  A pure
-// policy test cannot see that, and a booted-harness test only catches the one
-// path it happens to drive.
+// `server/bot-stop-policy.test.ts` pins the module surface.  This file pins
+// the call sites, which is where a latch would actually come back: a snooze
+// written by `interruptBot`, a stop gate growing back inside `startTurn`, a
+// resume path asking whether the bot "is stopped".  A pure policy test cannot
+// see any of that, and a booted-harness test only catches the one path it
+// happens to drive — so these assertions read the source, in the same style
+// as `bot-off-wiring.test.ts`, and they are orders and absences, never bare
+// "the string appears somewhere".
 //
-// So opting a bot back into running is a two-part, deliberate act: the call
-// site sets `personInitiated: true` AND carries a `person-initiated:` marker
-// comment saying who asked.  This test enforces the correspondence in BOTH
-// directions — a flag without a marker, or a marker without the flag, fails —
-// so neither can be added by accident and neither can drift apart in review.
-//
-// Scope detection by enclosing function name does not work here: most of
-// these routes live inside one enormous request handler, so walking back to
-// the nearest declaration attributes them to unrelated helpers.  The marker
-// is the stable anchor.
-//
-// Verified by mutation: re-marking the update resume as person-initiated fails
-// this file.  An earlier version of this test merely counted the flag, passed
-// while carrying the original bug, and was rewritten for that reason — do not
-// weaken it back to a count.
+// The contract being wired (docs/decisions/2026-11-23-stop-is-this-turn.md):
+// Stop interrupts the running turn and cancels its routine runs, leaves no
+// latch, and the next webhook, schedule or message runs as usual.  Off is
+// the only persistent hold.
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
-// Normalize line endings before locating the declaration/body boundaries,
-// independently of whichever admission fence is the first statement.
-const source = readFileSync(join(SERVER_DIR, "index.ts"), "utf8").replace(/\r\n/g, "\n");
+const read = (file: string) => readFileSync(join(SERVER_DIR, file), "utf8").replace(/\r\n/g, "\n");
+const index = read("index.ts");
+const routines = read("routines.ts");
 
-function stopPrologue(text: string): string {
-  const declaration = text.indexOf("async function startTurn(");
-  const opening = declaration < 0 ? -1 : text.indexOf(") {\n", declaration);
-  const closing = opening < 0 ? -1 : text.indexOf("\n}", opening);
-  if (opening < 0 || closing < 0) throw new Error("startTurn body is missing");
-  const body = text.slice(opening, closing);
-  const clear = body.indexOf("clearBotSnooze(");
-  if (clear < 0) throw new Error("startTurn does not contain its policy-gated clear");
-  return body.slice(0, clear + "clearBotSnooze(".length);
+/** The body of one top-level function, from its signature to its closing brace. */
+function functionBody(source: string, signature: string): string {
+  const start = source.indexOf(signature);
+  expect(start, `${signature} not found`).toBeGreaterThan(-1);
+  const end = source.indexOf("\n}\n", start);
+  expect(end, `${signature} has no end`).toBeGreaterThan(start);
+  return source.slice(start, end);
 }
 
-interface CallSite {
-  line: number;
-  text: string;
-  /** The nearest preceding `person-initiated:` comment, if any. */
-  marker: string | null;
-}
-
-/** Every `startTurn(` call site, with its person-initiated marker. */
-function startTurnCallSites(): CallSite[] {
-  const sites: CallSite[] = [];
-  const pattern = /(?:^|[^\w.])startTurn\(/g;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(source)) !== null) {
-    const before = source.slice(Math.max(0, match.index - 40), match.index);
-    if (/function\s+$/.test(before)) continue; // the declaration itself
-    if (/startTurn\s*$/.test(before)) continue; // a property reference
-    const start = match.index + match[0].length;
-    let depth = 1;
-    let i = start;
-    while (i < source.length && depth > 0) {
-      if (source[i] === "(") depth++;
-      else if (source[i] === ")") depth--;
-      i++;
+describe("no stop latch can grow back", () => {
+  it("index.ts carries no stop state at all: no snooze consult, gate, clear or refusal", () => {
+    // The retired mechanism, by name.  A reintroduction under any of these
+    // names is the regression; a new name fails the routines.ts assertions
+    // below instead, so neither spelling slips through.
+    for (const retired of ["snoozeBot", "isBotSnoozed", "clearBotSnooze", "decideBotStop", "botStopRefusalMessage", "isBotStoppedError", "botStopErrorCode"]) {
+      expect(index, `${retired} returned in index.ts`).not.toContain(retired);
     }
-    const line = source.slice(0, match.index).split("\n").length;
-    // The marker sits either in the lines directly above the call or inside
-    // the argument block itself, so look in both places and take the nearest.
-    const lead = source.slice(Math.max(0, match.index - 800), match.index);
-    const callText = source.slice(start, i);
-    const fromLead = [...lead.matchAll(/person-initiated:\s*(.+)/g)].pop();
-    const fromArgs = [...callText.matchAll(/person-initiated:\s*(.+)/g)].pop();
-    sites.push({
-      line,
-      text: callText,
-      marker: (fromArgs?.[1] ?? fromLead?.[1])?.trim() ?? null,
-    });
-  }
-  return sites;
-}
-
-const sites = startTurnCallSites();
-const claimsPerson = (site: CallSite) => /personInitiated\s*:\s*true/.test(site.text);
-
-describe("startTurn call sites classify who initiated the turn", () => {
-  it("finds the dispatch paths (guards against this test passing vacuously)", () => {
-    // If the scanner ever stops matching, every assertion below would pass
-    // on zero sites.  A scanner bug must fail loudly.
-    expect(sites.length).toBeGreaterThanOrEqual(10);
+    expect(index).not.toContain('"bot_stopped"');
   });
 
-  it("requires a stated reason wherever a dispatch wakes a stopped bot", () => {
-    const unmarked = sites.filter((site) => claimsPerson(site) && !site.marker);
-    expect(
-      unmarked.map((site) => `line ${site.line}`),
-      "these dispatches clear a stop without saying who asked: add a `person-initiated:` comment",
-    ).toEqual([]);
+  it("interruptBot still cancels the turn's routine runs — Stop is not a no-op", () => {
+    const body = functionBody(index, "async function interruptBot(");
+    expect(body).toContain("routines.cancelAllRunsForBot(bot.id)");
+    expect(body).toContain("jobHost?.stopThread(bot.id, interruptLiveThreadId)");
   });
 
-  it("does not let a marker outlive the flag it justified", () => {
-    const orphaned = sites.filter((site) => site.marker && !claimsPerson(site));
-    expect(
-      orphaned.map((site) => `line ${site.line}`),
-      "these sites carry a person-initiated marker but no longer set the flag",
-    ).toEqual([]);
+  it("startTurn refuses only an Off bot before dispatching, with no stop gate after it", () => {
+    const body = functionBody(index, "async function startTurn(");
+    const gate = body.indexOf("if (botIsOff(bot)) throw botOffError();");
+    expect(gate).toBeGreaterThan(-1);
+    expect(body.slice(gate)).not.toContain("bot_stopped");
   });
+});
 
-  it("keeps the update resume and boot recovery off the person-initiated list", () => {
-    // Named explicitly because these carried the bug: each replays work on
-    // the system's own initiative, whatever the original prompt was.  A
-    // future edit that marks one of them person-initiated is the regression
-    // returning, and this is the assertion that says so.
-    for (const site of sites) {
-      if (!/resumePrompt\.text|resumeUser|entry\.prompt|BOOT_RECOVERY/.test(site.text)) continue;
-      expect(claimsPerson(site), `line ${site.line} re-dispatches without a person asking`).toBe(false);
+describe("the routine manager holds no bot snooze", () => {
+  it("exposes no snooze methods", () => {
+    for (const retired of ["snoozeBot(", "clearBotSnooze(", "clearAllBotSnoozes(", "isBotSnoozed("]) {
+      expect(routines, `${retired} still defined in routines.ts`).not.toContain(retired);
     }
   });
 
-  it("clears a stop in exactly one place, gated on the policy", () => {
-    const clears = [...source.matchAll(/clearBotSnooze\(/g)]
-      .map((m) => source.slice(0, m.index).split("\n").length);
-    // One in startTurn (policy-gated), one on the explicit wake route.
-    expect(clears.length).toBeLessThanOrEqual(2);
+  it("drops a legacy botSnoozes file entry on load instead of restoring it", () => {
+    // The migration IS the absence of a restore: an old install's saved
+    // latch must die on upgrade, or Stop keeps holding bots it no longer
+    // owns.  Assert the load path mentions the field only to skip it.
+    const load = routines.slice(routines.indexOf("readFileSync"), routines.indexOf("if (this.passive) {", routines.indexOf("readFileSync")));
+    expect(load).not.toMatch(/disk\.botSnoozes\s*\)/);
+    expect(load).not.toContain("botSnoozeUntil");
+    expect(routines).not.toContain("botSnoozeUntil");
   });
 
-  it("enforces the stop in startTurn itself, ahead of the clear it gates", () => {
-    // Enforcing per-caller is the shape that let the bug exist: a new caller
-    // that forgets is silently permissive.  The guard has to be the one
-    // function every dispatch passes through, and it has to actually REFUSE —
-    // a bare `decideBotStop(...)` whose result is ignored looks identical to
-    // a working guard to a reader and to this file, so the throw is asserted
-    // too.  (Mutation-tested: deleting just the throw used to pass.)
-    const prologue = stopPrologue(source);
-    expect(prologue).toMatch(/decideBotStop\(/);
-    // The decision must be consumed, not merely computed.
-    expect(prologue).toMatch(/action\s*===\s*"refuse"/);
-    expect(prologue).toMatch(/bot_stopped/);
-    expect(prologue).toMatch(/status:\s*409/);
-    // And the clear must be downstream of the decision, never before it.
-    expect(prologue.indexOf("decideBotStop(")).toBeLessThan(prologue.indexOf("clearBotSnooze("));
+  it("never persists botSnoozes again", () => {
+    const save = functionBody(routines, "flushNow");
+    expect(save).not.toContain("botSnoozes");
+    // The wire object is explicit: adding the field back fails here even
+    // under a fresh name for the map.
+    expect(routines).not.toMatch(/\.\.\.\(Object\.keys\(botSnoozes\)/);
   });
 
-  it("cannot borrow a policy clear from an unrelated function", () => {
-    expect(() => stopPrologue("async function startTurn() {\n}\nfunction unrelated() { clearBotSnooze(); }")).toThrow(/policy-gated clear/);
+  it("skips scheduled and delivered work for Off only, never for a stop", () => {
+    expect(routines).not.toContain('"bot_stopped"');
+    // The Off skip path survives: turning Off still halts automation.
+    expect(routines).toContain("this.botIsOff(input.botId)");
+    expect(routines).toContain("skipForOff");
+  });
+});
+
+describe("the module only names an Off refusal", () => {
+  it("bot-stop-policy.ts exports botOffError and isBotOffError and nothing else", () => {
+    const policy = read("bot-stop-policy.ts");
+    const exports_ = [...policy.matchAll(/^export (?:async )?(?:function|const|class|interface|type) (\w+)/gm)].map((m) => m[1]).sort();
+    expect(exports_).toEqual(["botOffError", "isBotOffError"]);
+  });
+
+  it("its decision reference is a document that exists", () => {
+    const policy = read("bot-stop-policy.ts");
+    const cited = [...policy.matchAll(/docs\/decisions\/[\w.-]+\.md/g)].map((m) => m[0]);
+    expect(cited.length).toBeGreaterThan(0);
+    for (const doc of cited) {
+      expect(() => read(join("..", doc)), `${doc} cited but missing`).not.toThrow();
+    }
   });
 });

@@ -63,6 +63,7 @@ export interface ZulipWorkUnit {
   held?: string;
   /** The bot-stopped hold has been logged once (BF-2454): retries while the
    *  stop latch holds stay silent instead of logging every attempt. */
+  /** Legacy: set by pre-turn-scoped-Stop builds; parsed for old session files, never written. */
   stopLogged?: boolean;
   /** Items dropped at the queue cap before any turn saw them. */
   dropped?: number;

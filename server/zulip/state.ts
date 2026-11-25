@@ -87,6 +87,8 @@ const unitSchema = z.object({
   attempts: z.number(),
   notBefore: z.number(),
   held: z.string().optional(),
+  // Legacy: set by builds where a stopped bot held Zulip work.  Parsed so
+  // old session files still load; never written now that Stop is turn-scoped.
   stopLogged: z.boolean().optional(),
   dropped: z.number().optional(),
 }).strict();
