@@ -115,7 +115,6 @@ describe("the provider reload fence is reachable while the module evaluates", ()
         starts.push(botId);
       },
       subscribe: () => () => {},
-      snoozed: () => false,
       unattended: () => false,
     };
     const host = createJobHost(deps);

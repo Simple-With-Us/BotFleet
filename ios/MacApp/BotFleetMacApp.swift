@@ -162,6 +162,15 @@ struct BotFleetMacApp: App {
                 //  row is gated on any of them running, not on the shared one.
                 .disabled((session.controlStatus?.runningVMCount ?? 0) == 0 || session.isControllingVM)
 
+                //  The installed harness is started through launchd on request
+                //  (BF-2700).  The sentence that says why this row is greyed
+                //  out lives in Settings › Lifecycle, which always shows it.
+                Button("Start Server") {
+                    Task { await session.startServer() }
+                }
+                .disabled(session.startServerRefusal != nil)
+                .help(session.startServerRefusal ?? "Start the installed BotFleet Server.")
+
                 Divider()
 
                 Menu("Settings Section") {

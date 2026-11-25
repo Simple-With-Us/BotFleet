@@ -41,17 +41,13 @@ function routeBody(matcher: string): string {
 describe("startTurn", () => {
   const body = functionBody("async function startTurn(");
 
-  it("refuses an Off bot before the stop decision, so a refused message cannot clear a stop", () => {
+  it("refuses an Off bot before anything else, so no dispatch path reaches the provider", () => {
     const gate = body.indexOf("if (botIsOff(bot)) throw botOffError();");
-    const decision = body.indexOf("decideBotStop(");
     expect(gate).toBeGreaterThan(-1);
-    expect(decision).toBeGreaterThan(gate);
-    expect(body.indexOf("clearBotSnooze(")).toBeGreaterThan(gate);
-  });
-
-  it("does not let a person-initiated turn through the Off gate", () => {
-    const gateLine = body.split("\n").find((line) => line.includes("botIsOff(bot)")) ?? "";
-    expect(gateLine).not.toContain("personInitiated");
+    expect(body.indexOf("providerReloadInProgress")).toBeGreaterThan(gate);
+    expect(body.indexOf(".adapter.sendTurn(")).toBeGreaterThan(gate);
+    // Stop is turn-scoped now: there is no stop decision left to precede.
+    expect(body).not.toContain("decideBotStop(");
   });
 });
 

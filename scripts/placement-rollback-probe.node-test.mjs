@@ -328,7 +328,7 @@ test("a clean generated release needs a probe and is never called verified by in
   assert.equal(result.binding.buildIdentity.sourceCommit, fixture.commit);
   assert.equal(result.binding.buildIdentity.sourceDirty, false);
   assert.equal(result.binding.provenance.dependencies, "absent");
-  assert.match(result.binding.artifact.fingerprint, /^[a-f0-9]{64}$/);
+  assert.match(result.binding.tree.fingerprint, /^[a-f0-9]{64}$/);
   assert.match(result.binding.runtime.sha256, /^[a-f0-9]{64}$/);
   assert.equal(result.binding.runtime.bytes, statSync(NODE).size);
   assert.equal(result.binding.runtime.path, NODE);
@@ -432,7 +432,7 @@ test("the runtime is bound by its bytes, and a missing, linked, scripted or non-
   assert.equal(second.status, "probe-required");
   assert.notEqual(second.binding.runtime.sha256, first.binding.runtime.sha256);
   assert.notEqual(second.bindingDigest, first.bindingDigest);
-  assert.equal(second.binding.artifact.fingerprint, first.binding.artifact.fingerprint);
+  assert.equal(second.binding.tree.fingerprint, first.binding.tree.fingerprint);
 
   // A runtime reached through a linked DIRECTORY is bound by where it really
   // is, so repointing the link later cannot change which file was named.
@@ -672,7 +672,7 @@ test("the generated normalized fixture passes the recipe, with the ledger unchan
   assert.equal(receipt.candidate.releaseRoot, fixture.releaseRoot);
   assert.equal(receipt.candidate.sourceCommit, fixture.commit);
   assert.equal(receipt.candidate.buildIdentity.sourceDirty, false);
-  assert.equal(receipt.candidate.artifact.fingerprint, inspected.binding.artifact.fingerprint);
+  assert.equal(receipt.candidate.tree.fingerprint, inspected.binding.tree.fingerprint);
   assert.equal(receipt.candidate.runtime.sha256, inspected.binding.runtime.sha256);
   assert.equal(receipt.schema, "normalized-v1");
   assert.equal(receipt.recipeVersion, 1);
@@ -1006,7 +1006,10 @@ test("the restated launch shape, lockdown environment and action list match thei
   const directOpens = [...probeSource.matchAll(/\bopenSync\s*\(([^)]*)\)/g)].map((match) => match[1]);
   assert.equal(directOpens.filter((args) => !/^\w+Path, "w", /.test(args)).length, 1);
   assert.ok(directOpens.some((args) => /constants\.O_RDONLY \| noFollow\b/.test(args)));
-  assert.equal(probeSource.match(/=\s*openWithoutFollowing\(/g).length, 2);
+  // Three handles now:  the runtime's, the signed artifact's and one listed
+  // file's.  Every one of them comes from the helper, and every one of them
+  // refuses a link in its last component.
+  assert.equal(probeSource.match(/=\s*openWithoutFollowing\(/g).length, 3);
   const leases = readFileSync(join(REPO_ROOT, "server", "placement-leases.ts"), "utf8");
   const declared = leases.slice(leases.indexOf("export const PLACEMENT_LEASE_ACTIONS"));
   const actions = [...declared.slice(0, declared.indexOf("];")).matchAll(/"([a-z-]+)"/g)].map((match) => match[1]);

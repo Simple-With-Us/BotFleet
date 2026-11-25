@@ -49,7 +49,17 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { validBuildIdentity } from "../electron/runtime-identity.mjs";
-import { isReleaseDirectory, validateReleaseManifest } from "./harness-release-store.mjs";
+import {
+  holdRelease,
+  isReleaseDirectory,
+  isReleaseHeld,
+  readReleaseProof,
+  releasePath,
+  releaseProofMatches,
+  storeRootForReleaseDirectory,
+  validateReleaseManifest,
+  writeReleaseProof,
+} from "./harness-release-store.mjs";
 import { hashDependencyTree, verifyReleaseAgainstCommit } from "./release-provenance.mjs";
 import { readSourceBuildIdentity } from "./source-build-identity.mjs";
 
@@ -89,6 +99,7 @@ const FULL_COMMIT = /^[a-f0-9]{40}$/;
 const HOST_ID_PATTERN = /^(mac|server):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const OWNER_NONCE = /^[a-f0-9]{64}$/;
 const MANIFEST = ".botfleet-release.json";
+const DIGEST = /^[a-f0-9]{64}$/;
 const LOG_TAIL_BYTES = 16 * 1024;
 const TOOL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -291,9 +302,80 @@ function fingerprintRuntime(named) {
       bytes += read;
     }
     if (format === null) return { blocker: blocker("runtime-not-binary", `${path} is empty`) };
-    return { runtime: { path, format, sha256: hash.digest("hex"), bytes } };
+    // The device and inode are recorded with the bytes, so a later recheck can
+    // tell "the same file, unchanged" from "a different file that happens to
+    // hash the same".  The runtime's own rules are untouched; this only adds
+    // what a retention recheck needs.
+    return {
+      runtime: {
+        path,
+        format,
+        sha256: hash.digest("hex"),
+        bytes,
+        dev: String(opened.dev),
+        ino: String(opened.ino),
+      },
+    };
   } catch (error) {
     return { blocker: blocker("runtime-unreadable", `${path}: ${describe(error)}`) };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/**
+ * sha256 of the signed artifact file, opened without following a link in its
+ * last component.
+ *
+ * The artifact is named as a FILE, not as a bundle: it is read through a
+ * handle that refuses a link, it must be a regular file, and its bytes are
+ * what is hashed.  A link in the way would let the bytes that are hashed be
+ * bytes the caller did not name.
+ *
+ * This is a fourth thing, kept apart from the other three: the signed
+ * artifact's digest is not the harness tree fingerprint and not the shipped
+ * runtime's digest.
+ */
+function fingerprintSignedArtifact(named) {
+  let path;
+  try {
+    path = join(realpathSync(dirname(named)), basename(named));
+  } catch (error) {
+    return { blocker: blocker(error?.code === "ENOENT" ? "signed-artifact-missing" : "signed-artifact-unreadable", `${named}: ${describe(error)}`) };
+  }
+  const seen = lstatOrNull(path);
+  if (seen.error) {
+    return { blocker: blocker(seen.error.code === "ENOENT" ? "signed-artifact-missing" : "signed-artifact-unreadable", `${path}: ${describe(seen.error)}`) };
+  }
+  if (seen.stat.isSymbolicLink()) {
+    return { blocker: blocker("signed-artifact-symlink", `${path} is a symbolic link; name the physical artifact file`) };
+  }
+  if (!seen.stat.isFile()) return { blocker: blocker("signed-artifact-not-file", `${path} is not a regular file`) };
+  let fd;
+  try {
+    fd = openWithoutFollowing(path);
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== seen.stat.dev || opened.ino !== seen.stat.ino) {
+      return { blocker: blocker("signed-artifact-unreadable", `${path} changed while it was being opened`) };
+    }
+    // Another name for these bytes is another way to change them.  An
+    // artifact with one name is the only one whose hash pins the bytes that
+    // were checked (the runtime fingerprint above holds the same rule).
+    if (opened.nlink !== 1) {
+      return { blocker: blocker("signed-artifact-hard-linked", `${path} has another hard link; name a signed artifact file that has one name`) };
+    }
+    const hash = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(1024 * 1024);
+    let bytes = 0;
+    for (;;) {
+      const read = readSync(fd, chunk, 0, chunk.length, null);
+      if (read === 0) break;
+      hash.update(chunk.subarray(0, read));
+      bytes += read;
+    }
+    return { artifact: { path, sha256: hash.digest("hex"), bytes } };
+  } catch (error) {
+    return { blocker: blocker("signed-artifact-unreadable", `${path}: ${describe(error)}`) };
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
@@ -451,7 +533,16 @@ async function bindCandidate(candidate, { platform = process.platform } = {}) {
     return refused(kind, blocker("candidate-kind-unsupported", `"${kind}" is not a candidate kind this unit binds; only "${RELEASE_STORE_KIND}" is implemented`));
   }
 
-  const { releaseRoot, sourceCommit, sourceRepo, runtimePath, referenceDeps } = candidate;
+  // The optional fields of the candidate contract.  The existing ones are
+  // exactly as they were; these three (and the provenance below) let a caller
+  // name the SIGNED ARTIFACT and the digests it expects.  The `signed-bundle`
+  // kind keeps refusing above with `signed-bundle-binding-unimplemented`,
+  // because the bundle validation contract is still not wired: these fields
+  // bind a release-store candidate's artifact, not a Mac bundle's signature.
+  const {
+    releaseRoot, sourceCommit, sourceRepo, runtimePath, referenceDeps,
+    signedArtifact, signedArtifactSha256, runtimeSha256, signedArtifactProvenance,
+  } = candidate;
   if (!isText(releaseRoot) || !isAbsolute(releaseRoot)) {
     return refused(kind, blocker("release-root-invalid", "releaseRoot must be an absolute path to one release directory"));
   }
@@ -467,10 +558,28 @@ async function bindCandidate(candidate, { platform = process.platform } = {}) {
   if (referenceDeps !== undefined && referenceDeps !== null && (!isText(referenceDeps) || !isAbsolute(referenceDeps))) {
     return refused(kind, blocker("reference-deps-invalid", "referenceDeps, when given, must be an absolute path to a trusted dependency reference tree"));
   }
+  if (signedArtifact !== undefined && signedArtifact !== null && (!isText(signedArtifact) || !isAbsolute(signedArtifact))) {
+    return refused(kind, blocker("signed-artifact-path-invalid", "signedArtifact, when given, must be an absolute path to the signed artifact file"));
+  }
+  if (signedArtifactSha256 !== undefined && signedArtifactSha256 !== null && !DIGEST.test(signedArtifactSha256)) {
+    return refused(kind, blocker("signed-artifact-digest-invalid", "signedArtifactSha256, when given, must be a 64-character sha256"));
+  }
+  if (runtimeSha256 !== undefined && runtimeSha256 !== null && !DIGEST.test(runtimeSha256)) {
+    return refused(kind, blocker("runtime-digest-invalid", "runtimeSha256, when given, must be a 64-character sha256"));
+  }
+  // The artifact's own provenance: the commit and the build it was produced
+  // from.  Without them the artifact cannot be tied to the release, so a
+  // candidate that names one without them is refused rather than proved.
+  if (isText(signedArtifact)) {
+    const provenance = signedArtifactProvenance;
+    if (!isRecord(provenance) || !FULL_COMMIT.test(provenance.commit ?? "") || !isText(provenance.build)) {
+      return refused(kind, blocker("artifact-provenance-missing", "signedArtifactProvenance must name the commit and the build the signed artifact was produced from; without them the artifact cannot be tied to the release"));
+    }
+  }
 
   // Before anything is read, hashed, handed to git or started: none of the
   // four named paths may name or lead into a credential, login or dot directory.
-  for (const [label, named] of [["releaseRoot", releaseRoot], ["sourceRepo", sourceRepo], ["runtimePath", runtimePath], ["referenceDeps", referenceDeps]]) {
+  for (const [label, named] of [["releaseRoot", releaseRoot], ["sourceRepo", sourceRepo], ["runtimePath", runtimePath], ["referenceDeps", referenceDeps], ["signedArtifact", signedArtifact]]) {
     if (!isText(named)) continue;
     const protectedPath = protectedPathBlocker(label, named);
     if (protectedPath) return refused(kind, protectedPath);
@@ -559,18 +668,51 @@ async function bindCandidate(candidate, { platform = process.platform } = {}) {
   // The whole physical tree, manifest and dependencies included, hashed with
   // the provenance module's own walker: regular file bytes, executable bits
   // and symlink TARGET TEXT in sorted order, with every link confined to the
-  // release root.  No link is followed out of the tree.
-  let artifact = null;
+  // release root.  No link is followed out of the tree.  This is the HARNESS
+  // TREE fingerprint, and it is named as such everywhere below: it is not the
+  // signed artifact's digest.
+  let tree = null;
   try {
-    const tree = hashDependencyTree(physicalRoot);
-    if (tree.linkProblems.length) blockers.push(blocker("artifact-link-escape", tree.linkProblems.slice(0, 5).join("; ")));
-    else artifact = { algorithm: "sha256", fingerprint: tree.fingerprint, files: tree.files };
+    const inventory = hashDependencyTree(physicalRoot);
+    if (inventory.linkProblems.length) blockers.push(blocker("artifact-link-escape", inventory.linkProblems.slice(0, 5).join("; ")));
+    else tree = { algorithm: "sha256", fingerprint: inventory.fingerprint, files: inventory.files };
   } catch (error) {
     blockers.push(blocker("artifact-unreadable", describe(error)));
   }
 
+  // The SIGNED ARTIFACT, when one is named: a regular file, read without
+  // following a link, hashed on its own.  It is a fourth record, apart from
+  // the tree fingerprint and the runtime fingerprint.
+  let artifact = null;
+  if (isText(signedArtifact)) {
+    const found = fingerprintSignedArtifact(signedArtifact);
+    if (found.blocker) return refused(kind, found.blocker);
+    artifact = found.artifact;
+    if (isText(signedArtifactSha256) && artifact.sha256 !== signedArtifactSha256) {
+      return refused(kind, blocker("signed-artifact-digest-mismatch", `The signed artifact hashes to ${artifact.sha256}, not the expected ${signedArtifactSha256}`));
+    }
+    // THE ARTIFACT-TO-TREE LINK, checked here and not only when the proof
+    // record is written.  An artifact produced from another commit, or from
+    // another build of this commit, is not this release's artifact: its
+    // bytes may be perfectly good and still be the wrong bytes.  The digest
+    // check above proves the bytes are the ones the caller named; this
+    // proves they are the ones this release was built from.
+    if (signedArtifactProvenance.commit !== sourceCommit) {
+      return refused(kind, blocker("artifact-commit-mismatch", `The signed artifact names commit ${signedArtifactProvenance.commit}, not the release's commit ${sourceCommit}`));
+    }
+    if (!isText(manifest.build)) {
+      return refused(kind, blocker("release-build-missing", "The release manifest names no build, so the signed artifact's build cannot be tied to this release"));
+    }
+    if (signedArtifactProvenance.build !== manifest.build) {
+      return refused(kind, blocker("artifact-build-mismatch", `The signed artifact names build ${signedArtifactProvenance.build}, not the release's build ${manifest.build}`));
+    }
+  }
+
   const runtime = fingerprintRuntime(resolve(runtimePath));
   if (runtime.blocker) blockers.push(runtime.blocker);
+  else if (isText(runtimeSha256) && runtime.runtime.sha256 !== runtimeSha256) {
+    blockers.push(blocker("runtime-digest-mismatch", `The runtime binary hashes to ${runtime.runtime.sha256}, not the expected ${runtimeSha256}`));
+  }
 
   if (blockers.length) return refused(kind, ...blockers);
   const binding = {
@@ -581,7 +723,8 @@ async function bindCandidate(candidate, { platform = process.platform } = {}) {
     manifest: { ...manifest },
     buildIdentity,
     provenance: { checked: verdict.checked, dependencies: verdict.dependencies, depsFingerprint: verdict.depsFingerprint },
-    artifact,
+    tree,
+    signedArtifact: artifact,
     runtime: runtime.runtime,
   };
   let physical;
@@ -1155,6 +1298,8 @@ export async function runPlacementRollbackFixtureProbe(candidate, options = {}) 
   const ledger = {};
   let retainedTempRoot = null;
   let recheck = null;
+  let lastTeardown = null;
+  let proof = null;
   const record = (step, detail) => { outcomes.push({ step, ok: true, detail }); };
   const observe = async (phase, context) => {
     if (onPhase === undefined) return;
@@ -1180,7 +1325,7 @@ export async function runPlacementRollbackFixtureProbe(candidate, options = {}) 
     let port = null;
     let teardownComplete = true;
     const stop = async (stage) => {
-      if (run === null) return;
+      if (run === null) return null;
       const current = run;
       run = null;
       const stopped = await stopCandidate(current, port, timeouts);
@@ -1189,7 +1334,11 @@ export async function runPlacementRollbackFixtureProbe(candidate, options = {}) 
         teardownComplete = false;
         throw new ProbeBlocked("child-cleanup-incomplete", `${stage}: after the bounded process-group teardown the child ${stopped.exited ? "exited" : "did not exit"}, its group is ${stopped.groupGone ? "gone" : "still present"} and its loopback ports are ${stopped.portsClosed ? "closed" : "still answering"}`);
       }
+      // The teardown is evidence: the proof record says the child is gone, so
+      // what the teardown proved is kept rather than re-derived later.
+      lastTeardown = stopped;
       record(`${current.stage}-teardown`, "process group gone and both loopback ports closed");
+      return stopped;
     };
     const boot = async (stage, failure) => {
       run = launchCandidate({ binding, home: join(tempRoot, "home"), port, tempRoot, stage });
@@ -1392,7 +1541,7 @@ export async function runPlacementRollbackFixtureProbe(candidate, options = {}) 
       if (again.binding.runtime.sha256 !== binding.runtime.sha256 || again.binding.runtime.bytes !== binding.runtime.bytes) {
         blockers.push(blocker("runtime-changed", "the runtime binary's bytes changed during the probe", "recheck"));
       }
-      if (again.binding.artifact.fingerprint !== binding.artifact.fingerprint) {
+      if (again.binding.tree.fingerprint !== binding.tree.fingerprint) {
         blockers.push(blocker("artifact-changed", "the release content inventory changed during the probe", "recheck"));
       }
       if (again.bindingDigest !== bound.bindingDigest && !blockers.some((entry) => entry.phase === "recheck")) {
@@ -1400,6 +1549,57 @@ export async function runPlacementRollbackFixtureProbe(candidate, options = {}) 
       }
     }
     if (blockers.length === 0) record("binding-rechecked", "artifact, runtime and physical release unchanged after execution");
+
+    // 10. The proof record.  It lives in the store's own area, beside the
+    //     releases and never inside one, so the promoted tree and its strict
+    //     manifest stay exactly as they were promoted.
+    if (blockers.length === 0 && bound.binding.signedArtifact) {
+      const storeRoot = storeRootForReleaseDirectory(bound.binding.releaseRoot);
+      const storeEnv = storeRoot ? { BOTFLEET_RELEASES_ROOT: storeRoot } : null;
+      if (!storeEnv || releasePath(bound.binding.sourceCommit, storeEnv) !== bound.binding.releaseRoot) {
+        blockers.push(blocker("release-store-root-unknown", `The release at ${bound.binding.releaseRoot} is not a release directory of a release store, so no proof record can be written beside it`));
+      } else {
+        try {
+          const written = await writeReleaseProof({
+            commit: bound.binding.sourceCommit,
+            env: storeEnv,
+            artifact: bound.binding.signedArtifact,
+            provenance: candidate.signedArtifactProvenance,
+            tree: { fingerprint: bound.binding.tree.fingerprint },
+            runtime: bound.binding.runtime,
+            teardown: lastTeardown,
+          });
+          const link = await releaseProofMatches({
+            commit: bound.binding.sourceCommit,
+            build: written.record.provenance.build,
+            env: storeEnv,
+          });
+          // The HOLD, beside the proof and outside every promoted tree.  A
+          // proved rollback candidate is kept because somebody proved it, not
+          // because a process happens to hold it open right now: the live
+          // pointer is not what keeps a rollback candidate alive, and a proof
+          // that cannot survive the next prune is not a proof of anything.
+          // The marker moves no pointer - the live release is untouched, and
+          // the candidate stays exactly where it lies.
+          const held = await holdRelease({
+            commit: bound.binding.sourceCommit,
+            env: storeEnv,
+            reason: "rollback-bridge-artifact-proof",
+          });
+          proof = {
+            path: written.path,
+            holdPath: held.path,
+            provenance: written.record.provenance,
+            link: link.ok ? { ok: true } : { ok: false, reason: link.reason, detail: link.detail },
+          };
+          if (!link.ok) blockers.push(blocker(link.reason, link.detail));
+          record("release-proof-written", `the proof record at ${written.path} names the signed artifact, the tree and the runtime separately`);
+          record("release-held", `the hold marker at ${held.path} keeps this candidate out of the pruner without moving the live pointer`);
+        } catch (error) {
+          blockers.push(blocker(error?.cause || "release-proof-not-written", error?.message || String(error)));
+        }
+      }
+    }
 
     if (tempRoot !== null) {
       if (!teardownComplete) {
@@ -1434,6 +1634,16 @@ export async function runPlacementRollbackFixtureProbe(candidate, options = {}) 
     candidate: bound.blockers.length === 0 ? bound.binding : null,
     bindingDigest: bound.blockers.length === 0 ? bound.bindingDigest : null,
     physical: bound.blockers.length === 0 ? bound.physical : null,
+    // The signed artifact, the artifact's provenance, the harness tree
+    // fingerprint, the shipped runtime fingerprint and the teardown are five
+    // separate records in this receipt.  None of them stands in for another:
+    // the tree fingerprint is NOT the signed artifact's digest.
+    signedArtifact: bound.blockers.length === 0 ? bound.binding.signedArtifact : null,
+    artifactProvenance: proof ? proof.provenance ?? null : null,
+    treeFingerprint: bound.blockers.length === 0 ? { algorithm: "sha256", fingerprint: bound.binding.tree.fingerprint } : null,
+    runtimeFingerprint: bound.blockers.length === 0 ? bound.binding.runtime : null,
+    teardown: lastTeardown,
+    proof,
     recheck,
     blockers,
     outcomes,
@@ -1458,4 +1668,119 @@ export async function runPlacementRollbackFixtureProbe(candidate, options = {}) 
     }
   }
   return deepFreeze({ ...result, receiptPath });
+}
+
+
+// ---------------------------------------------------------------------------
+// Retention recheck
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-verify a proved candidate at a later moment, at the activation boundary.
+ *
+ * The probe's own recheck happens inside the probe run, against the bytes it
+ * just exercised.  This is a SECOND, separately runnable check, for the later
+ * boundary where the release may have been pruned, the hold cleared, the
+ * runtime replaced or the tree changed since the proof was written.
+ *
+ * It re-verifies four separate things - the harness tree fingerprint, the
+ * shipped runtime fingerprint, the hold marker and the signed artifact's
+ * recorded provenance - and names the first one that no longer holds.  It
+ * answers "still valid" or a named reason; it never answers "activate".
+ */
+export async function recheckPlacementRollbackCandidate(candidate) {
+  const reasons = [];
+  const refuse = (code, detail) => { reasons.push({ code, detail: String(detail) }); };
+  const observed = { treeFingerprint: null, runtime: null, hold: false, artifact: null };
+  const answered = (proof) => ({
+    status: reasons.length === 0 ? "still-valid" : "not-valid",
+    valid: reasons.length === 0,
+    reasons,
+    proof,
+    observed,
+  });
+  if (!isRecord(candidate)) {
+    refuse("candidate-invalid", "a recheck names the release directory whose proof is to be re-verified");
+    return answered(null);
+  }
+  const releaseRoot = candidate.releaseRoot;
+  if (!isText(releaseRoot) || !isAbsolute(releaseRoot)) {
+    refuse("release-root-invalid", "releaseRoot must be an absolute path to one release directory");
+    return answered(null);
+  }
+  const commit = basename(releaseRoot);
+  if (!FULL_COMMIT.test(commit)) {
+    refuse("release-root-invalid", `The release directory ${releaseRoot} is not named by a full commit`);
+    return answered(null);
+  }
+  const storeRoot = storeRootForReleaseDirectory(releaseRoot);
+  if (!storeRoot) {
+    refuse("release-store-root-unknown", `The release at ${releaseRoot} is not a release directory of a release store, so its proof and its hold cannot be found`);
+    return answered(null);
+  }
+  const env = { BOTFLEET_RELEASES_ROOT: storeRoot };
+  const read = await readReleaseProof(commit, env);
+  if (!read.ok) {
+    refuse(read.reason, read.detail);
+    return answered(null);
+  }
+  const proof = read.proof;
+
+  // The harness tree: the same fingerprint the proof recorded.
+  try {
+    const tree = hashDependencyTree(releaseRoot);
+    observed.treeFingerprint = tree.fingerprint;
+    if (tree.fingerprint !== proof.tree.fingerprint) {
+      refuse("tree-fingerprint-changed", `The release tree now hashes to ${tree.fingerprint}, not the proved ${proof.tree.fingerprint}`);
+    }
+  } catch (error) {
+    refuse("artifact-unreadable", `The release tree could not be hashed again: ${describe(error)}`);
+  }
+
+  // The shipped runtime: the same file, still with one name, still the same
+  // bytes.  A runtime that has been replaced or has vanished fails by name.
+  // The proof record names this path, so the protected-path guard that
+  // binding applied to caller-named paths is re-applied here before any
+  // bytes are read: a tampered proof must not steer the recheck into
+  // hashing a credential, login or dot-directory file.
+  const runtimeProtected = protectedPathBlocker("runtime", proof.runtime.path);
+  const runtime = runtimeProtected
+    ? { blocker: runtimeProtected }
+    : fingerprintRuntime(resolve(proof.runtime.path));
+  if (runtime.blocker) {
+    refuse(runtime.blocker.code, `The proved runtime is no longer usable: ${runtime.blocker.detail}`);
+  } else {
+    observed.runtime = runtime.runtime;
+    if (runtime.runtime.sha256 !== proof.runtime.sha256 || runtime.runtime.bytes !== proof.runtime.bytes) {
+      refuse("runtime-fingerprint-changed", `The runtime now hashes to ${runtime.runtime.sha256}, not the proved ${proof.runtime.sha256}`);
+    } else if (runtime.runtime.dev !== proof.runtime.dev || runtime.runtime.ino !== proof.runtime.ino) {
+      refuse("runtime-replaced", `The runtime at ${proof.runtime.path} is a different file (device ${runtime.runtime.dev}, inode ${runtime.runtime.ino}) than the proved one (device ${proof.runtime.dev}, inode ${proof.runtime.ino})`);
+    }
+  }
+
+  // The hold: without it nothing keeps the release from being pruned.
+  observed.hold = await isReleaseHeld(commit, env);
+  if (!observed.hold) {
+    refuse("hold-marker-missing", `The release ${commit.slice(0, 12)} carries no hold marker, so nothing keeps it from being pruned`);
+  }
+
+  // The signed artifact's recorded provenance against the release's own.
+  const link = await releaseProofMatches({ commit, build: proof.provenance.build, env });
+  if (!link.ok) refuse(link.reason, link.detail);
+
+  // The signed artifact's bytes.  Same re-guard as the runtime above: the
+  // path comes from the proof record, not from a caller who was checked.
+  const artifactProtected = protectedPathBlocker("signedArtifact", proof.artifact.path);
+  const artifact = artifactProtected
+    ? { blocker: artifactProtected }
+    : fingerprintSignedArtifact(proof.artifact.path);
+  if (artifact.blocker) {
+    refuse(artifact.blocker.code, `The proved signed artifact is no longer readable: ${artifact.blocker.detail}`);
+  } else {
+    observed.artifact = artifact.artifact;
+    if (artifact.artifact.sha256 !== proof.artifact.sha256 || artifact.artifact.bytes !== proof.artifact.bytes) {
+      refuse("signed-artifact-changed", `The signed artifact now hashes to ${artifact.artifact.sha256}, not the proved ${proof.artifact.sha256}`);
+    }
+  }
+  return answered(proof);
 }

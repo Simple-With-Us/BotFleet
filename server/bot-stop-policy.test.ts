@@ -1,67 +1,47 @@
 import { describe, expect, it } from "vitest";
 
-import { botAutomationsPausedMessage, botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
+import { BOT_OFF_CODE, BOT_OFF_REFUSAL } from "../shared/bot-power.ts";
+import { botOffError, isBotOffError } from "./bot-stop-policy.ts";
 
-// The rule under test, in one sentence: a bot a person stopped stays stopped
-// until a person asks for it again.  The regression this file exists for is
-// the update/boot resume clearing that stop and re-dispatching the bot by
-// itself — which is what "the bot I stopped restarted on its own" was.
-describe("decideBotStop", () => {
-  it("refuses a system-initiated dispatch to a stopped bot", () => {
-    expect(decideBotStop({ stopped: true, personInitiated: false })).toEqual({
-      action: "refuse",
-      reason: "bot-stopped",
-    });
-  });
-
-  it("lets a person's own turn through and lifts the stop", () => {
-    // Typing into a stopped bot is how you start it again.  Nothing here may
-    // regress: a stop that also blocked the owner would be unusable.
-    expect(decideBotStop({ stopped: true, personInitiated: true })).toEqual({
-      action: "allow",
-      clearsStop: true,
-    });
-  });
-
-  it("allows system work on a bot that is not stopped, without clearing anything", () => {
-    expect(decideBotStop({ stopped: false, personInitiated: false })).toEqual({
-      action: "allow",
-      clearsStop: false,
-    });
-  });
-
-  it("never lets a system dispatch clear a stop, whatever it is handed", () => {
-    // The original bug was a resume carrying a person's OLD prompt.  Whether
-    // the bot is stopped or not, a system turn must not touch the flag; the
-    // stopped case is the one that has to refuse rather than proceed.
-    for (const stopped of [true, false]) {
-      const decision = decideBotStop({ stopped, personInitiated: false });
-      expect(decision.action === "allow" ? decision.clearsStop : false).toBe(false);
-    }
+// The rule under test, in one sentence: Stop cancels only the turn in flight
+// and latches nothing, so the only refusal this module still names is an Off
+// bot (docs/decisions/2026-11-23-stop-is-this-turn.md).  The regression this
+// file exists for is a latch returning in disguise — a persisted stop, a
+// snooze, a "stays stopped" gate — which is why the module exports nothing
+// that consults stop state.
+describe("botOffError", () => {
+  it("is a 409 with the stable Off code and the shared refusal wording", () => {
+    const error = botOffError();
+    expect(error.status).toBe(409);
+    expect(error.code).toBe(BOT_OFF_CODE);
+    expect(error.message).toBe(BOT_OFF_REFUSAL);
+    expect(error).toBeInstanceOf(Error);
   });
 });
 
-describe("isBotStoppedError", () => {
-  it("recognises only this policy's refusal, not a real dispatch failure", () => {
-    // Callers retry on failure, so mistaking a provider error for a stop (or
-    // the reverse) would either spin or silently drop real work.
-    expect(isBotStoppedError(Object.assign(new Error("stopped"), { code: "bot_stopped" }))).toBe(true);
-    expect(isBotStoppedError(new Error("the provider is out of credit"))).toBe(false);
-    expect(isBotStoppedError(undefined)).toBe(false);
-    expect(isBotStoppedError("bot_stopped")).toBe(false);
+describe("isBotOffError", () => {
+  it("recognizes an Off refusal by its code", () => {
+    expect(isBotOffError(botOffError())).toBe(true);
+    expect(isBotOffError(Object.assign(new Error("off"), { code: BOT_OFF_CODE }))).toBe(true);
+  });
+
+  it("does not classify a provider fault as a decision", () => {
+    expect(isBotOffError(new Error("the provider is out of credit"))).toBe(false);
+    expect(isBotOffError(undefined)).toBe(false);
+    expect(isBotOffError(null)).toBe(false);
+    expect(isBotOffError("bot_off")).toBe(false);
+  });
+
+  it("does not revive the retired stop latch: a legacy bot_stopped error is not an Off refusal", () => {
+    // Nothing throws bot_stopped anymore; if old code or an old peer does,
+    // it is an ordinary failure, never a quiet settle.
+    expect(isBotOffError(Object.assign(new Error("stopped"), { code: "bot_stopped" }))).toBe(false);
   });
 });
 
-describe("botStopRefusalMessage", () => {
-  it("tells the person how to undo it", () => {
-    expect(botStopRefusalMessage()).toMatch(/stopped/i);
-    expect(botStopRefusalMessage()).toMatch(/start it again/i);
-  });
-});
-
-describe("botAutomationsPausedMessage", () => {
-  it("names a stop, not an offline harness", () => {
-    expect(botAutomationsPausedMessage()).toMatch(/Automations paused/i);
-    expect(botAutomationsPausedMessage()).not.toMatch(/offline/i);
+describe("the module surface", () => {
+  it("exposes no stop state to consult: Stop is this turn, so there is nothing to decide", async () => {
+    const policy = await import("./bot-stop-policy.ts");
+    expect(Object.keys(policy).sort()).toEqual(["botOffError", "isBotOffError"]);
   });
 });

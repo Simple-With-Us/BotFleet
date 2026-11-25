@@ -2139,10 +2139,10 @@ async function main() {
       console.error(`${prefix}: usage: node asc-api.mjs ensure-standing-testers <appleId> [buildVersion]`);
       process.exit(2);
     }
-    if (!emails.length) {
-      console.error(`${prefix}: ASC_STANDING_TESTERS is empty; set the repo secret to the standing tester emails`);
-      process.exit(2);
-    }
+    // An empty list must not stop the build from reaching the external group:
+    // there are just no testers to add.  Warn loudly (exit 3 at the end) and
+    // carry on with the group, the build assignment and the review submission.
+    const emptyList = !emails.length;
     const bad = emails.filter((e) => !EMAIL_RE.test(e));
     if (bad.length) {
       console.error(`${prefix}: ASC_STANDING_TESTERS has ${bad.length} malformed entr${bad.length === 1 ? "y" : "ies"}; nothing changed`);
@@ -2156,6 +2156,9 @@ async function main() {
     const errText = ascErrorText;
     let warnings = 0;
     const warn = (msg) => { warnings += 1; console.error(`${prefix}: WARNING ${msg}`); };
+    if (emptyList) {
+      warn("ASC_STANDING_TESTERS is empty; no testers will be added. Set the repo secret to the standing tester emails. Still assigning the build to the external group");
+    }
 
     // 1) External beta group: reuse "Public Beta" or the first external group;
     //    create a private "Public Beta" (public link off) only when none exists.

@@ -27,16 +27,17 @@ final class FleetServicesTests: XCTestCase {
 
     func testEveryProcessBotFleetStartsIsInTheRegistry() {
         let ids = FleetServiceRegistry.all.map(\.id)
-        // The pm2 applications the ecosystem file defines.
+        // The supported pm2 applications in this admin view.
         for appName in ["shellular", "code-main-keeper", "vision-worker", "xcode-health",
-                        "agy-acp", "grok-leader", "grok-acp", "clutch-web", "seat-mcp",
+                        "agy-acp", "grok-leader", "grok-acp", "clutch-web",
                         "botfleet-mcp"] {
             XCTAssertTrue(ids.contains(appName), "\(appName) is missing from the registry")
         }
         // The launchd agents.
         XCTAssertTrue(ids.contains("app.botfleet.server"))
         XCTAssertTrue(ids.contains("app.botfleet.companion"))
-        XCTAssertEqual(ids.count, 12)
+        XCTAssertFalse(ids.contains("seat-mcp"))
+        XCTAssertEqual(ids.count, 11)
     }
 
     func testTheMCPServerIsSupervisedByPM2AndFollowsTheBotFleetServer() {
@@ -209,9 +210,10 @@ final class FleetServicesTests: XCTestCase {
 
     func testTheFleetServicesMenuHasOneRowPerService() {
         let services = FleetServices(serverState: .running, states: [:])
-        XCTAssertEqual(services.menuItems.count, 12)
+        XCTAssertEqual(services.menuItems.count, 11)
+        XCTAssertFalse(services.menuItems.contains { $0.id == "seat-mcp" })
         XCTAssertEqual(services.menuItems.first?.id, "botfleet-mcp")
-        XCTAssertEqual(services.menuTitle, "Fleet Services (12)")
+        XCTAssertEqual(services.menuTitle, "Fleet Services (11)")
     }
 
     func testEachMenuRowShowsTheStateAndTheActions() {
@@ -1324,7 +1326,8 @@ final class FleetServicesTests: XCTestCase {
         XCTAssertEqual(states["shellular"], .running)
         XCTAssertEqual(states["grok-acp"], .failed)
         // An application pm2 has no record of is not running.
-        XCTAssertEqual(states["seat-mcp"], .stopped)
+        XCTAssertEqual(states["clutch-web"], .stopped)
+        XCTAssertNil(states["seat-mcp"])
     }
 
     // MARK: - Helpers

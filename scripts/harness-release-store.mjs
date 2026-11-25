@@ -32,9 +32,10 @@
 // one and never a missing pointer.
 
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { join, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, sep } from "node:path";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
@@ -61,6 +62,14 @@ const RELEASES = "releases";
 // Written into a promoted release so anything inspecting one can tell it is
 // immutable and which commit it holds, without resolving the symlink chain.
 const MANIFEST = ".botfleet-release.json";
+// The hold marker and the proof record live in the store's OWN area, beside
+// `releases/` and never inside a promoted release.  That is not a matter of
+// taste: a release directory IS the tree the probe fingerprints and the tree
+// the store compares byte-for-byte with its commit, so a file written into it
+// would change the very bytes a proof is about, and the proof could never be
+// re-verified.  Both records are keyed by the release commit.
+const HOLDS = "holds";
+const PROOFS = "proofs";
 // A release is kept while something may still be running from it.  A harness
 // that has been restarted once since the swap has let go of the old tree.
 const MIN_RELEASES_KEPT = 2;
@@ -151,6 +160,392 @@ export function validateReleaseManifest(manifest) {
   // oxlint-disable-next-line anti-slop/no-runtime-typeof -- schema field validation
   if (manifest.build !== undefined && typeof manifest.build !== "string") return null;
   return manifest;
+}
+
+// ---------------------------------------------------------------------------
+// Release proof records and hold markers.
+//
+// Both live in the store's OWN area - `proofs/` and `holds/` beside
+// `releases/` - and never inside a promoted release.  A release directory is
+// the tree the probe fingerprints and the tree this module compares with the
+// commit it names, so a marker written into it would change the very bytes a
+// proof is about.
+//
+// The proof record is a SECOND trust boundary beside the strict manifest, not
+// an extension of it.  The manifest's schema is read by older strict readers
+// and must not grow a field; the proof record is read by this module and by
+// the probe, so it can carry the evidence a manifest has no room for.
+// ---------------------------------------------------------------------------
+
+const DIGEST = /^[a-f0-9]{64}$/;
+
+/** A non-empty string, without a runtime typeof check. */
+function isTextValue(value) {
+  if (value === null || value === undefined) return false;
+  try {
+    return value === String(value) && value.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** A plain object: not null, not an array, not a primitive. */
+function isPlainObject(value) {
+  return value !== null && Object(value) === value && !Array.isArray(value);
+}
+
+const PROOF_FIELDS = Object.freeze(["schemaVersion", "writtenAt", "commit", "artifact", "provenance", "tree", "runtime", "teardown"]);
+const ARTIFACT_FIELDS = Object.freeze(["path", "sha256", "bytes"]);
+const PROVENANCE_FIELDS = Object.freeze(["commit", "build"]);
+const TREE_FIELDS = Object.freeze(["fingerprint"]);
+const RUNTIME_FIELDS = Object.freeze(["path", "format", "sha256", "bytes", "dev", "ino"]);
+const TEARDOWN_FIELDS = Object.freeze(["exited", "groupGone", "portsClosed"]);
+
+/**
+ * The first reason a proof record is not acceptable, or null when it is.
+ *
+ * The reader is strict on purpose.  A proof record is read at a trust
+ * boundary, and a check that only looks at the fields it happens to want
+ * accepts an object that also carries anything else - which is exactly the
+ * mistake the manifest reader was rewritten to avoid.
+ */
+function proofProblem(proof) {
+  if (!isPlainObject(proof)) return "is not an object";
+  for (const key of Object.keys(proof)) {
+    if (!PROOF_FIELDS.includes(key)) return `carries an unknown field: ${key}`;
+  }
+  if (proof.schemaVersion !== 1) return "does not declare schemaVersion 1";
+  if (!isTextValue(proof.writtenAt) || !Number.isFinite(Date.parse(proof.writtenAt))) return "records no readable writtenAt time";
+  if (!FULL_COMMIT.test(proof.commit ?? "")) return "names no full commit";
+  const artifact = proof.artifact;
+  if (!isPlainObject(artifact)) return "records no artifact";
+  for (const key of Object.keys(artifact)) {
+    if (!ARTIFACT_FIELDS.includes(key)) return `carries an unknown artifact field: ${key}`;
+  }
+  if (!isTextValue(artifact.path) || !isAbsolute(artifact.path)) return "records no absolute artifact path";
+  if (!DIGEST.test(artifact.sha256 ?? "")) return "records a malformed artifact sha256";
+  if (!Number.isSafeInteger(artifact.bytes) || artifact.bytes < 0) return "records no artifact byte length";
+  const provenance = proof.provenance;
+  if (!isPlainObject(provenance)) return "records no artifact provenance";
+  for (const key of Object.keys(provenance)) {
+    if (!PROVENANCE_FIELDS.includes(key)) return `carries an unknown provenance field: ${key}`;
+  }
+  if (!FULL_COMMIT.test(provenance.commit ?? "")) return "records an artifact provenance that names no commit";
+  if (!isTextValue(provenance.build)) return "records an artifact provenance with no build";
+  const tree = proof.tree;
+  if (!isPlainObject(tree)) return "records no tree fingerprint";
+  for (const key of Object.keys(tree)) {
+    if (!TREE_FIELDS.includes(key)) return `carries an unknown tree field: ${key}`;
+  }
+  if (!DIGEST.test(tree.fingerprint ?? "")) return "records a malformed tree fingerprint";
+  const runtime = proof.runtime;
+  if (!isPlainObject(runtime)) return "records no runtime fingerprint";
+  for (const key of Object.keys(runtime)) {
+    if (!RUNTIME_FIELDS.includes(key)) return `carries an unknown runtime field: ${key}`;
+  }
+  if (!isTextValue(runtime.path) || !isAbsolute(runtime.path)) return "records no absolute runtime path";
+  if (runtime.format !== "elf" && runtime.format !== "mach-o") return "records a runtime that is neither an ELF nor a Mach-O executable";
+  if (!DIGEST.test(runtime.sha256 ?? "")) return "records a malformed runtime sha256";
+  if (!Number.isSafeInteger(runtime.bytes) || runtime.bytes < 0) return "records no runtime byte length";
+  if (!isTextValue(runtime.dev)) return "records no runtime device";
+  if (!isTextValue(runtime.ino)) return "records no runtime inode";
+  const teardown = proof.teardown;
+  if (!isPlainObject(teardown)) return "records no teardown";
+  for (const key of Object.keys(teardown)) {
+    if (!TEARDOWN_FIELDS.includes(key)) return `carries an unknown teardown field: ${key}`;
+  }
+  if (teardown.exited !== true || teardown.groupGone !== true || teardown.portsClosed !== true) {
+    return "records an incomplete teardown";
+  }
+  return null;
+}
+
+/** Strictly validate a release proof record, or return null. */
+export function validateReleaseProof(proof) {
+  return proofProblem(proof) === null ? proof : null;
+}
+
+/** Where the hold markers live: the store's own area, outside every release. */
+export function holdsRoot(env = process.env) {
+  return join(storeRoot(env), HOLDS);
+}
+
+/** Where the release proof records live: the store's own area, outside every release. */
+export function proofsRoot(env = process.env) {
+  return join(storeRoot(env), PROOFS);
+}
+
+/** The hold marker for one release commit. */
+export function releaseHoldPath(commit, env = process.env) {
+  if (!FULL_COMMIT.test(commit || "")) {
+    throw new Error(`Refusing to address a hold by a non-commit value: ${commit}`);
+  }
+  return join(holdsRoot(env), commit);
+}
+
+/** The proof record for one release commit. */
+export function releaseProofPath(commit, env = process.env) {
+  if (!FULL_COMMIT.test(commit || "")) {
+    throw new Error(`Refusing to address a proof record by a non-commit value: ${commit}`);
+  }
+  return join(proofsRoot(env), `${commit}.json`);
+}
+
+/**
+ * Write one file that only its owner may read, through a handle that refuses
+ * a link in its last component.  Writing through a link would put the
+ * record wherever the link points, which is never where the reader looks.
+ */
+async function writePrivateFile(path, text) {
+  const noFollow = constants.O_NOFOLLOW;
+  const seen = await lstat(path).catch(() => null);
+  if (seen && seen.isSymbolicLink()) {
+    throw new ResolutionError(`Refusing to write through the symbolic link at ${path}`, "path-is-a-symlink", { path });
+  }
+  const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | (Number.isInteger(noFollow) ? noFollow : 0);
+  let handle;
+  try {
+    handle = await open(path, flags, 0o600);
+  } catch (error) {
+    if (error?.code === "ELOOP") {
+      throw new ResolutionError(`Refusing to write through the symbolic link at ${path}`, "path-is-a-symlink", { path });
+    }
+    throw error;
+  }
+  try {
+    await handle.writeFile(text);
+    await handle.chmod(0o600);
+  } finally {
+    await handle.close();
+  }
+  return path;
+}
+
+/**
+ * Write one release's proof record.
+ *
+ * The record binds three separate things and never presents one as another:
+ * the SIGNED ARTIFACT (its path, its sha256, its byte length) together with
+ * the provenance that artifact was produced from, the HARNESS TREE
+ * fingerprint over the release directory, and the SHIPPED RUNTIME
+ * fingerprint.  The tree fingerprint is not the artifact digest, and the
+ * artifact digest is not the runtime digest.
+ *
+ * The artifact's recorded provenance must equal the release's own commit and
+ * build.  That is the artifact-to-tree link, and it is refused by name when
+ * it does not hold rather than written down as if it did.
+ */
+export async function writeReleaseProof({ commit, env = process.env, artifact, provenance, tree, runtime, teardown, writtenAt = new Date().toISOString() } = {}) {
+  if (!FULL_COMMIT.test(commit || "")) {
+    throw new ResolutionError(`Refusing to write a proof record for a non-commit value: ${commit}`, "not-a-commit");
+  }
+  const release = releasePath(commit, env);
+  const manifest = validateReleaseManifest(await readReleaseManifest(release));
+  if (!manifest || manifest.commit !== commit) {
+    throw new ResolutionError(
+      `The release at ${release} does not carry a manifest this store accepts, so nothing can be proved about it`,
+      "release-manifest-invalid",
+      { releasePath: release },
+    );
+  }
+  if (!isTextValue(manifest.build)) {
+    throw new ResolutionError(
+      `The release ${commit.slice(0, 12)} records no build, so an artifact cannot be tied to it`,
+      "release-build-missing",
+      { releasePath: release },
+    );
+  }
+  if (!isPlainObject(provenance) || !FULL_COMMIT.test(provenance.commit ?? "") || !isTextValue(provenance.build)) {
+    throw new ResolutionError(
+      `No artifact provenance was given for ${commit.slice(0, 12)}; a proof needs the commit and the build the artifact was produced from`,
+      "artifact-provenance-missing",
+      { releasePath: release },
+    );
+  }
+  if (provenance.commit !== manifest.commit) {
+    throw new ResolutionError(
+      `The artifact names commit ${provenance.commit}, not the release's commit ${manifest.commit}`,
+      "artifact-commit-mismatch",
+      { artifactCommit: provenance.commit, releaseCommit: manifest.commit },
+    );
+  }
+  if (provenance.build !== manifest.build) {
+    throw new ResolutionError(
+      `The artifact names build ${provenance.build}, not the release's build ${manifest.build}`,
+      "artifact-build-mismatch",
+      { artifactBuild: provenance.build, releaseBuild: manifest.build },
+    );
+  }
+  const record = {
+    schemaVersion: 1,
+    writtenAt,
+    commit,
+    artifact: { path: artifact?.path, sha256: artifact?.sha256, bytes: artifact?.bytes },
+    provenance: { commit: provenance.commit, build: provenance.build },
+    tree: { fingerprint: tree?.fingerprint },
+    runtime: {
+      path: runtime?.path,
+      format: runtime?.format,
+      sha256: runtime?.sha256,
+      bytes: runtime?.bytes,
+      dev: runtime?.dev,
+      ino: runtime?.ino,
+    },
+    teardown: {
+      exited: teardown?.exited === true,
+      groupGone: teardown?.groupGone === true,
+      portsClosed: teardown?.portsClosed === true,
+    },
+  };
+  const problem = proofProblem(record);
+  if (problem !== null) {
+    throw new ResolutionError(
+      `The proof record for ${commit.slice(0, 12)} ${problem}`,
+      "release-proof-invalid",
+      { releasePath: release },
+    );
+  }
+  await mkdir(proofsRoot(env), { recursive: true, mode: 0o700 });
+  const path = releaseProofPath(commit, env);
+  await writePrivateFile(path, `${JSON.stringify(record, null, 2)}\n`);
+  return { path, record };
+}
+
+/**
+ * Read one release's proof record, strictly, or say why it cannot be read.
+ */
+export async function readReleaseProof(commit, env = process.env) {
+  if (!FULL_COMMIT.test(commit || "")) {
+    return { ok: false, reason: "not-a-commit", detail: `Refusing to read a proof record for a non-commit value: ${commit}` };
+  }
+  const path = releaseProofPath(commit, env);
+  let text;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return { ok: false, reason: "release-proof-missing", detail: `There is no release proof at ${path}` };
+    }
+    return { ok: false, reason: "release-proof-unreadable", detail: `${path}: ${error?.message || error}` };
+  }
+  let parsed = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    return { ok: false, reason: "release-proof-invalid", detail: `${path} is not JSON: ${error?.message || error}` };
+  }
+  const problem = proofProblem(parsed);
+  if (problem !== null) {
+    return { ok: false, reason: "release-proof-invalid", detail: `${path} ${problem}` };
+  }
+  if (parsed.commit !== commit) {
+    return { ok: false, reason: "release-proof-invalid", detail: `${path} names commit ${parsed.commit}, not ${commit}` };
+  }
+  return { ok: true, proof: parsed, path };
+}
+
+/**
+ * Does the signed artifact belong to this release?
+ *
+ * The answer compares the artifact's RECORDED provenance with the release's
+ * OWN commit and build, read from the strict manifest.  A missing or empty
+ * build, a missing provenance, a different commit or a different build are
+ * all refusals with a name, never a pass.
+ */
+export async function releaseProofMatches({ commit, build, env = process.env } = {}) {
+  if (!FULL_COMMIT.test(commit || "")) {
+    return { ok: false, reason: "not-a-commit", detail: `Refusing to check a proof record for a non-commit value: ${commit}` };
+  }
+  const release = releasePath(commit, env);
+  const manifest = validateReleaseManifest(await readReleaseManifest(release));
+  if (!manifest || manifest.commit !== commit) {
+    return { ok: false, reason: "release-manifest-invalid", detail: `The release at ${release} does not carry a manifest this store accepts` };
+  }
+  if (!isTextValue(manifest.build)) {
+    return { ok: false, reason: "release-build-missing", detail: `The release ${commit.slice(0, 12)} records no build, so an artifact cannot be tied to it` };
+  }
+  if (build !== undefined && build !== null && build !== manifest.build) {
+    return { ok: false, reason: "release-build-mismatch", detail: `The release records build ${manifest.build}, not the expected build ${build}` };
+  }
+  const read = await readReleaseProof(commit, env);
+  if (!read.ok) return { ok: false, reason: read.reason, detail: read.detail };
+  const proof = read.proof;
+  if (proof.provenance.commit !== manifest.commit) {
+    return {
+      ok: false,
+      reason: "artifact-commit-mismatch",
+      detail: `The proof record names artifact commit ${proof.provenance.commit}, not the release's commit ${manifest.commit}`,
+    };
+  }
+  if (proof.provenance.build !== manifest.build) {
+    return {
+      ok: false,
+      reason: "artifact-build-mismatch",
+      detail: `The proof record names artifact build ${proof.provenance.build}, not the release's build ${manifest.build}`,
+    };
+  }
+  return { ok: true, proof, path: read.path };
+}
+
+/**
+ * Hold one release: keep it, whatever the pruner would otherwise decide.
+ *
+ * The marker is the store's own record, keyed by the release commit and
+ * written beside `releases/`, never inside the release.  It moves no pointer:
+ * a candidate is held where it lies, and the live release is untouched.
+ */
+export async function holdRelease({ commit, env = process.env, reason = "rollback-bridge-artifact-proof", heldAt = new Date().toISOString() } = {}) {
+  if (!FULL_COMMIT.test(commit || "")) {
+    throw new ResolutionError(`Refusing to hold a non-commit value: ${commit}`, "not-a-commit");
+  }
+  await mkdir(holdsRoot(env), { recursive: true, mode: 0o700 });
+  const path = releaseHoldPath(commit, env);
+  const record = { schemaVersion: 1, commit, reason, heldAt };
+  await writePrivateFile(path, `${JSON.stringify(record, null, 2)}\n`);
+  return { path, record };
+}
+
+/** Clear one release's hold.  Returns whether there was one to clear. */
+export async function releaseHold({ commit, env = process.env } = {}) {
+  if (!FULL_COMMIT.test(commit || "")) {
+    throw new ResolutionError(`Refusing to release a hold on a non-commit value: ${commit}`, "not-a-commit");
+  }
+  const path = releaseHoldPath(commit, env);
+  let seen;
+  try {
+    seen = await lstat(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  if (seen.isSymbolicLink()) {
+    throw new ResolutionError(`The hold marker at ${path} is a symbolic link; refusing to remove it through one`, "hold-marker-symlink", { path });
+  }
+  await rm(path, { force: true });
+  return true;
+}
+
+/** Is this release held?  The marker is the answer; nothing else is. */
+export async function isReleaseHeld(commit, env = process.env) {
+  if (!FULL_COMMIT.test(commit || "")) return false;
+  let seen;
+  try {
+    seen = await lstat(releaseHoldPath(commit, env));
+  } catch {
+    return false;
+  }
+  return seen.isFile() && !seen.isSymbolicLink();
+}
+
+/**
+ * The store root a release directory belongs to, or null when it is not in
+ * one.  The release directory is `<store>/releases/<commit>`, so the store is
+ * two levels up - and only when the level above really is `releases`.
+ */
+export function storeRootForReleaseDirectory(directory) {
+  const parent = dirname(directory);
+  if (basename(parent) !== RELEASES) return null;
+  return dirname(parent);
 }
 
 /**
@@ -746,6 +1141,14 @@ export async function probeReleaseLiveness(directory, { timeoutMs = 25_000 } = {
 }
 
 export async function isHeld(directory, options = {}) {
+  // A hold marker is a decision, and a decision outranks a probe: the release
+  // is kept because somebody proved it, not because a process happens to hold
+  // it open right now.
+  const commit = basename(directory);
+  if (FULL_COMMIT.test(commit)) {
+    const root = options.env ? storeRoot(options.env) : storeRootForReleaseDirectory(directory);
+    if (root && await isReleaseHeld(commit, { BOTFLEET_RELEASES_ROOT: root })) return true;
+  }
   const state = await probeReleaseLiveness(directory, options);
   return state !== "free";
 }
@@ -795,6 +1198,12 @@ export async function pruneReleases({ env = process.env, keep = MIN_RELEASES_KEP
         // not comparable; fall through to the normal gates
       }
     }
+    // An explicit hold outranks every age and budget rule below.  The
+    // release is kept because it was proved, not because it is young.
+    if (await isReleaseHeld(commit, env)) {
+      kept.push({ commit, reason: "held-by-marker" });
+      continue;
+    }
     if (now - stat.mtimeMs < minAgeMs) {
       kept.push({ commit, reason: "too-young" });
       continue;
@@ -806,6 +1215,14 @@ export async function pruneReleases({ env = process.env, keep = MIN_RELEASES_KEP
     }
     if (liveness !== false && liveness !== "free") {
       kept.push({ commit, reason: "liveness-unknown" });
+      continue;
+    }
+    // The hold is checked again immediately before the removal, because the
+    // liveness probe above takes time and a hold applied during it must still
+    // save the release.  A prune that can lose a hold is not a prune that
+    // keeps what it was told to keep.
+    if (await isReleaseHeld(commit, env)) {
+      kept.push({ commit, reason: "held-by-marker" });
       continue;
     }
     // A promoted release is read-only, and a read-only directory cannot be

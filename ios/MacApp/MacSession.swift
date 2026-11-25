@@ -88,6 +88,13 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     }
     @Published public var selectedThreadId: String?
     @Published public var isSending: Bool = false
+    /// True while the sidebar's add-a-bot action is waiting on the harness.
+    /// The button stays disabled for exactly this interval, so a slow create
+    /// cannot be double-submitted.
+    @Published public private(set) var isCreatingBot: Bool = false
+    /// The last fleet-action failure in the owner's words, shown in the
+    /// sidebar.  Nil after any successful fleet action.
+    @Published public var fleetActionErrorMessage: String?
     @Published public private(set) var host: String = "127.0.0.1"
     @Published public private(set) var port: Int = 8799
     public let servers: ServersCoordinator
@@ -121,6 +128,24 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     @Published public var startupPolicyErrorMessage: String?
     /// The startup-policy store for this Mac's data directory.
     public let startupPolicyStore: MacStartupPolicyStore
+    /// What the last status read proved about whether the harness is up.
+    ///
+    /// The read's own outcome, never `controlStatus`:  a failed read keeps
+    /// the last known status in place beside the reason, so the status alone
+    /// would call a server that answered and has since stopped an answering
+    /// one and hold the start control off for good.
+    @Published public private(set) var controlPresence: MacServerPresence = .unknown
+    /// The state of the installed LaunchAgent, as launchd last said it.
+    @Published public private(set) var installedServerState: MacInstalledServerState?
+    /// Whether a start is running, so the button waits with it instead of
+    /// firing a second request the launchd fence would refuse anyway.
+    @Published public private(set) var isStartingServer = false
+    /// What the last start attempt did, or why the control is not offered.
+    @Published public var serverStartMessage: String?
+    /// The presence the last outcome was about.  An outcome is evidence about
+    /// the state it was observed in; once the state moves, showing it would
+    /// describe a server that is no longer there.
+    @Published private var serverStartMessagePresence: MacServerPresence?
 
     // Native companion listener lifecycle (BF-2590, the lifecycle half of BF-2511)
     /// What the native companion listener is doing, mirrored from the
@@ -185,6 +210,10 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     private var connectionGeneration = UUID()
     private var reconnectAttempt = 0
     private let policyStore: MacPersistencePolicyStore
+    /// Starts the installed harness LaunchAgent on request (BF-2700).  Its
+    /// boot-session reader is injected so the app reads the real boot and a
+    /// test can supply its own.
+    private let serverLaunchController: MacServerLaunchController
     private let permissionMonitor: CuaPermissionMonitor
     private let cuaStatusState = CuaStatusState()
     private var hasLaunched = false
@@ -202,10 +231,15 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     public init(
         policyStore: MacPersistencePolicyStore = MacPersistencePolicyStore(),
         startupPolicyStore: MacStartupPolicyStore = MacStartupPolicyStore(),
+        serverLaunchController: MacServerLaunchController? = nil,
         permissionMonitor: CuaPermissionMonitor = CuaPermissionMonitor()
     ) {
         self.policyStore = policyStore
         self.startupPolicyStore = startupPolicyStore
+        self.serverLaunchController = serverLaunchController ?? MacServerLaunchController(
+            store: startupPolicyStore,
+            bootSession: { try startupPolicyStore.readBootSession() }
+        )
         let hostStore = HostStore(fileURL: policyStore.dataDir.appendingPathComponent("hosts.json"))
         self.servers = ServersCoordinator(store: hostStore)
         self.resources = ResourcesCoordinator(store: hostStore)
@@ -280,9 +314,24 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
             let macRuntime = NativeMacCompanionRuntime(
                 database: database,
                 workspacesRoot: workspacesRoot,
-                processSupervisor: nativeProcessSupervisor
+                processSupervisor: nativeProcessSupervisor,
+                credentials: DatabaseCliLoginCredentials(database: database)
             )
             nativeRuntimeBox.store(macRuntime)
+            // BF-2689 composition: register every stored bot that derives
+            // a native profile, with its real driver, so satisfied waits
+            // dispatch instead of holding unclaimed.  Registration is
+            // best-effort per bot — a bot that cannot register stays
+            // admission-held and is named in the log, never substituted.
+            Task {
+                let report = await macRuntime.registerStoredBots()
+                if let loadFailure = report.loadFailure {
+                    NSLog("BF-2689: stored bots could not be loaded for native registration: %@", loadFailure)
+                }
+                for skip in report.skipped {
+                    NSLog("BF-2689: bot %@ not registered natively: %@", skip.botId, skip.reason)
+                }
+            }
             return NativeCompanionServer(
                 database: database,
                 deviceStoreURL: deviceStoreURL,
@@ -594,6 +643,26 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     private func reconcileWaitingThreadPin() {
         if waitingThreadPin.dropIfSelectionMoved(toBotId: selectedBotId) {
             selectedThreadId = nil
+            return
+        }
+        // A thread picked under another bot must not stay active when the
+        // sidebar moves to a different bot: `activeThreadId` prefers the
+        // picked thread, so without this the transcript keeps showing the
+        // previous bot's conversation under the new bot's name.  The picked
+        // thread survives only while it is the selected bot's own main
+        // thread or the thread the menubar pinned for that bot.  A selected
+        // bot the roster does not know (deleted, or a pick carried over
+        // from before a reconnect) keeps no pick either: every legitimate
+        // in-session pick is made while its bot is in the roster or pinned
+        // for it, so an unknown bot means the pick is stale, not pending.
+        if case .bot(let botId) = selection, let picked = selectedThreadId {
+            let bot = state.bots.first(where: { $0.id == botId })
+            let keepsPick = bot.map { picked == $0.threadId } ?? false
+                || waitingThreadPin.threadId == picked
+                || (bot == nil && waitingThreadPin.botId == botId)
+            if !keepsPick {
+                selectedThreadId = nil
+            }
         }
     }
 
@@ -753,6 +822,11 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         Task { @MainActor [weak self] in
             await self?.refreshLifecycleSettings()
             self?.refreshStartupPolicy()
+            //  launchd is asked at launch and not only from the connection's
+            //  callback:  a harness that is down never hydrates, so the start
+            //  control would otherwise stay unofferable in the one case it
+            //  exists for.
+            await self?.refreshInstalledServerState()
             await self?.companionListener.applyLaunch()
         }
         let generation = connectionGeneration
@@ -1049,6 +1123,46 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         }
     }
 
+    /// The active bot's main thread: the conversation the sidebar's Main
+    /// Thread row selects.  Nil when no bot is selected.
+    public var activeMainThreadId: String? {
+        activeBot?.threadId
+    }
+
+    /// Selects the active bot's main thread in the conversation list.
+    public func selectMainThread() {
+        selectedThreadId = activeMainThreadId
+    }
+
+    /// Creates a bot through the harness and selects it.  The harness picks
+    /// the name, colour and greeting, exactly as it does for the phone, so
+    /// a bot created here is indistinguishable from one created anywhere
+    /// else.  A failure is reported in `fleetActionErrorMessage` instead of
+    /// failing silently behind a button that looks live.
+    public func createBot() async {
+        guard let client = client else {
+            fleetActionErrorMessage = "Not connected, so a bot cannot be added yet."
+            return
+        }
+        guard !isCreatingBot else { return }
+        isCreatingBot = true
+        defer { isCreatingBot = false }
+        do {
+            let bot = try await client.createBot()
+            // Creating a bot does not broadcast, so fold the new bot in
+            // optimistically, exactly as the phone does (Session.createBot):
+            // the bot is already made, and selecting a bot that is missing
+            // from state would leave the sidebar pointing at nothing.  The
+            // stream and the next roster snapshot reconcile it from there.
+            state.apply(.bot(bot))
+            selection = .bot(bot.id)
+            selectedThreadId = bot.threadId
+            fleetActionErrorMessage = nil
+        } catch {
+            fleetActionErrorMessage = "Adding a bot failed: \(error.localizedDescription)"
+        }
+    }
+
     public func stopActiveTurn() async {
         guard let client = client else { return }
         guard let threadId = activeThreadId else { return }
@@ -1151,9 +1265,15 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         guard !isRefreshingControlStatus else { return }
         isRefreshingControlStatus = true
         defer { isRefreshingControlStatus = false }
+        //  launchd is asked first, before anything that can return early.  The
+        //  offer's third fact has to be current even when the endpoint is
+        //  refused or the read is cancelled, which is exactly the state a
+        //  server that is down leaves behind.
+        await refreshInstalledServerState()
         guard let client = makeControlStatusClient() else {
             controlStatus = nil
             controlStatusError = Self.controlClientUnavailableMessage
+            controlPresence = .unknown
             return
         }
         let generation = connectionGeneration
@@ -1162,10 +1282,23 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
             guard connectionGeneration == generation, !Task.isCancelled else { return }
             controlStatus = status
             controlStatusError = nil
+            controlPresence = .answering
         } catch {
             guard connectionGeneration == generation, !Task.isCancelled else { return }
             controlStatusError = error.localizedDescription
+            controlPresence = MacServerPresence.after(status: controlStatus, error: error as? MacControlStatusError)
         }
+    }
+
+    /// Reads the installed LaunchAgent's state from launchd (BF-2700).
+    ///
+    /// A fresh connection asks so the start control is offerable from the
+    /// first look, not only after a status read that may never come while the
+    /// harness is down.
+    public func refreshInstalledServerState() async {
+        let state = await serverLaunchController.installedServerState()
+        guard !Task.isCancelled else { return }
+        installedServerState = state
     }
 
     /// Starts the shared Local VM from Settings or the menu.
@@ -1197,6 +1330,72 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
             guard connectionGeneration == generation, !Task.isCancelled else { return }
             vmActionMessage = nil
             controlStatusError = error.localizedDescription
+        }
+    }
+
+    // MARK: - Start Server (BF-2700)
+
+    /// Whether the Start Server control may be used, and when it may not, the
+    /// one sentence that says why.
+    ///
+    /// `nil` means it is offered.  The three facts are the ones the control's
+    /// own fence asks for:  the wrapper can be started through the policy,
+    /// nothing answered on the harness port, and the job is installed without
+    /// a live process behind the label.  Anything not yet known is a sentence
+    /// that says to look again, never an offer.
+    public var startServerRefusal: String? {
+        guard !isStartingServer else {
+            return "The server is starting.\u{00A0} Wait for it to settle."
+        }
+        return MacServerLaunchController.startRefusal(
+            policySupported: supportsStartupPolicy,
+            presence: controlPresence,
+            installedState: installedServerState
+        )
+    }
+
+    /// The last start outcome, while it still describes this server.
+    ///
+    /// Nil once the presence has moved since the outcome was recorded, so a
+    /// success cannot sit over a server that has since stopped, and a refusal
+    /// cannot outlive the state it explained.
+    public var startServerDisplayMessage: String? {
+        guard serverStartMessagePresence == controlPresence else { return nil }
+        return serverStartMessage
+    }
+
+    /// Starts the installed harness LaunchAgent and reports what happened.
+    ///
+    /// The app does not start the harness itself:  launchd runs the installed
+    /// wrapper, and this asks launchd for that one job.  It is refused before
+    /// it begins whenever `startServerRefusal` is a sentence, so a control
+    /// that is greyed out can never start something the fence would not.
+    public func startServer() async {
+        guard !isStartingServer else { return }
+        if let refusal = startServerRefusal {
+            serverStartMessage = refusal
+            serverStartMessagePresence = controlPresence
+            return
+        }
+        isStartingServer = true
+        defer { isStartingServer = false }
+        do {
+            let outcome = try await serverLaunchController.startServerAndSettle()
+            serverStartMessage = outcome.message
+            //  The status read follows the start itself:  a process behind the
+            //  label proves launchd took the request, and only the harness
+            //  answering proves it is up.  That read also asks launchd for the
+            //  installed state, so one start lists the label once.
+            await refreshControlStatus()
+            //  The outcome is tied to the presence the reads above settled on:
+            //  a start that moved the port from refused to answering keeps the
+            //  sentence that says so, and a presence that moves later still
+            //  hides it.
+            serverStartMessagePresence = controlPresence
+        } catch {
+            serverStartMessage = error.localizedDescription
+            installedServerState = await serverLaunchController.installedServerState()
+            serverStartMessagePresence = controlPresence
         }
     }
 

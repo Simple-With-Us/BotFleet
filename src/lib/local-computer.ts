@@ -211,8 +211,8 @@ export function computerDestinationDisabledReason(
   const reach = reachFor(instances, bot);
   if (isLocalOnlyReach(reach)) return localOnlyComputerReason(name, platformIsMac);
   return mode === "vm"
-    ? `${name} cannot drive a Local VM.\u00A0 Choose Claude or an ACP engine, or another destination.`
-    : `${name} cannot drive a remote desktop.\u00A0 Choose Claude or an ACP engine, or another destination.`;
+    ? `${name} cannot drive a Local VM.\u00A0 Choose an ACP engine, or another destination.`
+    : `${name} cannot drive a remote desktop.\u00A0 Choose an ACP engine, or another destination.`;
 }
 
 /** The line under the Box / Self-hosted VPS control.
@@ -233,9 +233,9 @@ export function cloudBackendUnavailableNote(
   if (isLocalOnlyReach(reach)) return localOnlyComputerReason(name, platformIsMac);
   if (!vps && !box) return `${name} cannot use a remote computer.`;
   if (!vps) {
-    return `${name} can't run a desktop on your own server.\u00A0 Pick an engine that can control a computer, such as Claude, to use Self-hosted VPS.`;
+    return `${name} can't run a desktop on your own server.\u00A0 Pick an engine that can control a computer to use Self-hosted VPS.`;
   }
-  return `${name} cannot drive a remote desktop.\u00A0 Choose Claude or an ACP engine, or another destination.`;
+  return `${name} cannot drive a remote desktop.\u00A0 Choose an ACP engine, or another destination.`;
 }
 
 /** The one line under Runs On.

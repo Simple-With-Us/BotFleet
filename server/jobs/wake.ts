@@ -30,7 +30,7 @@
 
 import { BOT_OFF_CODE } from "../../shared/bot-power.ts";
 import type { JobSnapshot } from "../../shared/jobs.ts";
-import { botStopErrorCode } from "../bot-stop-policy.ts";
+import { isBotOffError } from "../bot-stop-policy.ts";
 import type { JobNoticeItem } from "../steer-queue.ts";
 
 export interface JobWakeDeps {
@@ -254,27 +254,14 @@ export class JobWakeCoordinator {
       // next settle tries again.
       this.used.set(threadId, Math.max(0, (this.used.get(threadId) ?? 1) - 1));
       this.deps.restoreNotices(threadId, items);
-      const code = botStopErrorCode(error);
-      if (code === "bot_stopped") {
-        // Stopped on purpose: park for the next settle with no retry timer
-        // and one log line per thread (BF-2454), not a 30 s poll forever.
-        // Lifting a stop runs a turn, and that turn settling delivers this.
-        this.park(threadId, botId, false);
-        this.logHeldOnce(
-          threadId,
-          code,
-          `[jobs] wake for ${threadId.slice(0, 8)} held: the bot is stopped; it will go out when the bot next settles`,
-        );
-        return;
-      }
-      if (code === BOT_OFF_CODE) {
+      if (isBotOffError(error)) {
         // Off is lifted by a settings patch alone — no turn starts or
         // settles — so the retry timer is the only autonomous delivery
         // path.  Keep it, but tell the log once (BF-2454).
         this.park(threadId, botId);
         this.logHeldOnce(
           threadId,
-          code,
+          BOT_OFF_CODE,
           `[jobs] wake for ${threadId.slice(0, 8)} held: the bot is off; it will retry until the bot is turned on`,
         );
         return;

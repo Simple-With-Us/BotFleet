@@ -183,16 +183,15 @@ struct MacSidebarView: View {
                         .clipShape(Capsule())
                 }
 
-                //  A button that does nothing still reads as a live
-                //  control, so this one says it is not available yet
-                //  instead of taking a click.
-                Button(action: {}) {
+                Button(action: {
+                    Task { @MainActor in await session.createBot() }
+                }) {
                     Image(systemName: "plus")
                 }
                 .buttonStyle(.plain)
-                .disabled(true)
-                .help("Adding a bot from here is not available yet.")
-                .accessibilityLabel("Adding a bot is not available yet")
+                .disabled(session.isCreatingBot || !session.status.isConnected)
+                .help(session.status.isConnected ? "Add a bot" : "Add a bot (connect first)")
+                .accessibilityLabel(session.isCreatingBot ? "Adding a bot" : "Add a bot")
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
             }
@@ -201,6 +200,16 @@ struct MacSidebarView: View {
                     ? Color.clear
                     : Color(NSColor.windowBackgroundColor)
             )
+
+            if let fleetError = session.fleetActionErrorMessage {
+                Text(fleetError)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .lineLimit(3)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
+                    .accessibilityLabel("Fleet action failed: \(fleetError)")
+            }
         }
         .task { await session.refreshModelWindows() }
     }
@@ -324,16 +333,28 @@ struct MacThreadListView: View {
 
                 List {
                     Section("Conversations") {
-                        //  This row used to be a link to an empty view, which
-                        //  cannot push anything because the app has no
-                        //  navigation stack.  It says plainly that it is not
-                        //  available yet.
-                        HStack {
-                            Label("Main Thread", systemImage: "bubble.left.and.bubble.right.fill")
-                            Spacer()
-                            Text("Not available yet")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
+                        if session.activeMainThreadId != nil {
+                            Button(action: { session.selectMainThread() }) {
+                                HStack {
+                                    Label("Main Thread", systemImage: "bubble.left.and.bubble.right.fill")
+                                    Spacer()
+                                    if session.selectedThreadId == session.activeMainThreadId {
+                                        Image(systemName: "checkmark")
+                                            .font(.caption)
+                                            .foregroundColor(.accentColor)
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Main Thread")
+                        } else {
+                            HStack {
+                                Label("Main Thread", systemImage: "bubble.left.and.bubble.right.fill")
+                                Spacer()
+                                Text("No conversation yet")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
                         }
                     }
 

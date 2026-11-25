@@ -180,7 +180,11 @@ describe("job wakes", () => {
     expect(t.wakes).toHaveLength(1);
   });
 
-  it("parks a stopped bot's wake without a retry timer and logs once (BF-2454)", async () => {
+  it("treats a legacy bot_stopped refusal as an ordinary dispatch failure (Stop no longer latches)", async () => {
+    // Stop is turn-scoped: nothing throws bot_stopped anymore, and if an old
+    // peer still does, it gets the generic failure path — notices restored
+    // unspent, the normal retry timer armed, one plain log line — never the
+    // retired settle-only park.
     const lines: string[] = [];
     const delivered: string[] = [];
     let stopped = true;
@@ -192,22 +196,19 @@ describe("job wakes", () => {
       },
     });
     t.finish(job("job_a"));
-    await t.fireTimers(); // the merge window: dispatch refused as stopped
+    await t.fireTimers(); // the merge window: dispatch refused
     expect(delivered).toEqual([]);
     expect(t.queue.get("thread-a")?.map((item) => item.jobId)).toEqual(["job_a"]);
     expect(t.coordinator.wakesLeft("thread-a")).toBe(3);
-    // settle-only: no 30-second retry timer is armed against a stopped bot
-    expect(t.timers.filter((timer) => !timer.cleared && timer.ms === 30_000)).toHaveLength(0);
-    expect(lines.filter((line) => line.includes("held: the bot is stopped"))).toHaveLength(1);
-    await t.fireTimers();
-    expect(lines.filter((line) => line.includes("held: the bot is stopped"))).toHaveLength(1);
+    // the ordinary retry timer IS armed: no special-casing for a stop
+    expect(t.timers.filter((timer) => !timer.cleared && timer.ms === 30_000)).toHaveLength(1);
+    expect(lines.filter((line) => line.includes("did not start: This bot is stopped."))).toHaveLength(1);
     stopped = false;
-    t.coordinator.botSettled("bot-a");
-    await new Promise((resolve) => setImmediate(resolve));
+    await t.fireTimers(); // the armed retry delivers
     expect(delivered).toEqual(["job_a"]);
   });
 
-  it("calls off an already-armed retry when a stopped refusal parks settle-only (BF-2454)", async () => {
+  it("keeps the already-armed retry when a legacy bot_stopped refusal parks (no settle-only path remains)", async () => {
     const delivered: string[] = [];
     let stopped = false;
     const t = setup({
@@ -223,8 +224,8 @@ describe("job wakes", () => {
     const retry = t.timers.find((timer) => timer.ms === 30_000 && !timer.cleared)!;
     expect(retry).toBeDefined();
     // A second completion fires while that timer is still armed, and this
-    // dispatch meets the stop instead: the armed poll is called off.  Fire
-    // only the 5-second merge timer, as real time would reach it first.
+    // dispatch meets the refusal: the generic park keeps the armed timer.
+    // Fire only the 5-second merge timer, as real time would reach it first.
     t.state.busy.delete("bot-a");
     stopped = true;
     t.finish(job("job_b"));
@@ -232,10 +233,9 @@ describe("job wakes", () => {
     merge.fn();
     await new Promise((resolve) => setImmediate(resolve));
     expect(delivered).toEqual([]);
-    expect(retry.cleared).toBe(true);
-    expect(t.timers.filter((timer) => !timer.cleared && timer.ms === 30_000)).toHaveLength(0);
+    expect(retry.cleared).toBe(false);
     stopped = false;
-    t.coordinator.botSettled("bot-a");
+    retry.fn();
     await new Promise((resolve) => setImmediate(resolve));
     expect(delivered).toEqual(["job_a", "job_b"]);
   });

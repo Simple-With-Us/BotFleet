@@ -562,7 +562,7 @@ function decodeInventoryRows(bytes, rowsPath) {
 }
 
 /** Refuse to write over anything that is not this script's own plain file. */
-function assertWritableReceiptPath(receiptPath) {
+export function assertWritableReceiptPath(receiptPath) {
   let entry;
   try {
     entry = lstatSync(receiptPath);

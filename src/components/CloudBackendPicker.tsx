@@ -41,9 +41,9 @@ export function CloudBackendPicker({
   const engineLabel = engineName?.trim() ? engineName.trim() : "This engine";
   const remoteOff = !vpsSupported && !boxSupported;
   const defaultNote = !vpsSupported
-    ? `${engineLabel} can't run a desktop on your own server.\u00A0 Pick an engine that can control a computer, such as Claude, to use Self-hosted VPS.`
+    ? `${engineLabel} can't run a desktop on your own server.\u00A0 Pick an engine that can control a computer to use Self-hosted VPS.`
     : !boxSupported
-      ? `${engineLabel} cannot drive a remote desktop.\u00A0 Choose Claude or an ACP engine, or another destination.`
+      ? `${engineLabel} cannot drive a remote desktop.\u00A0 Choose an ACP engine, or another destination.`
       : null;
   const note = unavailableNote ? unavailableNote : defaultNote;
   return (
