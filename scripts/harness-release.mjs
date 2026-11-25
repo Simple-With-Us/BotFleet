@@ -53,6 +53,8 @@ function usage() {
       "  activate <commit> [--repo <path>] [--version v]   stage, promote and swap",
       "  promote/activate stamp --version/--build into the release manifest;",
       "  without them the staged package.json version is recorded",
+      "  promote/activate bind a runtime with --runtime <path> (or --source);",
+      "  the bytes are kept in the store and bound to that release",
       "  status                                            where current points",
       "  list                                              every release in the store",
       "  prune [--keep N]                                  drop old, unheld releases",
@@ -116,7 +118,10 @@ function restartHint(env) {
  * quietly binding the machine's node.
  */
 async function bindRuntimeIfAsked({ commit, args, env }) {
-  const source = flag(args, "--runtime");
+  // --source names the runtime to keep, exactly as it does for
+  // retain-runtime and bind-runtime, so an operator who passes it is never
+  // left believing a release is bound when nothing was bound.
+  const source = flag(args, "--runtime") ?? flag(args, "--source");
   if (!source) return null;
   const bound = await bindReleaseRuntime({ commit, source, env });
   process.stdout.write(`runtime: ${bound.record.runtime.path}\n`);

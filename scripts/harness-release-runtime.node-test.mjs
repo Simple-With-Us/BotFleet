@@ -38,7 +38,27 @@ const ELF_STUB = Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.al
 /** A store, a source binary, and the teardown that removes both. */
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), "bf-release-runtime-test-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(async () => {
+    // A promoted release is read-only by construction, so the teardown has to
+    // make the tree writable before it can remove it.
+    const { chmod, readdir } = await import("node:fs/promises");
+    const walk = async (directory) => {
+      let entries = [];
+      try {
+        entries = await readdir(directory, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const child = join(directory, entry.name);
+        if (entry.isDirectory()) await walk(child);
+        else await chmod(child, 0o644).catch(() => {});
+      }
+      await chmod(directory, 0o755).catch(() => {});
+    };
+    await walk(root);
+    await rm(root, { recursive: true, force: true });
+  });
   const env = { BOTFLEET_RELEASES_ROOT: join(root, "store") };
   const source = join(root, "runtime-source");
   await writeFile(source, ELF_STUB);
@@ -165,4 +185,36 @@ test("a retained runtime is kept in the store's own area and named by its own di
   assert.match(bound.stdout, /runtime: /);
   const listed = await run(process.execPath, [CLI, "runtimes"], { env: { ...process.env, ...env } });
   assert.equal(listed.stdout.includes(digest), true);
+});
+test("an empty source is refused: the store keeps the bytes of a program", async (t) => {
+  const { env, root } = await fixture(t);
+  const empty = join(root, "empty-runtime");
+  await writeFile(empty, "");
+  await chmod(empty, 0o755);
+  assert.equal(await causeOf(() => retainRuntime({ source: empty, env })), "runtime-not-binary");
+  assert.deepEqual(await listRetainedRuntimes(env), []);
+});
+
+test("a file already at the kept path whose bytes are not its digest is refused", async (t) => {
+  const { env, source } = await fixture(t);
+  const first = await retainRuntime({ source, env });
+  // The file that is already there holds other bytes than its name says.
+  await rm(first.path, { force: true });
+  await writeFile(first.path, Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(60, 0x39)]));
+  await chmod(first.path, 0o555);
+  const planted = await causeOf(() => retainRuntime({ source, env }));
+  assert.equal(planted, "runtime-not-stored");
+});
+
+test("promote binds a runtime when the operator names one with --source", async (t) => {
+  const { env, source } = await fixture(t);
+  const staging = stagingPath(A, env);
+  await mkdir(staging, { recursive: true });
+  await writeFile(join(staging, "package.json"), '{"name":"botfleet","version":"0.1.0"}\n');
+  const promoted = await run(process.execPath, [CLI, "promote", A, "--source", source], { env: { ...process.env, ...env } });
+  assert.match(promoted.stdout, /promoted: /);
+  assert.match(promoted.stdout, /sha256:  [a-f0-9]{64}/);
+  const bound = await releaseRuntime(A, env);
+  assert.ok(bound, "promote --source must bind the runtime to the release");
+  assert.equal(bound.sha256, retainedRuntimePath(bound.sha256, env).split("/").pop());
 });

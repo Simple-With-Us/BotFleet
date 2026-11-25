@@ -359,6 +359,26 @@ function runtimeFormat(head) {
 }
 
 /**
+ * The sha256 of a file, read through a handle that follows no link.
+ */
+async function digestFile(path) {
+  const noFollow = Number.isInteger(constants.O_NOFOLLOW) ? constants.O_NOFOLLOW : 0;
+  const handle = await open(path, constants.O_RDONLY | noFollow);
+  try {
+    const hash = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(1024 * 1024);
+    for (;;) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (bytesRead === 0) break;
+      hash.update(chunk.subarray(0, bytesRead));
+    }
+    return hash.digest("hex");
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
  * Copy a runtime binary into the store and KEEP the copy.
  *
  * The copy is stored under its own sha256, so the bytes are named by their
@@ -437,6 +457,17 @@ export async function retainRuntime({ source, env = process.env } = {}) {
         bytes += read;
         await out.write(chunk.subarray(0, read), 0, read);
       }
+      // An EMPTY file never reaches the format check above, because no chunk
+      // is ever read: the loop reads nothing and breaks.  It is not a
+      // runtime, and storing it would leave the store holding a kept "runtime"
+      // that is not a program.
+      if (bytes === 0 || format === null) {
+        throw new ResolutionError(
+          `The runtime at ${named} is empty; the store keeps the bytes of the program that runs a release`,
+          "runtime-not-binary",
+          { source: named },
+        );
+      }
       digest = hash.digest("hex");
       await out.chmod(0o555);
     } finally {
@@ -461,11 +492,22 @@ export async function retainRuntime({ source, env = process.env } = {}) {
     if (error?.code !== "EEXIST") {
       throw new ResolutionError(`The retained runtime could not be stored at ${path}: ${error?.message || error}`, "runtime-not-stored", { path });
     }
-    // Another retain of the same bytes got there first.  Its file is kept: it
-    // is the same bytes under the same name.
+    // Another retain of the same bytes got there first.  Its file is kept:
+    // it is the same bytes under the same name -- but only if it IS those
+    // bytes.  A file that is already at that name and holds different bytes
+    // was planted or corrupted, and the kept runtime is named by its digest,
+    // so the bytes have to match the name before the file is trusted.
     const existing = await lstat(path).catch(() => null);
     if (!existing || !existing.isFile() || existing.isSymbolicLink()) {
       throw new ResolutionError(`The retained runtime at ${path} is not a regular file`, "runtime-not-stored", { path });
+    }
+    const keptDigest = await digestFile(path);
+    if (keptDigest !== digest) {
+      throw new ResolutionError(
+        `The file at ${path} holds bytes that are not the digest it is named by (${digest})`,
+        "runtime-not-stored",
+        { path },
+      );
     }
   }
   return { path, sha256: digest, bytes, format };
