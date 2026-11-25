@@ -16,6 +16,8 @@ BotFleetMac's Settings › Lifecycle section carries the product half of the Opt
 4. `launchctl enable`, then `bootstrap` only when `launchctl print` says the job is not loaded, then `kickstart`.
 5. The job is watched for eight looks a quarter of a second apart.  A process still behind the label at the last look is the start.  Otherwise the stop marker is put back with the bytes it had.
 
+The control itself is a button in Settings › Lifecycle and a row in the Fleet menu.  Both gate on those same three facts, and the section probes launchd beside the status read so the offer has its third fact whether or not the harness is there.
+
 Start Server is offered only when three facts agree:  the wrapper can be started through the policy, nothing answered on the harness port, and the job is installed without a live process behind the label.  The third is what keeps a hung server from being offered a start, because it refuses the connection too while launchd still shows its process.  A refused connection is the only read failure that counts as nothing listening.  A timeout or an unreadable reply does not.
 
 ## Fixture Verification

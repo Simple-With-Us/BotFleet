@@ -179,11 +179,18 @@ public enum MacServerPresence: Equatable, Sendable {
     /// could not be read.  None of that says whether the server is up.
     case unknown
 
-    /// The presence a status read leaves behind:  a status, or the error it
-    /// ended with, or neither before the first read.
+    /// The presence a status read leaves behind:  the error it ended with, or
+    /// the status when the read had none, or neither before the first read.
+    ///
+    /// The error is read first, and on purpose.  A failed read keeps the last
+    /// known status in place so the section can show it beside the reason, so
+    /// a stale status beside a refused connection is a server that answered
+    /// earlier and has stopped since —  which is exactly the case the start
+    /// control exists for.  An error that is not a refusal, an older server or
+    /// a foreign service, says only that something answered.
     public static func after(status: MacControlStatus?, error: MacControlStatusError?) -> MacServerPresence {
-        if status != nil { return .answering }
-        return error == .notReachable ? .refused : .unknown
+        if let error = error { return error == .notReachable ? .refused : .unknown }
+        return status == nil ? .unknown : .answering
     }
 }
 

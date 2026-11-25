@@ -286,6 +286,14 @@ struct MacServerStartTests {
                       .httpError(statusCode: 503, message: "starting")] {
             #expect(MacServerPresence.after(status: nil, error: error) == .unknown)
         }
+        //  A failed read keeps the last known status beside the reason it
+        //  failed, so a status is only evidence while no error contradicts
+        //  it:  a server that answered and has since stopped still shows its
+        //  status, and it is the refusal that says it is down.
+        let stale = MacControlStatus(activeBotCount: 3, localVMs: [])
+        #expect(MacServerPresence.after(status: stale, error: .notReachable) == .refused)
+        #expect(MacServerPresence.after(status: stale, error: .outdatedServer) == .unknown)
+        #expect(MacServerPresence.after(status: stale, error: nil) == .answering)
     }
 
     @Test("A refused connection is told apart from a reply that could not be read")
