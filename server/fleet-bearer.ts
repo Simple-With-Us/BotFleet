@@ -33,6 +33,11 @@
 //      read is one folder per seat, so a bearer for one bot cannot
 //      authenticate another.
 //
+// When the host names no fleet-ops project, server-side delivery is off by
+// configuration:  no read is attempted and no gap is reported, because the
+// seat's own custody (its private file) may well hold the bearer this
+// module never saw.  Crying wolf there would hide a real gap later.
+//
 // The read is not awaited by the drivers, for the same reason the CLI login
 // read is not:  every driver claims its thread with a guard and registers
 // the claim a few lines later, and that segment has to stay free of
@@ -42,7 +47,7 @@
 // in the background.
 
 import { FLEET_BEARER_ENV_NAME, fleetBearerSecretPath } from "./secret-map.ts";
-import { infisical } from "./infisical.ts";
+import { fleetOpsProjectId, infisical } from "./infisical.ts";
 import { redactSecretsInText } from "./redact.ts";
 
 /** The read a fleet bearer comes from.
@@ -120,6 +125,7 @@ export function resetFleetBearerCache(): void {
   cache.clear();
   inflight.clear();
   reportedWithoutBearer.clear();
+  reportedDeliveryOff = false;
 }
 
 /** The seat's entry, and the seat moved to the most recently used end of
@@ -210,6 +216,10 @@ async function readSeat(seat: string, secretPath: string): Promise<void> {
 export function primeFleetBearer(seat: string | null | undefined): void {
   const secretPath = seat ? fleetBearerSecretPath(seat) : null;
   if (!seat || !secretPath) return;
+  if (!serverDeliveryConfigured()) {
+    noteDeliveryOff();
+    return;
+  }
   const entry = readEntry(seat);
   const now = Date.now();
   if (entry && now - entry.readAt < FLEET_BEARER_TTL_MS) return;
@@ -259,6 +269,10 @@ function noteReportedWithoutBearer(seat: string): void {
  * the bot still has every other tool it was given. */
 export function fleetBearerEnvironment(seat: string | null | undefined) {
   if (!seat) return {};
+  // Delivery that is off serves nothing, not even a value read while it
+  // was on:  injecting it would mask the seat's own custody, which the
+  // tools only consult when the environment carries no bearer.
+  if (!serverDeliveryConfigured()) return {};
   const entry = readEntry(seat);
   if (!entry?.value) {
     // A read that is still in flight is not an absent bearer:  the first
@@ -276,6 +290,27 @@ export function fleetBearerEnvironment(seat: string | null | undefined) {
     return {};
   }
   return { [FLEET_BEARER_ENV_NAME]: entry.value };
+}
+
+/** True while this host names the fleet's project and server-side
+ * delivery is configured.  Read per call:  the config overlay can land
+ * the locator at any time, and a captured answer would go stale. */
+function serverDeliveryConfigured(): boolean {
+  return fleetOpsProjectId() !== "";
+}
+
+let reportedDeliveryOff = false;
+
+/** No fleet-ops project on this host is a configuration state, not a
+ * failed read:  the seat's tools fall back to the seat's own custody,
+ * so a missing-bearer report would accuse a gap the seat may not have.
+ * Said once, at info, because it is the expected state on such a host. */
+function noteDeliveryOff(): void {
+  if (reportedDeliveryOff) return;
+  reportedDeliveryOff = true;
+  console.info(
+    "[fleet-bearer] no fleet-ops project is configured on this host; server-side bearer delivery is off and each seat's own custody applies",
+  );
 }
 
 /** Say once that a seat has no bearer.  The seat is named, because the

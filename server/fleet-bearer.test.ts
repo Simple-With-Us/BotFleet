@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   FLEET_BEARER_ENV_NAME,
@@ -50,7 +50,14 @@ function failingVault() {
   return { calls, reader };
 }
 
+// The reads under test only run while the host names the fleet's project;
+// the delivery-off host has its own describe below.
+beforeEach(() => {
+  process.env.INFISICAL_FLEET_OPS_PROJECT_ID = "fleet-ops-test-project";
+});
+
 afterEach(() => {
+  delete process.env.INFISICAL_FLEET_OPS_PROJECT_ID;
   setFleetBearerVault(null);
   resetFleetBearerCache();
 });
@@ -78,6 +85,46 @@ describe("the fleet bearer table", () => {
     // The bearer is not a config field and does not live in BotFleet's own
     // project, so nothing in the config's own tables may claim it.
     expect(FLEET_BEARER_ENV_NAME).not.toBe("GH_TOKEN");
+  });
+});
+
+
+describe("a host with no fleet-ops project", () => {
+  it("attempts no read, reports no gap, and launches the child without a bearer", async () => {
+    delete process.env.INFISICAL_FLEET_OPS_PROJECT_ID;
+    const vault = stubVault({ [FLEET_BEARER_ENV_NAME]: SENTINEL_BEARER });
+    setFleetBearerVault(vault.reader as never);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    primeFleetBearer("BF-ECHO");
+    await awaitFleetBearer("BF-ECHO");
+    expect(vault.calls).toEqual([]);
+    expect(fleetBearerEnvironment("BF-ECHO")).toEqual({});
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("stops serving a cached bearer when the project locator is removed", async () => {
+    const vault = stubVault({ [FLEET_BEARER_ENV_NAME]: SENTINEL_BEARER });
+    setFleetBearerVault(vault.reader as never);
+    primeFleetBearer("BF-ECHO");
+    await awaitFleetBearer("BF-ECHO");
+    expect(fleetBearerEnvironment("BF-ECHO")).toEqual({ [FLEET_BEARER_ENV_NAME]: SENTINEL_BEARER });
+    delete process.env.INFISICAL_FLEET_OPS_PROJECT_ID;
+    expect(fleetBearerEnvironment("BF-ECHO")).toEqual({});
+    expect(seatCredentialEnvironment("BF-ECHO")).not.toHaveProperty(FLEET_BEARER_ENV_NAME);
+  });
+
+  it("starts reading once the project locator lands", async () => {
+    delete process.env.INFISICAL_FLEET_OPS_PROJECT_ID;
+    const vault = stubVault({ [FLEET_BEARER_ENV_NAME]: SENTINEL_BEARER });
+    setFleetBearerVault(vault.reader as never);
+    primeFleetBearer("BF-ECHO");
+    expect(vault.calls).toEqual([]);
+    process.env.INFISICAL_FLEET_OPS_PROJECT_ID = "fleet-ops-test-project";
+    primeFleetBearer("BF-ECHO");
+    await awaitFleetBearer("BF-ECHO");
+    expect(vault.calls).toEqual([{ project: "fleet-ops", secretPath: "/fleet-bearers/BF-ECHO" }]);
+    expect(fleetBearerEnvironment("BF-ECHO")).toEqual({ [FLEET_BEARER_ENV_NAME]: SENTINEL_BEARER });
   });
 });
 
