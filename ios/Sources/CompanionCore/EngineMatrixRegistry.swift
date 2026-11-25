@@ -287,7 +287,7 @@ public enum EngineMatrixRegistry {
             baseArguments: ["-p", "--verbose", "--output-format", "stream-json", "--input-format", "stream-json"],
             wireProtocol: .streamJSONStdio,
             authRequirement: .cliManagedLogin(cliBinary: "claude"),
-            defaultModel: "claude-sonnet-4-6"
+            defaultModel: "claude-sonnet-5-5"
         ),
         .codex: EngineDriverDescriptor(
             id: .codex,
