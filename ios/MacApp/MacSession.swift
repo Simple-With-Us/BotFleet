@@ -577,6 +577,19 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     private func reconcileWaitingThreadPin() {
         if waitingThreadPin.dropIfSelectionMoved(toBotId: selectedBotId) {
             selectedThreadId = nil
+            return
+        }
+        // A thread picked under another bot must not stay active when the
+        // sidebar moves to a different bot: `activeThreadId` prefers the
+        // picked thread, so without this the transcript keeps showing the
+        // previous bot's conversation under the new bot's name.  The picked
+        // thread survives only while it is the selected bot's own main
+        // thread or the thread the menubar pinned for that bot.
+        if case .bot(let botId) = selection,
+           let picked = selectedThreadId,
+           picked != state.bots.first(where: { $0.id == botId })?.threadId,
+           waitingThreadPin.threadId != picked {
+            selectedThreadId = nil
         }
     }
 
@@ -1048,12 +1061,12 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         defer { isCreatingBot = false }
         do {
             let bot = try await client.createBot()
-            // The roster snapshot is the source of truth: refetch it so the
-            // new bot arrives with the same fields every other client sees,
-            // then select it and open its main thread.
-            if let fleet = try? await client.fleet() {
-                state.hydrate(fleet)
-            }
+            // Creating a bot does not broadcast, so fold the new bot in
+            // optimistically, exactly as the phone does (Session.createBot):
+            // the bot is already made, and selecting a bot that is missing
+            // from state would leave the sidebar pointing at nothing.  The
+            // stream and the next roster snapshot reconcile it from there.
+            state.apply(.bot(bot))
             selection = .bot(bot.id)
             selectedThreadId = bot.threadId
             fleetActionErrorMessage = nil
