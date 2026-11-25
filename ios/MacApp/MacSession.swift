@@ -584,13 +584,19 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         // picked thread, so without this the transcript keeps showing the
         // previous bot's conversation under the new bot's name.  The picked
         // thread survives only while it is the selected bot's own main
-        // thread or the thread the menubar pinned for that bot.
-        if case .bot(let botId) = selection,
-           let bot = state.bots.first(where: { $0.id == botId }),
-           let picked = selectedThreadId,
-           picked != bot.threadId,
-           waitingThreadPin.threadId != picked {
-            selectedThreadId = nil
+        // thread or the thread the menubar pinned for that bot.  A selected
+        // bot the roster does not know (deleted, or a pick carried over
+        // from before a reconnect) keeps no pick either: every legitimate
+        // in-session pick is made while its bot is in the roster or pinned
+        // for it, so an unknown bot means the pick is stale, not pending.
+        if case .bot(let botId) = selection, let picked = selectedThreadId {
+            let bot = state.bots.first(where: { $0.id == botId })
+            let keepsPick = bot.map { picked == $0.threadId } ?? false
+                || waitingThreadPin.threadId == picked
+                || (bot == nil && waitingThreadPin.botId == botId)
+            if !keepsPick {
+                selectedThreadId = nil
+            }
         }
     }
 
