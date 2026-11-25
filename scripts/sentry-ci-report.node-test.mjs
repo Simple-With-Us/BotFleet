@@ -75,3 +75,45 @@ test("the reporter workflow runs for a successful main-branch catch-up", () => {
   assert.match(gate, /event == 'workflow_run'/);
   assert.match(gate, /event == 'workflow_dispatch'/);
 });
+
+function monitorConfig(workflowName, cronExpr) {
+  const probe = spawnSync(
+    "python3",
+    [
+      "-c",
+      [
+        "import importlib.util, json, pathlib",
+        "p = pathlib.Path('scripts/sentry-ci-report.py')",
+        "s = importlib.util.spec_from_file_location('sentry_ci_report', p)",
+        "m = importlib.util.module_from_spec(s)",
+        "s.loader.exec_module(m)",
+        "print(json.dumps(m.monitor_config_for(" +
+          JSON.stringify(workflowName) +
+          ", " +
+          JSON.stringify(cronExpr) +
+          ")))",
+      ].join("\n"),
+    ],
+    { cwd: ROOT, encoding: "utf8" },
+  );
+  assert.equal(probe.status, 0, probe.stderr);
+  return JSON.parse(probe.stdout);
+}
+
+test("the 15-minute auto-merge sweep sends no cron check-in (AFC-626)", () => {
+  assert.equal(checkinStatus("Auto-merge PRs", "schedule", "main", "success"), null);
+  assert.equal(checkinStatus("Auto-merge PRs", "schedule", "main", "failure"), null);
+});
+
+test("sub-hourly monitors need three misses in a row before they turn red (AFC-626)", () => {
+  const catchUp = monitorConfig("Vercel production catch-up", "41 * * * *");
+  assert.equal(catchUp.failure_issue_threshold, 3);
+  assert.equal(catchUp.recovery_threshold, 1);
+  assert.equal(catchUp.checkin_margin, 75);
+  const ship = monitorConfig("iOS TestFlight ship (GitHub-hosted macOS)", "18,48 * * * *");
+  assert.equal(ship.failure_issue_threshold, 3);
+  assert.equal(ship.checkin_margin, 105);
+  const weekly = monitorConfig("CI", "17 9 * * 1");
+  assert.equal(weekly.failure_issue_threshold, undefined);
+  assert.equal(weekly.checkin_margin, 55);
+});
