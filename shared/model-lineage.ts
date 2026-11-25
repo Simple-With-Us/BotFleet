@@ -256,7 +256,10 @@ const GROK: Family = {
 // member of a class attribute to that member (performanceStatsCarrier).
 // Gemini 4 Argon is not a BotFleet model option at all (owner
 // correction, 2026-11-21) and Carbon is outside the scheme: both are
-// deliberately unclassified, so their stats stay their own.  The Gemini
+// deliberately unclassified, so their stats stay their own.  Flash Lite
+// ids (gemini-<version>-flash-lite) are their own lite class (owner,
+// 2026-11-25): their stats carry to the current Flash Lite member and
+// never fold into the Flash class's Hydrogen.  The Gemini
 // driver kinds are deliberately absent from DRIVER_LINEAGE below —
 // selection, picker, and latest resolution for them do not change.
 const GEMINI_FLASH = /^gemini-(\d+)(?:\.(\d+))?-flash(?:-(?:lite|low|medium|high|xhigh))?$/;
