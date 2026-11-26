@@ -34,12 +34,53 @@ export const BRIDGE_ALLOWED_ROUTES = [
   { method: 'POST', path: '/api/companion/pairing/redeem', local: true, description: 'redeem a pairing code or token once' },
   { method: 'GET', path: '/api/companion/devices', local: true, description: 'public device list' },
   { method: 'DELETE', path: '/api/companion/devices/:id', local: true, description: 'revoke one device' },
+  { method: 'POST', path: '/api/companion/push-token', local: true, requiresDevice: true, description: 'register device APNs alert token' },
+  { method: 'POST', path: '/api/companion/live-activity-token', local: true, requiresDevice: true, description: 'register device Live Activity push-to-start token' },
+  { method: 'GET', path: '/api/companion/push-health', local: true, requiresDevice: true, description: 'APNs sender health without key material' },
   { method: 'GET', path: '/api/fleet', local: false, description: 'roster and fleet state hydration' },
   { method: 'GET', path: '/api/threads/:id', local: false, description: 'thread hydration' },
   { method: 'POST', path: '/api/threads/:id/messages', local: false, description: 'message and approval actions' },
   { method: 'POST', path: '/api/threads/:id/interrupt', local: false, description: 'interrupt a running turn' },
   { method: 'GET', path: '/api/events', local: false, description: 'SSE stream; cursor params pass through untouched' },
 ];
+
+/**
+ * Whether a local bridge route requires an authenticated paired device.
+ * Kept separate from `bridgeRouteDecision` so existing callers and tests
+ * continue to observe the exact `{ ok, upstream, local }` decision shape.
+ *
+ * @param {string} method
+ * @param {string} url
+ * @returns {boolean}
+ */
+export function bridgeLocalRouteRequiresDevice(method, url) {
+  const verb = String(method ?? '').toUpperCase();
+  const raw = String(url ?? '');
+  const queryIndex = raw.indexOf('?');
+  const path = (queryIndex === -1 ? raw : raw.slice(0, queryIndex)) || '/';
+  const segments = path.split('/').slice(1);
+  const decoded = [];
+  for (const segment of segments) {
+    const form = decodeSegment(segment);
+    if (form === null || form === '' || form === '.' || form === '..' || form.includes('/')) return false;
+    decoded.push(form);
+  }
+  for (const route of BRIDGE_ALLOWED_ROUTES) {
+    if (route.method !== verb) continue;
+    const pattern = route.path.split('/').slice(1);
+    if (pattern.length !== decoded.length) continue;
+    let matches = true;
+    for (let index = 0; index < pattern.length; index += 1) {
+      const part = pattern[index];
+      if (!part.startsWith(':') && part !== decoded[index]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return route.requiresDevice === true;
+  }
+  return false;
+}
 
 /**
  * Decode one path segment for the traversal check. Returns null when the
@@ -668,5 +709,168 @@ export function buildBridgeAlertPayload({ title, body, threadId, kind } = {}) {
     'content-available': 1,
   };
   if (String(threadId ?? '') !== '') aps['thread-id'] = String(threadId);
+  return { aps };
+}
+
+const isStringValue = (value) => Object.prototype.toString.call(value) === '[object String]';
+const isNumberValue = (value) => Object.prototype.toString.call(value) === '[object Number]' && Number.isFinite(value);
+const isBooleanValue = (value) => value === true || value === false;
+
+/**
+ * Validate and normalize a hex APNs device or Live Activity token.
+ * Matches `Client.swift` (>= 64 lowercase hex characters).
+ *
+ * @param {unknown} raw
+ * @returns {string|null}
+ */
+export function validateBridgePushToken(raw) {
+  if (!isStringValue(raw)) return null;
+  const normalized = String(raw).replace(/\s+/g, '').toLowerCase();
+  if (!/^[0-9a-f]{64,512}$/.test(normalized)) return null;
+  return normalized;
+}
+
+/** Literal Swift type name decoded by ActivityKit on iOS. */
+export const LIVE_ACTIVITY_ATTRIBUTES_TYPE = 'BotActivityAttributes';
+
+/** Seconds between Unix epoch and Apple's reference date (2001-01-01T00:00:00Z). */
+export const APPLE_REFERENCE_DATE_OFFSET = 978_307_200;
+
+/** Default Live Activity palette name when the notify frame carries none. */
+export const DEFAULT_LIVE_ACTIVITY_COLOR = 'gray';
+
+/**
+ * Derive the Live Activity APNs topic from the bundle identifier.
+ *
+ * @param {string} bundleId
+ * @returns {string}
+ */
+export function liveActivityTopic(bundleId) {
+  return `${String(bundleId ?? '').trim()}.push-type.liveactivity`;
+}
+
+/**
+ * True when an alert kind represents a blocking user prompt (approval or question).
+ *
+ * @param {unknown} kind
+ * @returns {boolean}
+ */
+export function isBlockingAlertKind(kind) {
+  return BLOCKING_KINDS.has(String(kind ?? ''));
+}
+
+/**
+ * Full APNs alert envelope mirroring `companion/src/apns.ts` `apnsPayload`.
+ *
+ * @param {{title?: string, body?: string, threadId?: string, botId?: string, kind?: string, requestId?: string, tool?: string, seq?: number}} [input]
+ * @returns {Record<string, unknown>}
+ */
+export function buildBridgeAlertEnvelope({ title, body, threadId, botId, kind, requestId, tool, seq } = {}) {
+  const payload = buildBridgeAlertPayload({ title, body, threadId, kind });
+  if (isStringValue(threadId) && threadId !== '') payload.threadId = threadId;
+  if (isStringValue(botId) && botId !== '') payload.botId = botId;
+  if (isStringValue(kind) && kind !== '') payload.kind = kind;
+  if (isStringValue(requestId) && requestId !== '') payload.requestId = requestId;
+  if (isStringValue(tool) && tool !== '') payload.tool = tool;
+  if (Number.isFinite(seq)) payload.seq = seq;
+  return payload;
+}
+
+/**
+ * Map a harness notify object onto `BotActivityAttributes` and `ContentState`.
+ * Returns null if `raw` is not a plain object or has malformed field types.
+ *
+ * @param {unknown} raw
+ * @param {number} [nowMs]
+ * @returns {{attributes: Record<string, unknown>, state: Record<string, unknown>, alert: {title: string, body: string}}|null}
+ */
+export function buildBridgeLiveActivityContent(raw, nowMs = Date.now()) {
+  if (!raw || Object(raw) !== raw || Array.isArray(raw)) return null;
+  const str = (key) => {
+    const val = raw[key];
+    if (val === undefined || val === null) return undefined;
+    return isStringValue(val) ? val : null;
+  };
+  const title = str('title');
+  const body = str('body');
+  const kind = str('kind');
+  const threadId = str('threadId');
+  const botId = str('botId');
+  const requestId = str('requestId');
+  const botName = str('botName');
+  const color = str('color');
+  if ([title, body, kind, threadId, botId, requestId, botName, color].includes(null)) return null;
+  let options;
+  if (raw.options !== undefined && raw.options !== null) {
+    if (!Array.isArray(raw.options) || !raw.options.every((item) => isStringValue(item))) return null;
+    options = [...raw.options];
+  }
+  let isPermission;
+  if (raw.isPermission !== undefined && raw.isPermission !== null) {
+    if (!isBooleanValue(raw.isPermission)) return null;
+    isPermission = raw.isPermission;
+  }
+  let sinceMs = nowMs;
+  if (raw.since !== undefined && raw.since !== null) {
+    if (!isNumberValue(raw.since)) return null;
+    sinceMs = raw.since;
+  }
+
+  const blocking = isBlockingAlertKind(kind);
+  const name = botName ?? title ?? 'BotFleet';
+  const resolvedPermission = isPermission ?? (kind === 'approval');
+  const headline = blocking ? `${name} needs you` : `${name} is working`;
+  const state = {
+    face: blocking ? 'thinking' : 'idle',
+    kind: blocking ? 'needsYou' : kind === 'done' ? 'toReview' : 'working',
+    headline,
+    line: body ?? '',
+    options: options ?? (resolvedPermission ? ['Allow', 'Deny'] : []),
+    isPermission: resolvedPermission,
+    since: sinceMs / 1000 - APPLE_REFERENCE_DATE_OFFSET,
+  };
+  if (requestId !== undefined) state.requestId = requestId;
+  return {
+    attributes: {
+      botId: botId ?? '',
+      threadId: threadId ?? '',
+      name,
+      color: color ?? DEFAULT_LIVE_ACTIVITY_COLOR,
+    },
+    state,
+    alert: { title: headline, body: body ?? '' },
+  };
+}
+
+/**
+ * Build the APNs payload for a Live Activity start, update, or end push.
+ *
+ * @param {{event: 'start'|'update'|'end', attributes: Record<string, unknown>, state: Record<string, unknown>, alert?: {title: string, body: string}, timestamp?: number, dismissalDate?: number}} input
+ * @returns {{aps: Record<string, unknown>}}
+ */
+export function buildBridgeLiveActivityPayload({
+  event,
+  attributes,
+  state,
+  alert,
+  timestamp,
+  dismissalDate,
+} = {}) {
+  const ts = Number.isFinite(timestamp) ? Math.floor(timestamp) : Math.floor(Date.now() / 1000);
+  const { requestId, ...restState } = state ?? {};
+  const contentState = requestId === undefined ? { ...restState } : { ...restState, requestId };
+  const aps = {
+    timestamp: ts,
+    event,
+    'content-state': contentState,
+  };
+  if (event === 'start') {
+    aps['attributes-type'] = LIVE_ACTIVITY_ATTRIBUTES_TYPE;
+    aps.attributes = attributes;
+    aps.alert = alert ?? { title: String(state?.headline ?? ''), body: String(state?.line ?? '') };
+  }
+  if (event === 'end' && Number.isFinite(dismissalDate)) {
+    aps['dismissal-date'] = Math.floor(dismissalDate);
+  }
   return { aps };
 }

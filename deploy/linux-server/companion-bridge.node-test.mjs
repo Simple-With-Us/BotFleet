@@ -8,12 +8,17 @@ import test from "node:test";
 import {
   BRIDGE_ALLOWED_ROUTES,
   bridgeDeviceDecision,
+  bridgeLocalRouteRequiresDevice,
   bridgeRouteDecision,
   buildBridgeAlertPayload,
+  buildBridgeLiveActivityContent,
+  buildBridgeLiveActivityPayload,
+  liveActivityTopic,
   openBridgePairingWindow,
   pushSenderForDevice,
   redeemBridgePairingWindow,
   sha256Hex,
+  validateBridgePushToken,
 } from "./companion-bridge.mjs";
 
 const NOW = 1_700_000_000_000;
@@ -47,6 +52,9 @@ test("every companion route the Phone tab needs is on the bridge", () => {
     ["POST", "/api/companion/pairing/redeem", true],
     ["GET", "/api/companion/devices", true],
     ["DELETE", "/api/companion/devices/d-1", true],
+    ["POST", "/api/companion/push-token", true],
+    ["POST", "/api/companion/live-activity-token", true],
+    ["GET", "/api/companion/push-health", true],
     ["GET", "/api/fleet", false],
     ["GET", "/api/threads/t-1", false],
     ["POST", "/api/threads/t-1/messages", false],
@@ -57,6 +65,11 @@ test("every companion route the Phone tab needs is on the bridge", () => {
     assert.equal(decision.ok, true, `${method} ${url}`);
     assert.equal(decision.local, local, `${method} ${url} locality`);
   }
+  assert.equal(bridgeLocalRouteRequiresDevice("POST", "/api/companion/push-token"), true);
+  assert.equal(bridgeLocalRouteRequiresDevice("POST", "/api/companion/live-activity-token"), true);
+  assert.equal(bridgeLocalRouteRequiresDevice("GET", "/api/companion/push-health"), true);
+  assert.equal(bridgeLocalRouteRequiresDevice("GET", "/api/companion/devices"), false);
+  assert.equal(bridgeLocalRouteRequiresDevice("POST", "/api/companion/pairing/redeem"), false);
 });
 
 test("unknown paths, wrong methods, and traversal are refused", () => {
@@ -639,4 +652,36 @@ test("a benign key before the visited cap still survives", () => {
   const decision = redeem(window, PROOF, { requestId: "pair-request-00000001", replayDeviceId: "d-9" });
   assert.equal(decision.ok, true);
   assert.equal(decision.window.beforeCap, "kept-before-the-cap");
+});
+
+test("push token validation and Live Activity payload match iOS ActivityKit expectations", () => {
+  assert.equal(validateBridgePushToken("  " + "A".repeat(64) + " "), "a".repeat(64));
+  assert.equal(validateBridgePushToken("short"), null);
+  assert.equal(validateBridgePushToken("z".repeat(64)), null);
+  assert.equal(validateBridgePushToken(12345), null);
+  assert.equal(liveActivityTopic("app.botfleet.ios"), "app.botfleet.ios.push-type.liveactivity");
+
+  const content = buildBridgeLiveActivityContent({
+    title: "Forge",
+    body: "Allow edit?",
+    kind: "approval",
+    threadId: "t-1",
+    botId: "b-1",
+    requestId: "req-1",
+    color: "blue",
+  }, 1_700_000_000_000);
+  assert.ok(content);
+  assert.equal(content.attributes.botId, "b-1");
+  assert.equal(content.state.kind, "needsYou");
+  assert.deepEqual(content.state.options, ["Allow", "Deny"]);
+  const startPayload = buildBridgeLiveActivityPayload({
+    event: "start",
+    attributes: content.attributes,
+    state: content.state,
+    alert: content.alert,
+    timestamp: 1_700_000_000,
+  });
+  assert.equal(startPayload.aps["attributes-type"], "BotActivityAttributes");
+  assert.equal(startPayload.aps.event, "start");
+  assert.equal(startPayload.aps["content-state"].requestId, "req-1");
 });

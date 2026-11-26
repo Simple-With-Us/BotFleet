@@ -32,12 +32,13 @@
  * malformed entry is skipped rather than trusted.  The credential itself is
  * returned to the phone once, at redeem time, and never again.
  *
- * What this file is NOT: it does not send push notifications, it does not
- * bind anything but loopback, it does not retire the Node `:8810`
- * sidecar, and it does not change any route on the harness.  The APNs
- * material the Linux sender would use is resolved by
+ * What this file is NOT: it does not bind anything but loopback, it does
+ * not retire the Node `:8810` sidecar, and it does not change any route on
+ * the harness.  The APNs material the Linux sender uses is resolved by
  * `companion-bridge-apns.mjs` through the scoped read-only Infisical
- * binding, and nothing here sends it anywhere.
+ * binding, and when present, `companion-bridge-apns-sender.mjs` delivers
+ * background alerts and Live Activity push-to-start notifications for
+ * disconnected paired devices over HTTP/2.
  */
 
 import crypto from 'node:crypto';
@@ -48,18 +49,24 @@ import { pathToFileURL } from 'node:url';
 import {
   BRIDGE_ALLOWED_ROUTES,
   bridgeDeviceDecision,
+  bridgeLocalRouteRequiresDevice,
   bridgeRouteDecision,
   OMB_PAIR_TOKEN,
   openBridgePairingWindow,
   redeemBridgePairingWindow,
   replayableRequestId,
   sha256Hex,
+  validateBridgePushToken,
 } from './companion-bridge.mjs';
 import {
   readBootstrapTokenFile,
   readInfisicalSecrets,
 } from '../../electron/infisical-read.mjs';
 import { bridgeApnsMaterial } from './companion-bridge-apns.mjs';
+import {
+  createBridgeApnsSender,
+  startBridgeHarnessEventSubscriber,
+} from './companion-bridge-apns-sender.mjs';
 import { loadBridgeState, saveBridgeState } from './companion-bridge-state.mjs';
 
 /** The loopback address the listener binds.  Never a routable address. */
@@ -332,6 +339,15 @@ const PairingRedeemSchema = z.strictObject({
   requestId: z.string().max(128).optional(),
 });
 
+const PushTokenSchema = z.strictObject({
+  token: z.unknown(),
+});
+
+const LiveActivityTokenSchema = z.strictObject({
+  token: z.unknown().optional(),
+  kind: z.unknown().optional(),
+});
+
 /**
  * The bridge's device registry: digests only, and never a cleartext
  * credential.
@@ -358,13 +374,19 @@ export class BridgeDeviceRegistry {
       // be zero, and zero is a stamp.
       const rawRevoked = entry.revokedAtMs;
       const revokedAtMs = rawRevoked === null || rawRevoked === undefined ? null : Number(rawRevoked);
-      this.devices.push({
+      const validRevoked = revokedAtMs !== null && Number.isFinite(revokedAtMs) ? revokedAtMs : null;
+      const pushToken = validRevoked === null ? validateBridgePushToken(entry.pushToken) : null;
+      const liveActivityToken = validRevoked === null ? validateBridgePushToken(entry.liveActivityToken) : null;
+      const record = {
         id,
         name: String(entry.name ?? ''),
         tokenDigest,
         pairedAtMs: Number.isFinite(pairedAtMs) ? pairedAtMs : 0,
-        revokedAtMs: revokedAtMs !== null && Number.isFinite(revokedAtMs) ? revokedAtMs : null,
-      });
+        revokedAtMs: validRevoked,
+      };
+      if (pushToken) record.pushToken = pushToken;
+      if (liveActivityToken) record.liveActivityToken = liveActivityToken;
+      this.devices.push(record);
     }
   }
 
@@ -460,7 +482,95 @@ export class BridgeDeviceRegistry {
     const row = this.devices.find((entry) => entry.id === String(id ?? ''));
     if (!row) return false;
     if (row.revokedAtMs === null) row.revokedAtMs = Number(atMs ?? 0);
+    delete row.pushToken;
+    delete row.liveActivityToken;
     return true;
+  }
+
+  /**
+   * Store a validated push token for an active paired device.
+   *
+   * @param {string} id
+   * @param {string} rawToken
+   * @returns {{ok: true, token: string, previous?: string} | {ok: false, reason: string}}
+   */
+  setPushToken(id, rawToken) {
+    const row = this.devices.find((entry) => entry.id === String(id ?? '') && entry.revokedAtMs === null);
+    if (!row) return { ok: false, reason: 'unknown device' };
+    const token = validateBridgePushToken(rawToken);
+    if (!token) return { ok: false, reason: 'that push token is not usable' };
+    const previous = row.pushToken;
+    row.pushToken = token;
+    return { ok: true, token, previous };
+  }
+
+  /**
+   * Clear a device's push token (optionally matching only the expected rejected token).
+   *
+   * @param {string} id
+   * @param {string} [expectedToken]
+   * @returns {boolean}
+   */
+  clearPushToken(id, expectedToken) {
+    const row = this.devices.find((entry) => entry.id === String(id ?? ''));
+    if (!row || !row.pushToken) return false;
+    if (expectedToken !== undefined) {
+      const normalized = validateBridgePushToken(expectedToken);
+      if (normalized && row.pushToken !== normalized) return false;
+    }
+    delete row.pushToken;
+    return true;
+  }
+
+  /**
+   * Store a validated Live Activity push-to-start token for an active paired device.
+   *
+   * @param {string} id
+   * @param {string} rawToken
+   * @returns {{ok: true, token: string, previous?: string} | {ok: false, reason: string}}
+   */
+  setLiveActivityToken(id, rawToken) {
+    const row = this.devices.find((entry) => entry.id === String(id ?? '') && entry.revokedAtMs === null);
+    if (!row) return { ok: false, reason: 'unknown device' };
+    const token = validateBridgePushToken(rawToken);
+    if (!token) return { ok: false, reason: 'that Live Activity token is not usable' };
+    const previous = row.liveActivityToken;
+    row.liveActivityToken = token;
+    return { ok: true, token, previous };
+  }
+
+  /**
+   * Clear a device's Live Activity token (optionally matching only the expected rejected token).
+   *
+   * @param {string} id
+   * @param {string} [expectedToken]
+   * @returns {boolean}
+   */
+  clearLiveActivityToken(id, expectedToken) {
+    const row = this.devices.find((entry) => entry.id === String(id ?? ''));
+    if (!row || !row.liveActivityToken) return false;
+    if (expectedToken !== undefined) {
+      const normalized = validateBridgePushToken(expectedToken);
+      if (normalized && row.liveActivityToken !== normalized) return false;
+    }
+    delete row.liveActivityToken;
+    return true;
+  }
+
+  /** Active paired devices holding at least one push channel token. */
+  pushTargets() {
+    return this.active()
+      .filter((entry) => isText(entry.pushToken) || isText(entry.liveActivityToken))
+      .map((entry) => ({
+        deviceId: entry.id,
+        pushToken: entry.pushToken,
+        liveActivityToken: entry.liveActivityToken,
+      }));
+  }
+
+  /** Active paired devices holding a push alert token. */
+  pushTokenCount() {
+    return this.active().filter((entry) => isText(entry.pushToken)).length;
   }
 
   /** The public rows: no digest and no credential. */
@@ -783,12 +893,17 @@ export function createCompanionBridge({
   log,
   now = () => Date.now(),
   persist = () => true,
+  apns,
+  apnsSender,
+  startEventSubscriber = false,
 } = {}) {
   if (!state || !isObject(state)) throw new Error('createCompanionBridge needs the bridge state');
   const logger = isCallable(log) ? log : () => {};
   const port = Number(upstreamPort) || BRIDGE_UPSTREAM_PORT;
   const host = String(upstreamHost || BRIDGE_UPSTREAM_HOST);
   const upstreamAgent = new http.Agent({ keepAlive: false });
+  const activeSseStreams = new Map();
+  const sender = apnsSender ?? createBridgeApnsSender({ material: apns, now, log: logger });
 
   // The persist callback is normalized once:  a throw and a `false` answer
   // are the same fact, and neither may reach a caller as a success.  Every
@@ -802,16 +917,79 @@ export function createCompanionBridge({
     }
   };
 
+  const disconnectDeviceSse = (deviceId) => {
+    const streams = activeSseStreams.get(deviceId);
+    if (!streams) return;
+    for (const closeStream of Array.from(streams)) {
+      closeStream();
+    }
+    activeSseStreams.delete(deviceId);
+  };
+
+  let eventSubscriber = null;
+  if (startEventSubscriber && sender.configured) {
+    eventSubscriber = startBridgeHarnessEventSubscriber({
+      host,
+      port,
+      log: logger,
+      onNotify: (notification, seq) =>
+        sender.dispatchHarnessNotification({
+          notification,
+          seq,
+          targets: state.registry.pushTargets(),
+          activeDeviceIds: activeSseStreams.keys(),
+          onInvalidPushToken: (id, token) => {
+            if (state.registry.clearPushToken(id, token)) persistState(state);
+          },
+          onInvalidLiveActivityToken: (id, token) => {
+            if (state.registry.clearLiveActivityToken(id, token)) persistState(state);
+          },
+        }),
+    });
+  }
+
   const server = http.createServer((req, res) => {
     // Every request runs on its own, so a failure in one may not take the
     // listener with it:  the backstop logs the reason and answers 500 if
     // nothing was written yet.
-    void handleRequest({ req, res, state, owners, publicOrigin, tokenSha256, host, port, upstreamAgent, logger, now, persist: persistState }).catch((error) => {
+    void handleRequest({
+      req,
+      res,
+      state,
+      owners,
+      publicOrigin,
+      tokenSha256,
+      host,
+      port,
+      upstreamAgent,
+      logger,
+      now,
+      persist: persistState,
+      sender,
+      activeSseStreams,
+      disconnectDeviceSse,
+    }).catch((error) => {
       logger(`[companion-bridge] request failed: ${error instanceof Error ? error.message : String(error)}`);
       if (!res.headersSent) respondJson(res, 500, { error: 'the request could not be handled' });
       else res.destroy();
     });
   });
+
+  const cleanupBridge = () => {
+    eventSubscriber?.stop();
+    sender.stop?.();
+    for (const deviceId of Array.from(activeSseStreams.keys())) {
+      disconnectDeviceSse(deviceId);
+    }
+  };
+
+  const originalClose = server.close.bind(server);
+  server.close = (callback) => {
+    cleanupBridge();
+    server.closeAllConnections?.();
+    return originalClose(callback);
+  };
+  server.on('close', cleanupBridge);
 
   // A long server-sent event stream must never be cut short by a timeout.
   server.requestTimeout = 0;
@@ -831,6 +1009,7 @@ export function createCompanionBridge({
 async function handleRequest({
   req, res, state, owners, publicOrigin, tokenSha256,
   host, port, upstreamAgent, logger, now, persist,
+  sender, activeSseStreams, disconnectDeviceSse,
 }) {
   const method = String(req.method ?? 'GET').toUpperCase();
   const url = String(req.url ?? '/');
@@ -860,7 +1039,33 @@ async function handleRequest({
   }
 
   if (decision.local) {
-    await handleLocalRoute({ req, res, method, url, decision, state, logger, now, persist });
+    let deviceId = '';
+    if (bridgeLocalRouteRequiresDevice(method, url)) {
+      const device = state.registry.decide(
+        bridgePresentedDeviceCredential(req.headers),
+        bridgePresentedDeviceId(req.headers),
+      );
+      if (!device.ok) {
+        logger(`[companion-bridge] refused ${method} ${pathOf(url)}: ${device.reason}`);
+        respondJson(res, 403, { error: device.reason });
+        return;
+      }
+      deviceId = device.deviceId;
+    }
+    await handleLocalRoute({
+      req,
+      res,
+      method,
+      url,
+      decision,
+      state,
+      logger,
+      now,
+      persist,
+      deviceId,
+      sender,
+      disconnectDeviceSse,
+    });
     return;
   }
 
@@ -879,7 +1084,19 @@ async function handleRequest({
     return;
   }
 
-  await proxyRequest({ req, res, method, url, decision, host, port, upstreamAgent, logger });
+  await proxyRequest({
+    req,
+    res,
+    method,
+    url,
+    decision,
+    host,
+    port,
+    upstreamAgent,
+    logger,
+    deviceId: device.deviceId,
+    activeSseStreams,
+  });
 }
 
 /**
@@ -894,7 +1111,9 @@ async function handleRequest({
  * @param {object} input
  * @returns {Promise<void>}
  */
-async function handleLocalRoute({ req, res, method, url, state, logger, now, persist }) {
+async function handleLocalRoute({
+  req, res, method, url, state, logger, now, persist, deviceId, sender, disconnectDeviceSse,
+}) {
   const path = pathOf(url);
 
   if (method === 'GET' && path === '/api/companion/endpoints') {
@@ -905,6 +1124,83 @@ async function handleLocalRoute({ req, res, method, url, state, logger, now, per
   const unsaved = () => {
     respondJson(res, 503, { error: 'the durable state could not be saved, so the change is not confirmed' });
   };
+
+  if (method === 'POST' && path === '/api/companion/push-token') {
+    const body = await readJsonBody(req);
+    if (!body.ok) {
+      respondJson(res, 400, { error: body.reason });
+      return;
+    }
+    const parsed = PushTokenSchema.safeParse(body.value);
+    if (!parsed.success || !isText(parsed.data.token)) {
+      respondJson(res, 400, { error: 'a push token string is required' });
+      return;
+    }
+    const updated = state.registry.setPushToken(deviceId, parsed.data.token);
+    if (!updated.ok) {
+      respondJson(res, 400, { error: updated.reason });
+      return;
+    }
+    if (!persist(state)) {
+      if (updated.previous) state.registry.setPushToken(deviceId, updated.previous);
+      else state.registry.clearPushToken(deviceId);
+      logger('[companion-bridge] the durable state refused a save; push token not confirmed');
+      unsaved();
+      return;
+    }
+    respondJson(res, 200, { ok: true });
+    return;
+  }
+
+  if (method === 'POST' && path === '/api/companion/live-activity-token') {
+    const body = await readJsonBody(req);
+    if (!body.ok) {
+      respondJson(res, 400, { error: body.reason });
+      return;
+    }
+    const parsed = LiveActivityTokenSchema.safeParse(body.value);
+    if (!parsed.success) {
+      respondJson(res, 400, { error: 'the Live Activity token request does not match the contract' });
+      return;
+    }
+    if (parsed.data.token === undefined) {
+      respondJson(res, 400, { error: 'a Live Activity token is required' });
+      return;
+    }
+    if (!isText(parsed.data.token)) {
+      respondJson(res, 400, { error: 'token must be a string' });
+      return;
+    }
+    if (Object.hasOwn(body.value, 'kind')) {
+      if (!isText(parsed.data.kind)) {
+        respondJson(res, 400, { error: 'kind must be a string' });
+        return;
+      }
+      if (parsed.data.kind !== 'push-to-start') {
+        respondJson(res, 400, { error: 'only push-to-start Live Activity tokens are supported' });
+        return;
+      }
+    }
+    const updated = state.registry.setLiveActivityToken(deviceId, parsed.data.token);
+    if (!updated.ok) {
+      respondJson(res, 400, { error: updated.reason });
+      return;
+    }
+    if (!persist(state)) {
+      if (updated.previous) state.registry.setLiveActivityToken(deviceId, updated.previous);
+      else state.registry.clearLiveActivityToken(deviceId);
+      logger('[companion-bridge] the durable state refused a save; Live Activity token not confirmed');
+      unsaved();
+      return;
+    }
+    respondJson(res, 200, { ok: true });
+    return;
+  }
+
+  if (method === 'GET' && path === '/api/companion/push-health') {
+    respondJson(res, 200, sender.health(state.registry.pushTokenCount()));
+    return;
+  }
 
   if (method === 'POST' && path === '/api/companion/pairing/open') {
     const body = await readJsonBody(req);
@@ -1007,8 +1303,9 @@ async function handleLocalRoute({ req, res, method, url, state, logger, now, per
   }
 
   if (method === 'DELETE' && path.startsWith('/api/companion/devices/')) {
-    const deviceId = decodeURIComponent(path.slice('/api/companion/devices/'.length));
-    const revoked = state.registry.revokeDevice(deviceId, now());
+    const targetDeviceId = decodeURIComponent(path.slice('/api/companion/devices/'.length));
+    const revoked = state.registry.revokeDevice(targetDeviceId, now());
+    if (revoked) disconnectDeviceSse(targetDeviceId);
     if (revoked && !persist(state)) {
       // A revocation the durable state cannot hold would be a revocation a
       // restart forgets, which is a revocation that does not exist.  The
@@ -1018,7 +1315,7 @@ async function handleLocalRoute({ req, res, method, url, state, logger, now, per
       unsaved();
       return;
     }
-    respondJson(res, revoked ? 200 : 404, revoked ? { revoked: true, deviceId } : { error: 'unknown device' });
+    respondJson(res, revoked ? 200 : 404, revoked ? { revoked: true, deviceId: targetDeviceId } : { error: 'unknown device' });
     return;
   }
 
@@ -1035,7 +1332,7 @@ async function handleLocalRoute({ req, res, method, url, state, logger, now, per
  * @param {object} input
  * @returns {Promise<void>}
  */
-function proxyRequest({ req, res, method, url, decision, host, port, upstreamAgent, logger }) {
+function proxyRequest({ req, res, method, url, decision, host, port, upstreamAgent, logger, deviceId = '', activeSseStreams }) {
   const target = new URL(decision.upstream, `http://${host}:${port}`);
   let upstreamResponse = null;
   const upstream = http.request({
@@ -1051,18 +1348,49 @@ function proxyRequest({ req, res, method, url, decision, host, port, upstreamAge
     response.pipe(res);
     response.on('error', () => res.destroy());
   });
+
+  const isEventStream = method === 'GET' && pathOf(url) === '/api/events' && deviceId && activeSseStreams;
+  let unregisterSse = () => {};
+  if (isEventStream) {
+    let set = activeSseStreams.get(deviceId);
+    if (!set) {
+      set = new Set();
+      activeSseStreams.set(deviceId, set);
+    }
+    const closeStream = () => {
+      try { upstream.destroy(); } catch { /* ignore */ }
+      try { upstreamResponse?.destroy(); } catch { /* ignore */ }
+      try { res.destroy(); } catch { /* ignore */ }
+    };
+    set.add(closeStream);
+    unregisterSse = () => {
+      const current = activeSseStreams.get(deviceId);
+      if (!current) return;
+      current.delete(closeStream);
+      if (current.size === 0) activeSseStreams.delete(deviceId);
+    };
+  }
+
   upstream.on('error', (error) => {
+    unregisterSse();
     logger(`[companion-bridge] upstream failed for ${method} ${pathOf(url)}: ${error.message}`);
     if (!res.headersSent) respondJson(res, 502, { error: 'the harness did not answer' });
     else res.destroy();
   });
   req.pipe(upstream);
-  req.on('error', () => upstream.destroy());
-  upstream.on('close', () => req.destroy());
+  req.on('error', () => {
+    unregisterSse();
+    upstream.destroy();
+  });
+  upstream.on('close', () => {
+    unregisterSse();
+    req.destroy();
+  });
   // A client that hangs up ends the whole hop, including a long-lived
   // event stream:  otherwise the upstream connection outlives the request
   // that opened it.
   res.on('close', () => {
+    unregisterSse();
     // Only a response that did not finish tears the upstream down:  a
     // finished one has already had its upstream end with it.
     if (!res.writableFinished) {
@@ -1250,6 +1578,11 @@ async function main() {
     owners,
     publicOrigin,
     tokenSha256,
+    apns,
+    startEventSubscriber: apns.available,
+    log: (message) => {
+      process.stderr.write(`${new Date().toISOString()} ${message}\n`);
+    },
     persist: (current) => {
       try {
         saveBridgeState(statePath, current.toState());

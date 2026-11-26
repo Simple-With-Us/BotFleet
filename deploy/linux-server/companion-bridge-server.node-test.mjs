@@ -47,6 +47,7 @@ import {
   bridgeApnsNamesSummary,
   bridgeApnsSecretNames,
 } from './companion-bridge-apns.mjs';
+import { createBridgeApnsSender } from './companion-bridge-apns-sender.mjs';
 import { loadBridgeState, saveBridgeState } from './companion-bridge-state.mjs';
 
 /** A header value the test asserts on, assembled so the relay's secret scan
@@ -1126,4 +1127,279 @@ test('a metadata key named like the prototype accessor is dropped, not applied',
   assert.deepEqual(carried, { note: 'kept' });
   assert.equal({}.polluted, undefined);
   assert.equal(Object.keys(carried).includes('__proto__'), false);
+});
+
+test('push-token, live-activity-token, and push-health routes enforce auth, validation, persistence rollback, and secret-free output', async () => {
+  let savesWork = true;
+  const { privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const p8 = privateKey.export({ type: 'pkcs8', format: 'pem' });
+  const sender = createBridgeApnsSender({
+    material: { available: true, keyId: 'KEYID12345', teamId: 'CC8UTF7ATG', p8, reason: '' },
+    sendImpl: async () => ({ status: 200 }),
+  });
+
+  const bridge = await startBridge({
+    bridgeOptions: {
+      apnsSender: sender,
+      persist: () => savesWork,
+    },
+  });
+  try {
+    const device = await bridge.pair('phone-push');
+    const pushToken = 'Ab'.repeat(32);
+    const laToken = 'Cd'.repeat(32);
+
+    // Device credential is required on all three routes.
+    for (const [method, path, body] of [
+      ['POST', '/api/companion/push-token', JSON.stringify({ token: pushToken })],
+      ['POST', '/api/companion/live-activity-token', JSON.stringify({ token: laToken, kind: 'push-to-start' })],
+      ['GET', '/api/companion/push-health', undefined],
+    ]) {
+      const denied = await call(bridge.port, {
+        method,
+        path,
+        headers: ownerHeaders(body ? { 'content-type': 'application/json' } : {}),
+        body,
+      });
+      assert.equal(denied.status, 403, `${method} ${path}`);
+    }
+
+    // Invalid token or unsupported kind returns 400.
+    const badHex = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/push-token',
+      headers: ownerHeaders({ 'content-type': 'application/json', authorization: `Bearer ${device.credential}` }),
+      body: JSON.stringify({ token: 'not-hex' }),
+    });
+    assert.equal(badHex.status, 400);
+
+    const badKind = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/live-activity-token',
+      headers: ownerHeaders({ 'content-type': 'application/json', authorization: `Bearer ${device.credential}` }),
+      body: JSON.stringify({ token: laToken, kind: 'update' }),
+    });
+    assert.equal(badKind.status, 400);
+
+    // Persistence failure rolls back in-memory token and answers 503.
+    savesWork = false;
+    const failedSave = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/push-token',
+      headers: ownerHeaders({ 'content-type': 'application/json', authorization: `Bearer ${device.credential}` }),
+      body: JSON.stringify({ token: pushToken }),
+    });
+    assert.equal(failedSave.status, 503);
+    assert.equal(bridge.state.registry.pushTokenCount(), 0);
+
+    // Valid registrations succeed and survive in state without leaking into publicDevices.
+    savesWork = true;
+    const okPush = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/push-token',
+      headers: ownerHeaders({ 'content-type': 'application/json', authorization: `Bearer ${device.credential}` }),
+      body: JSON.stringify({ token: pushToken }),
+    });
+    assert.equal(okPush.status, 200);
+
+    const okLive = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/live-activity-token',
+      headers: ownerHeaders({ 'content-type': 'application/json', authorization: `Bearer ${device.credential}` }),
+      body: JSON.stringify({ token: laToken, kind: 'push-to-start' }),
+    });
+    assert.equal(okLive.status, 200);
+
+    const devicesList = await call(bridge.port, { path: '/api/companion/devices' });
+    assert.equal(devicesList.status, 200);
+    assert.equal(JSON.stringify(devicesList.json).includes(pushToken.toLowerCase()), false);
+    assert.equal(JSON.stringify(devicesList.json).includes(laToken.toLowerCase()), false);
+
+    const health = await call(bridge.port, {
+      path: '/api/companion/push-health',
+      headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
+    });
+    assert.equal(health.status, 200);
+    assert.equal(health.json.configured, true);
+    assert.equal(health.json.tokensRegistered, 1);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('revoking a device terminates its active SSE stream immediately', async () => {
+  let upstreamClosed = false;
+  const openRes = [];
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      if (info.path === '/api/events') {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        res.write('data: {"kind":"hello","cursor":"1"}\n\n');
+        openRes.push(res);
+        res.on('close', () => {
+          upstreamClosed = true;
+        });
+        return;
+      }
+      res.writeHead(200);
+      res.end('{}');
+    },
+  });
+
+  try {
+    const device = await bridge.pair('phone-sse-revoke');
+    const sseClosed = new Promise((resolve) => {
+      const req = http.request({
+        hostname: '127.0.0.1',
+        port: bridge.port,
+        path: '/api/events',
+        method: 'GET',
+        headers: ownerHeaders({
+          authorization: `Bearer ${device.credential}`,
+          'x-botfleet-device': 'phone-sse-revoke',
+        }),
+      }, (res) => {
+        res.once('data', async () => {
+          const revoked = await call(bridge.port, {
+            method: 'DELETE',
+            path: '/api/companion/devices/phone-sse-revoke',
+          });
+          assert.equal(revoked.status, 200);
+        });
+        res.on('end', () => resolve('ended'));
+        res.on('close', () => resolve('closed'));
+        res.on('error', () => resolve('errored'));
+      });
+      req.end();
+    });
+
+    const outcome = await Promise.race([
+      sseClosed,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('SSE stream stayed open after revoke')), 3000)),
+    ]);
+    assert.ok(['ended', 'closed', 'errored'].includes(outcome));
+    assert.equal(upstreamClosed, true);
+  } finally {
+    for (const r of openRes) r.destroy();
+    await bridge.close();
+  }
+});
+
+test('loopback SSE notify frames send background alerts and Live Activities while skipping active SSE devices', async () => {
+  const { privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const p8 = privateKey.export({ type: 'pkcs8', format: 'pem' });
+  const sent = [];
+  const sender = createBridgeApnsSender({
+    material: { available: true, keyId: 'KEYID12345', teamId: 'CC8UTF7ATG', p8, reason: '' },
+    sendImpl: async (req) => {
+      sent.push(req);
+      if (req.path.endsWith('f'.repeat(64))) return { status: 410, reason: 'Unregistered' };
+      return { status: 200 };
+    },
+  });
+
+  const sseClients = [];
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      if (info.path === '/api/events') {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        res.write('data: {"kind":"hello","cursor":"10"}\n\n');
+        sseClients.push(res);
+        res.on('close', () => {
+          const idx = sseClients.indexOf(res);
+          if (idx !== -1) sseClients.splice(idx, 1);
+        });
+        return;
+      }
+      res.writeHead(200);
+      res.end('{}');
+    },
+    bridgeOptions: {
+      apnsSender: sender,
+      startEventSubscriber: true,
+    },
+  });
+
+  try {
+    const online = await bridge.pair('phone-online');
+    const offline = await bridge.pair('phone-offline');
+
+    await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/push-token',
+      headers: ownerHeaders({ 'content-type': 'application/json', authorization: `Bearer ${online.credential}` }),
+      body: JSON.stringify({ token: 'e'.repeat(64) }),
+    });
+    await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/push-token',
+      headers: ownerHeaders({ 'content-type': 'application/json', authorization: `Bearer ${offline.credential}` }),
+      body: JSON.stringify({ token: 'f'.repeat(64) }),
+    });
+    await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/live-activity-token',
+      headers: ownerHeaders({ 'content-type': 'application/json', authorization: `Bearer ${offline.credential}` }),
+      body: JSON.stringify({ token: '9'.repeat(64), kind: 'push-to-start' }),
+    });
+
+    // Connect phone-online to /api/events so it is marked active foreground SSE.
+    let onlineReq;
+    await new Promise((resolve) => {
+      onlineReq = http.request({
+        hostname: '127.0.0.1',
+        port: bridge.port,
+        path: '/api/events',
+        method: 'GET',
+        headers: ownerHeaders({ authorization: `Bearer ${online.credential}` }),
+      }, (res) => {
+        res.once('data', () => resolve());
+      });
+      onlineReq.end();
+    });
+
+    // Wait until the bridge subscriber is also connected to /api/events.
+    const deadline = Date.now() + 3000;
+    while (sseClients.length < 2 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(sseClients.length >= 2);
+
+    const frame = JSON.stringify({
+      kind: 'notify',
+      seq: 11,
+      notification: {
+        title: 'Forge',
+        body: 'Approve tool call?',
+        kind: 'approval',
+        threadId: 'thread-99',
+        botId: 'bot-1',
+        botName: 'Forge',
+        requestId: 'req-99',
+      },
+    });
+    for (const clientRes of Array.from(sseClients)) {
+      clientRes.write(`id: 11\ndata: ${frame}\n\n`);
+    }
+
+    const sendDeadline = Date.now() + 3000;
+    while (sent.length < 2 && Date.now() < sendDeadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    onlineReq.destroy();
+
+    assert.equal(sent.length, 2);
+    assert.equal(sent.some((r) => r.path.endsWith('e'.repeat(64))), false);
+    assert.equal(sent.some((r) => r.path.endsWith('f'.repeat(64))), true);
+    assert.equal(sent.some((r) => r.path.endsWith('9'.repeat(64))), true);
+    // The 410 Unregistered response cleared phone-offline's dead alert token.
+    const checkDeadline = Date.now() + 1000;
+    while (bridge.state.registry.pushTokenCount() > 1 && Date.now() < checkDeadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.equal(bridge.state.registry.pushTokenCount(), 1);
+  } finally {
+    for (const r of sseClients) r.destroy();
+    await bridge.close();
+  }
 });
