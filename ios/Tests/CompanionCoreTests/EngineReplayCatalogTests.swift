@@ -38,9 +38,9 @@ struct EngineReplayCatalogTests {
     }
 
     @Test("Coverage names the resolvable six and gives a reason for the rest")
-    func coverageNamesResolutionsAndReasons() {
+    func coverageNamesResolutionsAndReasons() throws {
         let resolvable = EngineReplayCatalog.coverage(for: ["antigravity", "claude", "codex", "grok-acp", "mcode", "muse"])
-        #expect(resolvable.allSatisfy(\.resolves))
+        #expect(resolvable.allSatisfy { $0.resolves })
         #expect(resolvable.allSatisfy { $0.reason == nil })
         #expect(resolvable.compactMap(\.family) == [.antigravity, .claude, .codex, .grok, .mcode, .muse])
 
@@ -60,7 +60,7 @@ struct EngineReplayCatalogTests {
         // A thirteen-engine packet can never go green, and coverage says
         // so before any fixture runs.
         let all = EngineReplayCatalog.coverage(for: EngineMatrixID.allCases.map(\.rawValue))
-        #expect(all.filter(\.resolves).count == 6)
+        #expect(all.filter { $0.resolves }.count == 6)
         #expect(all.count == 13)
     }
 
