@@ -7,7 +7,7 @@ decommission): neither lands until every row below has a Swift owner or a
 retired reason.
 
 Surveyed at commit `c7902d63` (2026-10-21), re-counted 2026-10-25:
-`server/` 374 non-test files, ~142,800 lines · `companion/src/` 17 files,
+`server/` 375 non-test files, ~142,813 lines · `companion/src/` 17 files,
 ~11,330 lines · `shared/` 58 non-test files, ~11,050 lines (zero `node:`
 imports in source — only the three `*.test.ts` files reach for `node:fs`, so
 the portable set really is portable) · `electron/` 122 `.mjs`/`.cjs` files,
@@ -48,7 +48,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | `server/helpers/tracker.ts` | Helper progress → `EngineCoordinator` BF-2504 |
 | `server/procs.ts`, `server/tools/process-group.ts` | Process-group spawn/kill → `EngineDriver` supervision BF-2504 |
 | `server/permission-proxy.ts`, `server/computer-proxy.ts`, `server/mcp-bridge.ts`, `server/mcp-remote-proxy.ts` | Per-turn MCP/permission proxies → `EngineDriver` BF-2504 |
-| `server/launch-identity.ts`, `server/contracts.ts`, `server/schema.ts`, `server/names.ts` | Launch contract + canonical types → `EngineDriver` BF-2504; contracts port as Swift protocols |
+| `server/launch-identity.ts`, `server/contracts.ts`, `server/schema.ts`, `server/names.ts`, `server/advisor-model.ts` | Launch contract + canonical types → `EngineDriver` BF-2504; contracts port as Swift protocols; the advisor model id rule rides the contracts |
 | `server/tool-fields.ts`, `server/turn-tools.ts`, `server/tools/{agents,computer,github,host,jobs,phone,prompts,recall,shell-env,zulip}.ts`, `server/tools/registry.ts`, `schedule.ts` | Tool catalog + executors → `EngineDriver` tool lane BF-2504 (HTTP-lane tools fold into actor methods) |
 | `server/capability-profile.ts`, `server/computer-capability.ts`, `server/doomed-dispatch.ts`, `server/turn-safety.ts`, `server/turn-worktree-admission.ts` + wiring test | Dispatch gates → `EngineCoordinator` BF-2504 |
 | `server/model-{context-windows,fallback,lineage,default-slots,rejections}.ts`, `server/retired-model-ids.ts`, `server/instance-models.ts`, `server/claude-models.ts`, `server/antigravity-models.ts` | Model metadata + fallback chains → BF-2507 (data tables port with `shared/model-lineage.ts`) |
