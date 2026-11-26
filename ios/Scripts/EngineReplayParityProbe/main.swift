@@ -43,10 +43,11 @@ import CompanionCore
 
 /// The usage text, printed when the arguments are wrong.
 let usage = """
-usage: EngineReplayParityProbe --request <bundle-request.json> --out <report.json>
+usage: EngineReplayParityProbe --request <bundle-request.json> --out <report.json> [--coverage]
 
-  --request  the evidence bundle request; its `engines` list names the engines to replay
-  --out      the file the per-engine replay report is written to
+  --request   the evidence bundle request; its `engines` list names the engines to replay
+  --out       the file the per-engine replay report is written to
+  --coverage  write which requested engines resolve to a replay family (and why the rest do not) instead of measuring
 """
 
 /// A flag's value, or nil when the flag is absent.
@@ -151,29 +152,12 @@ func measure(engines: [String]) async -> [EngineReplayReport] {
     return reports
 }
 
-/// Run the probe and write the report.
-func run() async throws {
-    let args = Array(CommandLine.arguments.dropFirst())
-    guard let requestPath = flagValue(args, "--request"), let outPath = flagValue(args, "--out") else {
-        FileHandle.standardError.write(Data((usage + "\n").utf8))
-        exit(2)
-    }
-    let engines = try requestedEngines(in: requestPath)
-    let reports = await measure(engines: engines)
-    let fullyVerified = EngineReplayParityReport.aggregateFullyVerified(engines: reports)
-
-    let report = EngineReplayParityReport(
-        version: 1,
-        engines: reports,
-        isFullyVerified: fullyVerified,
-        requestedEngines: engines
-    )
-
+/// Writes one report owner-only, creating its directory private when the
+/// probe is the one that creates it.  Shared by the measured report and
+/// the coverage report so both land with the same protections.
+func writePrivate<T: Encodable>(_ report: T, to outPath: String) throws {
     let out = URL(fileURLWithPath: outPath)
     let outDirectory = out.deletingLastPathComponent()
-    // The directory is made private only when this probe creates it.  A
-    // directory that was already there belongs to whoever made it, and
-    // changing its mode out from under them is not this probe's business.
     var isDirectory: ObjCBool = false
     if !FileManager.default.fileExists(atPath: outDirectory.path, isDirectory: &isDirectory) {
         try FileManager.default.createDirectory(
@@ -189,14 +173,76 @@ func run() async throws {
     } else {
         throw ProbeError("the report's parent path is not a directory: \(outDirectory.path)")
     }
-
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let bytes = try encoder.encode(report)
     try bytes.write(to: out, options: [.atomic])
-    // The report names the executables the engines were launched with, so it
-    // is owner-only.
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: out.path)
+}
+
+/// The coverage report `--coverage` writes: one entry per requested id,
+/// in the request's order.
+struct CoverageReport: Codable {
+    let version: Int
+    let requestedEngines: [String]
+    let engines: [EngineReplayCatalog.Coverage]
+    let resolvableCount: Int
+}
+
+/// Run the probe and write the report.
+func run() async throws {
+    let args = Array(CommandLine.arguments.dropFirst())
+    guard let requestPath = flagValue(args, "--request"), let outPath = flagValue(args, "--out") else {
+        FileHandle.standardError.write(Data((usage + "\n").utf8))
+        exit(2)
+    }
+    let engines = try requestedEngines(in: requestPath)
+    // Coverage answers which of the requested ids can ever be measured,
+    // before any fixture runs:  six of the thirteen matrix ids resolve to
+    // a replay family and seven do not, so a packet naming all thirteen
+    // can never go green, and the operator should learn that here rather
+    // than from a failed run.
+    if args.contains("--coverage") {
+        let coverage = EngineReplayCatalog.coverage(for: engines)
+        let report = CoverageReport(
+            version: 1,
+            requestedEngines: engines,
+            engines: coverage,
+            resolvableCount: coverage.filter(\.resolves).count
+        )
+        try writePrivate(report, to: outPath)
+        let summary: [String: Any] = [
+            "report": outPath,
+            "requestedEngines": engines,
+            "resolvableCount": report.resolvableCount,
+            "engines": coverage.map { entry -> [String: Any] in
+                var row: [String: Any] = ["engine": entry.engineId, "resolves": entry.resolves]
+                if let family = entry.family { row["family"] = family.rawValue }
+                if let reason = entry.reason { row["reason"] = reason }
+                return row
+            },
+        ]
+        print(String(data: try JSONSerialization.data(withJSONObject: summary, options: [.prettyPrinted, .sortedKeys]), encoding: .utf8) ?? "{}")
+        // An unresolvable id in the request is a finding, not a pass.
+        if report.resolvableCount != engines.count {
+            exit(1)
+        }
+        return
+    }
+    let reports = await measure(engines: engines)
+    let fullyVerified = EngineReplayParityReport.aggregateFullyVerified(engines: reports)
+
+    let report = EngineReplayParityReport(
+        version: 1,
+        engines: reports,
+        isFullyVerified: fullyVerified,
+        requestedEngines: engines
+    )
+
+    let out = URL(fileURLWithPath: outPath)
+    // The report names the executables the engines were launched with, so
+    // it is owner-only, through the same private write coverage uses.
+    try writePrivate(report, to: outPath)
 
     let summary: [String: Any] = [
         "report": out.path,
