@@ -93,12 +93,15 @@ jobs:
         env:
           # The shared planner reads the App Store Connect credential from the
           # store through its own bootstrap binding, never from the environment
-          # (INFISICAL.md §12).  These two names ARE that binding:  a read-only
-          # service token that reaches Infisical, not a copy of the credential.
-          # The same pair the adjacent infisical-secrets action consumes, so the
-          # grant the action uses is the grant the planner uses.
-          INFISICAL_TOKEN: ${{ secrets.INFISICAL_IOS_SHIP_READ_TOKEN }}
+          # (INFISICAL.md §12).  This is this workflow's own binding, the same
+          # one the adjacent infisical-secrets action consumes:  the native
+          # release's read-only token, the project, and the folder that action
+          # reads, where the ASC trio lives for this workflow.  Naming the
+          # folder keeps the planner's store walk on that exact grant instead
+          # of falling back to prod root.
+          INFISICAL_TOKEN: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
+          INFISICAL_SECRET_PATH: /botfleet-server
         run: |
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           # The shared planner answers the fixed marketing version 0.1.0
