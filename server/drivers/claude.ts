@@ -2363,10 +2363,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       };
       advisorFlagProbe = probe;
       void probe.result.then((answer) => {
-        if (answer === "yes") probe.expiresAt = Infinity;
+        // A yes expires with the same bound as the other answers:  a CLI
+        // that is downgraded afterwards must be noticed, not believed
+        // forever, or the next advisor turn dies on an unknown option.
         // Not an answer: look again soon, but not on every call — each look
         // is another process on an already busy engine.
-        else if (answer === "unknown") probe.expiresAt = Date.now() + 5_000;
+        if (answer === "unknown") probe.expiresAt = Date.now() + 5_000;
       });
       return probe.result;
     };

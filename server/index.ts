@@ -2666,6 +2666,9 @@ function checkedModelSelection(
     selection.instanceId !== current.selection.instanceId ||
     selection.model !== current.selection.model ||
     selection.effort !== current.selection.effort ||
+    // An advisor is the model a turn consults, so swapping it while the bot
+    // works is the same stop-before-changing-models case as the model itself.
+    selection.advisorModel !== current.selection.advisorModel ||
     selection.contextCap !== current.selection.contextCap ||
     selection.maxOutputTokens !== current.selection.maxOutputTokens ||
     JSON.stringify(selection.fallbacks) !== JSON.stringify(current.selection.fallbacks)
@@ -7727,9 +7730,10 @@ async function startTurn(
   // busy flips immediately so the composer locks; the dispatch itself runs
   // in the background — box provisioning can take ~90s and must never
   // hang the HTTP request
-  // The advisor a turn runs under, built in its own statement so the
-  // property is simply absent when the bot has none.
-  const activeAdvisor = { advisorModel: selection.advisorModel };
+  // The advisor a turn runs under.  The property is absent when the bot has
+  // none, so a selection without an advisor carries no advisor key at all.
+  const activeAdvisor: Pick<ModelSelection, "advisorModel"> = {};
+  if (selection.advisorModel) activeAdvisor.advisorModel = selection.advisorModel;
   const activeSelection: ModelSelection = {
     instanceId,
     model,
@@ -8379,9 +8383,10 @@ async function startTurn(
       const savedMaxHistoryTurns = maxHistoryTurnsSchema.safeParse(bot.maxHistoryTurns);
       if (savedMaxHistoryTurns.success) historySettings.maxHistoryTurns = savedMaxHistoryTurns.data;
       if (bot.historySummaryModel === true) historySettings.historySummaryModel = true;
-      // The advisor this turn runs under, built in its own statement so the
-      // property is simply absent when the bot has none.
-      const turnAdvisor = { advisorModel: selection.advisorModel };
+      // The advisor this turn runs under.  The property is absent when the
+      // bot has none, so a turn without an advisor carries no advisor key.
+      const turnAdvisor: Pick<ModelSelection, "advisorModel"> = {};
+      if (selection.advisorModel) turnAdvisor.advisorModel = selection.advisorModel;
       const turnInput = {
         threadId,
         text: remindedWakeText(wakeUserText),
