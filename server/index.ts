@@ -391,11 +391,11 @@ import {
   type InstanceConfigMap,
   type ModelSelection,
   type EffortLevel,
-  isAdvisorModel,
   type ProviderInstance,
   type RequestOutcome,
   type RuntimeEvent,
 } from "./contracts.ts";
+import { isAdvisorModelId } from "./advisor-model.ts";
 import { buildTurnTools } from "./turn-tools.ts";
 import { createTurnToolHost } from "./tools/host.ts";
 import { adoptGroupLedger } from "./tools/process-group.ts";
@@ -2576,7 +2576,7 @@ function checkedModelSelection(
   // An advisor is a model id, never free text: the driver hands it to the
   // engine as one launch argument.
   if (value.advisorModel !== undefined && value.advisorModel !== null) {
-    if (!isAdvisorModel(value.advisorModel)) {
+    if (typeof value.advisorModel !== "string" || !isAdvisorModelId(value.advisorModel)) {
       return {
         ok: false,
         status: 400,
@@ -7727,11 +7727,14 @@ async function startTurn(
   // busy flips immediately so the composer locks; the dispatch itself runs
   // in the background — box provisioning can take ~90s and must never
   // hang the HTTP request
+  // The advisor a turn runs under, built in its own statement so the
+  // property is simply absent when the bot has none.
+  const activeAdvisor = { advisorModel: selection.advisorModel };
   const activeSelection: ModelSelection = {
     instanceId,
     model,
     effort,
-    ...(selection.advisorModel ? { advisorModel: selection.advisorModel } : {}),
+    ...activeAdvisor,
   };
   // A turn dispatched here is the thread running again, which retires any
   // boot-resume failure remembered against it: the refusal exists to stop a
@@ -8376,6 +8379,9 @@ async function startTurn(
       const savedMaxHistoryTurns = maxHistoryTurnsSchema.safeParse(bot.maxHistoryTurns);
       if (savedMaxHistoryTurns.success) historySettings.maxHistoryTurns = savedMaxHistoryTurns.data;
       if (bot.historySummaryModel === true) historySettings.historySummaryModel = true;
+      // The advisor this turn runs under, built in its own statement so the
+      // property is simply absent when the bot has none.
+      const turnAdvisor = { advisorModel: selection.advisorModel };
       const turnInput = {
         threadId,
         text: remindedWakeText(wakeUserText),
@@ -8383,7 +8389,7 @@ async function startTurn(
         effort,
         // An advisor model rides this turn: the driver passes it per launch,
         // so the owner's global engine settings are never written.
-        ...(selection.advisorModel ? { advisorModel: selection.advisorModel } : {}),
+        ...turnAdvisor,
         // Only a cap this model's row offers reaches a driver; a stale value
         // from a model the bot has since left is dropped here.
         ...(!boxCloud && selection.contextCap !== undefined &&

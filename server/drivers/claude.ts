@@ -50,7 +50,8 @@ import { STATIC_CLAUDE_MODELS } from "../claude-models.ts";
 export { STATIC_CLAUDE_MODELS };
 import { computerProxyEnv } from "../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
-import { isAdvisorModel, newEventId, newId } from "../contracts.ts";
+import { newEventId, newId } from "../contracts.ts";
+import { isAdvisorModelId } from "../advisor-model.ts";
 import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials, seatCredentialsReady } from "../child-credentials.ts";
 import { CLI_LOGIN_ENV_NAMES, FLEET_BEARER_ENV_NAME } from "../secret-map.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
@@ -2370,7 +2371,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       return probe.result;
     };
     const requireAdvisorSupport = async (advisorModel: string): Promise<void> => {
-      if (!isAdvisorModel(advisorModel)) {
+      if (!isAdvisorModelId(advisorModel)) {
         throw new Error(`"${advisorModel}" is not a model id, so it cannot be an advisor`);
       }
       const env = claudeEnvironment(undefined, { ...process.env, ...input.environment });

@@ -54,18 +54,6 @@ export function isEffortLevel(value: unknown): value is EffortLevel {
   return (EFFORT_LEVELS as readonly unknown[]).includes(value);
 }
 
-/** An advisor model id: a model slug, a short alias, or an injected id.  It
- *  reaches the engine as one launch argument, so it may not carry spaces or
- *  punctuation that would make it a different argument. */
-export function isAdvisorModel(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    value.trim().length > 0 &&
-    value.trim().length <= 64 &&
-    /^[a-z0-9][a-z0-9._:/-]*$/i.test(value.trim())
-  );
-}
-
 // ── model selection ────────────────────────────────────────────────────
 // "Which model" is a data value carried on the request, never a service
 // binding (upstream ModelSelectionWire). instanceId is the routing key.
