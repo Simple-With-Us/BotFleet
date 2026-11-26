@@ -9,7 +9,9 @@ import crypto from 'node:crypto';
 import test from 'node:test';
 
 import {
+  APNS_CIRCUIT_WINDOW_MS,
   APNS_TOKEN_TTL_MS,
+  APNS_TRANSPORT_BREAKER_THRESHOLD,
   createApnsProviderToken,
   createBridgeApnsSender,
   DEFAULT_APNS_BUNDLE_ID,
@@ -212,4 +214,80 @@ test('dispatchHarnessNotification skips foreground SSE devices and sends Live Ac
     ['liveactivity', 'bg-phone', true],
   ]);
   assert.equal(sent.length, 2);
+});
+
+test('invalid device tokens fail before HTTP/2, transport breaker sheds load and recovers, and dispatch fans out concurrently', async () => {
+  const { p8 } = makeEphemeralEcPrivateKeyPem();
+  let clock = 1_700_000_000_000;
+  let transportDown = true;
+  let sendCalls = 0;
+  const invalidCalls = [];
+
+  const sender = createBridgeApnsSender({
+    material: { available: true, keyId: 'KEYID12345', teamId: 'CC8UTF7ATG', p8, reason: '' },
+    now: () => clock,
+    sendImpl: async () => {
+      sendCalls += 1;
+      if (transportDown) return { status: 0, reason: 'SendFailed', errorCode: 'ECONNREFUSED' };
+      return { status: 200 };
+    },
+  });
+
+  // Malformed device token is refused before sendImpl is invoked.
+  const bad = await sender.sendAlert({
+    deviceId: 'd-bad',
+    token: '../evil?x=1',
+    title: 'T',
+    body: 'B',
+    onInvalidToken: (id, tok) => invalidCalls.push([id, tok]),
+  });
+  assert.equal(bad.status, 400);
+  assert.equal(bad.reason, 'BadDeviceToken');
+  assert.equal(sendCalls, 0);
+  assert.deepEqual(invalidCalls, [['d-bad', '../evil?x=1']]);
+
+  // Trip the transport breaker after APNS_TRANSPORT_BREAKER_THRESHOLD consecutive failures.
+  for (let i = 0; i < APNS_TRANSPORT_BREAKER_THRESHOLD; i += 1) {
+    const res = await sender.sendAlert({ deviceId: 'd-1', token: 'a'.repeat(64), title: 'T', body: 'B' });
+    assert.equal(res.status, 0);
+  }
+  assert.equal(sendCalls, APNS_TRANSPORT_BREAKER_THRESHOLD);
+
+  const shed = await sender.sendAlert({ deviceId: 'd-1', token: 'a'.repeat(64), title: 'T', body: 'B' });
+  assert.equal(shed.skipped, true);
+  assert.equal(shed.reason, 'apns-circuit-open');
+  assert.equal(sendCalls, APNS_TRANSPORT_BREAKER_THRESHOLD);
+  assert.equal(sender.health(1).circuitDropped, 1);
+  assert.equal(sender.health(1).dropped, 1);
+
+  // After the circuit window elapses and transport recovers, consecutive failures reset.
+  clock += APNS_CIRCUIT_WINDOW_MS + 1;
+  transportDown = false;
+  const recovered = await sender.sendAlert({ deviceId: 'd-1', token: 'a'.repeat(64), title: 'T', body: 'B' });
+  assert.equal(recovered.ok, true);
+  assert.equal(sender.health(1).consecutiveTransportFailures, 0);
+
+  // Concurrent dispatch starts both sends before either resolves.
+  let inFlight = 0;
+  let peakInFlight = 0;
+  const concurrentSender = createBridgeApnsSender({
+    material: { available: true, keyId: 'KEYID12345', teamId: 'CC8UTF7ATG', p8, reason: '' },
+    sendImpl: async () => {
+      inFlight += 1;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 15));
+      inFlight -= 1;
+      return { status: 200 };
+    },
+  });
+  const parallelOutcomes = await concurrentSender.dispatchHarnessNotification({
+    notification: { title: 'Forge', body: 'Approve?', kind: 'approval', threadId: 't-1', botId: 'b-1' },
+    targets: [
+      { deviceId: 'p-1', pushToken: '1'.repeat(64) },
+      { deviceId: 'p-2', pushToken: '2'.repeat(64) },
+    ],
+    activeDeviceIds: [],
+  });
+  assert.equal(parallelOutcomes.length, 2);
+  assert.equal(peakInFlight, 2);
 });

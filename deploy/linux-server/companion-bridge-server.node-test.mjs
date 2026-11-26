@@ -1181,6 +1181,14 @@ test('push-token, live-activity-token, and push-health routes enforce auth, vali
     });
     assert.equal(badKind.status, 400);
 
+    const oversize = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/push-token',
+      headers: ownerHeaders({ 'content-type': 'application/json', authorization: `Bearer ${device.credential}` }),
+      body: JSON.stringify({ token: 'a'.repeat(513) }),
+    });
+    assert.equal(oversize.status, 400);
+
     // Persistence failure rolls back in-memory token and answers 503.
     savesWork = false;
     const failedSave = await call(bridge.port, {
@@ -1222,6 +1230,26 @@ test('push-token, live-activity-token, and push-health routes enforce auth, vali
     assert.equal(health.status, 200);
     assert.equal(health.json.configured, true);
     assert.equal(health.json.tokensRegistered, 1);
+
+    // Malformed expectedToken must not clear a valid stored token.
+    assert.equal(bridge.state.registry.clearPushToken('phone-push', 'not-a-valid-token'), false);
+    assert.equal(bridge.state.registry.clearLiveActivityToken('phone-push', 'not-a-valid-token'), false);
+    assert.equal(bridge.state.registry.pushTargets().length, 1);
+
+    // A device with only a Live Activity token counts in push-health tokensRegistered.
+    const liveOnly = await bridge.pair('phone-live-only');
+    const regLiveOnly = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/live-activity-token',
+      headers: ownerHeaders({ 'content-type': 'application/json', authorization: `Bearer ${liveOnly.credential}` }),
+      body: JSON.stringify({ token: 'ef'.repeat(32), kind: 'push-to-start' }),
+    });
+    assert.equal(regLiveOnly.status, 200);
+    const healthAfter = await call(bridge.port, {
+      path: '/api/companion/push-health',
+      headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
+    });
+    assert.equal(healthAfter.json.tokensRegistered, 2);
   } finally {
     await bridge.close();
   }
@@ -1377,9 +1405,12 @@ test('loopback SSE notify frames send background alerts and Live Activities whil
         botName: 'Forge',
         requestId: 'req-99',
       },
-    });
+    }, null, 2);
+    // Send as a multi-line SSE data frame to verify multi-line joining.
+    const sseDataRows = frame.split('\n').map((line) => `data: ${line}`).join('\n');
+    const ssePayload = `id: 11\n${sseDataRows}\n\n`;
     for (const clientRes of Array.from(sseClients)) {
-      clientRes.write(`id: 11\ndata: ${frame}\n\n`);
+      clientRes.write(ssePayload);
     }
 
     const sendDeadline = Date.now() + 3000;

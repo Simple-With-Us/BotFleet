@@ -15,11 +15,14 @@ import {
   isBlockingAlertKind,
   liveActivityTopic,
   pushSenderForDevice,
+  validateBridgePushToken,
 } from './companion-bridge.mjs';
 
 export const DEFAULT_APNS_BUNDLE_ID = 'app.botfleet.ios';
 export const APNS_TOKEN_TTL_MS = 50 * 60 * 1000;
 export const APNS_REQUEST_TIMEOUT_MS = 10_000;
+export const APNS_TRANSPORT_BREAKER_THRESHOLD = 5;
+export const APNS_CIRCUIT_WINDOW_MS = 60_000;
 
 const EXPIRED_PROVIDER_TOKEN = 'Expired' + 'ProviderToken';
 const INVALID_PROVIDER_TOKEN = 'Invalid' + 'ProviderToken';
@@ -169,6 +172,7 @@ export function createBridgeApnsSender({
   let cachedToken = null;
   let cachedAtMs = 0;
   let cachedFingerprint = '';
+  let circuitOpenUntilMs = 0;
 
   const stats = {
     configured,
@@ -229,9 +233,23 @@ export function createBridgeApnsSender({
     if (stats.keyRejected) {
       return { ok: false, skipped: true, reason: stats.keyRejected };
     }
+    const cleanToken = validateBridgePushToken(token);
+    if (!cleanToken) {
+      try {
+        onInvalidToken?.(deviceId, token);
+      } catch {
+        log('[companion-bridge] failed to forget invalid device push token');
+      }
+      return { ok: false, status: 400, reason: 'BadDeviceToken' };
+    }
+    if (circuitOpenUntilMs > now()) {
+      stats.circuitDropped += 1;
+      stats.dropped += 1;
+      return { ok: false, skipped: true, reason: 'apns-circuit-open' };
+    }
 
     const body = JSON.stringify(payload);
-    const path = `/3/device/${token}`;
+    const path = `/3/device/${encodeURIComponent(cleanToken)}`;
     let result;
     let attempt = 0;
     while (attempt < 2) {
@@ -272,6 +290,7 @@ export function createBridgeApnsSender({
       stats.sent += 1;
       stats.lastSentAt = at;
       stats.consecutiveTransportFailures = 0;
+      circuitOpenUntilMs = 0;
       stats.failureKind = 'none';
       stats.lastErrorCode = null;
       return { ok: true, status: 200 };
@@ -285,6 +304,9 @@ export function createBridgeApnsSender({
       stats.failureKind = 'transport';
       stats.consecutiveTransportFailures += 1;
       stats.lastErrorCode = result?.errorCode ? String(result.errorCode) : null;
+      if (stats.consecutiveTransportFailures >= APNS_TRANSPORT_BREAKER_THRESHOLD) {
+        circuitOpenUntilMs = at + APNS_CIRCUIT_WINDOW_MS;
+      }
       return { ok: false, status: 0, reason: stats.lastError, errorCode: stats.lastErrorCode };
     }
 
@@ -388,21 +410,21 @@ export function createBridgeApnsSender({
         tool: str('tool'),
         seq: Number.isFinite(seq) ? seq : undefined,
       };
-      const outcomes = [];
+      const tasks = [];
       for (const target of targets ?? []) {
         if (!target?.deviceId || active.has(target.deviceId)) continue;
         if (target.pushToken) {
-          outcomes.push({
+          tasks.push({
             channel: 'alert',
             deviceId: target.deviceId,
-            ...(await this.sendAlert({
+            promise: this.sendAlert({
               deviceId: target.deviceId,
               token: target.pushToken,
               ...alertFields,
               serverOwnsPairing: target.serverOwnsPairing ?? true,
               macOwnsPairing: target.macOwnsPairing ?? false,
               onInvalidToken: onInvalidPushToken,
-            })),
+            }),
           });
         }
       }
@@ -413,10 +435,10 @@ export function createBridgeApnsSender({
           for (const target of targets ?? []) {
             if (!target?.deviceId || active.has(target.deviceId)) continue;
             if (target.liveActivityToken) {
-              outcomes.push({
+              tasks.push({
                 channel: 'liveactivity',
                 deviceId: target.deviceId,
-                ...(await this.sendLiveActivity({
+                promise: this.sendLiveActivity({
                   deviceId: target.deviceId,
                   token: target.liveActivityToken,
                   event: 'start',
@@ -427,13 +449,20 @@ export function createBridgeApnsSender({
                   serverOwnsPairing: target.serverOwnsPairing ?? true,
                   macOwnsPairing: target.macOwnsPairing ?? false,
                   onInvalidToken: onInvalidLiveActivityToken,
-                })),
+                }),
               });
             }
           }
         }
       }
-      return outcomes;
+      const settled = await Promise.allSettled(tasks.map((task) => task.promise));
+      return settled.map((result, index) => {
+        const meta = tasks[index];
+        if (result.status === 'fulfilled') {
+          return { channel: meta.channel, deviceId: meta.deviceId, ...result.value };
+        }
+        return { channel: meta.channel, deviceId: meta.deviceId, ok: false, status: 0, reason: 'SendFailed' };
+      });
     },
     health(tokensRegistered = 0) {
       return {
@@ -489,18 +518,20 @@ export function startBridgeHarnessEventSubscriber({
   };
 
   const processChunk = (bufferState, chunk) => {
-    bufferState.buf += chunk;
+    bufferState.buf += String(chunk).replace(/\r\n/g, '\n');
     const parts = bufferState.buf.split('\n\n');
     bufferState.buf = parts.pop() ?? '';
     for (const part of parts) {
       const rows = part.split('\n');
       const idRow = rows.find((row) => row.startsWith('id:'));
       if (idRow) lastEventId = idRow.slice(3).trim();
-      const dataRow = rows.find((row) => row.startsWith('data:'));
-      if (!dataRow) continue;
+      const dataLines = rows
+        .filter((row) => row.startsWith('data:'))
+        .map((row) => (row.startsWith('data: ') ? row.slice(6) : row.slice(5)));
+      if (dataLines.length === 0) continue;
       let frame;
       try {
-        frame = JSON.parse(dataRow.slice(5).trim());
+        frame = JSON.parse(dataLines.join('\n').trim());
       } catch {
         continue;
       }

@@ -340,12 +340,12 @@ const PairingRedeemSchema = z.strictObject({
 });
 
 const PushTokenSchema = z.strictObject({
-  token: z.unknown(),
+  token: z.string().max(512),
 });
 
 const LiveActivityTokenSchema = z.strictObject({
-  token: z.unknown().optional(),
-  kind: z.unknown().optional(),
+  token: z.string().max(512),
+  kind: z.string().max(64).optional(),
 });
 
 /**
@@ -516,7 +516,7 @@ export class BridgeDeviceRegistry {
     if (!row || !row.pushToken) return false;
     if (expectedToken !== undefined) {
       const normalized = validateBridgePushToken(expectedToken);
-      if (normalized && row.pushToken !== normalized) return false;
+      if (!normalized || row.pushToken !== normalized) return false;
     }
     delete row.pushToken;
     return true;
@@ -551,7 +551,7 @@ export class BridgeDeviceRegistry {
     if (!row || !row.liveActivityToken) return false;
     if (expectedToken !== undefined) {
       const normalized = validateBridgePushToken(expectedToken);
-      if (normalized && row.liveActivityToken !== normalized) return false;
+      if (!normalized || row.liveActivityToken !== normalized) return false;
     }
     delete row.liveActivityToken;
     return true;
@@ -1198,7 +1198,7 @@ async function handleLocalRoute({
   }
 
   if (method === 'GET' && path === '/api/companion/push-health') {
-    respondJson(res, 200, sender.health(state.registry.pushTokenCount()));
+    respondJson(res, 200, sender.health(state.registry.pushTargets().length));
     return;
   }
 
