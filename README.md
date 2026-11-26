@@ -1,6 +1,8 @@
 
 <div align="center">
 
+<img src="apps/site/icon-transparent-1024.png" alt="BotFleet logo" width="96" height="96">
+
 # BotFleet
 
 **Choose an Engine for Each Bot.**<br>
