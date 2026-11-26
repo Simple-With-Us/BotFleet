@@ -81,6 +81,61 @@ public enum EngineReplayCatalog {
         corpus(for: family).first?.expectedSpawnSpec.executable
     }
 
+    /// Whether one engine id the packet may name resolves to a replay
+    /// family, and why it does not when it does not (`BF-2647`).
+    ///
+    /// The bundle's `engines` list is operator-supplied free text, and six
+    /// of the thirteen matrix ids resolve while seven do not, so a packet
+    /// that names all thirteen can never go green.  Coverage is how the
+    /// operator learns that before the run rather than after it.
+    public struct Coverage: Equatable, Sendable, Codable {
+        public let engineId: String
+        /// The family behind the id, or nil when none resolves.
+        public let family: EngineReplayFamily?
+        /// The executable the id's driver would launch, or nil when the
+        /// id launches no CLI or names nothing the tree knows.
+        public let executable: String?
+        /// Why the id does not resolve, in words.  Nil when it resolves.
+        public let reason: String?
+
+        public var resolves: Bool { family != nil }
+
+        public init(engineId: String, family: EngineReplayFamily?, executable: String?, reason: String?) {
+            self.engineId = engineId
+            self.family = family
+            self.executable = executable
+            self.reason = reason
+        }
+    }
+
+    /// Coverage for one engine id.
+    public static func coverage(forEngineId engineId: String) -> Coverage {
+        if let family = family(forEngineId: engineId) {
+            return Coverage(engineId: engineId, family: family, executable: executable(forEngineId: engineId), reason: nil)
+        }
+        guard let executable = executable(forEngineId: engineId) else {
+            if EngineMatrixID(rawValue: engineId) != nil || EngineReplayFamily(rawValue: engineId) != nil {
+                return Coverage(
+                    engineId: engineId, family: nil, executable: nil,
+                    reason: "this engine launches no CLI, so no replay family drives it"
+                )
+            }
+            return Coverage(
+                engineId: engineId, family: nil, executable: nil,
+                reason: "no engine or replay family in the tree names this id"
+            )
+        }
+        return Coverage(
+            engineId: engineId, family: nil, executable: executable,
+            reason: "no replay family drives the executable '\(executable)' this engine launches"
+        )
+    }
+
+    /// Coverage for every id in a request, in the request's order.
+    public static func coverage(for engineIds: [String]) -> [Coverage] {
+        engineIds.map { coverage(forEngineId: $0) }
+    }
+
     /// The family an engine id names, or nil when the corpus covers none.
     ///
     /// A matrix id is resolved through the matrix registry's own descriptor,

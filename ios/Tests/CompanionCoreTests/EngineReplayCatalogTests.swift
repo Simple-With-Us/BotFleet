@@ -37,6 +37,33 @@ struct EngineReplayCatalogTests {
         #expect(EngineReplayCatalog.family(forEngineId: "no-such-engine") == nil)
     }
 
+    @Test("Coverage names the resolvable six and gives a reason for the rest")
+    func coverageNamesResolutionsAndReasons() throws {
+        let resolvable = EngineReplayCatalog.coverage(for: ["antigravity", "claude", "codex", "grok-acp", "mcode", "muse"])
+        #expect(resolvable.allSatisfy { $0.resolves })
+        #expect(resolvable.allSatisfy { $0.reason == nil })
+        #expect(resolvable.compactMap(\.family) == [.antigravity, .claude, .codex, .grok, .mcode, .muse])
+
+        // HTTPS engines launch no CLI; unscripted CLIs have an executable
+        // no family drives; an unknown id names nothing.  Three different
+        // refusals, three different reasons.
+        let api = EngineReplayCatalog.coverage(forEngineId: "grok-api")
+        #expect(!api.resolves && api.executable == nil)
+        #expect(api.reason?.contains("launches no CLI") == true)
+        let unscripted = EngineReplayCatalog.coverage(forEngineId: "cursor")
+        #expect(!unscripted.resolves && unscripted.executable == "cursor-agent")
+        #expect(unscripted.reason?.contains("cursor-agent") == true)
+        let unknown = EngineReplayCatalog.coverage(forEngineId: "no-such-engine")
+        #expect(!unknown.resolves && unknown.executable == nil)
+        #expect(unknown.reason?.contains("names this id") == true)
+
+        // A thirteen-engine packet can never go green, and coverage says
+        // so before any fixture runs.
+        let all = EngineReplayCatalog.coverage(for: EngineMatrixID.allCases.map(\.rawValue))
+        #expect(all.filter { $0.resolves }.count == 6)
+        #expect(all.count == 13)
+    }
+
     @Test("The catalog carries the numbered corpus and the standalone protocol fixtures")
     func corpusCarriesEveryFixture() {
         let numbered = EngineReplayHarness.allFixtures()
