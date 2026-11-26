@@ -1198,7 +1198,7 @@ async function handleLocalRoute({
   }
 
   if (method === 'GET' && path === '/api/companion/push-health') {
-    respondJson(res, 200, sender.health(state.registry.pushTargets().length));
+    respondJson(res, 200, sender.health(state.registry.pushTokenCount()));
     return;
   }
 

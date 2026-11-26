@@ -1236,7 +1236,8 @@ test('push-token, live-activity-token, and push-health routes enforce auth, vali
     assert.equal(bridge.state.registry.clearLiveActivityToken('phone-push', 'not-a-valid-token'), false);
     assert.equal(bridge.state.registry.pushTargets().length, 1);
 
-    // A device with only a Live Activity token counts in push-health tokensRegistered.
+    // A device with only a Live Activity token stays in pushTargets() for dispatch
+    // without inflating alert-only push-health tokensRegistered.
     const liveOnly = await bridge.pair('phone-live-only');
     const regLiveOnly = await call(bridge.port, {
       method: 'POST',
@@ -1245,11 +1246,12 @@ test('push-token, live-activity-token, and push-health routes enforce auth, vali
       body: JSON.stringify({ token: 'ef'.repeat(32), kind: 'push-to-start' }),
     });
     assert.equal(regLiveOnly.status, 200);
+    assert.equal(bridge.state.registry.pushTargets().length, 2);
     const healthAfter = await call(bridge.port, {
       path: '/api/companion/push-health',
       headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
     });
-    assert.equal(healthAfter.json.tokensRegistered, 2);
+    assert.equal(healthAfter.json.tokensRegistered, 1);
   } finally {
     await bridge.close();
   }

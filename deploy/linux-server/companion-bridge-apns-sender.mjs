@@ -23,6 +23,7 @@ export const APNS_TOKEN_TTL_MS = 50 * 60 * 1000;
 export const APNS_REQUEST_TIMEOUT_MS = 10_000;
 export const APNS_TRANSPORT_BREAKER_THRESHOLD = 5;
 export const APNS_CIRCUIT_WINDOW_MS = 60_000;
+export const APNS_DISPATCH_CONCURRENCY = 8;
 
 const EXPIRED_PROVIDER_TOKEN = 'Expired' + 'ProviderToken';
 const INVALID_PROVIDER_TOKEN = 'Invalid' + 'ProviderToken';
@@ -417,7 +418,7 @@ export function createBridgeApnsSender({
           tasks.push({
             channel: 'alert',
             deviceId: target.deviceId,
-            promise: this.sendAlert({
+            run: () => this.sendAlert({
               deviceId: target.deviceId,
               token: target.pushToken,
               ...alertFields,
@@ -438,7 +439,7 @@ export function createBridgeApnsSender({
               tasks.push({
                 channel: 'liveactivity',
                 deviceId: target.deviceId,
-                promise: this.sendLiveActivity({
+                run: () => this.sendLiveActivity({
                   deviceId: target.deviceId,
                   token: target.liveActivityToken,
                   event: 'start',
@@ -455,14 +456,25 @@ export function createBridgeApnsSender({
           }
         }
       }
-      const settled = await Promise.allSettled(tasks.map((task) => task.promise));
-      return settled.map((result, index) => {
-        const meta = tasks[index];
-        if (result.status === 'fulfilled') {
-          return { channel: meta.channel, deviceId: meta.deviceId, ...result.value };
+      if (tasks.length === 0) return [];
+      const outcomes = Array.from({ length: tasks.length });
+      let nextIndex = 0;
+      const workerCount = Math.min(APNS_DISPATCH_CONCURRENCY, tasks.length);
+      const runWorker = async () => {
+        while (nextIndex < tasks.length) {
+          const current = nextIndex;
+          nextIndex += 1;
+          const task = tasks[current];
+          try {
+            const value = await task.run();
+            outcomes[current] = { channel: task.channel, deviceId: task.deviceId, ...value };
+          } catch {
+            outcomes[current] = { channel: task.channel, deviceId: task.deviceId, ok: false, status: 0, reason: 'SendFailed' };
+          }
         }
-        return { channel: meta.channel, deviceId: meta.deviceId, ok: false, status: 0, reason: 'SendFailed' };
-      });
+      };
+      await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+      return outcomes;
     },
     health(tokensRegistered = 0) {
       return {

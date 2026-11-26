@@ -10,6 +10,7 @@ import test from 'node:test';
 
 import {
   APNS_CIRCUIT_WINDOW_MS,
+  APNS_DISPATCH_CONCURRENCY,
   APNS_TOKEN_TTL_MS,
   APNS_TRANSPORT_BREAKER_THRESHOLD,
   createApnsProviderToken,
@@ -282,12 +283,39 @@ test('invalid device tokens fail before HTTP/2, transport breaker sheds load and
   });
   const parallelOutcomes = await concurrentSender.dispatchHarnessNotification({
     notification: { title: 'Forge', body: 'Approve?', kind: 'approval', threadId: 't-1', botId: 'b-1' },
+    targets: Array.from({ length: 12 }, (_, idx) => ({
+      deviceId: `p-${idx}`,
+      pushToken: `${(idx % 9) + 1}`.repeat(64),
+    })),
+    activeDeviceIds: [],
+  });
+  assert.equal(parallelOutcomes.length, 12);
+  assert.ok(peakInFlight >= 2, 'dispatch runs targets concurrently');
+  assert.ok(peakInFlight <= APNS_DISPATCH_CONCURRENCY, `peak ${peakInFlight} stays within pool limit`);
+
+  // A synchronous throw on one target does not abort or orphan remaining targets.
+  const isolatedSender = createBridgeApnsSender({
+    material: { available: true, keyId: 'KEYID12345', teamId: 'CC8UTF7ATG', p8, reason: '' },
+    sendImpl: async () => ({ status: 200 }),
+  });
+  let throwOnce = true;
+  const origSendAlert = isolatedSender.sendAlert;
+  isolatedSender.sendAlert = (opts) => {
+    if (throwOnce) {
+      throwOnce = false;
+      throw new Error('sync fault');
+    }
+    return origSendAlert(opts);
+  };
+  const isolatedOutcomes = await isolatedSender.dispatchHarnessNotification({
+    notification: { title: 'Forge', body: 'Ping', kind: 'done' },
     targets: [
-      { deviceId: 'p-1', pushToken: '1'.repeat(64) },
-      { deviceId: 'p-2', pushToken: '2'.repeat(64) },
+      { deviceId: 'bad-sync', pushToken: '1'.repeat(64) },
+      { deviceId: 'good-after', pushToken: '2'.repeat(64) },
     ],
     activeDeviceIds: [],
   });
-  assert.equal(parallelOutcomes.length, 2);
-  assert.equal(peakInFlight, 2);
+  assert.equal(isolatedOutcomes.length, 2);
+  assert.equal(isolatedOutcomes[0].ok, false);
+  assert.equal(isolatedOutcomes[1].ok, true);
 });
