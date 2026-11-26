@@ -2733,6 +2733,49 @@ describe("harness HTTP API", () => {
     expect(patched.body.error).toContain("not recognized");
   });
 
+  it("keeps an advisor model in the saved selection and refuses one that is not a model id", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const patched = await api("PATCH", `/api/bots/${bot.id}`, {
+      modelSelection: { instanceId: "ghost", model: "ghost-1", advisorModel: "claude-opus-5-5" },
+    });
+
+    expect(patched.status).toBe(200);
+    expect(patched.body.bot.modelSelection.advisorModel).toBe("claude-opus-5-5");
+
+    // An advisor reaches the engine as one launch argument, so a value that
+    // is not a model id is refused instead of being saved and passed on.
+    const refused = await api("PATCH", `/api/bots/${bot.id}`, {
+      modelSelection: { instanceId: "ghost", model: "ghost-1", advisorModel: "opus; rm -rf /" },
+    });
+    expect(refused.status).toBe(400);
+    expect(refused.body.error).toContain("advisorModel");
+  });
+
+  it("refuses an advisor-only change while the bot is working", async () => {
+    const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: claude.models.default },
+      });
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "hold this fixture turn" })).status).toBe(202);
+      await expect
+        .poll(async () => (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id)?.busy)
+        .toBe(true);
+
+      // An advisor is the model a turn consults, so swapping it while the
+      // bot works is refused the same way a model swap is.
+      const changed = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: claude.models.default, advisorModel: "claude-opus-5-5" },
+      });
+      expect(changed.status).toBe(409);
+      expect(changed.body.error).toContain("the bot is working");
+    } finally {
+      await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
   it("clears legacy unsupported effort from task selection without clobbering primary bot effort", async () => {
     const created = await api("POST", "/api/bots", {
       name: "EffortBot",

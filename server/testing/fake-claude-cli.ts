@@ -136,7 +136,17 @@ if (argv[0] === "--help") {
     await new Promise((resolve) => setTimeout(resolve, 60_000));
     process.exit(0);
   }
-  process.stdout.write(process.env.FAKE_CLAUDE_HELP === "unsupported" ? "Usage: claude\n" : "  --strict-mcp-config  Only load explicit MCP servers\n");
+  // The real CLI announces the advisor flag in its help text; a CLI old
+  // enough to lack it is faked with FAKE_CLAUDE_ADVISOR=off.
+  const advisorHelp =
+    process.env.FAKE_CLAUDE_ADVISOR === "off"
+      ? ""
+      : "  --advisor <model>  Turn on the advisor tool with this model\n";
+  process.stdout.write(
+    process.env.FAKE_CLAUDE_HELP === "unsupported"
+      ? "Usage: claude\n"
+      : "  --strict-mcp-config  Only load explicit MCP servers\n" + advisorHelp,
+  );
   process.exit(0);
 }
 

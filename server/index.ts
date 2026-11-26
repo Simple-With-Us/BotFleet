@@ -395,6 +395,7 @@ import {
   type RequestOutcome,
   type RuntimeEvent,
 } from "./contracts.ts";
+import { isAdvisorModelId } from "./advisor-model.ts";
 import { buildTurnTools } from "./turn-tools.ts";
 import { createTurnToolHost } from "./tools/host.ts";
 import { adoptGroupLedger } from "./tools/process-group.ts";
@@ -2547,7 +2548,15 @@ function checkedModelSelection(
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return { ok: false, status: 400, error: "modelSelection must be an object" };
   }
-  const value = raw as { instanceId?: unknown; model?: unknown; effort?: unknown; contextCap?: unknown; maxOutputTokens?: unknown; latest?: unknown };
+  const value = raw as {
+    instanceId?: unknown;
+    model?: unknown;
+    effort?: unknown;
+    contextCap?: unknown;
+    maxOutputTokens?: unknown;
+    latest?: unknown;
+    advisorModel?: unknown;
+  };
   if (typeof value.instanceId !== "string" || !value.instanceId.trim()) {
     return { ok: false, status: 400, error: "modelSelection.instanceId is required" };
   }
@@ -2563,6 +2572,18 @@ function checkedModelSelection(
       return { ok: false, status: 400, error: `effort "${String(value.effort)}" is not recognized` };
     }
     selection.effort = value.effort;
+  }
+  // An advisor is a model id, never free text: the driver hands it to the
+  // engine as one launch argument.
+  if (value.advisorModel !== undefined && value.advisorModel !== null) {
+    if (typeof value.advisorModel !== "string" || !isAdvisorModelId(value.advisorModel)) {
+      return {
+        ok: false,
+        status: 400,
+        error: 'modelSelection.advisorModel must be a model id such as "claude-opus-5-5"',
+      };
+    }
+    selection.advisorModel = value.advisorModel.trim();
   }
   if (value.contextCap !== undefined && value.contextCap !== null) {
     const contextCap = TOKEN_LIMIT_SCHEMA.safeParse(value.contextCap);
@@ -2645,6 +2666,9 @@ function checkedModelSelection(
     selection.instanceId !== current.selection.instanceId ||
     selection.model !== current.selection.model ||
     selection.effort !== current.selection.effort ||
+    // An advisor is the model a turn consults, so swapping it while the bot
+    // works is the same stop-before-changing-models case as the model itself.
+    selection.advisorModel !== current.selection.advisorModel ||
     selection.contextCap !== current.selection.contextCap ||
     selection.maxOutputTokens !== current.selection.maxOutputTokens ||
     JSON.stringify(selection.fallbacks) !== JSON.stringify(current.selection.fallbacks)
@@ -7706,7 +7730,16 @@ async function startTurn(
   // busy flips immediately so the composer locks; the dispatch itself runs
   // in the background — box provisioning can take ~90s and must never
   // hang the HTTP request
-  const activeSelection: ModelSelection = { instanceId, model, effort };
+  // The advisor a turn runs under.  The property is absent when the bot has
+  // none, so a selection without an advisor carries no advisor key at all.
+  const activeAdvisor: Pick<ModelSelection, "advisorModel"> = {};
+  if (selection.advisorModel) activeAdvisor.advisorModel = selection.advisorModel;
+  const activeSelection: ModelSelection = {
+    instanceId,
+    model,
+    effort,
+    ...activeAdvisor,
+  };
   // A turn dispatched here is the thread running again, which retires any
   // boot-resume failure remembered against it: the refusal exists to stop a
   // doomed turn being retried by every boot, never to stop a person asking.
@@ -8350,11 +8383,18 @@ async function startTurn(
       const savedMaxHistoryTurns = maxHistoryTurnsSchema.safeParse(bot.maxHistoryTurns);
       if (savedMaxHistoryTurns.success) historySettings.maxHistoryTurns = savedMaxHistoryTurns.data;
       if (bot.historySummaryModel === true) historySettings.historySummaryModel = true;
+      // The advisor this turn runs under.  The property is absent when the
+      // bot has none, so a turn without an advisor carries no advisor key.
+      const turnAdvisor: Pick<ModelSelection, "advisorModel"> = {};
+      if (selection.advisorModel) turnAdvisor.advisorModel = selection.advisorModel;
       const turnInput = {
         threadId,
         text: remindedWakeText(wakeUserText),
         model,
         effort,
+        // An advisor model rides this turn: the driver passes it per launch,
+        // so the owner's global engine settings are never written.
+        ...turnAdvisor,
         // Only a cap this model's row offers reaches a driver; a stale value
         // from a model the bot has since left is dropped here.
         ...(!boxCloud && selection.contextCap !== undefined &&

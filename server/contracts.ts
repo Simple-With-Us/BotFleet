@@ -62,6 +62,10 @@ export interface ModelSelection {
   model: string;
   /** Optional: no effort means no flag, and the CLI keeps its own default. */
   effort?: EffortLevel;
+  /** Optional: a second model the engine consults as an advisor while it
+   *  answers.  A driver passes it per turn and never writes it into a
+   *  provider's global settings. */
+  advisorModel?: string;
   /** Optional working-context cap in tokens (for example 524288 for 512K).
    *  Absent means the model's full window.  Only honored for a model whose
    *  catalog row lists it in `contextCaps`. */
@@ -328,6 +332,10 @@ export interface SendTurnInput {
   text: string;
   model?: string;
   effort?: EffortLevel;
+  /** Optional: a second model the driver consults as an advisor for THIS
+   *  turn.  The driver passes it per launch, so a turn can never change a
+   *  provider's global settings. */
+  advisorModel?: string;
   /** The bot's chosen context cap in tokens, when its model offers one.  A
    *  driver that budgets the prompt sizes it from this (see `contextCapTokens`
    *  in the driver config, which this overrides for the turn). */
