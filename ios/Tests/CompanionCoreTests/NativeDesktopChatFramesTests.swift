@@ -121,6 +121,24 @@ struct NativeDesktopChatFramesTests {
         #expect(types == ["content.delta", "test.settled", "turn.failed"])
     }
 
+    @Test("Events after the turn has ended are dropped, not streamed")
+    func postTerminalEventsDropped() async {
+        let events = stream([
+            .textDelta("a"),
+            .completed(stopReason: "end_turn", inputTokens: nil, outputTokens: nil),
+            .textDelta("late"),
+            .error(code: "x", message: "after the end")
+        ])
+        var state = CompanionState()
+        var types: [String] = []
+        for await frame in NativeDesktopChatFrames.frames(from: events, threadId: "thread-a") {
+            state.apply(frame)
+            if case let .runtime(event) = frame { types.append(event.type) }
+        }
+        #expect(types == ["content.delta", "turn.completed"])
+        #expect(state.streaming["thread-a"] == nil)
+    }
+
     private static let settledMarker = Frame.runtime(
         RuntimeEvent(type: "test.settled", threadId: "thread-a", delta: nil, streamKind: nil)
     )

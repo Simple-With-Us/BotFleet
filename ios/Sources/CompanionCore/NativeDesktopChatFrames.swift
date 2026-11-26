@@ -38,13 +38,21 @@ public enum NativeDesktopChatFrames {
 
     /// A turn's whole event stream as window frames, in order.
     ///
-    /// The frame that ends the turn (`turn.completed` or `turn.failed`) is
-    /// held until the stream ends, and the frames `settled` returns go out
-    /// before it: the settled reply lands in the transcript first, so the
-    /// live bubble is never cleared while nothing has replaced it.  A stream
-    /// that ends without either terminal event (the engine dropped it) ends
-    /// with `turn.aborted`, so a partial reply never stays on screen as if
-    /// it were still coming.
+    /// The first terminal event (`.completed` or `.error`) ends the turn:
+    /// anything the stream yields after it is dropped, so a late or
+    /// duplicate delta never streams into a turn that has already ended.
+    /// Its frame (`turn.completed` or `turn.failed`) is held until the
+    /// stream ends, and the frames `settled` returns go out before it: the
+    /// settled reply lands in the transcript first, so the live bubble is
+    /// never cleared while nothing has replaced it.  A stream that ends
+    /// without either terminal event (the engine dropped it) ends with
+    /// `turn.aborted`, so a partial reply never stays on screen as if it
+    /// were still coming.
+    ///
+    /// `settled` runs on every ending, aborted included, because it reads
+    /// only what the dispatcher durably wrote to the native store: on a
+    /// dropped turn that is still the person's own prompt, which must not
+    /// vanish from the window.
     ///
     /// Cancelling the returned stream cancels the turn's stream underneath
     /// it, which `NativeDesktopChatService` turns into cancelling the engine
@@ -59,6 +67,7 @@ public enum NativeDesktopChatFrames {
             let relay = Task {
                 var ending: Frame?
                 for await event in events {
+                    guard ending == nil else { continue }
                     switch event {
                     case .completed, .error:
                         ending = NativeDesktopChatFrames.frames(for: event, threadId: threadId).first
