@@ -1297,6 +1297,7 @@
     {"path":"scripts/release-provenance.mjs","category":"runtime","reason":"Import from scripts/source-build-identity.mjs"},
     {"path":"scripts/source-build-identity.mjs","category":"runtime","reason":"Import from server/runtime-identity.ts"},
     {"path":"scripts/stage-entries.mjs","category":"runtime","reason":"Import from server/update-control.ts"},
+    {"path":"server/advisor-model.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/ai-usage.ts","category":"runtime","reason":"Import from server/telemetry.ts"},
     {"path":"server/antigravity-models.ts","category":"runtime","reason":"Import from server/antigravity-quota.ts"},
     {"path":"server/antigravity-quota.ts","category":"runtime","reason":"Import from server/index.ts"},
