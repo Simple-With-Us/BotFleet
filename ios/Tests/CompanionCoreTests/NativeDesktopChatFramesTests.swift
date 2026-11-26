@@ -63,13 +63,12 @@ struct NativeDesktopChatFramesTests {
 
     @Test("A whole turn stream becomes the same frames in order")
     func streamMapsInOrder() async {
-        let events = AsyncStream<TurnEvent> { continuation in
-            continuation.yield(.sessionStarted(sessionId: "s"))
-            continuation.yield(.textDelta("a"))
-            continuation.yield(.textDelta("b"))
-            continuation.yield(.completed(stopReason: "end_turn", inputTokens: nil, outputTokens: nil))
-            continuation.finish()
-        }
+        let events = stream([
+            .sessionStarted(sessionId: "s"),
+            .textDelta("a"),
+            .textDelta("b"),
+            .completed(stopReason: "end_turn", inputTokens: nil, outputTokens: nil)
+        ])
         var state = CompanionState()
         var sawText = false
         for await frame in NativeDesktopChatFrames.frames(from: events, threadId: "thread-a") {
@@ -78,5 +77,58 @@ struct NativeDesktopChatFramesTests {
         }
         #expect(sawText)
         #expect(state.streaming["thread-a"] == nil)
+    }
+
+    @Test("The settled reply's frames land before the frame that ends the turn")
+    func settledFramesPrecedeTurnEnd() async {
+        let events = stream([
+            .textDelta("a"),
+            .completed(stopReason: "end_turn", inputTokens: nil, outputTokens: nil)
+        ])
+        let settled: @Sendable () async -> [Frame] = { () async -> [Frame] in
+            [Self.settledMarker]
+        }
+        var types: [String] = []
+        for await frame in NativeDesktopChatFrames.frames(from: events, threadId: "thread-a", settled: settled) {
+            if case let .runtime(event) = frame { types.append(event.type) }
+        }
+        #expect(types == ["content.delta", "test.settled", "turn.completed"])
+    }
+
+    @Test("A stream that ends with no terminal event ends the turn as aborted")
+    func droppedStreamEndsAborted() async {
+        let events = stream([.textDelta("partial")])
+        var state = CompanionState()
+        var types: [String] = []
+        for await frame in NativeDesktopChatFrames.frames(from: events, threadId: "thread-a") {
+            state.apply(frame)
+            if case let .runtime(event) = frame { types.append(event.type) }
+        }
+        #expect(types == ["content.delta", "turn.aborted"])
+        #expect(state.streaming["thread-a"] == nil)
+    }
+
+    @Test("A failed stream ends with turn.failed, after the settled frames")
+    func failedStreamEndsFailed() async {
+        let events = stream([.textDelta("partial"), .error(code: "x", message: "boom")])
+        let settled: @Sendable () async -> [Frame] = { () async -> [Frame] in
+            [Self.settledMarker]
+        }
+        var types: [String] = []
+        for await frame in NativeDesktopChatFrames.frames(from: events, threadId: "thread-a", settled: settled) {
+            if case let .runtime(event) = frame { types.append(event.type) }
+        }
+        #expect(types == ["content.delta", "test.settled", "turn.failed"])
+    }
+
+    private static let settledMarker = Frame.runtime(
+        RuntimeEvent(type: "test.settled", threadId: "thread-a", delta: nil, streamKind: nil)
+    )
+
+    private func stream(_ events: [TurnEvent]) -> AsyncStream<TurnEvent> {
+        AsyncStream { continuation in
+            for event in events { continuation.yield(event) }
+            continuation.finish()
+        }
     }
 }
