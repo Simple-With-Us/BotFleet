@@ -85,10 +85,21 @@ public actor MacExecutionContext: NativeExecutionContextSource {
     }
 
     public func resolve(wait: NativeEventWait) async throws -> NativeExecutionAdmission {
+        guard let threadId = wait.threadId, let prompt = wait.prompt else {
+            guard !stopped else { throw NativeRuntimeServicesError.stopped }
+            return .held(.credentialsUnavailable)
+        }
+        return try await resolveTurn(botId: wait.botId, threadId: threadId, prompt: prompt)
+    }
+
+    /// Resolves one turn for a registered bot on its registered thread, the
+    /// same admission a satisfied wait gets.  The desktop chat sends through
+    /// here (`BF-2705`), so a chat message and a wait follow-up are prepared
+    /// by one rule set: same profile, credentials and confined workspace.
+    public func resolveTurn(botId: String, threadId: String, prompt: String) async throws -> NativeExecutionAdmission {
         guard !stopped else { throw NativeRuntimeServicesError.stopped }
-        guard let profile = profiles[wait.botId],
-              profile.threadId == wait.threadId,
-              let prompt = wait.prompt,
+        guard let profile = profiles[botId],
+              profile.threadId == threadId,
               !prompt.isEmpty else {
             return .held(.credentialsUnavailable)
         }
