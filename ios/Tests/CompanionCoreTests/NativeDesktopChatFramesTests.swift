@@ -121,13 +121,13 @@ struct NativeDesktopChatFramesTests {
         #expect(types == ["content.delta", "test.settled", "turn.failed"])
     }
 
-    @Test("Events after the turn has ended are dropped, not streamed")
-    func postTerminalEventsDropped() async {
+    @Test("Deltas after the turn has ended are dropped, not streamed")
+    func postTerminalDeltasDropped() async {
         let events = stream([
             .textDelta("a"),
             .completed(stopReason: "end_turn", inputTokens: nil, outputTokens: nil),
             .textDelta("late"),
-            .error(code: "x", message: "after the end")
+            .reasoningDelta("late")
         ])
         var state = CompanionState()
         var types: [String] = []
@@ -137,6 +137,48 @@ struct NativeDesktopChatFramesTests {
         }
         #expect(types == ["content.delta", "turn.completed"])
         #expect(state.streaming["thread-a"] == nil)
+    }
+
+    @Test("A persistence failure after completion ends the turn as failed")
+    func persistenceFailureAfterCompletionFails() async {
+        // TurnDispatcherActor forwards .completed, then writes the reply, and
+        // yields .error(persistence_failed) when that write fails.
+        let events = stream([
+            .textDelta("a"),
+            .completed(stopReason: "end_turn", inputTokens: nil, outputTokens: nil),
+            .error(code: "persistence_failed", message: "Native turn output could not be persisted")
+        ])
+        var types: [String] = []
+        for await frame in NativeDesktopChatFrames.frames(from: events, threadId: "thread-a") {
+            if case let .runtime(event) = frame { types.append(event.type) }
+        }
+        #expect(types == ["content.delta", "turn.failed"])
+    }
+
+    @Test("The settled hook runs only after the whole stream has ended")
+    func settledWaitsForStreamEnd() async {
+        // The reply is durable only once the dispatcher's stream ends, so the
+        // hook must not run at .completed while the stream is still open.
+        let (events, input) = AsyncStream<TurnEvent>.makeStream()
+        let probe = SettledProbe()
+        let settled: @Sendable () async -> [Frame] = { () async -> [Frame] in
+            await probe.markRan()
+            return []
+        }
+        let frames = NativeDesktopChatFrames.frames(from: events, threadId: "thread-a", settled: settled)
+        let consumer = Task { () -> [String] in
+            var types: [String] = []
+            for await frame in frames {
+                if case let .runtime(event) = frame { types.append(event.type) }
+            }
+            return types
+        }
+        input.yield(.completed(stopReason: "end_turn", inputTokens: nil, outputTokens: nil))
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        #expect(await probe.ran == false)
+        input.finish()
+        #expect(await consumer.value == ["turn.completed"])
+        #expect(await probe.ran == true)
     }
 
     private static let settledMarker = Frame.runtime(
@@ -149,4 +191,9 @@ struct NativeDesktopChatFramesTests {
             continuation.finish()
         }
     }
+}
+
+private actor SettledProbe {
+    private(set) var ran = false
+    func markRan() { ran = true }
 }

@@ -38,10 +38,18 @@ public enum NativeDesktopChatFrames {
 
     /// A turn's whole event stream as window frames, in order.
     ///
-    /// The first terminal event (`.completed` or `.error`) ends the turn:
-    /// anything the stream yields after it is dropped, so a late or
-    /// duplicate delta never streams into a turn that has already ended.
-    /// Its frame (`turn.completed` or `turn.failed`) is held until the
+    /// The stream is read to its end, not just to its first terminal event:
+    /// `TurnDispatcherActor` writes the assistant reply to the native store
+    /// after it has forwarded `.completed`, and returns right after that
+    /// write, so the end of the stream is the signal that the reply is
+    /// durable.  Reading on to it keeps `settled` from looking at the store
+    /// before the reply is there.
+    ///
+    /// Once a terminal event has arrived, later deltas are dropped, so a late
+    /// or duplicate delta never streams into a turn that has ended.  A later
+    /// `.error` still wins over `.completed`: the dispatcher yields one when
+    /// the completed reply could not be persisted, and that turn has failed.
+    /// The ending frame (`turn.completed` or `turn.failed`) is held until the
     /// stream ends, and the frames `settled` returns go out before it: the
     /// settled reply lands in the transcript first, so the live bubble is
     /// never cleared while nothing has replaced it.  A stream that ends
@@ -51,8 +59,9 @@ public enum NativeDesktopChatFrames {
     ///
     /// `settled` runs on every ending, aborted included, because it reads
     /// only what the dispatcher durably wrote to the native store: on a
-    /// dropped turn that is still the person's own prompt, which must not
-    /// vanish from the window.
+    /// dropped turn that is still the person's own prompt, which the
+    /// dispatcher writes before the engine runs and which must not vanish
+    /// from the window.
     ///
     /// Cancelling the returned stream cancels the turn's stream underneath
     /// it, which `NativeDesktopChatService` turns into cancelling the engine
@@ -67,11 +76,13 @@ public enum NativeDesktopChatFrames {
             let relay = Task {
                 var ending: Frame?
                 for await event in events {
-                    guard ending == nil else { continue }
                     switch event {
-                    case .completed, .error:
-                        ending = NativeDesktopChatFrames.frames(for: event, threadId: threadId).first
+                    case .completed:
+                        if ending == nil { ending = turnEnd("turn.completed", threadId: threadId) }
+                    case .error:
+                        ending = turnEnd("turn.failed", threadId: threadId)
                     default:
+                        guard ending == nil else { continue }
                         for frame in NativeDesktopChatFrames.frames(for: event, threadId: threadId) {
                             continuation.yield(frame)
                         }
