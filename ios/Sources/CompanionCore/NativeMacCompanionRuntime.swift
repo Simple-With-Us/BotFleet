@@ -263,4 +263,21 @@ public struct NativeMacCompanionRuntime: Sendable {
         return 0
         #endif
     }
+
+    /// A desktop chat service on this graph (`BF-2705`): the Mac app's chat
+    /// window sends through it, with the same database, execution context,
+    /// engine coordinator and engine switch the satisfied waits use, so a
+    /// chat turn and a wait follow-up share one admission and one
+    /// active-turn count.  When the runtime was built with a
+    /// non-`MacExecutionContext` override, no bot is registered on
+    /// `macExecutionContext`, so every message is refused as
+    /// `.botNotRegistered` instead of running outside the override.
+    public func makeDesktopChatService() -> NativeDesktopChatService {
+        NativeDesktopChatService(
+            database: database,
+            executionContext: macExecutionContext,
+            engineCoordinator: runtime.engineCoordinator,
+            engineSwitch: runtime.engineSwitch
+        )
+    }
 }
