@@ -277,7 +277,7 @@ public enum EngineMatrixRegistry {
             baseArguments: ["--output-format", "stream-json"],
             wireProtocol: .streamJSONStdio,
             authRequirement: .cliManagedLogin(cliBinary: "agy"),
-            defaultModel: "gemini-3.1-pro-high"
+            defaultModel: "gemini-4-neon"
         ),
         .claude: EngineDriverDescriptor(
             id: .claude,
@@ -297,7 +297,7 @@ public enum EngineMatrixRegistry {
             baseArguments: ["app-server"],
             wireProtocol: .appServerJSONRPC,
             authRequirement: .cliManagedLogin(cliBinary: "codex"),
-            defaultModel: "gpt-5.4"
+            defaultModel: "gpt-6-luna"
         ),
         .grokAcp: EngineDriverDescriptor(
             id: .grokAcp,
@@ -387,7 +387,7 @@ public enum EngineMatrixRegistry {
             baseArguments: ["--profile", "acp"],
             wireProtocol: .acpJSONRPC,
             authRequirement: .clutchOrInfisical(key: "DEEPSEEK_API_KEY"),
-            defaultModel: "deepseek-chat",
+            defaultModel: "DeepSeek-V4.1-Flash",
             baseInitTimeoutMs: 90_000
         ),
         .opencode: EngineDriverDescriptor(
