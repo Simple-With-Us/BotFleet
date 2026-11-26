@@ -2733,6 +2733,24 @@ describe("harness HTTP API", () => {
     expect(patched.body.error).toContain("not recognized");
   });
 
+  it("keeps an advisor model in the saved selection and refuses one that is not a model id", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const patched = await api("PATCH", `/api/bots/${bot.id}`, {
+      modelSelection: { instanceId: "ghost", model: "ghost-1", advisorModel: "claude-opus-5-5" },
+    });
+
+    expect(patched.status).toBe(200);
+    expect(patched.body.bot.modelSelection.advisorModel).toBe("claude-opus-5-5");
+
+    // An advisor reaches the engine as one launch argument, so a value that
+    // is not a model id is refused instead of being saved and passed on.
+    const refused = await api("PATCH", `/api/bots/${bot.id}`, {
+      modelSelection: { instanceId: "ghost", model: "ghost-1", advisorModel: "opus; rm -rf /" },
+    });
+    expect(refused.status).toBe(400);
+    expect(refused.body.error).toContain("advisorModel");
+  });
+
   it("clears legacy unsupported effort from task selection without clobbering primary bot effort", async () => {
     const created = await api("POST", "/api/bots", {
       name: "EffortBot",

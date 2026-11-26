@@ -50,7 +50,7 @@ import { STATIC_CLAUDE_MODELS } from "../claude-models.ts";
 export { STATIC_CLAUDE_MODELS };
 import { computerProxyEnv } from "../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
-import { newEventId, newId } from "../contracts.ts";
+import { isAdvisorModel, newEventId, newId } from "../contracts.ts";
 import { awaitSeatCredentials, launchedChildCredentials, primeSeatCredentials, seatCredentialsReady } from "../child-credentials.ts";
 import { CLI_LOGIN_ENV_NAMES, FLEET_BEARER_ENV_NAME } from "../secret-map.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
@@ -1189,6 +1189,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       }
       try {
         await requireStrictMcp();
+        // The advisor is a launch flag, so the CLI has to know it before the
+        // turn starts: a CLI that does not announce the flag is refused here
+        // rather than dying on an unknown option mid-turn.
+        if (turn.advisorModel) await requireAdvisorSupport(turn.advisorModel);
       } catch (error) {
         preflightError = error;
       } finally {
@@ -1261,6 +1265,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const injected = applyClaudeInject({ ...turnEnvironment }, turnModel);
       if (injected.model) args.push("--model", injected.model);
       if (turn.effort) args.push("--effort", turn.effort);
+      // An advisor model rides this turn only.  The flag is per launch, so
+      // nothing here writes the owner's global Claude settings — the reason
+      // "/advisor" is denied in the first place.
+      if (turn.advisorModel) args.push("--advisor", turn.advisorModel.trim());
       // Only the stable half rides the spawn contract, and so argsKey: the
       // volatile half (memory, mentions) is delivered inside the user turn
       // below, so a memory write or a mention no longer relaunches a healthy
@@ -2326,6 +2334,58 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       };
       if (spawnFailure) reason.setup = true;
       throw reason;
+    };
+
+    // The advisor tool is a launch flag (`--advisor <model>`), so a CLI that
+    // does not announce it cannot run a turn that asks for one.  It is probed
+    // the way `--strict-mcp-config` is: one answer, cached, and a probe that
+    // runs out of time never reads as "too old".
+    type AdvisorFlagAnswer = "yes" | "no" | "unknown";
+    let advisorFlagProbe: { expiresAt: number; result: Promise<AdvisorFlagAnswer> } | undefined;
+    const probeAdvisorFlag = (env: NodeJS.ProcessEnv): Promise<AdvisorFlagAnswer> => {
+      if (advisorFlagProbe && advisorFlagProbe.expiresAt > Date.now()) return advisorFlagProbe.result;
+      const startedAt = Date.now();
+      const helpTimeout = claudeHelpTimeoutMs();
+      const probe = {
+        expiresAt: Date.now() + 30_000,
+        result: new Promise<AdvisorFlagAnswer>((resolve) => {
+          execCli(config.cli, ["--help"], { timeout: helpTimeout, env }, (error, stdout) => {
+            if (!error && /(?:^|\s)--advisor(?:\s|$)/m.test(stdout)) return resolve("yes");
+            const elapsed = Date.now() - startedAt;
+            if (isProbeTimeout(error) || (!stdout?.trim() && elapsed >= helpTimeout)) {
+              logProbeFailure(instanceId, `${config.cli} --help`, error, elapsed);
+              return resolve("unknown");
+            }
+            resolve("no");
+          });
+        }),
+      };
+      advisorFlagProbe = probe;
+      void probe.result.then((answer) => {
+        if (answer === "yes") probe.expiresAt = Infinity;
+        // Not an answer: look again soon, but not on every call — each look
+        // is another process on an already busy engine.
+        else if (answer === "unknown") probe.expiresAt = Date.now() + 5_000;
+      });
+      return probe.result;
+    };
+    const requireAdvisorSupport = async (advisorModel: string): Promise<void> => {
+      if (!isAdvisorModel(advisorModel)) {
+        throw new Error(`"${advisorModel}" is not a model id, so it cannot be an advisor`);
+      }
+      const env = claudeEnvironment(undefined, { ...process.env, ...input.environment });
+      const support = await probeAdvisorFlag(env);
+      if (support === "yes") return;
+      // `--help` gave no answer in time: nothing says this CLI is too old, so
+      // the turn must not tell the user to update it.  It still cannot run
+      // unverified, so it fails as a slow check the next turn retries.
+      if (support === "unknown") {
+        throw new Error(`${input.displayName || "Claude"} did not answer in time; try again in a moment`);
+      }
+      throw new Error(
+        `${input.displayName || "Claude"} on this engine does not support the advisor model.  ` +
+          `Update Claude Code on the engine, or clear the advisor model on the bot.`,
+      );
     };
 
     // Last definitive answers, so one probe that runs out of time on a busy

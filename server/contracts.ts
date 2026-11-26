@@ -54,6 +54,18 @@ export function isEffortLevel(value: unknown): value is EffortLevel {
   return (EFFORT_LEVELS as readonly unknown[]).includes(value);
 }
 
+/** An advisor model id: a model slug, a short alias, or an injected id.  It
+ *  reaches the engine as one launch argument, so it may not carry spaces or
+ *  punctuation that would make it a different argument. */
+export function isAdvisorModel(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.trim().length <= 64 &&
+    /^[a-z0-9][a-z0-9._:/-]*$/i.test(value.trim())
+  );
+}
+
 // ── model selection ────────────────────────────────────────────────────
 // "Which model" is a data value carried on the request, never a service
 // binding (upstream ModelSelectionWire). instanceId is the routing key.
@@ -62,6 +74,10 @@ export interface ModelSelection {
   model: string;
   /** Optional: no effort means no flag, and the CLI keeps its own default. */
   effort?: EffortLevel;
+  /** Optional: a second model the engine consults as an advisor while it
+   *  answers.  A driver passes it per turn and never writes it into a
+   *  provider's global settings. */
+  advisorModel?: string;
   /** Optional working-context cap in tokens (for example 524288 for 512K).
    *  Absent means the model's full window.  Only honored for a model whose
    *  catalog row lists it in `contextCaps`. */
@@ -328,6 +344,10 @@ export interface SendTurnInput {
   text: string;
   model?: string;
   effort?: EffortLevel;
+  /** Optional: a second model the driver consults as an advisor for THIS
+   *  turn.  The driver passes it per launch, so a turn can never change a
+   *  provider's global settings. */
+  advisorModel?: string;
   /** The bot's chosen context cap in tokens, when its model offers one.  A
    *  driver that budgets the prompt sizes it from this (see `contextCapTokens`
    *  in the driver config, which this overrides for the turn). */

@@ -391,6 +391,7 @@ import {
   type InstanceConfigMap,
   type ModelSelection,
   type EffortLevel,
+  isAdvisorModel,
   type ProviderInstance,
   type RequestOutcome,
   type RuntimeEvent,
@@ -2547,7 +2548,15 @@ function checkedModelSelection(
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return { ok: false, status: 400, error: "modelSelection must be an object" };
   }
-  const value = raw as { instanceId?: unknown; model?: unknown; effort?: unknown; contextCap?: unknown; maxOutputTokens?: unknown; latest?: unknown };
+  const value = raw as {
+    instanceId?: unknown;
+    model?: unknown;
+    effort?: unknown;
+    contextCap?: unknown;
+    maxOutputTokens?: unknown;
+    latest?: unknown;
+    advisorModel?: unknown;
+  };
   if (typeof value.instanceId !== "string" || !value.instanceId.trim()) {
     return { ok: false, status: 400, error: "modelSelection.instanceId is required" };
   }
@@ -2563,6 +2572,18 @@ function checkedModelSelection(
       return { ok: false, status: 400, error: `effort "${String(value.effort)}" is not recognized` };
     }
     selection.effort = value.effort;
+  }
+  // An advisor is a model id, never free text: the driver hands it to the
+  // engine as one launch argument.
+  if (value.advisorModel !== undefined && value.advisorModel !== null) {
+    if (!isAdvisorModel(value.advisorModel)) {
+      return {
+        ok: false,
+        status: 400,
+        error: 'modelSelection.advisorModel must be a model id such as "claude-opus-5-5"',
+      };
+    }
+    selection.advisorModel = value.advisorModel.trim();
   }
   if (value.contextCap !== undefined && value.contextCap !== null) {
     const contextCap = TOKEN_LIMIT_SCHEMA.safeParse(value.contextCap);
@@ -7706,7 +7727,12 @@ async function startTurn(
   // busy flips immediately so the composer locks; the dispatch itself runs
   // in the background — box provisioning can take ~90s and must never
   // hang the HTTP request
-  const activeSelection: ModelSelection = { instanceId, model, effort };
+  const activeSelection: ModelSelection = {
+    instanceId,
+    model,
+    effort,
+    ...(selection.advisorModel ? { advisorModel: selection.advisorModel } : {}),
+  };
   // A turn dispatched here is the thread running again, which retires any
   // boot-resume failure remembered against it: the refusal exists to stop a
   // doomed turn being retried by every boot, never to stop a person asking.
@@ -8355,6 +8381,9 @@ async function startTurn(
         text: remindedWakeText(wakeUserText),
         model,
         effort,
+        // An advisor model rides this turn: the driver passes it per launch,
+        // so the owner's global engine settings are never written.
+        ...(selection.advisorModel ? { advisorModel: selection.advisorModel } : {}),
         // Only a cap this model's row offers reaches a driver; a stale value
         // from a model the bot has since left is dropped here.
         ...(!boxCloud && selection.contextCap !== undefined &&

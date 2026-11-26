@@ -238,6 +238,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.FAKE_CLAUDE_RETRY_SCALE;
     delete process.env.FAKE_CLAUDE_HELP;
     delete process.env.FAKE_CLAUDE_HELP_PROBES;
+    delete process.env.FAKE_CLAUDE_ADVISOR;
     delete process.env.FAKE_CLAUDE_PROMPTS;
     delete process.env.FAKE_CLAUDE_LIFECYCLE;
     delete process.env.FAKE_CLAUDE_RESULT_MARK;
@@ -690,6 +691,50 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     } finally {
       rmSync(globalConfig, { force: true });
     }
+  });
+
+  it("launches the turn with the advisor model the turn asked for", async () => {
+    await create();
+    const dump = join(scratch, "advisor.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-advisor",
+      text: "hi",
+      advisorModel: "claude-opus-5-5",
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv[seen.argv.indexOf("--advisor") + 1]).toBe("claude-opus-5-5");
+  });
+
+  it("leaves the advisor off a turn that asked for none", async () => {
+    await create();
+    const dump = join(scratch, "no-advisor.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-no-advisor", text: "hi" });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv).not.toContain("--advisor");
+  });
+
+  it("refuses the turn when the CLI does not announce the advisor flag", async () => {
+    process.env.FAKE_CLAUDE_ADVISOR = "off";
+    await create();
+
+    await expect(
+      instance.adapter.sendTurn({
+        threadId: "t-advisor-unsupported",
+        text: "hi",
+        advisorModel: "claude-opus-5-5",
+      }),
+    ).resolves.toMatchObject({ dispatched: false });
+    expect(recorder.events).toContainEqual(
+      expect.objectContaining({ type: "runtime.error", message: expect.stringContaining("advisor") }),
+    );
   });
 
   it("only ever passes --permission-prompt-tool alongside the botfleet server it names — never one without the other", async () => {
@@ -2462,6 +2507,7 @@ describe("ClaudeDriver snapshot auth (fake CLI)", () => {
     delete process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS;
     delete process.env.FAKE_CLAUDE_HELP;
     delete process.env.FAKE_CLAUDE_HELP_PROBES;
+    delete process.env.FAKE_CLAUDE_ADVISOR;
     delete process.env.FAKE_CLAUDE_VERSION;
     delete process.env.ANTHROPIC_API_KEY;
     await instance?.dispose();
