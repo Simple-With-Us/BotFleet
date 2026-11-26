@@ -97,6 +97,40 @@ struct NativeDesktopChatServiceTests {
         #expect(await fixture.engine.prompts.isEmpty)
     }
 
+    @Test("Cancelling the chat stream cancels the engine turn")
+    func cancellingStreamCancelsTurn() async throws {
+        let engine = HangingFixtureEngine()
+        let fixture = try await makeFixture(engine: engine)
+        defer { fixture.cleanup() }
+        try await fixture.switchBotToNative()
+        try await fixture.context.register(
+            MacBotExecutionProfile(id: "bot-a", threadId: "thread-a", engineId: "desktop-fixture")
+        )
+
+        let stream = try await fixture.service.send(botId: "bot-a", threadId: "thread-a", text: "keep going")
+        let consumer = Task {
+            var count = 0
+            for await _ in stream { count += 1 }
+            return count
+        }
+        // Wait until the engine has the turn, then walk away from the window.
+        var waited = 0
+        while await engine.started == 0, waited < 200 {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            waited += 1
+        }
+        #expect(await engine.started == 1)
+        consumer.cancel()
+        _ = await consumer.value
+
+        waited = 0
+        while await engine.cancelledThreads.isEmpty, waited < 200 {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            waited += 1
+        }
+        #expect(await engine.cancelledThreads == ["thread-a"])
+    }
+
     @Test("Wait admission still resolves through the shared turn rule")
     func waitAdmissionUnchanged() async throws {
         let fixture = try await makeFixture()
@@ -144,7 +178,8 @@ struct NativeDesktopChatServiceTests {
     }
 
     private func makeFixture(
-        credentials: any NativeServiceCredentialSource = FixtureCredentials()
+        credentials: any NativeServiceCredentialSource = FixtureCredentials(),
+        engine driver: (any EngineDriver)? = nil
     ) async throws -> Fixture {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("desktop-chat-\(UUID().uuidString)", isDirectory: true)
@@ -156,7 +191,7 @@ struct NativeDesktopChatServiceTests {
         )
         let engine = DesktopFixtureEngine()
         let coordinator = EngineCoordinatorActor(
-            drivers: [engine],
+            drivers: [driver ?? (engine as any EngineDriver)],
             botFallbackChains: ["bot-a": ["desktop-fixture"]],
             dispatcher: TurnDispatcherActor(database: database, maxRetriesPerEngine: 0, requiresDurablePersistence: true)
         )
@@ -200,4 +235,26 @@ private actor DesktopFixtureEngine: EngineDriver {
     }
 
     func cancelTurn(threadId: String) async {}
+}
+
+/// Holds its turn open until the coordinator cancels it.
+private actor HangingFixtureEngine: EngineDriver {
+    nonisolated let engineId = "desktop-fixture"
+    private(set) var started = 0
+    private(set) var cancelledThreads: [String] = []
+    private var continuation: AsyncStream<TurnEvent>.Continuation?
+
+    func sendTurn(input: TurnInput) async throws -> AsyncStream<TurnEvent> {
+        started += 1
+        let (stream, continuation) = AsyncStream<TurnEvent>.makeStream()
+        self.continuation = continuation
+        continuation.yield(.textDelta("working"))
+        return stream
+    }
+
+    func cancelTurn(threadId: String) async {
+        cancelledThreads.append(threadId)
+        continuation?.finish()
+        continuation = nil
+    }
 }

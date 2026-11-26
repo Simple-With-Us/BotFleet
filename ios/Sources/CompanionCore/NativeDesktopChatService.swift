@@ -16,6 +16,9 @@ public enum NativeDesktopChatError: LocalizedError, Equatable, Sendable {
     /// The bot's runtime owner is still the Node harness, so the native
     /// runtime is fenced from answering it.
     case runtimeNotNative(botId: String)
+    /// The bot's runtime owner is changing right now; the message can be
+    /// sent again once the switch settles.
+    case runtimeSwitchInProgress(botId: String)
     /// A turn is already running on this thread.
     case turnAlreadyActive(threadId: String)
 
@@ -33,6 +36,8 @@ public enum NativeDesktopChatError: LocalizedError, Equatable, Sendable {
             return "This bot's engine credentials or workspace are not available on this Mac."
         case .runtimeNotNative(let botId):
             return "Bot \(botId) still answers through the Node harness, so this Mac cannot run its turn."
+        case .runtimeSwitchInProgress(let botId):
+            return "Bot \(botId) is switching runtimes right now.  Send the message again in a moment."
         case .turnAlreadyActive(let threadId):
             return "A turn is already running on thread \(threadId)."
         }
@@ -98,8 +103,10 @@ public actor NativeDesktopChatService {
         let turnId = "desktop_\(UUID().uuidString.lowercased())"
         do {
             try await engineSwitch.beginTurn(botId: botId, callerRuntime: .nativeSwift, turnId: turnId)
-        } catch {
+        } catch BotEngineSwitchError.runtimeFenced {
             throw NativeDesktopChatError.runtimeNotNative(botId: botId)
+        } catch BotEngineSwitchError.transitionInProgress {
+            throw NativeDesktopChatError.runtimeSwitchInProgress(botId: botId)
         }
 
         let upstream: AsyncStream<TurnEvent>
@@ -120,14 +127,17 @@ public actor NativeDesktopChatService {
                 for await event in upstream {
                     continuation.yield(event)
                 }
-                if Task.isCancelled {
-                    await engineCoordinator.cancelTurn(threadId: threadId)
-                }
                 await engineSwitch.endTurn(botId: botId, turnId: turnId)
                 continuation.finish()
             }
+            // A window that goes away stops the engine at once: the turn is
+            // cancelled through the coordinator (which cancels the driver)
+            // instead of waiting for the relay to notice, and the relay is
+            // cancelled so it releases the switch admission and finishes.
             continuation.onTermination = { termination in
-                if case .cancelled = termination { relay.cancel() }
+                guard case .cancelled = termination else { return }
+                relay.cancel()
+                Task { await engineCoordinator.cancelTurn(threadId: threadId) }
             }
         }
     }
