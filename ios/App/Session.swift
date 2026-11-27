@@ -143,6 +143,8 @@ final class Session: ObservableObject {
     /// sends `token`, a route of the server sends this one, and neither ever
     /// travels to the other.
     private var bridgeToken: String?
+    /// The Mac placement probe in flight, if any.
+    private var placementProbe: Task<Void, Never>?
     /// True when the server's token could not be read because the keychain
     /// was locked: read again each time the app comes to the front, until it
     /// reads.
