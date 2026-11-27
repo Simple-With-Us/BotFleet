@@ -1410,6 +1410,23 @@ async function handleLocalRoute({
     return;
   }
 
+  if (method === 'POST' && path === '/api/companion/pairing/close') {
+    // Closing is forgetting the window whole:  its code and its QR
+    // credential stop working at once, and nothing is left to spend.  A
+    // close the durable state cannot hold is not a close, so the window is
+    // put back and the caller is told.
+    const previous = state.window;
+    state.window = null;
+    if (previous && !persist(state)) {
+      state.window = previous;
+      logger('[companion-bridge] the durable state refused a save; the pairing window is still open');
+      unsaved();
+      return;
+    }
+    respondJson(res, 200, { closed: previous !== null });
+    return;
+  }
+
   if (method === 'POST' && path === '/api/companion/pairing/redeem') {
     const body = await readJsonBody(req);
     if (!body.ok) {

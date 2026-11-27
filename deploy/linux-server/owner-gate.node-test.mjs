@@ -11,6 +11,8 @@ import crypto from "node:crypto";
 import net from "node:net";
 
 import {
+  bridgeAdminTarget,
+  bridgeUpstreamHeaders,
   createOwnerGate,
   gateConfigFromSecrets,
   gateDecision,
@@ -560,10 +562,10 @@ function createFakeUpstream() {
   return { upstream, state };
 }
 
-function gateRequest({ port, headers = {}, path = "/api/thing" }) {
+function gateRequest({ port, headers = {}, path = "/api/thing", method = "GET", body = undefined }) {
   return new Promise((resolve, reject) => {
     const req = http.request(
-      { host: "127.0.0.1", port, path, method: "GET", headers, agent: false },
+      { host: "127.0.0.1", port, path, method, headers, agent: false },
       (res) => {
         const chunks = [];
         res.on("data", (chunk) => chunks.push(chunk));
@@ -577,7 +579,7 @@ function gateRequest({ port, headers = {}, path = "/api/thing" }) {
       },
     );
     req.on("error", reject);
-    req.end();
+    req.end(body);
   });
 }
 
@@ -934,4 +936,278 @@ test("integration: a websocket upgrade carries the gate token too", async (t) =>
   });
   sockets.push(refused.socket);
   assert.match(refused.head, /^HTTP\/1\.1 403/);
+});
+
+// ---------------------------------------------------------------------------
+// the companion bridge hop
+// ---------------------------------------------------------------------------
+
+test("bridgeAdminTarget names the five routes and refuses the rest of the prefix", () => {
+  assert.equal(
+    bridgeAdminTarget("GET", "/api/companion/bridge/endpoints"),
+    "/api/companion/endpoints",
+  );
+  assert.equal(
+    bridgeAdminTarget("POST", "/api/companion/bridge/pairing/open"),
+    "/api/companion/pairing/open",
+  );
+  assert.equal(bridgeAdminTarget("GET", "/api/companion/bridge/devices"), "/api/companion/devices");
+  assert.equal(
+    bridgeAdminTarget("POST", "/api/companion/bridge/pairing/close"),
+    "/api/companion/pairing/close",
+  );
+  assert.equal(
+    bridgeAdminTarget("DELETE", "/api/companion/bridge/devices/phone-1"),
+    "/api/companion/devices/phone-1",
+  );
+
+  // Under the prefix, but not one of the four: the bridge's other owner-only
+  // routes never see a request that came through the gate.
+  assert.equal(bridgeAdminTarget("POST", "/api/companion/bridge/pairing/redeem"), null);
+  assert.equal(bridgeAdminTarget("POST", "/api/companion/bridge/endpoints"), null);
+  assert.equal(bridgeAdminTarget("DELETE", "/api/companion/bridge/devices"), null);
+  assert.equal(bridgeAdminTarget("DELETE", "/api/companion/bridge/devices/"), null);
+  assert.equal(bridgeAdminTarget("DELETE", "/api/companion/bridge/devices/a/b"), null);
+  assert.equal(bridgeAdminTarget("DELETE", "/api/companion/bridge/devices/../pairing"), null);
+  assert.equal(bridgeAdminTarget("GET", "/api/companion/bridge/"), null);
+
+  // Without its trailing slash the prefix is not a prefix: that path is the
+  // harness's to answer, 404 or not.
+  assert.equal(bridgeAdminTarget("GET", "/api/companion/bridge"), undefined);
+
+  // Not under the prefix at all: the harness answers, as before.
+  assert.equal(bridgeAdminTarget("GET", "/api/companion/endpoints"), undefined);
+  assert.equal(bridgeAdminTarget("GET", "/api/bots"), undefined);
+  assert.equal(bridgeAdminTarget("GET", "/api/companion/bridge-other/endpoints"), undefined);
+});
+
+test("bridgeUpstreamHeaders keeps only what the bridge needs for its own owner decision", () => {
+  const headers = bridgeUpstreamHeaders(
+    {
+      host: "box.tailnet.ts.net:8799",
+      accept: "application/json",
+      "content-type": "application/json",
+      "content-length": "17",
+      "x-botfleet-gate-token": DESKTOP_TOKEN,
+      "tailscale-user-login": OWNER,
+      "tailscale-user-name": "Owner",
+      origin: PUBLIC_ORIGIN,
+      referer: `${PUBLIC_ORIGIN}/`,
+      "sec-fetch-site": "same-origin",
+      "sec-fetch-mode": "cors",
+      "cf-ray": "abc123",
+      "x-forwarded-for": "100.64.0.7",
+      "x-forwarded-proto": "https",
+      "x-real-ip": "100.64.0.7",
+      authorization: "Bearer harness-token",
+      cookie: "session=1",
+      connection: "keep-alive",
+    },
+    8797,
+  );
+  assert.deepEqual(headers, {
+    host: "127.0.0.1:8797",
+    accept: "application/json",
+    "content-type": "application/json",
+    "content-length": "17",
+    origin: PUBLIC_ORIGIN,
+    "sec-fetch-site": "same-origin",
+    "tailscale-user-login": OWNER,
+    "x-botfleet-gate-token": DESKTOP_TOKEN,
+  });
+});
+
+test("gateConfigFromSecrets turns the bridge on only when its advertised origin is named", () => {
+  assert.equal(gateConfigFromSecrets({ BOTFLEET_OWNER_LOGINS: OWNER }).bridgeEnabled, false);
+  assert.equal(gateConfigFromSecrets({ BOTFLEET_OWNER_LOGINS: OWNER, BOTFLEET_COMPANION_BRIDGE_ORIGIN: "   " }).bridgeEnabled, false);
+  assert.equal(
+    gateConfigFromSecrets({
+      BOTFLEET_OWNER_LOGINS: OWNER,
+      BOTFLEET_COMPANION_BRIDGE_ORIGIN: "https://box.tailnet.ts.net:8800",
+    }).bridgeEnabled,
+    true,
+  );
+});
+
+// A stand-in for the bridge: it records what it was asked and answers JSON.
+function createFakeBridge() {
+  const state = { requests: [], headers: [], bodies: [] };
+  const bridge = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      state.requests.push(`${req.method} ${req.url}`);
+      state.headers.push({ ...req.headers });
+      state.bodies.push(Buffer.concat(chunks).toString("utf8"));
+      res.writeHead(201, { "content-type": "application/json" });
+      res.end(JSON.stringify({ bridge: true, path: req.url, method: req.method }));
+    });
+  });
+  return { bridge, state };
+}
+
+test("integration: with a bridge configured, the gate answers the bridge prefix from the bridge and nothing else from it", async (t) => {
+  const { upstream, state: harness } = createFakeUpstream();
+  const harnessPort = await listen(upstream);
+  const { bridge, state: seen } = createFakeBridge();
+  const bridgePort = await listen(bridge);
+
+  const gate = createOwnerGate({
+    owners: ownerSet(),
+    publicOrigin: PUBLIC_ORIGIN,
+    tokenSha256,
+    harnessPort,
+    harnessHost: "127.0.0.1",
+    bridgeEnabled: true,
+    bridgePort,
+    log: () => {},
+  });
+  const gatePort = await listen(gate);
+  t.after(async () => {
+    await close(gate);
+    await close(bridge);
+    await close(upstream);
+  });
+
+  // The desktop app's credential opens it, and the bridge sees the same
+  // credential and a loopback Host, with nothing else about the caller.
+  const tokenHeaders = {
+    "x-botfleet-gate-token": DESKTOP_TOKEN,
+    accept: "application/json",
+    "cf-ray": "abc123",
+    "x-forwarded-for": "100.64.0.7",
+    referer: `${PUBLIC_ORIGIN}/`,
+  };
+  const advertisement = await gateRequest({ port: gatePort, path: "/api/companion/bridge/endpoints", headers: tokenHeaders });
+  assert.equal(advertisement.status, 201);
+  assert.deepEqual(JSON.parse(advertisement.body), { bridge: true, path: "/api/companion/endpoints", method: "GET" });
+  assert.equal(seen.requests.length, 1);
+  assert.equal(seen.headers[0].host, `127.0.0.1:${bridgePort}`);
+  assert.equal(seen.headers[0]["x-botfleet-gate-token"], DESKTOP_TOKEN);
+  assert.equal(seen.headers[0]["cf-ray"], undefined);
+  assert.equal(seen.headers[0]["x-forwarded-for"], undefined);
+  assert.equal(seen.headers[0].referer, undefined);
+
+  // A pairing window: the method and the body cross as sent.
+  const opened = await gateRequest({
+    port: gatePort,
+    method: "POST",
+    path: "/api/companion/bridge/pairing/open",
+    headers: { "x-botfleet-gate-token": DESKTOP_TOKEN, "content-type": "application/json" },
+    body: '{"metadata":{}}',
+  });
+  assert.equal(opened.status, 201);
+  assert.equal(seen.requests[1], "POST /api/companion/pairing/open");
+  assert.equal(seen.bodies[1], '{"metadata":{}}');
+
+  // The device list, and one revocation.
+  await gateRequest({ port: gatePort, path: "/api/companion/bridge/devices", headers: tokenHeaders });
+  await gateRequest({ port: gatePort, method: "DELETE", path: "/api/companion/bridge/devices/phone-1", headers: tokenHeaders });
+  assert.deepEqual(seen.requests.slice(2), ["GET /api/companion/devices", "DELETE /api/companion/devices/phone-1"]);
+
+  // The owner's own phone-less login crosses too, so the bridge can decide it.
+  const byLogin = await gateRequest({
+    port: gatePort,
+    path: "/api/companion/bridge/endpoints",
+    headers: { "tailscale-user-login": OWNER, "tailscale-user-name": "Owner" },
+  });
+  assert.equal(byLogin.status, 201);
+  assert.equal(seen.headers[4]["tailscale-user-login"], OWNER);
+  assert.equal(seen.headers[4]["tailscale-user-name"], undefined);
+
+  // Closing the window crosses too, and the query string never does.
+  await gateRequest({
+    port: gatePort,
+    method: "POST",
+    path: "/api/companion/bridge/pairing/close?code=000000",
+    headers: { "x-botfleet-gate-token": DESKTOP_TOKEN },
+  });
+  assert.equal(seen.requests[5], "POST /api/companion/pairing/close");
+
+  // The bridge's other routes are refused at the gate.
+  const refused = await gateRequest({ port: gatePort, method: "POST", path: "/api/companion/bridge/pairing/redeem", headers: tokenHeaders });
+  assert.equal(refused.status, 404);
+  assert.equal(JSON.parse(refused.body).error, "no such companion bridge route");
+
+  // A caller with no owner credential is refused before either listener.
+  const anonymous = await gateRequest({ port: gatePort, path: "/api/companion/bridge/endpoints" });
+  assert.equal(anonymous.status, 403);
+  assert.equal(seen.requests.length, 6);
+
+  // Everything outside the prefix still goes to the harness.
+  await gateRequest({ port: gatePort, path: "/api/companion/endpoints", headers: tokenHeaders });
+  await gateRequest({ port: gatePort, path: "/api/bots", headers: tokenHeaders });
+  assert.deepEqual(harness.requests, ["/api/companion/endpoints", "/api/bots"]);
+  assert.equal(seen.requests.length, 6);
+});
+
+test("integration: without a bridge configured the prefix goes to the harness as before", async (t) => {
+  const { upstream, state: harness } = createFakeUpstream();
+  const harnessPort = await listen(upstream);
+  const gate = createOwnerGate({
+    owners: ownerSet(),
+    publicOrigin: PUBLIC_ORIGIN,
+    tokenSha256,
+    harnessPort,
+    harnessHost: "127.0.0.1",
+    log: () => {},
+  });
+  const gatePort = await listen(gate);
+  t.after(async () => {
+    await close(gate);
+    await close(upstream);
+  });
+
+  const answer = await gateRequest({
+    port: gatePort,
+    path: "/api/companion/bridge/pairing/redeem",
+    headers: { "x-botfleet-gate-token": DESKTOP_TOKEN },
+  });
+  assert.equal(answer.status, 200);
+  assert.deepEqual(harness.requests, ["/api/companion/bridge/pairing/redeem"]);
+});
+
+test("integration: a bridge that is not answering is a 502, and the harness is still reached", async (t) => {
+  const { upstream, state: harness } = createFakeUpstream();
+  const harnessPort = await listen(upstream);
+  // A port with nothing on it: bound once to reserve it, then released.
+  const reserved = net.createServer();
+  const deadPort = await listen(reserved);
+  await close(reserved);
+
+  const lines = [];
+  const gate = createOwnerGate({
+    owners: ownerSet(),
+    publicOrigin: PUBLIC_ORIGIN,
+    tokenSha256,
+    harnessPort,
+    harnessHost: "127.0.0.1",
+    bridgeEnabled: true,
+    bridgePort: deadPort,
+    log: (line) => lines.push(line),
+  });
+  const gatePort = await listen(gate);
+  t.after(async () => {
+    await close(gate);
+    await close(upstream);
+  });
+
+  const answer = await gateRequest({
+    port: gatePort,
+    path: "/api/companion/bridge/endpoints",
+    headers: { "x-botfleet-gate-token": DESKTOP_TOKEN },
+  });
+  assert.equal(answer.status, 502);
+  assert.equal(JSON.parse(answer.body).error, "companion bridge unavailable");
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /companion bridge unreachable on 127\.0\.0\.1:\d+/);
+  assert.equal(lines[0].includes(DESKTOP_TOKEN), false);
+
+  const harnessAnswer = await gateRequest({
+    port: gatePort,
+    path: "/api/health",
+    headers: { "x-botfleet-gate-token": DESKTOP_TOKEN },
+  });
+  assert.equal(harnessAnswer.status, 200);
+  assert.deepEqual(harness.requests, ["/api/health"]);
 });

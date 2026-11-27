@@ -2695,3 +2695,53 @@ test('an answer torn down with nothing but a close gives its room back, and the 
     await bridge.close();
   }
 });
+
+test('a pairing window can be closed, and its code and its QR credential stop working', async () => {
+  let savesWork = true;
+  const bridge = await startBridge({ bridgeOptions: { persist: () => savesWork } });
+  const owner = ownerHeaders({ 'content-type': 'application/json' });
+  const close = () => call(bridge.port, { method: 'POST', path: '/api/companion/pairing/close', headers: owner, body: '{}' });
+  const open = () => call(bridge.port, { method: 'POST', path: '/api/companion/pairing/open', headers: owner, body: '{}' });
+  const redeem = (field, value) => call(bridge.port, {
+    method: 'POST', path: '/api/pair', headers: owner,
+    body: JSON.stringify({ [field]: value, deviceName: 'phone-close', pairRequestId: `close-${field}` }),
+  });
+  try {
+    // Nothing is open, so there is nothing to close.
+    const idle = await close();
+    assert.equal(idle.status, 200);
+    assert.deepEqual(idle.json, { closed: false });
+
+    const first = await open();
+    assert.equal(first.status, 200);
+    assert.ok(first.json.code && first.json.token);
+
+    // A close the durable state cannot hold is not a close: the window is
+    // put back, and its QR credential still pairs a phone.
+    savesWork = false;
+    const refused = await close();
+    assert.equal(refused.status, 503);
+    assert.match(refused.json.error, /could not be saved/);
+    savesWork = true;
+    const stillOpen = await redeem('credential', first.json.token);
+    assert.equal(stillOpen.status, 201);
+
+    const second = await open();
+    assert.equal(second.status, 200);
+    const closed = await close();
+    assert.equal(closed.status, 200);
+    assert.deepEqual(closed.json, { closed: true });
+
+    // The code and the QR credential are both dead, and each refusal says so
+    // without spending anything there is left to spend.
+    const byCode = await redeem('code', second.json.code);
+    assert.equal(byCode.status, 401);
+    const byToken = await redeem('credential', second.json.token);
+    assert.equal(byToken.status, 401);
+
+    const devices = await call(bridge.port, { path: '/api/companion/devices' });
+    assert.equal(devices.json.devices.length, 1, 'only the phone paired before the close');
+  } finally {
+    await bridge.close();
+  }
+});

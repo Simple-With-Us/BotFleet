@@ -22,6 +22,16 @@
  * does not hand over the token itself.  Either credential opens the gate; the
  * token header is dropped before the request reaches the harness.
  *
+ * The companion bridge gets one more hop.  When Infisical names the bridge's
+ * advertised origin (`BOTFLEET_COMPANION_BRIDGE_ORIGIN`), the gate also
+ * answers five paths under `/api/companion/bridge/` by passing them to the
+ * bridge on loopback: its advertisement, opening and closing a pairing
+ * window, and listing and revoking devices.  That is how the desktop app, whose gate
+ * credential is bound to this one origin, sets a phone up with the server.
+ * The owner credential crosses this hop on purpose, because the bridge makes
+ * the same owner decision again on its own loopback listener; nothing else
+ * about the caller does.
+ *
  * The gate also rewrites the upstream request head: the Host becomes the
  * loopback harness address, and every identity, edge, forwarding and
  * hop-by-hop header is dropped so the harness only ever sees a plain loopback
@@ -119,11 +129,33 @@ const DEFAULT_HARNESS_PORT = 8799;
 const HEALTH_PATH = '/__gate/health';
 const GATE_NAME = 'botfleet-owner-gate';
 
+// The companion bridge listens on loopback beside the harness.  Its port is
+// fixed in code like the others; whether this host has a bridge at all is
+// Infisical's answer, the same name the bridge reads for its advertised route.
+const DEFAULT_BRIDGE_PORT = 8797;
+const BRIDGE_ORIGIN_SECRET_NAME = 'BOTFLEET_COMPANION_BRIDGE_ORIGIN';
+const BRIDGE_ADMIN_PREFIX = '/api/companion/bridge/';
+const BRIDGE_DEVICE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+// What the bridge must see to reach the same owner decision the gate just
+// reached.  Everything else about the caller, its edge headers included,
+// stays at the gate.
+const BRIDGE_FORWARDED_HEADERS = Object.freeze([
+  'accept',
+  'content-type',
+  'content-length',
+  'origin',
+  'sec-fetch-site',
+  'tailscale-user-login',
+  'x-botfleet-gate-token',
+]);
+
 /** The Infisical names the gate reads. */
 const GATE_SECRET_NAMES = [
   'BOTFLEET_OWNER_LOGINS',
   'BOTFLEET_PUBLIC_ORIGIN',
   'BOTFLEET_SERVER_GATE_TOKEN',
+  BRIDGE_ORIGIN_SECRET_NAME,
 ];
 
 /** How the vault is named in a message.  Names and metadata only. */
@@ -376,6 +408,48 @@ export function downstreamHeaders(headers) {
 }
 
 /**
+ * The bridge path one gate path stands for.  `undefined` when the path is not
+ * under the bridge prefix, `null` when it is under the prefix and is not one
+ * of the five the gate answers.  The bridge has other owner-only routes; a
+ * request for them through this prefix is refused here and never reaches it.
+ *
+ * @param {string|undefined} method
+ * @param {string} path
+ * @returns {string|null|undefined}
+ */
+export function bridgeAdminTarget(method, path) {
+  const route = String(path ?? '');
+  if (!route.startsWith(BRIDGE_ADMIN_PREFIX)) return undefined;
+  const rest = route.slice(BRIDGE_ADMIN_PREFIX.length);
+  const verb = String(method ?? '').toUpperCase();
+  if (verb === 'GET' && rest === 'endpoints') return '/api/companion/endpoints';
+  if (verb === 'POST' && rest === 'pairing/open') return '/api/companion/pairing/open';
+  if (verb === 'POST' && rest === 'pairing/close') return '/api/companion/pairing/close';
+  if (verb === 'GET' && rest === 'devices') return '/api/companion/devices';
+  if (verb === 'DELETE' && rest.startsWith('devices/') && BRIDGE_DEVICE_ID.test(rest.slice('devices/'.length))) {
+    return `/api/companion/${rest}`;
+  }
+  return null;
+}
+
+/**
+ * The header set sent to the bridge: a loopback Host and only what the bridge
+ * needs to reach the same owner decision the gate reached.
+ *
+ * @param {Record<string, string|string[]|undefined>|undefined} headers
+ * @param {number|string} bridgePort
+ * @returns {Record<string, string>}
+ */
+export function bridgeUpstreamHeaders(headers, bridgePort) {
+  const out = { host: `127.0.0.1:${bridgePort}` };
+  for (const name of BRIDGE_FORWARDED_HEADERS) {
+    const value = headerValue(headers, name);
+    if (value !== undefined) out[name] = value;
+  }
+  return out;
+}
+
+/**
  * Parse the path out of a request URL.
  *
  * @param {string|undefined} url
@@ -472,6 +546,51 @@ function proxyRequest(req, res, harnessHost, harnessPort, agent, log, worker = f
 }
 
 /**
+ * Proxy one request to the companion bridge on loopback.  The path is the one
+ * `bridgeAdminTarget` named and the headers are the few the bridge needs.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {import('node:http').ServerResponse} res
+ * @param {string} target
+ * @param {number} bridgePort
+ * @param {import('node:http').Agent} agent
+ * @param {(message: string) => void} log
+ */
+function proxyToBridge(req, res, target, bridgePort, agent, log) {
+  const upstream = http.request(
+    {
+      host: DEFAULT_GATE_HOST,
+      port: bridgePort,
+      method: req.method,
+      path: target,
+      headers: bridgeUpstreamHeaders(req.headers, bridgePort),
+      agent,
+    },
+    (upstreamRes) => {
+      upstreamRes.on('error', () => res.destroy());
+      res.writeHead(upstreamRes.statusCode ?? 502, downstreamHeaders(upstreamRes.headers));
+      upstreamRes.pipe(res);
+    },
+  );
+
+  upstream.on('error', (err) => {
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    log(`[owner-gate] companion bridge unreachable on ${DEFAULT_GATE_HOST}:${bridgePort}: ${err.code ?? err.message}`);
+    respondJson(res, 502, { error: 'companion bridge unavailable' });
+  });
+
+  res.on('close', () => {
+    if (!res.writableFinished) upstream.destroy();
+  });
+  req.on('error', () => upstream.destroy());
+
+  req.pipe(upstream);
+}
+
+/**
  * Write the rewritten request head for an upgraded connection.
  *
  * @param {import('node:http').IncomingMessage} req
@@ -497,7 +616,7 @@ function upgradeHead(req, harnessPort) {
 /**
  * Create the gate server.  The returned server is not listening yet.
  *
- * @param {{owners?: Set<string>|string, publicOrigin?: string, tokenSha256?: string|null, harnessPort?: number|string, harnessHost?: string, log?: (message: string) => void}} options
+ * @param {{owners?: Set<string>|string, publicOrigin?: string, tokenSha256?: string|null, harnessPort?: number|string, harnessHost?: string, bridgeEnabled?: boolean, bridgePort?: number|string, log?: (message: string) => void}} options
  * @returns {import('node:http').Server}
  */
 export function createOwnerGate({
@@ -506,11 +625,15 @@ export function createOwnerGate({
   tokenSha256,
   harnessPort = DEFAULT_HARNESS_PORT,
   harnessHost = DEFAULT_GATE_HOST,
+  bridgeEnabled = false,
+  bridgePort = DEFAULT_BRIDGE_PORT,
   log,
 } = {}) {
   const allowlist = owners instanceof Set ? owners : parseOwnerLogins(owners);
   const logger = isCallable(log) ? log : defaultLog;
   const port = Number(harnessPort) || DEFAULT_HARNESS_PORT;
+  const bridgedPort = Number(bridgePort) || DEFAULT_BRIDGE_PORT;
+  const hasBridge = bridgeEnabled === true;
   const origin = isText(publicOrigin) ? publicOrigin.trim() : '';
   const tokenDigest = isText(tokenSha256) ? tokenSha256.trim() : '';
 
@@ -547,6 +670,21 @@ export function createOwnerGate({
     if (pathOf(req.url) === HEALTH_PATH) {
       respondJson(res, 200, { ok: true, gate: GATE_NAME });
       return;
+    }
+
+    //  Only a host whose bridge is configured answers the prefix at all; on
+    //  any other host the path goes to the harness as before.
+    if (hasBridge) {
+      const target = bridgeAdminTarget(req.method, pathOf(req.url));
+      if (target === null) {
+        logger(`[owner-gate] refused ${req.method} ${pathOf(req.url)}: not a companion bridge route the gate answers`);
+        respondJson(res, 404, { error: 'no such companion bridge route' });
+        return;
+      }
+      if (target !== undefined) {
+        proxyToBridge(req, res, target, bridgedPort, upstreamAgent, logger);
+        return;
+      }
     }
 
     proxyRequest(req, res, harnessHost, port, upstreamAgent, logger, worker.kind === 'worker');
@@ -659,8 +797,12 @@ export function parseArgs(argv) {
  * by the gate, so a leaked configuration cannot be replayed as a credential.
  * No value is logged here.
  *
+ * Whether this host has a companion bridge is read here too: the gate routes
+ * the bridge prefix when Infisical names the bridge's advertised origin.  The
+ * gate keeps only that fact; the bridge reads the origin itself.
+ *
  * @param {Record<string, string>|undefined} secrets
- * @returns {{owners: Set<string>, publicOrigin: string, tokenSha256: string|null}}
+ * @returns {{owners: Set<string>, publicOrigin: string, tokenSha256: string|null, bridgeEnabled: boolean}}
  */
 export function gateConfigFromSecrets(secrets) {
   const ownerLogins = isText(secrets?.BOTFLEET_OWNER_LOGINS) ? secrets.BOTFLEET_OWNER_LOGINS : '';
@@ -675,10 +817,13 @@ export function gateConfigFromSecrets(secrets) {
     ? crypto.createHash('sha256').update(gateToken, 'utf8').digest('hex')
     : null;
 
+  const bridgeOrigin = isText(secrets?.[BRIDGE_ORIGIN_SECRET_NAME]) ? secrets[BRIDGE_ORIGIN_SECRET_NAME].trim() : '';
+
   return {
     owners: parseOwnerLogins(ownerLogins),
     publicOrigin,
     tokenSha256,
+    bridgeEnabled: bridgeOrigin !== '',
   };
 }
 
@@ -726,7 +871,7 @@ async function main() {
     return;
   }
 
-  const { owners, publicOrigin, tokenSha256 } = gateConfigFromSecrets(secrets);
+  const { owners, publicOrigin, tokenSha256, bridgeEnabled } = gateConfigFromSecrets(secrets);
 
   //  The digest goes through the gate's own hash check, so a malformed hash
   //  is a configuration error rather than a silently ignored value.  The hash
@@ -755,6 +900,8 @@ async function main() {
     tokenSha256: gateTokenSha256,
     harnessPort: DEFAULT_HARNESS_PORT,
     harnessHost: DEFAULT_GATE_HOST,
+    bridgeEnabled,
+    bridgePort: DEFAULT_BRIDGE_PORT,
   });
 
   server.on('error', (err) => {
@@ -770,7 +917,7 @@ async function main() {
     defaultLog(
       `[owner-gate] listening on ${DEFAULT_GATE_HOST}:${boundPort} -> harness ` +
         `${DEFAULT_GATE_HOST}:${DEFAULT_HARNESS_PORT} ` +
-        `(owners: ${owners.size}, token: ${gateTokenSha256 ? 'yes' : 'no'})`,
+        `(owners: ${owners.size}, token: ${gateTokenSha256 ? 'yes' : 'no'}, bridge: ${bridgeEnabled ? 'yes' : 'no'})`,
     );
   });
 }
