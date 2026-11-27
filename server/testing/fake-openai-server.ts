@@ -114,7 +114,7 @@ function recordHeaders(req: IncomingMessage): Record<string, string> {
 }
 
 function sendSse(res: ServerResponse, script: Extract<ScriptedCompletion, { kind: "sse" }>): void {
-  res.writeHead(script.status ?? 200, { "content-type": "text/event-stream" });
+  res.writeHead(script.status ?? 200, { ...CLOSE_CONNECTION, "content-type": "text/event-stream" });
   const frames = script.frames;
   for (let i = 0; i < frames.length; i++) {
     const isLast = i === frames.length - 1;
