@@ -52,6 +52,7 @@ The gate reads the **BotFleet** project (`836aebe2-c8f7-4e09-978e-7e3e82500bce`)
 | `BOTFLEET_SERVER_GATE_TOKEN` | secret | The desktop gate token.  The gate hashes it in memory and keeps only the sha256, so a leaked configuration cannot be replayed as a credential. |
 | `BOTFLEET_OWNER_LOGINS` | config | Comma-separated Tailscale logins on the owner allowlist. |
 | `BOTFLEET_PUBLIC_ORIGIN` | config | The only browser `Origin` the gate accepts. |
+| `BOTFLEET_COMPANION_BRIDGE_ORIGIN` | config | Optional. When it is set, this host has a companion bridge and the gate answers the `/api/companion/bridge/` prefix for the desktop app. The gate keeps only that fact; the bridge reads the origin itself. |
 
 At least one of `BOTFLEET_OWNER_LOGINS` and `BOTFLEET_SERVER_GATE_TOKEN` has to be there: without an owner credential the gate refuses to start rather than wave every request through to the harness.
 
