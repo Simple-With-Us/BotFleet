@@ -262,6 +262,71 @@ final class ServerBridgePairingTests: XCTestCase {
         XCTAssertFalse(second === afterForgetting, "a server no longer enrolled gets a fresh backend, with no window and no credential")
         let kept = await ServerBridgePairingBackend.shared(host: host, credential: enrolled, session: session())
         XCTAssertTrue(first === kept)
+
+        // The registry lasts for the life of the process, which here is the
+        // whole run: leave no server in it for the next test.
+        await ServerBridgePairingBackend.retainOnly([])
+    }
+
+    func testAServerForgottenWhileItsCodeIsOpenHasItsCodeClosed() async throws {
+        let (host, enrolled) = try host()
+        ServerBridgeURLProtocol.handler = { request in
+            request.url!.path.hasSuffix("/close") ? (200, ["closed": true]) : (200, self.windowBody())
+        }
+        let backend = await ServerBridgePairingBackend.shared(host: host, credential: enrolled, session: session())
+        _ = await backend.openPairingWindow()
+
+        // Removed under Servers while its code was open. The server keeps a
+        // window open until it expires, so the code leaves with the backend.
+        await ServerBridgePairingBackend.retainOnly([])
+        let closed = try await eventually {
+            ServerBridgeURLProtocol.captured.last?.url.absoluteString == "\(self.origin)/api/companion/bridge/pairing/close"
+        }
+        XCTAssertTrue(closed, "a forgotten backend's window would stay open on the server with nothing left to close it")
+        let after = await ServerBridgePairingBackend.shared(host: host, credential: nil, session: session())
+        XCTAssertFalse(backend === after)
+        let active = await after.activePairingWindow()
+        XCTAssertNil(active, "the new backend starts with no window")
+    }
+
+    func testAServerForgottenWithNoCodeOpenIsAskedNothing() async throws {
+        let (host, enrolled) = try host()
+        _ = await ServerBridgePairingBackend.shared(host: host, credential: enrolled, session: session())
+        await ServerBridgePairingBackend.retainOnly([])
+        // A request that should never come is given the time to arrive.
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertTrue(ServerBridgeURLProtocol.captured.isEmpty, "nothing is open on the server, so there is nothing to close")
+    }
+
+    func testAServerForgottenAfterItsCodeExpiredIsAskedNothing() async throws {
+        let (host, enrolled) = try host()
+        ServerBridgeURLProtocol.handler = { _ in (200, self.windowBody(expiresAtMs: self.nowMs + 300)) }
+        let backend = await ServerBridgePairingBackend.shared(host: host, credential: enrolled, session: session())
+        _ = await backend.openPairingWindow()
+        try await Task.sleep(for: .milliseconds(600))
+        await ServerBridgePairingBackend.retainOnly([])
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(ServerBridgeURLProtocol.captured.count, 1, "the server dropped the expired window itself")
+    }
+
+    func testAListThatWasNotReadForgetsNothing() async throws {
+        let (host, enrolled) = try host()
+        ServerBridgeURLProtocol.handler = { request in
+            request.url!.path.hasSuffix("/close") ? (200, ["closed": true]) : (200, self.windowBody())
+        }
+        let backend = await ServerBridgePairingBackend.shared(host: host, credential: enrolled, session: session())
+        _ = await backend.openPairingWindow()
+
+        // The saved list failed to read. That is not a list with no server in it.
+        await ServerBridgePairingBackend.retainOnly(nil)
+        let kept = await ServerBridgePairingBackend.shared(host: host, credential: nil, session: session())
+        XCTAssertTrue(backend === kept)
+        let window = await kept.activePairingWindow()
+        XCTAssertEqual(window?.code, "123456", "the code stays open on screen and closable")
+        XCTAssertEqual(ServerBridgeURLProtocol.captured.count, 1, "nothing was closed")
+
+        await kept.closePairingWindow()
+        await ServerBridgePairingBackend.retainOnly([])
     }
 
     func testAServerEnrolledAgainAtAnotherAddressGetsANewBackendAndANewNameDoesNot() async throws {
