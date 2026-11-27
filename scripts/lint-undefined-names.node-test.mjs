@@ -67,7 +67,7 @@ test("the rule is on for the repository's Node scripts, with Node's globals decl
   const config = LintConfig.parse(JSON.parse(readFileSync(join(repoRoot, ".oxlintrc.json"), "utf8")));
   const override = config.overrides.find((entry) => entry.rules["no-undef"] === "error");
   assert.deepEqual(override?.files, ["**/*.mjs", "**/*.cjs"]);
-  assert.equal(config.env?.node, true);
+  assert.equal(config.env.node, true);
   // TypeScript is left out on purpose: without type information the rule
   // reports every type name.
   assert.equal(override.files.some((pattern) => pattern.includes("ts")), false);
