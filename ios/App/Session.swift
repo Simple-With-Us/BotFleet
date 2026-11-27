@@ -1524,8 +1524,9 @@ final class Session: ObservableObject {
         connection = updated
         CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
         rotation = CandidateRotation(endpoints: updated.syncEndpoints)
-        if let token {
-            client = CompanionClient(connection: updated.dialing(endpoint), token: token)
+        // The token is the one that belongs to the typed route's own pairing.
+        if let rebuilt = makeClient(dialing: endpoint) {
+            client = rebuilt
         }
         // Dial the new address now rather than on the next backoff tick —
         // someone who just typed an address is watching the banner.
