@@ -873,6 +873,12 @@ export function bridgePairResponse({ credential, device, advertised }) {
     // `PairResponse.serverName`: what the phone's connection list calls this
     // server.
     serverName: BRIDGE_SERVER_NAME,
+    // `PairResponse.isBridge`: this is the server, and not a computer. A
+    // phone that is already paired with a Mac keeps that pairing and holds
+    // this one beside it (`Connection.bridgeConnection`), which is what lets
+    // it follow the server under `serverFirst` and fall back to the Mac.
+    // A computer never sends the field, so false is the default there.
+    isBridge: true,
   };
   // `PairResponse.endpoints`, each a `CompanionEndpoint` of `url`, `kind`
   // and `priority`. It is optional in Swift, and it is left out rather than
