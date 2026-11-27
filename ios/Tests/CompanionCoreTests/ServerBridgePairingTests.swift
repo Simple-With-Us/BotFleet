@@ -114,6 +114,17 @@ final class ServerBridgePairingTests: XCTestCase {
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
+    /// Waits for a request the registry sends off the main actor, so a test
+    /// never asserts against a forget that is still on its way.
+    private func eventually(timeout: TimeInterval = 2, _ condition: @MainActor () -> Bool) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return condition()
+    }
+
     // MARK: - The window
 
     func testOpenPairingWindowSendsTheAppCredentialToTheEnrolledOriginOnly() async throws {
