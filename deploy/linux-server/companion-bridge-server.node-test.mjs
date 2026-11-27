@@ -2522,3 +2522,17 @@ test('an event stream the scrubber cannot hold is ended, never forwarded half an
           res.on('error', finish);
         },
       );
+      request.on('error', () => resolve({ status: 0, text: '' }));
+      request.end();
+    });
+    // The stream is cut and nothing of the oversized event crosses. The
+    // downstream headers are written but not flushed until the first byte
+    // crosses, and no byte ever does here, so the phone sees the connection
+    // reset before any status rather than a 200 that ends empty.
+    assert.ok(response.status === 0 || response.status === 200, `status ${response.status}`);
+    assert.equal(response.text.length, 0);
+  } finally {
+    for (const stream of streams) stream.destroy();
+    await bridge.close();
+  }
+});
