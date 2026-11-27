@@ -79,7 +79,7 @@ const MOUNT_PREFIX = "bf-native-host-mount-";
 
 // Mount an image read-only at a private mount point and hand back that path.
 export function mountDiskImage(image, { attached = attachDiskImage } = {}) {
-  const mountpoint = mkdtempSync(join(realpathSync(tmpdir()), "bf-native-host-mount-"));
+  const mountpoint = mkdtempSync(join(realpathSync(tmpdir()), MOUNT_PREFIX));
   if (!attached(image, mountpoint)) {
     // Nothing was mounted, so the directory goes, unless the file system says
     // otherwise.
