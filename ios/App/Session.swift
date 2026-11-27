@@ -789,6 +789,9 @@ final class Session: ObservableObject {
             after: .signedOut
         )
         if let id = connection?.id { Keychain.remove(id) }
+        if let server = connection?.bridgeConnection { Keychain.remove(server.id) }
+        bridgeToken = nil
+        serverPairingOffer = nil
         CompanionConnectionStore.saveConnectionData(nil)
         UserDefaults.standard.removeObject(
             forKey: CompanionOnboardingPreferences.pendingNotificationOnboardingKey
