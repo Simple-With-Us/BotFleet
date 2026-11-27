@@ -1271,7 +1271,15 @@ final class Session: ObservableObject {
     /// when the Mac runs `serverFirst` and this phone is paired with one.
     private func adoptWalk() {
         guard let connection else { return }
-        rotation = CandidateRotation(endpoints: connection.syncEndpoints)
+        let walk = connection.syncEndpoints
+        // The walk starts at its first route whose token is in hand. Under
+        // serverFirst with the server's token still unread that is the Mac's,
+        // and the server's routes follow it rather than lead.
+        let dialable = walk.firstIndex { makeClient(dialing: $0) != nil }
+        let ordered = dialable.map { index in
+            [walk[index]] + walk.enumerated().filter { $0.offset != index }.map(\.element)
+        } ?? walk
+        rotation = CandidateRotation(endpoints: ordered)
         if let first = rotation.currentEndpoint, let made = makeClient(dialing: first) {
             client = made
         }
