@@ -649,7 +649,7 @@ public struct PairResponse: Codable, Sendable {
     public var isBridge: Bool
 
     private enum CodingKeys: String, CodingKey {
-        case token, device, serverName, hosts, endpoints
+        case token, device, serverName, hosts, endpoints, placement, isBridge
     }
 
     public init(from decoder: Decoder) throws {
