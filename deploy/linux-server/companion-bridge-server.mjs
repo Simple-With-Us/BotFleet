@@ -1777,6 +1777,14 @@ async function proxyRequest({ req, res, method, url, decision, host, port, upstr
       res.writeHead(response.statusCode ?? 502, headers);
       res.end(out);
     });
+    // `close` is the last event an answer gives, on every path.  One that
+    // reaches it without having ended, failed or been cut off was torn down
+    // without another word, and it is treated as cut off:  the room it took
+    // goes back and the phone hears why, instead of the room staying taken
+    // for good and the phone waiting on nothing.
+    response.on('close', () => {
+      fail(new Error('the harness closed the answer without finishing it'), 'the harness did not finish its answer');
+    });
   }
 
   const isEventStream = method === 'GET' && pathOf(url) === '/api/events' && deviceId && activeSseStreams;
