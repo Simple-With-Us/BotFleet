@@ -83,6 +83,15 @@ export interface FakeOpenAiServer {
 
 const DEFAULT_MODELS_BODY = { data: [{ id: "fake-model", object: "model" }] };
 
+/** On every answered request. A kept-alive socket outlives the fake that
+ *  opened it: the next fake a file starts takes the same port, and the
+ *  caller's pool then hands a request to the socket of the fake that is gone,
+ *  which fails that request at random with ECONNRESET or `other side closed`.
+ *  A connection that ends with its answer is never pooled, so it is never
+ *  reused. The one script that must not carry it is the one that cuts its
+ *  own body off (`kind: "close"`). */
+const CLOSE_CONNECTION = { connection: "close" };
+
 function readRequestBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = "";
