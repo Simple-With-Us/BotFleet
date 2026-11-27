@@ -10,6 +10,8 @@
     {"path":"deploy/linux-server/botfleet-server.service.in","category":"deploy","reason":"Reviewed Linux delivery or build input"},
     {"path":"deploy/linux-server/check-storage.mjs","category":"deploy","reason":"Reviewed Linux delivery or build input"},
     {"path":"deploy/linux-server/common.sh","category":"deploy","reason":"Reviewed Linux delivery or build input"},
+    {"path":"deploy/linux-server/companion-bridge-apns-sender.mjs","category":"runtime","reason":"Import from deploy/linux-server/companion-bridge-server.mjs"},
+    {"path":"deploy/linux-server/companion-bridge-apns-sender.node-test.mjs","category":"verification","reason":"Linux entry point"},
     {"path":"deploy/linux-server/companion-bridge-apns.mjs","category":"runtime","reason":"Import from deploy/linux-server/companion-bridge-server.mjs"},
     {"path":"deploy/linux-server/companion-bridge-server.mjs","category":"runtime","reason":"Linux entry point"},
     {"path":"deploy/linux-server/companion-bridge-server.node-test.mjs","category":"verification","reason":"Linux entry point"},
