@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { z } from "zod";
-import { HOST_CAPABILITIES, inspectHostMachO, verifyNativeHostArtifact, sha256 } from "./native-host-artifact.mjs";
+import { HOST_CAPABILITIES, hostArtifactName, inspectHostMachO, verifyNativeHostArtifact, sha256 } from "./native-host-artifact.mjs";
 import { nativeHostNotaryCredentials, packageNativeHost } from "./package-native-host.mjs";
 import { build, identity, source, thin, universal } from "./native-host-macho.fixture.mjs";
 
@@ -152,18 +152,99 @@ test("setuid files and sticky directories are refused like writable ones", { ski
     assert.throws(() => verifyNativeHostArtifact(f.options));
   } finally { f.remove(); }
 });
+// The native release lane's read token is scoped to exactly one folder, and
+// the fetcher refuses a token whose scope does not match the folder asked for.
+// The fixture answers for that folder, and for any narrower grant it refuses.
+// No fixture here is credential-shaped:  the key marker is assembled at run time.
+const releaseProject = "836aebe2-c8f7-4e09-978e-7e3e82500bce", releaseFolder = "/botfleet-server";
+const fixtureKey = () => Buffer.from(`${["-----BEGIN", "PRIVATE", "KEY-----"].join(" ")}\nfixture\n${["-----END", "PRIVATE", "KEY-----"].join(" ")}\n`).toString("base64");
+function notaryFetch({ scope = releaseFolder, names = {}, requests = [] } = {}) {
+  return async (url) => {
+    requests.push(String(url));
+    if (String(url).includes("/service-token")) {
+      return new Response(JSON.stringify({ workspace: releaseProject, scopes: [{ environment: "prod", secretPath: scope }],
+        permissions: ["read"], expiresAt: null }));
+    }
+    return new Response(JSON.stringify({ secrets: Object.entries(names).map(([secretKey, secretValue]) => ({ workspace: releaseProject,
+      environment: "prod", secretPath: releaseFolder, secretKey, secretValueHidden: false, secretValue })) }));
+  };
+}
 test("a missing notarization secret is named without printing any value", async (t) => {
   const logged = t.mock.method(console, "error", () => {});
   const printed = () => logged.mock.calls.map((call) => String(call.arguments[0])).join("\n");
   await assert.rejects(nativeHostNotaryCredentials({ env: {}, fetchImpl: () => assert.fail("No token reached the network") }), /packaging refused/);
   assert.match(printed(), /INFISICAL_NATIVE_RELEASE_READ_TOKEN/);
-  const scope = { workspace: "836aebe2-c8f7-4e09-978e-7e3e82500bce", environment: "prod" };
-  const fetchImpl = async (url) => new Response(JSON.stringify(String(url).includes("/service-token")
-    ? { workspace: scope.workspace, scopes: [{ environment: "prod", secretPath: "/" }], permissions: ["read"], expiresAt: null }
-    : { secrets: [{ ...scope, secretKey: "APPLE_API_KEY_ID", secretValueHidden: false, secretValue: "fixture-key-id" }] }));
-  await assert.rejects(nativeHostNotaryCredentials({ env: { INFISICAL_NATIVE_RELEASE_READ_TOKEN: "fixture" }, fetchImpl }), /packaging refused/);
+  await assert.rejects(nativeHostNotaryCredentials({ env: { INFISICAL_NATIVE_RELEASE_READ_TOKEN: "fixture" },
+    fetchImpl: notaryFetch({ names: { APPLE_API_KEY_ID: "fixture-key-id" } }) }), /packaging refused/);
   assert.match(printed(), /APPLE_API_KEY_P8_BASE64 is missing or unresolved/);
   assert.doesNotMatch(printed(), /fixture-key-id/);
+});
+test("the notarization credentials are read from the folder the release lane's token covers", async (t) => {
+  // The packager has to ask for that one folder.  A read at the project root
+  // can only be refused there, after the app's own notarization, from the same
+  // folder, has already succeeded.
+  const logged = t.mock.method(console, "error", () => {});
+  const names = { APPLE_API_KEY_P8_BASE64: fixtureKey(), APPLE_API_KEY_ID: "fixture-key-id", APPLE_API_ISSUER_ID: "fixture-issuer-id" };
+  const requests = [];
+  const credentials = await nativeHostNotaryCredentials({ env: { INFISICAL_NATIVE_RELEASE_READ_TOKEN: "fixture" },
+    fetchImpl: notaryFetch({ names, requests }) });
+  assert.deepEqual(credentials, { p8: Buffer.from(names.APPLE_API_KEY_P8_BASE64, "base64"), keyId: "fixture-key-id", issuerId: "fixture-issuer-id" });
+  assert.equal(logged.mock.calls.length, 0);
+  const list = new URL(requests.find((url) => url.includes("/secrets/raw?")) ?? "about:blank");
+  assert.equal(list.searchParams.get("secretPath"), releaseFolder);
+  assert.equal(list.searchParams.get("workspaceId"), releaseProject);
+  assert.equal(list.searchParams.get("environment"), "prod");
+  assert.equal(list.searchParams.get("expandSecretReferences"), "false");
+  // A token scoped to the project root alone is refused at its own metadata,
+  // before any secret is listed, and nothing is printed.
+  const rootOnly = [];
+  await assert.rejects(nativeHostNotaryCredentials({ env: { INFISICAL_NATIVE_RELEASE_READ_TOKEN: "fixture" },
+    fetchImpl: notaryFetch({ scope: "/", requests: rootOnly }) }), /packaging refused/);
+  assert.deepEqual(rootOnly.map((url) => url.includes("/service-token")), [true]);
+  assert.equal(logged.mock.calls.length, 0);
+});
+test("a signed package stops at the notarization credentials before anything is built, and names the stage", async (t) => {
+  // The credentials are read before the two release builds, so a grant that
+  // does not reach the folder costs seconds instead of a build, and the log
+  // says where it stopped rather than only that packaging was refused.
+  const logged = t.mock.method(console, "error", () => {});
+  const printed = () => logged.mock.calls.map((call) => String(call.arguments[0])).join("\n");
+  const root = mkdtempSync(join(tmpdir(), "bf-host-notary-")), repo = join(root, "repo"), output = join(root, "artifact");
+  mkdirSync(repo);
+  let reads = 0, built = false;
+  const options = { repoRoot: repo, output, build, platform: "darwin", signIdentity: "Developer ID Application",
+    run: (command, args) => {
+      if (command === "git") return args.includes("rev-parse") ? source : "";
+      built = true;
+      assert.fail("A build command ran");
+    } };
+  try {
+    // The reader's own error is what propagates; the stage line is what the log gains.
+    await assert.rejects(packageNativeHost({ ...options, readCredentials: () => { reads += 1; throw new Error("no grant"); } }), /no grant/);
+    assert.match(printed(), /stopped at notarization credentials/);
+    assert.equal(built, false);
+    assert.equal(existsSync(output), false);
+    // The unsigned development package reads no credentials at all:  it gets as
+    // far as its first build command without ever asking for them.
+    await assert.rejects(packageNativeHost({ ...options, unsignedDevelopment: true,
+      readCredentials: () => { reads += 1; throw new Error("no grant"); } }));
+    assert.equal(built, true);
+    assert.equal(reads, 1);
+    assert.equal(existsSync(output), false); // A failed package leaves nothing behind.
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+test("the artifact name is one function for the signed image and the unsigned archive", () => {
+  // The two never share a name, so a NOT DISTRIBUTABLE archive cannot be
+  // mistaken for the release artifact, and the packager and the release
+  // verifier cannot disagree about what a build is called.
+  assert.equal(hostArtifactName(build), `BotFleetNativeHost-0.1.0-${build}.dmg`);
+  assert.equal(hostArtifactName(build, true), `BotFleetNativeHost-0.1.0-${build}-UNSIGNED.zip`);
+  for (const bad of ["20261103100", "0".repeat(12), 202611031000, undefined, null]) assert.throws(() => hostArtifactName(bad), /verification refused/);
+  const packager = readFileSync(new URL("./package-native-host.mjs", import.meta.url), "utf8");
+  assert.match(packager, /const name = hostArtifactName\(build, unsignedDevelopment\);/);
+  // Both distributions name their file through it, and nothing spells the stem by hand.
+  assert.equal(packager.split("artifact = join(destination, name);").length - 1, 2);
+  assert.doesNotMatch(packager, /BotFleetNativeHost-0\.1\.0-/);
 });
 test("explicit unsigned-development mode remains nondistributable and never inspects credentials/signing", () => {
   const stamp = identity({ distribution: "unsigned-development", sourceDirty: true });
