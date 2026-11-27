@@ -1671,3 +1671,13 @@ export function bridgePairRefusalSentence(reason) {
 }
 
 /**
+ * The refusal for a retried pairing request. The bridge hands a device
+ * credential out exactly once and keeps only its digest, so the same phone
+ * request that arrives after a lost response cannot be answered with a
+ * credential a second time, and a body shaped like a pairing success with
+ * no credential would leave the phone holding an empty token.
+ */
+export const BRIDGE_PAIR_REPLAY_REFUSAL = Object.freeze({
+  status: 409,
+  error: 'That pairing request was already completed, and its credential is issued only once. Start pairing again.',
+});
