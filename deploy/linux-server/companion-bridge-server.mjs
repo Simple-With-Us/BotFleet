@@ -1057,6 +1057,9 @@ export function createCompanionBridge({
   const host = String(upstreamHost || BRIDGE_UPSTREAM_HOST);
   const upstreamAgent = new http.Agent({ keepAlive: false });
   const activeSseStreams = new Map();
+  // Per bridge, like the streams: how many JSON answers are held whole right
+  // now, so the ceiling below cannot be spent by another bridge instance.
+  const jsonScrubs = { inFlight: 0 };
   const sender = apnsSender ?? createBridgeApnsSender({ material: apns, now, log: logger });
 
   // The persist callback is normalized once:  a throw and a `false` answer
