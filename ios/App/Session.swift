@@ -72,6 +72,10 @@ final class Session: ObservableObject {
     @Published private(set) var notificationAuthorizationResolved = false
     /// A short-lived desktop handoff waiting for PairingView to present it.
     @Published private(set) var pairingInvite: PairingInvite?
+    /// A code the server opened, received while this phone is paired with a
+    /// Mac. It is offered rather than put through pairing, because pairing
+    /// with the server does not replace the Mac.
+    @Published private(set) var serverPairingOffer: PairingInvite?
     @Published var config: ConfigStatus?
     /// Cached APNs sender health from the sidecar, surfaced as a Settings
     /// row so a closed-app wake problem is visible without opening a
