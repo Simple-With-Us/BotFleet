@@ -1256,6 +1256,7 @@ async function handleRequest({
     logger,
     deviceId,
     activeSseStreams,
+    jsonScrubs,
   });
 }
 
