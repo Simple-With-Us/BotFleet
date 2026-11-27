@@ -1168,7 +1168,7 @@ export function createCompanionBridge({
 async function handleRequest({
   req, res, state, owners, publicOrigin, tokenSha256,
   host, port, upstreamAgent, logger, now, persist, origins,
-  sender, activeSseStreams, disconnectDeviceSse,
+  sender, activeSseStreams, jsonScrubs, disconnectDeviceSse,
 }) {
   const method = String(req.method ?? 'GET').toUpperCase();
   const url = String(req.url ?? '/');
