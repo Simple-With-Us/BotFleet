@@ -8,8 +8,8 @@ BF-2652 closes only when three different kinds of evidence exist, and none of th
 
 | Slot | What it proves | State today |
 | --- | --- | --- |
-| 1. Packaged source | The bridge source on `main` passes its offline contract tests at an exact revision | **Verified** — see the receipt below |
-| 2. Authorized running server | An owner-authorized server actually runs that revision and serves the bridge route | **Not verified** — no deploy or enable was done |
+| 1. Packaged source | The bridge source on `main` passes its offline contract tests at an exact revision | **Verified** at `c202b4d6` and at `53bb9e15`, the revision the server serves: see the two receipts below |
+| 2. Authorized running server | An owner-authorized server actually runs that revision and serves the bridge route | **Verified** on 2026-11-27: see the receipt below |
 | 3. iPhone build + physical device | A named TestFlight build on a named physical device completes pairing, stream, and push checks | **Not verified** — no device run was scheduled |
 
 A green Slot 1 says nothing about Slot 2, and a foreground receipt in Slot 3 does not prove a background wake.  Each slot is filed under its own evidence and never borrowed from another.
