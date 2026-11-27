@@ -375,6 +375,9 @@ final class ServerBridgePairingTests: XCTestCase {
         XCTAssertNotNil(window, "a lookup that carries no credential must not cost the tab the enrolled one")
         let sent = try XCTUnwrap(ServerBridgeURLProtocol.captured.last)
         XCTAssertEqual(sent.gate, "fixture-gate")
+
+        await again.closePairingWindow()
+        await ServerBridgePairingBackend.retainOnly([])
     }
 
     func testAWindowOpenedBeforeTheTabReopenedIsStillShownAndCanBeClosed() async throws {
