@@ -72,10 +72,12 @@ public actor ServerBridgePairingBackend: PhonePairingBackend {
     /// lives here alone: a backend made anew by a tab that closed and
     /// reopened would know nothing about it, and its code could not be
     /// closed from the app until it expired. The credential is refreshed on
-    /// every lookup, because a server can be enrolled again.
+    /// every lookup that carries one, because a server can be enrolled again;
+    /// a lookup with none leaves the enrolled one in place, because a read
+    /// that failed once must not cost the tab its pairing until the next one.
     public static func shared(host: HostRecord, credential: HostGateCredential?, session: URLSession = .shared) async -> ServerBridgePairingBackend {
         let backend = await registry.backend(for: host, session: session)
-        await backend.updateCredential(credential)
+        if let credential { await backend.updateCredential(credential) }
         return backend
     }
 
@@ -301,12 +303,20 @@ public actor ServerBridgePairingBackend: PhonePairingBackend {
 /// One `ServerBridgePairingBackend` per enrolled server for the life of the
 /// process, so an open pairing window outlives the tab that opened it.
 private actor ServerBridgePairingRegistry {
-    private var backends: [String: ServerBridgePairingBackend] = [:]
+    private var backends: [String: (host: HostRecord, backend: ServerBridgePairingBackend)] = [:]
 
+    /// The backend for one server record. A record enrolled again with
+    /// another address or identity is another server to this app, so it gets
+    /// a new backend and the old window goes with the old one; a new name
+    /// alone changes nothing. The session is the one given when the backend
+    /// was first made.
     func backend(for host: HostRecord, session: URLSession) -> ServerBridgePairingBackend {
-        if let existing = backends[host.id] { return existing }
+        if let existing = backends[host.id],
+           existing.host.origin == host.origin, existing.host.hostId == host.hostId {
+            return existing.backend
+        }
         let created = ServerBridgePairingBackend(host: host, credential: nil, session: session)
-        backends[host.id] = created
+        backends[host.id] = (host, created)
         return created
     }
 
