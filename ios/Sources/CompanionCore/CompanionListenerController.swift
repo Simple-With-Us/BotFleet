@@ -121,6 +121,13 @@ public protocol CompanionListenerBackend: Sendable {
     ) async throws -> UInt16?
     /// Stops the listener; a stop with nothing running is not an error.
     func stop() async
+    /// Says which placement the Mac app has applied, so a phone can read it
+    /// off the advertisement. A backend with no server to tell does nothing.
+    func setPlacement(_ mode: NativePlacementMode?) async
+}
+
+extension CompanionListenerBackend {
+    public func setPlacement(_ mode: NativePlacementMode?) async {}
 }
 
 /// Owns the companion listener's lifecycle for the native Mac app.
