@@ -701,7 +701,7 @@ public struct CompanionConnectionMetadata: Decodable, Sendable {
     /// True when the server's companion bridge answered.
     public var isBridge: Bool
 
-    private enum CodingKeys: String, CodingKey { case serverName, hosts, endpoints }
+    private enum CodingKeys: String, CodingKey { case serverName, hosts, endpoints, placement, isBridge }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
