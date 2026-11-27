@@ -316,6 +316,9 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
     /// Held here, so a server built on a later start is built with it.  The
     /// owner-side setters below also tell a server that is already up.
     private var desktopLaunch: CompanionDesktopLaunchWiring
+    /// The placement the app has applied, for the same reason: told to a
+    /// server that is up, and told to one built on a later start.
+    private var placement: NativePlacementMode?
 
     /// - Parameters:
     ///   - port: the port to bind; 0 lets the system pick one.
