@@ -73,6 +73,8 @@ public struct Connection: Codable, Hashable, Identifiable, Sendable {
         self.endpoints = endpoints
         self.allowedRouteKinds = allowedRouteKinds
         self.allowedLocalRouteURLs = allowedLocalRouteURLs
+        self.placement = placement
+        self.bridge = CompanionBridgePairing.holding(bridge)
     }
 
     /// The representation `URLComponents.host` accepts for a literal IPv6
