@@ -680,6 +680,7 @@ test('a proxied route needs a device the bridge knows; one it does not know, or 
     const anonymous = await call(bridge.port, { path: '/api/bots' });
     assert.equal(anonymous.status, 401);
     assert.equal(anonymous.json.error, 'device credential required');
+    assert.equal(anonymous.headers.get('www-authenticate'), 'Bearer realm="companion-bridge"');
     assert.equal(reached, 0);
 
     // A credential the bridge never issued is refused as well.
