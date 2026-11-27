@@ -36,9 +36,8 @@ The earlier 46/46 core result at `a024b67f` is superseded by this receipt: that 
 
 ## Slot 1 Receipt: The Revision The Server Serves
 
-- The serving host reports its exact revision (`git -C <serving checkout> rev-parse HEAD`) and it matches a revision whose Slot 1 receipt exists.
-- `botfleet-companion-bridge.service` is enabled only under the owner's `BF_COMPANION_BRIDGE=1` decision, listens on loopback, and is published through the owner's `tailscale serve` step.
-- The bridge answers its local routes (`/api/companion/endpoints`, pairing, devices) and proxies the fleet, thread, and `/api/events` routes without rewriting cursor parameters.
+- **Exact tested revision:** `53bb9e15c84bc389a6cfd83d876a1ce8b1a16c51` (`origin/main`, after PR #2245, which makes the bridge speak the shipped app's contract, and PR #2248, which answers `401` to a device credential it does not know).  This is the revision the serving host reports in the Slot 2 receipt.
+- **Lane:** `zc/bf-2652-slot-2-receipt`, cut from `origin/main` at that revision, working tree clean, Node `v24.16.0`, dependencies installed with `pnpm install --frozen-lockfile`.
 
 Until an owner authorizes that deploy, the bridge is packaged source only: the unit is written, default-off, and answers nothing live.
 
