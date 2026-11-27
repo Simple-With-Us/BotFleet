@@ -811,6 +811,8 @@ final class Session: ObservableObject {
         bridgeToken = nil
         serverTokenUnread = false
         serverPairingOffer = nil
+        placementProbe?.cancel()
+        placementProbe = nil
         CompanionConnectionStore.saveConnectionData(nil)
         UserDefaults.standard.removeObject(
             forKey: CompanionOnboardingPreferences.pendingNotificationOnboardingKey
