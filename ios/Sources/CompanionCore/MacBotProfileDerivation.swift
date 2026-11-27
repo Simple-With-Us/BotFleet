@@ -109,7 +109,7 @@ public final class DatabaseCliLoginCredentials: NativeServiceCredentialSource, @
     }
 
     public func credentials(forBotId botId: String) async throws -> NativeServiceCredentialResult {
-        let engines = try await cache.engines(forBotId: botId, load: {
+        let engines = try await cache.engines(load: {
             var map: [String: EngineMatrixID] = [:]
             for record in try await database.loadBots() {
                 if let derived = MacBotProfileDerivation.derive(from: record) {
@@ -123,6 +123,12 @@ public final class DatabaseCliLoginCredentials: NativeServiceCredentialSource, @
             return .available(environment: Self.minimalEnvironment())
         }
         return .unavailable
+    }
+
+    /// Clears the cached bot-engine lookup map so a newly persisted bot is
+    /// visible immediately without bypassing negative-lookup caching.
+    public func invalidateCache() async {
+        await cache.invalidate()
     }
 
     /// The only variables a CLI-login child is explicitly given: its login
@@ -146,20 +152,18 @@ public final class DatabaseCliLoginCredentials: NativeServiceCredentialSource, @
 
 /// Registered-engine map with the same lazy TTL shape as the workspace
 /// source's bot-id cache: the bot table has no change signal, so one load
-/// serves every known bot until the entry expires, while a miss reloads once
-/// so newly created bots resolve without waiting out the TTL.
+/// serves both hits and negative lookups until the entry expires or is
+/// explicitly invalidated when a bot profile is registered.
 private actor CliLoginCredentialCache {
     private var cachedEngines: [String: EngineMatrixID]?
     private var loadedAt: Date?
     private let ttl: TimeInterval = 30
 
     func engines(
-        forBotId botId: String,
         load: @Sendable () async throws -> [String: EngineMatrixID]
     ) async throws -> [String: EngineMatrixID] {
         if let cachedEngines,
            let loadedAt,
-           cachedEngines[botId] != nil,
            Date().timeIntervalSince(loadedAt) < ttl {
             return cachedEngines
         }
@@ -167,5 +171,10 @@ private actor CliLoginCredentialCache {
         cachedEngines = loaded
         loadedAt = Date()
         return loaded
+    }
+
+    func invalidate() {
+        cachedEngines = nil
+        loadedAt = nil
     }
 }

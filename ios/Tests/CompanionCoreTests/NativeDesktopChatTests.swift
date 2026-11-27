@@ -235,7 +235,7 @@ struct NativeDesktopChatTests {
         #expect(countAfterFailure == countBeforeFailure)
     }
 
-    @Test("DatabaseCliLoginCredentials reloads on a cache miss after a new bot is stored")
+    @Test("DatabaseCliLoginCredentials caches negative lookups and reloads when invalidated")
     func credentialCacheReloadsOnNewBot() async throws {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("cred-cache-miss-\(UUID().uuidString)", isDirectory: true)
@@ -243,8 +243,13 @@ struct NativeDesktopChatTests {
         defer { try? FileManager.default.removeItem(at: base) }
         let database = try DatabaseService(path: ":memory:")
         let credentials = DatabaseCliLoginCredentials(database: database)
+        let runtime = NativeMacCompanionRuntime(
+            database: database,
+            workspacesRoot: base.appendingPathComponent("workspaces", isDirectory: true),
+            credentials: credentials
+        )
 
-        // Populate cache with an empty table before inserting a bot.
+        // Populate negative-lookup cache while table is empty.
         let beforeInsert = try await credentials.credentials(forBotId: "bot-new")
         guard case .unavailable = beforeInsert else {
             Issue.record("Expected unavailable credentials before inserting the bot")
@@ -259,9 +264,23 @@ struct NativeDesktopChatTests {
             rawJSON: Self.botJSON(id: "bot-new", threadId: "thread-new")
         )
         try await database.upsertBot(record)
+
+        // Repeated missing-bot lookup within TTL hits cache without rescanning SQLite.
+        let cachedMiss = try await credentials.credentials(forBotId: "bot-new")
+        guard case .unavailable = cachedMiss else {
+            Issue.record("Expected TTL cache to keep negative lookup cached until invalidated")
+            return
+        }
+
+        // Registering the bot profile invalidates the cache immediately.
+        try await runtime.macExecutionContext.register(MacBotExecutionProfile(
+            id: "bot-new",
+            threadId: "thread-new",
+            engineId: "claude"
+        ))
         let result = try await credentials.credentials(forBotId: "bot-new")
         guard case .available = result else {
-            Issue.record("Expected credentials to reload and resolve .available on cache miss")
+            Issue.record("Expected credentials to reload and resolve .available after registration invalidation")
             return
         }
     }

@@ -56,7 +56,7 @@ public actor MacExecutionContext: NativeExecutionContextSource {
     }
 
     /// Registers or replaces the execution profile for a bot.
-    public func register(_ profile: MacBotExecutionProfile) throws {
+    public func register(_ profile: MacBotExecutionProfile) async throws {
         guard !stopped else { throw NativeRuntimeServicesError.stopped }
         guard Self.safeBotId(profile.id),
               !profile.threadId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -65,6 +65,9 @@ public actor MacExecutionContext: NativeExecutionContextSource {
         }
         profiles[profile.id] = profile
         generation &+= 1
+        if let cliCredentials = credentials as? DatabaseCliLoginCredentials {
+            await cliCredentials.invalidateCache()
+        }
     }
 
     /// Removes a bot's execution profile so future waits remain admission-held.

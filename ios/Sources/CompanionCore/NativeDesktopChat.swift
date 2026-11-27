@@ -318,15 +318,17 @@ public struct NativeDesktopChat: Sendable {
             try await runtime.registerBot(derivedProfile, matrixEngine: engine)
         }
 
-        try await database.upsertThread(threadRecord)
         do {
+            try await database.upsertThread(threadRecord)
             try await database.upsertBot(botRecord)
             try await runtime.runtime.engineSwitch.switchToNativeSwift(
                 botId: botId,
                 historySnapshot: BotHistoryImportSnapshot(botId: botId, threads: [threadRecord], messagesByThread: [:])
             )
         } catch {
+            try? await database.deleteBot(id: botId)
             try? await database.deleteThread(id: threadId)
+            await runtime.macExecutionContext.unregister(botId: botId)
             throw error
         }
         return bot
