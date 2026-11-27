@@ -606,8 +606,11 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         NSApp.activate(ignoringOtherApps: true)
         if let opener = settingsSceneOpener {
             opener()
-            Self.focusSettingsWindowIfPresent()
-            return
+            if NSApp.windows.contains(where: { $0.identifier?.rawValue == "com_apple_SwiftUI_Settings_window" }) {
+                Self.focusSettingsWindowIfPresent()
+                return
+            }
+            settingsSceneOpener = nil
         }
         if Self.triggerMainMenuSettingsItem() {
             Self.focusSettingsWindowIfPresent()
