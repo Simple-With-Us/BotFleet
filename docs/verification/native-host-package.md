@@ -150,9 +150,12 @@ node scripts/package-native-host.mjs --repo-root . --output "$work/package" --bu
 node scripts/verify-native-host-artifact.mjs payload "$work/package/payload" \
   --source "$source" --build "$build" --unsigned-development
 hdiutil create -volname BotFleetNativeHost -srcfolder "$work/package/payload" -ov -format UDZO "$work/local.dmg"
-mkdir "$work/mnt"
-hdiutil attach -readonly -nobrowse -mountpoint "$work/mnt" "$work/local.dmg"
-node scripts/verify-native-host-artifact.mjs payload "$work/mnt" \
+# A mount that cannot happen leaves no mount point behind.
+node --input-type=module -e 'import { mountDiskImage } from "./scripts/verify-native-host-artifact.mjs";
+  mountDiskImage(process.argv[1]);' "$work/missing.dmg" && exit 1
+mnt="$(node --input-type=module -e 'import { mountDiskImage } from "./scripts/verify-native-host-artifact.mjs";
+  console.log(mountDiskImage(process.argv[1]));' "$work/local.dmg")"
+node scripts/verify-native-host-artifact.mjs payload "$mnt" \
   --source "$source" --build "$build" --unsigned-development
 # The verifier's own detach removes nothing while the image is on the mount point.
 node --input-type=module -e 'import { unmountDiskImage } from "./scripts/verify-native-host-artifact.mjs";
