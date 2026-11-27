@@ -320,9 +320,9 @@ private actor ServerBridgePairingRegistry {
 
     /// The backend for one server record. A record enrolled again with
     /// another address or identity is another server to this app, so it gets
-    /// a new backend and the old window goes with the old one; a new name
-    /// alone changes nothing. The session is the one given when the backend
-    /// was first made.
+    /// a new backend and the old one is forgotten, its window closed on the
+    /// server it is still open on; a new name alone changes nothing. The
+    /// session is the one given when the backend was first made.
     func backend(for host: HostRecord, session: URLSession) -> ServerBridgePairingBackend {
         if let existing = backends[host.id],
            existing.host.origin == host.origin, existing.host.hostId == host.hostId {
