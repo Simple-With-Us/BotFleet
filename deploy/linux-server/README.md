@@ -221,6 +221,7 @@ The bridge speaks the shipped iOS app's own contract, so no new phone build is n
 - Five sidecar rows are not forwarded: the three companion routes the bridge answers itself, `POST /api/bots/:id/computer/join`, which needs a per-device grant the bridge does not have, and the two update actions `POST /api/update/check` and `POST /api/update/run`, whose purpose is to stop and replace the harness.
 - On the phone's behalf the bridge does what the sidecar does: it checks the two `PATCH` bodies that reach broader harness routes against the sidecar's field lists, and withholds `resumeCursors` and `sshAlias` from JSON and event-stream responses.
 - The advertisement (`GET /api/companion/endpoints`, and `endpoints` in the pairing answer) carries the bridge's own route: `BOTFLEET_COMPANION_BRIDGE_ORIGIN` from Infisical when it is set, else the route the request arrived on, read from the forwarding headers a proxy in front of the bridge sets.
+- Both answers say `isBridge: true`. A computer never sends it. A phone that reads it knows the pairing belongs beside its Mac pairing rather than in its place, which is what lets it follow the server when the Mac says it runs `serverFirst`, and fall back to the Mac when the server does not answer (BF-2714).
 
 `BOTFLEET_COMPANION_BRIDGE_ORIGIN` is optional config in the same Infisical folder as the gate's names (BotFleet, prod, `/botfleet-server`):
 
