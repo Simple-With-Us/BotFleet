@@ -90,6 +90,7 @@ struct ChatListView: View {
                     roster
                         .navigationDestination(for: Chat.self) { ChatView(chat: $0) }
                         .navigationDestination(isPresented: $showingDebugSettings) { SettingsView() }
+                        .navigationDestination(isPresented: $showingDebugConnection) { ConnectionSecurityView() }
                 }
             }
         }
