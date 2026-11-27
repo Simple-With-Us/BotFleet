@@ -11,6 +11,8 @@ import crypto from "node:crypto";
 import net from "node:net";
 
 import {
+  bridgeAdminTarget,
+  bridgeUpstreamHeaders,
   createOwnerGate,
   gateConfigFromSecrets,
   gateDecision,
