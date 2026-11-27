@@ -157,7 +157,7 @@ mnt="$(node --input-type=module -e 'import { mountDiskImage } from "./scripts/ve
   console.log(mountDiskImage(process.argv[1]));' "$work/local.dmg")"
 node scripts/verify-native-host-artifact.mjs payload "$mnt" \
   --source "$source" --build "$build" --unsigned-development
-# The verifier's own detach removes nothing while the image is on the mount point.
+# While the image is on it, the verifier's own detach removes nothing.
 node --input-type=module -e 'import { unmountDiskImage } from "./scripts/verify-native-host-artifact.mjs";
   unmountDiskImage(process.argv[1], { detached: () => true });' "$work/mnt" && exit 1
 test -d "$work/mnt/bin"
