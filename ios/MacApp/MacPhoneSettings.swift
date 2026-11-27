@@ -17,6 +17,12 @@ import CoreImage.CIFilterBuiltins
 /// credentials except the active pairing code and invite, which die with
 /// their window: device rows come from `publicDevice`, which carries no
 /// push token by construction.
+///
+/// Below the Mac's own cards sits the server's: the same code, QR, phones
+/// and routes, answered by the server's companion bridge through the owner
+/// gate on the origin this Mac is enrolled on (`ServerPairingCard`). It
+/// needs no listener on this Mac and follows the server the saved placement
+/// names, or the one server this Mac is enrolled on.
 struct MacPhoneSettings: View {
     @ObservedObject var session: MacSession
 
