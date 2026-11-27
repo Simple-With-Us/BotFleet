@@ -926,6 +926,18 @@ struct ConnectionSecurityView: View {
         } message: {
             Text("This removes the connection from this iPhone only. It does not revoke this phone on your Mac. To remove Mac-side access, open BotFleet → Settings → Phone and remove this device.")
         }
+        .confirmationDialog(
+            "Remove the server pairing?",
+            isPresented: $confirmingServerRemoval,
+            titleVisibility: .visible
+        ) {
+            Button("Remove from this iPhone", role: .destructive) {
+                session.forgetServerPairing()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes the server from this iPhone only, and your Mac pairing stays.\u{00A0} The server keeps this phone listed until you remove it there.")
+        }
     }
 
     private var troubleshootingText: String {
