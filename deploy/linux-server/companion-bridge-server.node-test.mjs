@@ -2176,7 +2176,7 @@ test('every forwarded route needs a paired device, and each one reaches the harn
         headers: ownerHeaders({ ...json, authorization: `Bearer ${DEVICE_CREDENTIAL}` }),
         body,
       });
-      assert.equal(stranger.status, 403, label);
+      assert.equal(stranger.status, 401, label);
       assert.equal(stranger.json.error, 'unknown device', label);
     }
     assert.equal(reached.length, 0, 'nothing reached the harness without a paired device');
