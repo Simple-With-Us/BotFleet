@@ -231,6 +231,34 @@ struct BridgePreferenceTests {
         #expect(mac.syncEndpoints.map(\.url) == [Routes.macHosted.url])
     }
 
+    @Test("A Mac that advertises no route is still heard: its mode travels alone and the routes stay")
+    func aModeWithoutRoutesIsHeard() throws {
+        // The native Mac server advertises no route until the app sets some,
+        // so its answer is a mode and nothing else.
+        let heard = try JSONDecoder().decode(
+            CompanionConnectionMetadata.self,
+            from: Data(#"{"serverName":"Ada's Mac","endpoints":[],"placement":"serverFirst"}"#.utf8)
+        )
+        #expect(heard.placement == .serverFirst)
+        #expect(heard.endpoints.isEmpty)
+
+        // Without a mode it is the unreadable snapshot it always was, so a
+        // phone keeps the routes it has.
+        #expect(throws: (any Error).self) {
+            _ = try JSONDecoder().decode(
+                CompanionConnectionMetadata.self,
+                from: Data(#"{"serverName":"Ada's Mac","endpoints":[]}"#.utf8)
+            )
+        }
+
+        var mac = pairedMac(placement: .localOnly)
+        mac.bridgeConnection = pairedBridge()
+        mac.reconcile(heard)
+        #expect(mac.placement == .serverFirst)
+        #expect(mac.prefersBridge)
+        #expect(mac.syncEndpoints.map(\.url) == [Routes.server.url] + Routes.mac, "the Mac's routes are as they were")
+    }
+
     // MARK: The invite
 
     @Test("A bridge invite names itself, and any other role value rejects the invite")
@@ -310,6 +338,12 @@ struct BridgePreferenceTests {
 
         await server.setPlacement(.serverFirst)
         #expect(try await endpoints().contains(#""placement":"serverFirst""#))
+        // Read as the phone reads it: a mode and no route decodes, where a
+        // snapshot with neither is refused.
+        let told = await server.handleRequest(CompanionHTTPRequest(method: "GET", path: "/api/companion/endpoints", headers: headers))
+        let heard = try told.decodeJSON(CompanionConnectionMetadata.self)
+        #expect(heard.placement == .serverFirst)
+        #expect(heard.endpoints.isEmpty)
 
         let paired = await server.handleRequest(
             CompanionHTTPRequest(method: "POST", path: "/api/pair", headers: headers,
