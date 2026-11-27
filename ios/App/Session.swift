@@ -138,6 +138,11 @@ final class Session: ObservableObject {
     /// dial moves to another stored host. The keychain remains the only place
     /// it is persisted.
     private var token: String?
+    /// The token of this phone's pairing with the server's bridge, when it
+    /// has one. Kept beside `token`, never in its place: a route of the Mac
+    /// sends `token`, a route of the server sends this one, and neither ever
+    /// travels to the other.
+    private var bridgeToken: String?
     /// Which of the connection's stored hosts the next attempt dials. The
     /// walk advances on address-shaped failures and the winner is promoted —
     /// and persisted — when a stream goes live.
