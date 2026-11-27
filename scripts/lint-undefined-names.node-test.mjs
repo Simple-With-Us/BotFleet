@@ -17,6 +17,15 @@ import { z } from "zod";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
+/** What this test reads from the linter's configuration, checked before it is believed. */
+const LintConfig = z.object({
+  env: z.object({ node: z.boolean() }),
+  overrides: z.array(z.object({
+    files: z.array(z.string()),
+    rules: z.record(z.string(), z.string()),
+  })),
+});
+
 /** Lint one file with the repository's own configuration and hand back its exit status and output. */
 function lint(file) {
   const config = join(repoRoot, ".oxlintrc.json");
