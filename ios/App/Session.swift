@@ -528,6 +528,8 @@ final class Session: ObservableObject {
                 assert(!Thread.isMainThread)
                 return (Self.readLaunchToken(connectionId), serverId.map { Self.readLaunchToken($0) } ?? .missing)
             }.value
+            tokenRead = reads.0
+            serverTokenRead = reads.1
         } else {
             tokenRead = .missing
         }
