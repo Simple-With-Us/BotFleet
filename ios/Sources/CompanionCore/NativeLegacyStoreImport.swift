@@ -14,15 +14,18 @@ import Foundation
 /// installed harness, the harness is still the writer of those files and a
 /// copy would go stale.  A marker beside the native store records a finished
 /// import, so later launches skip it.  The marker is written only when the
-/// importer returns, so a failed or interrupted run is tried again on the
-/// next launch.
+/// importer returns with row and content parity, so a failed, interrupted or
+/// unverified run is tried again on the next launch.  A marker beside a
+/// native store that holds no bots is not trusted: the store was reset, so
+/// the import runs again.
 public struct NativeLegacyStoreImport: Sendable {
     /// What one call of `runIfNeeded` did.
     public enum Outcome: Equatable, Sendable {
         /// Nothing was imported, and why.
         case skipped(SkipReason)
         /// The import finished.  The counts are what the native store holds
-        /// afterwards, as the importer's parity report gives them.
+        /// afterwards, as the importer's parity report gives them.  Without
+        /// parity no marker is written, so the next launch imports again.
         case imported(bots: Int, threads: Int, messages: Int, parityVerified: Bool)
         /// The importer threw.  No marker was written, so the next launch
         /// tries again.
@@ -45,7 +48,10 @@ public struct NativeLegacyStoreImport: Sendable {
         let threads: Int
         let messages: Int
         let parityVerified: Bool
+        /// Parity and no warnings: the importer's `isFullyVerified`.
+        let fullyVerified: Bool
         let mismatches: [String]
+        let warnings: [String]
     }
 
     /// The folder holding the legacy `bots.json` and `messages.db`.
@@ -103,7 +109,8 @@ public struct NativeLegacyStoreImport: Sendable {
     /// installed, the import already finished, or there is nothing to import.
     public func runIfNeeded(into database: DatabaseService) async -> Outcome {
         guard harnessIsGone() else { return .skipped(.harnessPresent) }
-        guard !FileManager.default.fileExists(atPath: markerURL.path) else {
+        if FileManager.default.fileExists(atPath: markerURL.path),
+           let bots = try? await database.loadBots(), !bots.isEmpty {
             return .skipped(.alreadyImported)
         }
         guard FileManager.default.fileExists(
@@ -117,13 +124,26 @@ public struct NativeLegacyStoreImport: Sendable {
         } catch {
             return .failed(String(describing: error))
         }
+        let outcome = Outcome.imported(
+            bots: report.targetBotCount,
+            threads: report.targetThreadCount,
+            messages: report.targetMessageCount,
+            parityVerified: report.isParityVerified
+        )
+        // Without parity a later launch must try again, so the marker that
+        // would stop it is not written.  Warnings alone do not hold it back:
+        // they name source data the importer cannot map (a snooze for a bot
+        // that is gone), which another run would only report again.
+        guard report.isParityVerified else { return outcome }
         let marker = Marker(
             importedAt: Date().timeIntervalSince1970,
             bots: report.targetBotCount,
             threads: report.targetThreadCount,
             messages: report.targetMessageCount,
             parityVerified: report.isParityVerified,
-            mismatches: report.mismatches
+            fullyVerified: report.isFullyVerified,
+            mismatches: report.mismatches,
+            warnings: report.warnings
         )
         do {
             try FileManager.default.createDirectory(
@@ -138,11 +158,6 @@ public struct NativeLegacyStoreImport: Sendable {
             // import again, which adds nothing because the importer is
             // idempotent, so this is not a failure of the import.
         }
-        return .imported(
-            bots: report.targetBotCount,
-            threads: report.targetThreadCount,
-            messages: report.targetMessageCount,
-            parityVerified: report.isParityVerified
-        )
+        return outcome
     }
 }
