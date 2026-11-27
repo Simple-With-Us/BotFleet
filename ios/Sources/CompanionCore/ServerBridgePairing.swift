@@ -335,6 +335,7 @@ private actor ServerBridgePairingRegistry {
     }
 
     func retainOnly(_ hostIDs: Set<String>) {
+        backends.values.filter { !hostIDs.contains($0.host.id) }.map(\.backend).forEach(forget)
         backends = backends.filter { hostIDs.contains($0.key) }
     }
 }
