@@ -172,7 +172,9 @@ Each verifier call answers
 or exits 1 with a refusal and no pass line.   A build or commit other than the
 stamp's is refused, and so is the same payload held to the distributable
 standard, because the real signature inspector finds nothing to trust in an
-unsigned binary.
+unsigned binary.  The two detach calls answer
+`the disk image is still mounted after the detach` while the image is on the
+mount point, and nothing while they remove it afterwards.
 
 ## What The Receipt Has To Say
 
