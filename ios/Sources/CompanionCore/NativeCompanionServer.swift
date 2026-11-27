@@ -168,6 +168,7 @@ public struct CompanionEndpointAdvertisement: Sendable, Equatable {
         self.serverName = serverName
         self.hosts = hosts
         self.endpoints = endpoints
+        self.isBridge = isBridge
     }
 
     /// Builds an ordered endpoint advertisement from explicit host inputs,
