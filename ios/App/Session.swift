@@ -76,6 +76,10 @@ final class Session: ObservableObject {
     /// Mac. It is offered rather than put through pairing, because pairing
     /// with the server does not replace the Mac.
     @Published private(set) var serverPairingOffer: PairingInvite?
+    /// The newest server code offered. Unlike the offer itself it outlives
+    /// the alert's closing, so a tap on an offer a newer one replaced can be
+    /// told apart, and ignored.
+    private var newestServerOffer: PairingInvite?
     @Published var config: ConfigStatus?
     /// Cached APNs sender health from the sidecar, surfaced as a Settings
     /// row so a closed-app wake problem is visible without opening a
