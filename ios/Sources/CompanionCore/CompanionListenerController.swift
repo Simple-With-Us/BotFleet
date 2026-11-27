@@ -356,6 +356,9 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
         }
         var options = self.options
         options.advertisedName = advertising?.name
+        // Said before the socket opens, whichever way this server came to be,
+        // so no first answer leaves the mode out.
+        await server.setPlacement(placement)
         // The server answers once the socket is ready, with the port it bound,
         // or throws the listener's own error; a loopback bind drops the
         // advertisement whatever was asked.
