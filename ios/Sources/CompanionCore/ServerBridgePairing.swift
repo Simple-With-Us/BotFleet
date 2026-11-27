@@ -329,6 +329,7 @@ private actor ServerBridgePairingRegistry {
             return existing.backend
         }
         let created = ServerBridgePairingBackend(host: host, credential: nil, session: session)
+        if let replaced = backends[host.id]?.backend { forget(replaced) }
         backends[host.id] = (host, created)
         return created
     }
