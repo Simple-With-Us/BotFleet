@@ -153,6 +153,15 @@ public actor ServerBridgePairingBackend: PhonePairingBackend {
         opened = nil
     }
 
+    /// Closes the window this backend remembers, and nothing else. For a
+    /// backend the registry is forgetting: its server keeps that window open
+    /// until it expires, and nothing would be left to close it. The answer
+    /// is not read; a window the server could not close expires there.
+    func closeRememberedWindow() async {
+        guard await activePairingWindow() != nil else { return }
+        await closePairingWindow()
+    }
+
     public func activePairingWindow() async -> NativePairingWindow? {
         guard let window = opened else { return nil }
         guard window.expiresAt > Date() else {
