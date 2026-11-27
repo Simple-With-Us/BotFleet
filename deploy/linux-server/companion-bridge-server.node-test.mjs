@@ -1707,7 +1707,7 @@ test('POST /api/pair answers the body the iOS app decodes as PairResponse', asyn
 
     // Exactly the keys `PairResponse` names and exactly the keys
     // `PairedDevice` names: nothing is sent that the app does not decode.
-    assert.deepEqual(Object.keys(paired.json).sort(), ['device', 'endpoints', 'serverName', 'token']);
+    assert.deepEqual(Object.keys(paired.json).sort(), ['device', 'endpoints', 'isBridge', 'serverName', 'token']);
     assert.deepEqual(Object.keys(paired.json.device).sort(), ['createdAt', 'id', 'lastSeenAt', 'name']);
     assert.deepEqual(Object.keys(paired.json.endpoints[0]).sort(), ['kind', 'priority', 'url']);
 
