@@ -100,6 +100,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     @Published public private(set) var port: Int = 8799
     public let servers: ServersCoordinator
     public let resources: ResourcesCoordinator
+    private var placementTelling = Set<AnyCancellable>()
 
     // Lifecycle & Remote Wake state (BF-2497)
     @Published public var lifecycleSettings = MacLifecycleSettings()
