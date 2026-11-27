@@ -169,6 +169,10 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     // graceful-stop drain counters (AG busy-flag note).
     private let nativeProcessSupervisor: ProcessSupervisorActor
     private let nativeRuntimeBox: MacNativeRuntimeBox
+    /// The one native runtime the listener and the chat window share
+    /// (BF-2705).  It opens on first use by either, so nothing is created
+    /// while neither is in use.
+    private let nativeRuntimeHost: NativeMacRuntimeHost
     /// Native engine work currently in flight on the listener graph, for the
     /// server-bridge session state.  Zero until the listener first starts.
     @Published public private(set) var nativeBusy = MacNativeBusySnapshot()
@@ -206,6 +210,17 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     #endif
 
     private var client: CompanionClient?
+    /// The chat window on the native engine, set while This Mac has no Node
+    /// harness installed and the native store has been read (BF-2705).
+    /// Messages go here instead of to `client` while it is set.
+    private var nativeChat: NativeDesktopChat?
+    /// Whether the current connection is the native one, from the moment it
+    /// starts, so an installed-state read does not start it twice.
+    private var isNativeConnection = false
+    /// Native turns the window is reading, by thread, so Stop cancels the
+    /// one in the open thread.  The id keeps a finished turn from removing
+    /// a newer one on the same thread.
+    private var nativeTurns: [String: (id: UUID, task: Task<Void, Never>)] = [:]
     private var streamTask: Task<Void, Never>?
     private var connectionGeneration = UUID()
     private var reconnectAttempt = 0
@@ -285,6 +300,29 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         let nativeRuntimeBox = MacNativeRuntimeBox()
         self.nativeProcessSupervisor = nativeProcessSupervisor
         self.nativeRuntimeBox = nativeRuntimeBox
+        // BF-2705: the listener and the chat window share one native runtime,
+        // opened by whichever needs it first.  A store of the app's own,
+        // under the Mac's data directory; where the native engine's store
+        // finally lives is BF-2504's call, and this path is the provisional
+        // one the BF-2590 PR named.  Workspaces are confined beside it.
+        let nativeRuntimeHost = NativeMacRuntimeHost {
+            try FileManager.default.createDirectory(
+                at: storeURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let database = try DatabaseService(path: storeURL.path)
+            let workspacesRoot = storeURL.deletingLastPathComponent()
+                .appendingPathComponent("workspaces", isDirectory: true)
+            let macRuntime = NativeMacCompanionRuntime(
+                database: database,
+                workspacesRoot: workspacesRoot,
+                processSupervisor: nativeProcessSupervisor,
+                credentials: DatabaseCliLoginCredentials(database: database)
+            )
+            nativeRuntimeBox.store(macRuntime)
+            return (database, macRuntime)
+        }
+        self.nativeRuntimeHost = nativeRuntimeHost
         // BF-2690: the action behind the phone's "Open on Mac".  It brings the
         // app forward without reading the session, so it is given here, before
         // the session exists.  The gate it sits behind is mirrored from the
@@ -296,35 +334,20 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
                 onDesktopOpen: { await MacSession.bringApplicationForward() }
             )
         ) { desktopLaunch in
-            // A store of the listener's own, under the Mac's data directory,
-            // created only when the listener is first turned on.  Where the
-            // native engine's store finally lives is BF-2504's call; this
-            // path is provisional and named in the BF-2590 PR.
-            try FileManager.default.createDirectory(
-                at: storeURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            let database = try DatabaseService(path: storeURL.path)
-            // Inject the native runtime so the wait routes serve instead of
-            // answering 503, with workspaces confined beside the store.  The
-            // server retains the runtime (and through it the graph's actors);
-            // the listener stays default-off and stop stays socket-only.
-            let workspacesRoot = storeURL.deletingLastPathComponent()
-                .appendingPathComponent("workspaces", isDirectory: true)
-            let macRuntime = NativeMacCompanionRuntime(
-                database: database,
-                workspacesRoot: workspacesRoot,
-                processSupervisor: nativeProcessSupervisor,
-                credentials: DatabaseCliLoginCredentials(database: database)
-            )
-            nativeRuntimeBox.store(macRuntime)
-            // BF-2689 composition: register every stored bot that derives
-            // a native profile, with its real driver, so satisfied waits
-            // dispatch instead of holding unclaimed.  Registration is
+            // Inject the shared native runtime so the wait routes serve
+            // instead of answering 503.  The server retains the runtime (and
+            // through it the graph's actors); the listener stays default-off
+            // and stop stays socket-only.
+            let opened = try nativeRuntimeHost.open()
+            let database = opened.database
+            let macRuntime = opened.runtime
+            // BF-2689 composition: the host registered every stored bot that
+            // derives a native profile, with its real driver, so satisfied
+            // waits dispatch instead of holding unclaimed.  Registration is
             // best-effort per bot — a bot that cannot register stays
             // admission-held and is named in the log, never substituted.
             Task {
-                let report = await macRuntime.registerStoredBots()
+                let report = await opened.registration.value
                 if let loadFailure = report.loadFailure {
                     NSLog("BF-2689: stored bots could not be loaded for native registration: %@", loadFailure)
                 }
@@ -782,6 +805,15 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         self.port = connection.port
         disconnect()
 
+        // BF-2705: with the Node harness's LaunchAgent gone nothing listens
+        // where the client would connect, so This Mac's chat runs on the
+        // native engine instead.  Only then: beside an installed harness
+        // the native runtime must not answer the harness's bots.
+        if installedServerState == .notInstalled {
+            connectNative(record: record)
+            return
+        }
+
         if didDeliberatelyStopServer {
             // The harness was deliberately stopped in this session, so a
             // reconnect would only hammer a server that is meant to stay down.
@@ -902,9 +934,11 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         // so the counters it watches can actually reach zero.  In-flight
         // engine turns keep running until they settle or are stopped below.
         // This is the right layer for this composition: the app dispatches
-        // native turns only through the wait queue, which this shutdown
-        // fences, and supervised processes stop through the engine
-        // cancellations the terminal shutdown below performs.
+        // native turns through the wait queue, which this shutdown fences,
+        // and through the chat window, fenced by dropping `nativeChat` so a
+        // later message is refused; supervised processes stop through the
+        // engine cancellations the terminal shutdown below performs.
+        nativeChat = nil
         await macRuntime.runtime.shutdown()
         var result = await MacNativeGracefulDrain.drain(
             deadlineMs: deadlineMs,
@@ -1023,6 +1057,12 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         streamTask?.cancel()
         streamTask = nil
         client = nil
+        // A native turn the window stops reading is cancelled, as when the
+        // window goes away: nothing would fold its reply in.
+        nativeChat = nil
+        isNativeConnection = false
+        for turn in nativeTurns.values { turn.task.cancel() }
+        nativeTurns.removeAll()
         servers.connectedRecordID = nil
         status = .disconnected
         syncSystemSurfaces(force: true)
@@ -1090,8 +1130,115 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         }
     }
 
+    // MARK: - Native chat (BF-2705)
+
+    /// What the status pill names while the chat runs on the native engine.
+    static let nativeEndpointLabel = "native engine on this Mac"
+
+    private func connectNative(record: HostRecord) {
+        isNativeConnection = true
+        status = .connecting
+        servers.connectedRecordID = record.id
+        let generation = connectionGeneration
+        let host = nativeRuntimeHost
+        streamTask = Task { [weak self] in
+            await self?.runNativeConnection(host: host, generation: generation)
+        }
+    }
+
+    /// Opens the shared runtime, moves the registered bots onto it and
+    /// hydrates the window from the native store.  There is no event stream
+    /// to follow: the window's own turns bring their frames with them.
+    private func runNativeConnection(host: NativeMacRuntimeHost, generation: UUID) async {
+        let chat: NativeDesktopChat
+        let start: NativeDesktopChatStart
+        do {
+            let opened = try host.open()
+            chat = NativeDesktopChat(opened: opened)
+            start = try await chat.start()
+        } catch {
+            guard !Task.isCancelled, connectionGeneration == generation else { return }
+            status = .failed("The native store could not be read: \(error.localizedDescription)")
+            syncSystemSurfaces(force: true)
+            return
+        }
+        guard !Task.isCancelled, connectionGeneration == generation else { return }
+        if let loadFailure = start.registration.loadFailure {
+            NSLog("BF-2705: stored bots could not be loaded for native registration: %@", loadFailure)
+        }
+        for skip in start.cutoverSkipped {
+            NSLog("BF-2705: bot %@ stays off the native engine: %@", skip.botId, skip.reason)
+        }
+        for skip in start.snapshot.skipped {
+            NSLog("BF-2705: bot %@ is not shown: %@", skip.botId, skip.reason)
+        }
+        nativeChat = chat
+        state.hydrate(start.snapshot.fleet)
+        if selection == nil, let first = start.snapshot.fleet.bots.first {
+            selection = .bot(first.id)
+        }
+        status = .connected(endpoint: Self.nativeEndpointLabel)
+        reconnectAttempt = 0
+        syncSystemSurfaces(force: true)
+    }
+
+    /// Runs one message as a native turn and folds its frames into the
+    /// window as they come.  Returns once the turn has started; the reply
+    /// keeps streaming after that, like a harness reply does.
+    private func sendNative(_ text: String, chat: NativeDesktopChat) async -> Bool {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let threadId = activeThreadId,
+              let bot = activeBot else { return false }
+        isSending = true
+        defer { isSending = false }
+
+        let frames: AsyncStream<Frame>
+        do {
+            frames = try await chat.send(botId: bot.id, threadId: threadId, text: text)
+        } catch {
+            status = .failed("Send failed: \(error.localizedDescription)")
+            return false
+        }
+        let turnId = UUID()
+        let task = Task { [weak self] in
+            var showedPrompt = false
+            for await frame in frames {
+                // The turn stores the person's message before its engine
+                // runs, so by the first frame it is in the store: show it
+                // first, before any live text, so the reply lands under it.
+                if !showedPrompt {
+                    showedPrompt = true
+                    let stored = await chat.settledFrames(threadId: threadId)
+                    guard let self, !Task.isCancelled else { return }
+                    for settled in stored { self.state.apply(settled) }
+                }
+                guard let self, !Task.isCancelled else { return }
+                self.state.apply(frame)
+                if self.activeThreadId == threadId, let streaming = self.state.streaming[threadId] {
+                    self.transcriptEngine.updateStreamingText(streaming, messageId: "streaming:\(threadId)")
+                }
+                self.syncSystemSurfaces()
+            }
+            guard let self, self.nativeTurns[threadId]?.id == turnId else { return }
+            self.nativeTurns[threadId] = nil
+        }
+        nativeTurns[threadId] = (turnId, task)
+        return true
+    }
+
+    /// Stops the open thread's native turn: cancelling the window's read
+    /// cancels the engine turn under it, and the window clears its own live
+    /// bubble because no more frames will come to clear it.
+    private func stopNativeTurn() {
+        guard let threadId = activeThreadId, let turn = nativeTurns.removeValue(forKey: threadId) else { return }
+        turn.task.cancel()
+        state.clearStream(threadId)
+        syncSystemSurfaces()
+    }
+
     @discardableResult
     public func sendMessage(_ text: String) async -> Bool {
+        if let nativeChat { return await sendNative(text, chat: nativeChat) }
         guard let client = client, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         guard let threadId = activeThreadId else { return false }
         isSending = true
@@ -1164,6 +1311,10 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     }
 
     public func stopActiveTurn() async {
+        if nativeChat != nil {
+            stopNativeTurn()
+            return
+        }
         guard let client = client else { return }
         guard let threadId = activeThreadId else { return }
         do {
@@ -1299,6 +1450,11 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         let state = await serverLaunchController.installedServerState()
         guard !Task.isCancelled else { return }
         installedServerState = state
+        // BF-2705: a harness found uninstalled after the window connected
+        // (or failed to) moves This Mac's chat onto the native engine.
+        if state == .notInstalled, !isNativeConnection, servers.connectedRecordID != nil {
+            connect()
+        }
     }
 
     /// Starts the shared Local VM from Settings or the menu.
