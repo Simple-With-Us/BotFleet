@@ -680,6 +680,8 @@ public struct PairResponse: Codable, Sendable {
         try container.encode(serverName, forKey: .serverName)
         try container.encodeIfPresent(hosts, forKey: .hosts)
         try container.encodeIfPresent(endpoints, forKey: .endpoints)
+        try container.encodeIfPresent(placement, forKey: .placement)
+        if isBridge { try container.encode(true, forKey: .isBridge) }
     }
 }
 
