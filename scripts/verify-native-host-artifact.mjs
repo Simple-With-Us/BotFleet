@@ -107,8 +107,14 @@ export function unmountDiskImage(mountpoint, { detached = detachDiskImage, mount
 const detachDiskImage = (mountpoint) =>
   spawnSync("/usr/bin/hdiutil", ["detach", mountpoint], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).status === 0;
 
-// Remove a mount point, and only one the file system says has nothing mounted
-// on it:  a tree that may still be mounted is never removed.
+// Remove a mount point, and only one that is both this script's own and, by
+// the file system's answer, clear of every volume:  a tree that may still be
+// mounted is never removed, and neither is a directory this script did not
+// make.  Answers false when something is still mounted on it.  The removal
+// is recursive, so the path is held to two things before anything is deleted:
+// its name is the one this script gives, and it sits directly inside the
+// temporary directory once written out in full, which a link placed there
+// under that name is not.
 function removeMountPoint(path, mounted = isMountPoint) {
   if (mounted(path)) return false;
   rmSync(path, { recursive: true, force: true });
