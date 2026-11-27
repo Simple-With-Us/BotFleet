@@ -210,6 +210,13 @@ public final class CompanionListenerController {
         }
     }
 
+    /// Tells phones which placement this Mac is running. The backend keeps
+    /// it for a listener that is not up yet, so it is said from the first
+    /// answer once the listener starts.
+    public func setPlacement(_ mode: NativePlacementMode?) async {
+        await backend.setPlacement(mode)
+    }
+
     /// Applies the exit policy the same way the harness shutdown reads it.
     public func applyExitPolicy(_ event: CompanionListenerExitEvent, persistOnExit: Bool) async {
         switch event {
