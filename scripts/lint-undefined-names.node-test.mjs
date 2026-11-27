@@ -39,7 +39,8 @@ function lint(file) {
     // failure, not a retry.
     const result = spawnSync(cmd, args, { cwd: repoRoot, encoding: "utf8", timeout: 60000,
       env: { ...process.env, NODE_OPTIONS: "--experimental-strip-types" } });
-    if (result.error?.code === "ENOENT" || (result.status === null && !result.stdout && !result.stderr)) continue;
+    if (result.error?.code === "ENOENT") continue;
+    if (result.error?.code === "ETIMEDOUT") return { status: null, output: "oxlint did not finish within a minute." };
     return { status: result.status, output: `${result.stdout}${result.stderr}` };
   }
   return { status: null, output: "oxlint was not found" };
