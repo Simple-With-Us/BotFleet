@@ -159,6 +159,15 @@ public final class ServersCoordinator: ObservableObject {
     /// controller holds the record.  A second 409, a false acknowledgement, or
     /// a 400, 403, or 503 leaves applied state unchanged.  This does not start
     /// a worker or open a runtime connection.
+    /// The gate credential enrolled for one host, for a client that talks to
+    /// that host on its own origin. It is bound to that origin by
+    /// `HostGateCredential` and is handed out for no other. A host this
+    /// coordinator does not hold has none.
+    public func credential(for host: HostRecord) async -> HostGateCredential? {
+        guard let record = hosts.first(where: { $0.id == host.id }) else { return nil }
+        return try? await credentials.read(record)
+    }
+
     @discardableResult
     public func applySavedPlacement(on host: HostRecord, credential: HostGateCredential?, controller: ControllerAcknowledgement) async -> Bool {
         guard canMutate else { return false }
