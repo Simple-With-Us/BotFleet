@@ -816,6 +816,7 @@ final class Session: ObservableObject {
         bridgeToken = nil
         serverTokenUnread = false
         serverPairingOffer = nil
+        newestServerOffer = nil
         placementProbe?.cancel()
         placementProbe = nil
         CompanionConnectionStore.saveConnectionData(nil)
