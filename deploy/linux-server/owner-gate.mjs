@@ -632,6 +632,8 @@ export function createOwnerGate({
   const allowlist = owners instanceof Set ? owners : parseOwnerLogins(owners);
   const logger = isCallable(log) ? log : defaultLog;
   const port = Number(harnessPort) || DEFAULT_HARNESS_PORT;
+  const bridgedPort = Number(bridgePort) || DEFAULT_BRIDGE_PORT;
+  const hasBridge = bridgeEnabled === true;
   const origin = isText(publicOrigin) ? publicOrigin.trim() : '';
   const tokenDigest = isText(tokenSha256) ? tokenSha256.trim() : '';
 
