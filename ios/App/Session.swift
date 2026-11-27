@@ -1357,9 +1357,15 @@ final class Session: ObservableObject {
     /// Persist the route that carried a live stream. Legacy host lists promote
     /// it for the next launch; typed lists keep their explicit policy order.
     private func rememberWorkingRoute() {
-        guard let winner = rotation.currentEndpoint, var updated = connection,
-              updated.activeEndpoint?.url != winner.url else { return }
-        updated.promote(winner)
+        guard let winner = rotation.currentEndpoint, var updated = connection else { return }
+        if updated.isBridgeRoute(winner) {
+            guard var server = updated.bridgeConnection, server.activeEndpoint?.url != winner.url else { return }
+            server.promote(winner)
+            updated.bridgeConnection = server
+        } else {
+            guard updated.activeEndpoint?.url != winner.url else { return }
+            updated.promote(winner)
+        }
         connection = updated
         CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
     }
