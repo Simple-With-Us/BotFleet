@@ -86,6 +86,10 @@ export function mountDiskImage(image, { attached = attachDiskImage } = {}) {
   return mountpoint;
 }
 
+const attachDiskImage = (image, mountpoint) =>
+  spawnSync("/usr/bin/hdiutil", ["attach", "-readonly", "-nobrowse", "-mountpoint", mountpoint, image],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).status === 0;
+
 // Detach, then remove the mount point, and only once the detach is confirmed
 // twice:  by hdiutil's exit status and by the file system.  A tree that may
 // still be mounted is never removed.  Once the path is back on its parent's
