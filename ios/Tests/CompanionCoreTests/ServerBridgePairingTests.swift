@@ -331,7 +331,9 @@ final class ServerBridgePairingTests: XCTestCase {
 
     func testAServerEnrolledAgainAtAnotherAddressGetsANewBackendAndANewNameDoesNot() async throws {
         let (host, enrolled) = try host()
-        ServerBridgeURLProtocol.handler = { _ in (200, self.windowBody()) }
+        ServerBridgeURLProtocol.handler = { request in
+            request.url!.path.hasSuffix("/close") ? (200, ["closed": true]) : (200, self.windowBody())
+        }
         let first = await ServerBridgePairingBackend.shared(host: host, credential: enrolled, session: session())
         _ = await first.openPairingWindow()
 
