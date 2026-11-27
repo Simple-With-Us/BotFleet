@@ -1695,6 +1695,14 @@ async function proxyRequest({ req, res, method, url, decision, host, port, upstr
     // than a path. An encoded body cannot be read for its keys without
     // decoding it, and it is forwarded intact rather than broken.
     if (bridgeIsJson(contentType) && (encoding === '' || encoding === 'identity')) {
+      if (jsonScrubs.inFlight >= MAX_BRIDGE_JSON_SCRUBS) {
+        logger(`[companion-bridge] ${method} ${pathOf(url)}: refused, ${jsonScrubs.inFlight} JSON answers are already held for checking`);
+        response.destroy();
+        res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '1' });
+        res.end(JSON.stringify({ error: 'the bridge is holding too many answers to check at once; try again shortly' }));
+        return;
+      }
+      jsonScrubs.inFlight += 1;
       forwardScrubbedJson(response);
       return;
     }
