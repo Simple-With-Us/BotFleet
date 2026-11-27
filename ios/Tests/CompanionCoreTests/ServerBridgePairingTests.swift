@@ -253,6 +253,41 @@ final class ServerBridgePairingTests: XCTestCase {
         XCTAssertTrue(first === kept)
     }
 
+    func testAServerEnrolledAgainAtAnotherAddressGetsANewBackendAndANewNameDoesNot() async throws {
+        let (host, enrolled) = try host()
+        ServerBridgeURLProtocol.handler = { _ in (200, self.windowBody()) }
+        let first = await ServerBridgePairingBackend.shared(host: host, credential: enrolled, session: session())
+        _ = await first.openPairingWindow()
+
+        // Renaming the server keeps its backend and its window.
+        let renamed = HostRecord(id: host.id, name: "Renamed", origin: host.origin, hostId: host.hostId)
+        let afterRename = await ServerBridgePairingBackend.shared(host: renamed, credential: enrolled, session: session())
+        XCTAssertTrue(first === afterRename)
+
+        // The same record enrolled again at another address is another server:
+        // a new backend, and nothing of the old window travels with it.
+        let moved = HostRecord(id: host.id, name: renamed.name, origin: try HostOrigin("https://moved.fixture.test"), hostId: host.hostId)
+        let movedCredential = try HostGateCredential(origin: moved.origin, token: RedactedSecret("fixture-gate"))
+        let afterMove = await ServerBridgePairingBackend.shared(host: moved, credential: movedCredential, session: session())
+        XCTAssertFalse(first === afterMove)
+        let carried = await afterMove.activePairingWindow()
+        XCTAssertNil(carried)
+        _ = await afterMove.currentAdvertisement()
+        let sent = try XCTUnwrap(ServerBridgeURLProtocol.captured.last)
+        XCTAssertEqual(sent.url.host, "moved.fixture.test", "the request follows the record, not the backend made first")
+    }
+
+    func testALookupWithNoCredentialKeepsTheEnrolledOne() async throws {
+        let (host, enrolled) = try host()
+        ServerBridgeURLProtocol.handler = { _ in (200, self.windowBody()) }
+        _ = await ServerBridgePairingBackend.shared(host: host, credential: enrolled, session: session())
+        let again = await ServerBridgePairingBackend.shared(host: host, credential: nil, session: session())
+        let window = await again.openPairingWindow()
+        XCTAssertNotNil(window, "a lookup that carries no credential must not cost the tab the enrolled one")
+        let sent = try XCTUnwrap(ServerBridgeURLProtocol.captured.last)
+        XCTAssertEqual(sent.gate, "fixture-gate")
+    }
+
     func testAWindowOpenedBeforeTheTabReopenedIsStillShownAndCanBeClosed() async throws {
         let (host, enrolled) = try host()
         ServerBridgeURLProtocol.handler = { request in
