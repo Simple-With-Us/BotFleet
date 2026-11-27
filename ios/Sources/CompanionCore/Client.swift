@@ -241,6 +241,11 @@ public indirect enum CompanionBridgePairing: Codable, Hashable, Sendable {
 public struct PairingInvite: Equatable, Sendable {
     public let connection: Connection
     public let credential: String
+    /// Who the invite pairs the phone with. `.bridge` is the server's
+    /// companion bridge: a phone already paired with a Mac keeps that
+    /// pairing and adds the server beside it (`Connection.bridgeConnection`).
+    /// Any other invite is a computer, and replaces the pairing as before.
+    public let role: Role
 
     public init(connection: Connection, credential: String) {
         self.connection = connection
