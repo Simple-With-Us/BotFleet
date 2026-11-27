@@ -366,7 +366,9 @@ final class ServerBridgePairingTests: XCTestCase {
 
     func testALookupWithNoCredentialKeepsTheEnrolledOne() async throws {
         let (host, enrolled) = try host()
-        ServerBridgeURLProtocol.handler = { _ in (200, self.windowBody()) }
+        ServerBridgeURLProtocol.handler = { request in
+            request.url!.path.hasSuffix("/close") ? (200, ["closed": true]) : (200, self.windowBody())
+        }
         _ = await ServerBridgePairingBackend.shared(host: host, credential: enrolled, session: session())
         let again = await ServerBridgePairingBackend.shared(host: host, credential: nil, session: session())
         let window = await again.openPairingWindow()
