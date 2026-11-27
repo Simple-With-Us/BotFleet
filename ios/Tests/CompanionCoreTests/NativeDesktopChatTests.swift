@@ -146,6 +146,126 @@ struct NativeDesktopChatTests {
         #expect(await fixture.engine.prompts.isEmpty)
     }
 
+    @Test("Clean install creates first native bot, sends a turn, and reopens with saved transcript")
+    func cleanInstallCreateBotSendAndReopen() async throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("desktop-clean-install-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let dbPath = base.appendingPathComponent("companion.sqlite").path
+        let workspacesRoot = base.appendingPathComponent("workspaces", isDirectory: true)
+
+        let db1 = try DatabaseService(path: dbPath)
+        let runtime1 = NativeMacCompanionRuntime(
+            database: db1,
+            workspacesRoot: workspacesRoot,
+            credentials: DatabaseCliLoginCredentials(database: db1)
+        )
+        let chat1 = NativeDesktopChat(
+            database: db1,
+            runtime: runtime1,
+            registration: { MacBotRegistrationReport() }
+        )
+        let initialStart = try await chat1.start()
+        #expect(initialStart.snapshot.fleet.bots.isEmpty)
+
+        // Warm the credential cache while the store is still empty.
+        let creds = DatabaseCliLoginCredentials(database: db1)
+        let missingCreds = try await creds.credentials(forBotId: "nonexistent")
+        guard case .unavailable = missingCreds else {
+            Issue.record("Expected unavailable credentials before any bot is stored")
+            return
+        }
+
+        let engine1 = ChatFixtureEngine()
+        let created = try await chat1.createBot(driver: engine1)
+        #expect(created.name == "Bot 1")
+        #expect(await runtime1.runtime.engineSwitch.owner(for: created.id) == .nativeSwift)
+
+        let frames = try await chat1.send(botId: created.id, threadId: created.threadId, text: "first turn")
+        var state1 = CompanionState()
+        for await frame in frames {
+            state1.apply(frame)
+        }
+        let settled = try await db1.loadRecentMessages(forThread: created.threadId, limit: 10).messages
+        #expect(settled.map(\.content) == ["first turn", "hi from native"])
+
+        // Reopen a fresh DatabaseService + runtime + NativeDesktopChat over the same SQLite file.
+        let db2 = try DatabaseService(path: dbPath)
+        let runtime2 = NativeMacCompanionRuntime(
+            database: db2,
+            workspacesRoot: workspacesRoot,
+            credentials: DatabaseCliLoginCredentials(database: db2)
+        )
+        let engine2 = ChatFixtureEngine()
+        let profile2 = MacBotExecutionProfile(
+            id: created.id,
+            threadId: created.threadId,
+            engineId: engine2.engineId,
+            modelId: created.modelSelection.model
+        )
+        try await runtime2.registerBot(profile2, driver: engine2)
+        var report2 = MacBotRegistrationReport()
+        report2.registered = [created.id]
+        let chat2 = NativeDesktopChat(database: db2, runtime: runtime2, registration: { report2 })
+        let reopened = try await chat2.start()
+
+        #expect(reopened.nativeBots == [created.id])
+        #expect(reopened.snapshot.fleet.bots.count == 1)
+        #expect(reopened.snapshot.fleet.bots.first?.id == created.id)
+        #expect(reopened.snapshot.fleet.bots.first?.messages?.map(\.text) == ["first turn", "hi from native"])
+    }
+
+    @Test("Default bot naming avoids collisions and unsupported engines leave SQLite untouched")
+    func createBotNamingAndValidation() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let chat = fixture.chat(registered: [])
+
+        let first = try await chat.createBot(driver: fixture.engine)
+        let second = try await chat.createBot(driver: fixture.engine)
+        #expect(first.name == "Bot 1")
+        #expect(second.name == "Bot 2")
+
+        let countBeforeFailure = try await fixture.database.loadBots().count
+        await #expect(throws: NativeDesktopCreateBotError.unsupportedEngine("unknown-engine")) {
+            _ = try await chat.createBot(engineInstanceId: "unknown-engine", driver: fixture.engine)
+        }
+        let countAfterFailure = try await fixture.database.loadBots().count
+        #expect(countAfterFailure == countBeforeFailure)
+    }
+
+    @Test("DatabaseCliLoginCredentials reloads on a cache miss after a new bot is stored")
+    func credentialCacheReloadsOnNewBot() async throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cred-cache-miss-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let database = try DatabaseService(path: ":memory:")
+        let credentials = DatabaseCliLoginCredentials(database: database)
+
+        // Populate cache with an empty table before inserting a bot.
+        let beforeInsert = try await credentials.credentials(forBotId: "bot-new")
+        guard case .unavailable = beforeInsert else {
+            Issue.record("Expected unavailable credentials before inserting the bot")
+            return
+        }
+
+        let record = StoredBotRecord(
+            id: "bot-new",
+            name: "Bot 1",
+            threadId: "thread-new",
+            createdAt: 1,
+            rawJSON: Self.botJSON(id: "bot-new", threadId: "thread-new")
+        )
+        try await database.upsertBot(record)
+        let result = try await credentials.credentials(forBotId: "bot-new")
+        guard case .available = result else {
+            Issue.record("Expected credentials to reload and resolve .available on cache miss")
+            return
+        }
+    }
+
     // MARK: - Fixture
 
     private struct Fixture {

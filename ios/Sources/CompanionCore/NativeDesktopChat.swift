@@ -79,8 +79,24 @@ public struct NativeDesktopChatStart: Sendable {
     public let registration: MacBotRegistrationReport
     /// Bots the native runtime now answers.
     public let nativeBots: [String]
-    /// Registered bots that stayed fenced, with the reason.
+    /// A registered bot that stayed fenced on the Node runtime, with the reason.
     public let cutoverSkipped: [NativeDesktopCutoverSkip]
+}
+
+/// Errors raised when creating a native bot for a standalone desktop install
+/// without the Node harness (`BF-2689`).
+public enum NativeDesktopCreateBotError: LocalizedError, Equatable, Sendable {
+    case unsupportedEngine(String)
+    case encodingFailed
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedEngine(let engineId):
+            return "Engine '\(engineId)' has no native driver on this Mac yet."
+        case .encodingFailed:
+            return "The new bot record could not be encoded."
+        }
+    }
 }
 
 /// The Mac app's chat window on the native engine (`BF-2705`, slice 2b), for
@@ -182,5 +198,148 @@ public struct NativeDesktopChat: Sendable {
     /// person's own message as soon as the turn has stored it.
     public func settledFrames(threadId: String) async -> [Frame] {
         await source.settledFrames(threadId: threadId)
+    }
+
+    /// Creates a new bot directly in the native store, registers its native
+    /// execution profile/driver, and moves it onto `.nativeSwift` (`BF-2689`),
+    /// so a fresh standalone Mac install with no Node harness can create its
+    /// first bot and send a turn immediately without `CompanionClient`.
+    public func createBot(
+        name: String? = nil,
+        engineInstanceId: String = "claude",
+        model: String = ""
+    ) async throws -> Bot {
+        try await createBot(name: name, engineInstanceId: engineInstanceId, model: model, driver: nil)
+    }
+
+    func createBot(
+        name: String? = nil,
+        engineInstanceId: String = "claude",
+        model: String = "",
+        driver: (any EngineDriver)?
+    ) async throws -> Bot {
+        let normalizedInstanceId = engineInstanceId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let engine = MacBotProfileDerivation.matrixEngine(forInstanceId: normalizedInstanceId),
+              NativeEngineDriverFactory.supports(engine) else {
+            throw NativeDesktopCreateBotError.unsupportedEngine(engineInstanceId)
+        }
+        let existingBots = try await database.loadBots()
+        let resolvedName = Self.resolveBotName(requested: name, existing: existingBots)
+        let palette = ["#4f46e5", "#0ea5e9", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6"]
+        let resolvedColor = palette[existingBots.count % palette.count]
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedModel = trimmedModel.isEmpty
+            ? EngineMatrixRegistry.descriptor(for: engine).defaultModel
+            : trimmedModel
+
+        let botId = "bot-\(UUID().uuidString.lowercased())"
+        let threadId = "thread-\(UUID().uuidString.lowercased())"
+        let nowSeconds = Date().timeIntervalSince1970
+        let bot = Bot(
+            id: botId,
+            threadId: threadId,
+            name: resolvedName,
+            title: "",
+            description: "",
+            notifications: true,
+            color: resolvedColor,
+            avatarUrl: nil,
+            avatarCrop: nil,
+            unread: false,
+            modelSelection: ModelSelection(instanceId: normalizedInstanceId, model: resolvedModel),
+            activeModelSelection: nil,
+            maxToolRounds: nil,
+            createdAt: nowSeconds * 1000,
+            busy: false,
+            pinned: false,
+            hidden: false,
+            off: false,
+            chiefOfStaff: nil,
+            approvePeerComms: nil,
+            section: nil,
+            autoApprove: nil,
+            autoReview: nil,
+            bypassPermissions: nil,
+            bypassLocalComputer: nil,
+            alwaysAllow: nil,
+            composio: nil,
+            computers: nil,
+            cloudBackend: nil,
+            effectiveCloudBackend: nil,
+            autoStartVps: nil,
+            cwd: nil,
+            extraCwds: nil,
+            userNotes: nil,
+            speakReplies: nil,
+            speechDevices: nil,
+            voice: nil,
+            voices: nil,
+            mascotExpression: nil,
+            tasks: nil,
+            roomUsageByInstance: nil,
+            messages: [],
+            activeLeafId: nil,
+            hasMore: false,
+            pinnedMessageId: nil
+        )
+        let rawData = try JSONEncoder().encode(bot)
+        guard let rawJSON = String(data: rawData, encoding: .utf8) else {
+            throw NativeDesktopCreateBotError.encodingFailed
+        }
+        let botRecord = StoredBotRecord(
+            id: botId,
+            name: resolvedName,
+            threadId: threadId,
+            createdAt: nowSeconds,
+            snoozedUntil: nil,
+            rawJSON: rawJSON
+        )
+        let threadRecord = ThreadRecord(
+            id: threadId,
+            title: resolvedName,
+            botId: botId,
+            createdAt: nowSeconds,
+            updatedAt: nowSeconds
+        )
+
+        let derivedProfile = MacBotProfileDerivation.derive(from: botRecord)?.profile
+            ?? MacBotExecutionProfile(id: botId, threadId: threadId, engineId: engine.rawValue, modelId: resolvedModel)
+        // Register the profile and driver before persisting rows so a runtime or
+        // driver failure never leaves an unregistered bot stranded in SQLite.
+        if let driver {
+            let profile = MacBotExecutionProfile(
+                id: derivedProfile.id,
+                threadId: derivedProfile.threadId,
+                engineId: driver.engineId,
+                modelId: derivedProfile.modelId
+            )
+            try await runtime.registerBot(profile, driver: driver)
+        } else {
+            try await runtime.registerBot(derivedProfile, matrixEngine: engine)
+        }
+
+        try await database.upsertThread(threadRecord)
+        do {
+            try await database.upsertBot(botRecord)
+            try await runtime.runtime.engineSwitch.switchToNativeSwift(
+                botId: botId,
+                historySnapshot: BotHistoryImportSnapshot(botId: botId, threads: [threadRecord], messagesByThread: [:])
+            )
+        } catch {
+            try? await database.deleteThread(id: threadId)
+            throw error
+        }
+        return bot
+    }
+
+    private static func resolveBotName(requested: String?, existing: [StoredBotRecord]) -> String {
+        let trimmed = requested?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmed.isEmpty { return trimmed }
+        let taken = Set(existing.map { $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        var index = 1
+        while taken.contains("bot \(index)") {
+            index += 1
+        }
+        return "Bot \(index)"
     }
 }
