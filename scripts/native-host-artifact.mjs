@@ -22,6 +22,13 @@ export function sha256File(path) {
   });
 }
 
+/** The one file the packager writes for one build.  The signed disk image and the unsigned development archive never share a name, so an archive whose receipt says NOT DISTRIBUTABLE can never be mistaken for the release artifact. */
+export function hostArtifactName(build, unsignedDevelopment = false) {
+  // A numeric build is refused like every other non-string, as the stamp refuses one.
+  if (String(build) !== build || !/^[0-9]{12}$/.test(build) || /^0+$/.test(build)) fail();
+  return `BotFleetNativeHost-0.1.0-${build}${unsignedDevelopment ? "-UNSIGNED.zip" : ".dmg"}`;
+}
+
 export function encodeHostIdentity(identity) {
   if (!identity) fail();
   // Bootstrap JSON validation runs before package installation; no external schema runtime is available.
