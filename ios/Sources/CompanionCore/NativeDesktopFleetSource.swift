@@ -23,14 +23,21 @@ public struct NativeDesktopFleetSnapshot: Sendable {
 /// harness's `GET /api/fleet` and event stream.
 ///
 /// A stored bot's record is the harness's own bot JSON, so it decodes as the
-/// same `Bot` the harness sends, and its main thread's transcript is attached
-/// the way a harness snapshot attaches it.  Messages are the dispatcher's
-/// `MessageRecord`s in the shape the window folds: `assistant` reads as the
-/// bot, times become milliseconds.  `settledFrames(threadId:)` is the
-/// `settled` hook `NativeDesktopChatFrames.frames(from:threadId:settled:)`
-/// takes, so a finished turn's stored reply lands before the live bubble
-/// clears.
+/// same `Bot` the harness sends, and its main thread's newest page of
+/// transcript is attached the way a harness snapshot attaches it, with
+/// `hasMore` saying whether older messages exist.  Messages are the
+/// dispatcher's `MessageRecord`s in the shape the window folds: `assistant`
+/// reads as the bot, times become milliseconds.
+/// `settledFrames(threadId:)` is the `settled` hook
+/// `NativeDesktopChatFrames.frames(from:threadId:settled:)` takes, so a
+/// finished turn's stored reply lands before the live bubble clears.
+///
+/// Reads go one after another: `DatabaseService` is an actor over one
+/// SQLite connection, so concurrent reads would queue on it anyway.
 public struct NativeDesktopFleetSource: Sendable {
+    /// How many of a thread's newest messages one read returns.
+    public static let pageSize = 100
+
     private let database: DatabaseService
 
     public init(database: DatabaseService) {
@@ -38,9 +45,10 @@ public struct NativeDesktopFleetSource: Sendable {
     }
 
     /// Every stored bot whose record decodes as a `Bot`, each with its main
-    /// thread's stored transcript.  A record that does not decode, or names
-    /// another bot's id, is left out and named in `skipped`, never guessed
-    /// at.
+    /// thread's newest stored messages.  A record that does not decode,
+    /// names another bot's id, or whose transcript cannot be read is left
+    /// out and named in `skipped`, never guessed at, and never costs the
+    /// rest of the fleet.
     public func snapshot() async throws -> NativeDesktopFleetSnapshot {
         let records = try await database.loadBots()
         let decoder = JSONDecoder()
@@ -60,35 +68,50 @@ public struct NativeDesktopFleetSource: Sendable {
                 ))
                 continue
             }
-            bot.messages = try await transcript(threadId: bot.threadId)
-            bot.hasMore = false
+            do {
+                let page = try await recentTranscript(threadId: bot.threadId)
+                bot.messages = page.messages
+                bot.hasMore = page.hasMore
+            } catch {
+                skipped.append(NativeDesktopFleetSkip(
+                    botId: record.id, reason: "the stored transcript cannot be read"
+                ))
+                continue
+            }
             bots.append(bot)
         }
         return NativeDesktopFleetSnapshot(fleet: Fleet(bots: bots, groups: []), skipped: skipped)
     }
 
-    /// The thread's stored transcript as `.message` frames, oldest first.  A
-    /// store that cannot be read gives no frames: the turn still ends, and
-    /// the next snapshot reconciles the transcript.
+    /// The thread's newest stored messages as `.message` frames, oldest
+    /// first, so the reply a turn just stored is always among them.  A store
+    /// that cannot be read gives no frames: the turn still ends, and the
+    /// next snapshot reconciles the transcript.
     public func settledFrames(threadId: String) async -> [Frame] {
-        guard let messages = try? await transcript(threadId: threadId) else { return [] }
-        return messages.map { Frame.message(threadId: threadId, message: $0) }
+        guard let page = try? await recentTranscript(threadId: threadId) else { return [] }
+        return page.messages.map { Frame.message(threadId: threadId, message: $0) }
     }
 
-    func transcript(threadId: String) async throws -> [Message] {
-        try await database.loadMessages(forThread: threadId)
+    func recentTranscript(threadId: String) async throws -> (messages: [Message], hasMore: Bool) {
+        let page = try await database.loadRecentMessages(forThread: threadId, limit: Self.pageSize)
+        let messages = page.messages
             .compactMap(Self.message(from:))
             .sorted { $0.at == $1.at ? $0.id < $1.id : $0.at < $1.at }
+        return (messages, page.hasMore)
     }
 
     /// One stored message in the window's shape, or nil when it cannot be
-    /// read as one.
+    /// read as one.  A stored kind left empty reads as text, the kind every
+    /// dispatcher-written message has.
     static func message(from record: MessageRecord) -> Message? {
-        var json: [String: Any] = ["id": record.id, "at": record.createdAt * 1000]
-        json["role"] = role(fromStored: record.role)
-        json["kind"] = record.kind
-        if json["kind"] == nil { json["kind"] = "text" }
-        json["text"] = record.content
+        let kind = record.kind.trimmingCharacters(in: .whitespacesAndNewlines)
+        let json: [String: Any] = [
+            "id": record.id,
+            "at": record.createdAt * 1000,
+            "role": role(fromStored: record.role),
+            "kind": kind.isEmpty ? "text" : kind,
+            "text": record.content
+        ]
         guard JSONSerialization.isValidJSONObject(json),
               let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
         return try? JSONDecoder().decode(Message.self, from: data)
@@ -97,7 +120,7 @@ public struct NativeDesktopFleetSource: Sendable {
     /// The dispatcher stores `user` and `assistant`; the window says `user`
     /// and `bot`.  Anything else that is not `system` reads as the bot,
     /// never as the person, for the reason `Message.Role` gives.
-    private static func role(fromStored stored: String?) -> String {
+    private static func role(fromStored stored: String) -> String {
         switch stored {
         case "user": return "user"
         case "system": return "system"

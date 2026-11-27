@@ -26,6 +26,48 @@ struct NativeDesktopFleetSourceTests {
         #expect(messages.allSatisfy { $0.kind == .text })
     }
 
+    @Test("A long thread opens on its newest page and says older messages exist")
+    func longThreadShowsNewestPage() async throws {
+        let database = try await makeStore()
+        let total = NativeDesktopFleetSource.pageSize + 5
+        for index in 0..<total {
+            try await database.insertMessage(record(
+                String(format: "m%03d", index), role: "user", content: "line \(index)", at: Double(index + 1)
+            ))
+        }
+
+        let source = NativeDesktopFleetSource(database: database)
+        let bot = try #require(try await source.snapshot().fleet.bots.first)
+        let messages = try #require(bot.messages)
+
+        #expect(messages.count == NativeDesktopFleetSource.pageSize)
+        #expect(messages.first?.text == "line 5")
+        #expect(messages.last?.text == "line \(total - 1)")
+        #expect(bot.hasMore == true)
+        // The settled hook reads the same newest page, so a just-stored reply is in it.
+        let settled = await source.settledFrames(threadId: "thread-a")
+        if case let .message(_, last)? = settled.last {
+            #expect(last.text == "line \(total - 1)")
+        } else {
+            Issue.record("expected the newest message last")
+        }
+    }
+
+    @Test("The newest page from the store is oldest-first with an exact older-messages flag")
+    func recentMessagesPage() async throws {
+        let database = try await makeStore()
+        for index in 0..<3 {
+            try await database.insertMessage(record("m\(index)", role: "user", content: "\(index)", at: Double(index + 1)))
+        }
+        let exact = try await database.loadRecentMessages(forThread: "thread-a", limit: 3)
+        #expect(exact.messages.map(\.content) == ["0", "1", "2"])
+        #expect(exact.hasMore == false)
+
+        let short = try await database.loadRecentMessages(forThread: "thread-a", limit: 2)
+        #expect(short.messages.map(\.content) == ["1", "2"])
+        #expect(short.hasMore == true)
+    }
+
     @Test("A record that does not decode as a bot is named, not shown")
     func undecodableBotSkipped() async throws {
         let database = try await makeStore()
@@ -85,6 +127,12 @@ struct NativeDesktopFleetSourceTests {
         #expect(NativeDesktopFleetSource.message(from: record("b", role: "assistant", content: "x", at: 1))?.role == .bot)
         #expect(NativeDesktopFleetSource.message(from: record("c", role: "system", content: "x", at: 1))?.role == .system)
         #expect(NativeDesktopFleetSource.message(from: record("d", role: "tool", content: "x", at: 1))?.role == .bot)
+    }
+
+    @Test("An empty stored kind reads as text")
+    func emptyKindReadsAsText() {
+        let blank = MessageRecord(id: "k", threadId: "thread-a", role: "assistant", kind: " ", content: "x", createdAt: 1, model: nil)
+        #expect(NativeDesktopFleetSource.message(from: blank)?.kind == .text)
     }
 
     // MARK: - Fixture
