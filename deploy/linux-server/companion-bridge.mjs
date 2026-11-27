@@ -1638,7 +1638,12 @@ export function bridgeParseOrigins(value) {
  */
 export function bridgeCleanDeviceName(raw) {
   const name = String(raw ?? '')
-    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    // By Unicode category rather than a spelled-out range: Cc is every
+    // control character (C0, DEL and the C1 block, NEL included) and Zl, Zp
+    // are the line and paragraph separators. The sidecar's cleaner stops at
+    // C0 and DEL; the fleet's review rule asks for the terminators too,
+    // because a name that carries one splits a line in a device list.
+    .replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, ' ')
     .trim()
     .slice(0, 60);
   return name || 'Companion';
