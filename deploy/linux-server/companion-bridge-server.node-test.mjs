@@ -2637,3 +2637,54 @@ test('an answer that finds no room to be held for checking is refused at once, a
     await bridge.close();
   }
 });
+
+test('an answer torn down with nothing but a close gives its room back, and the phone hears why', async () => {
+  const held = [];
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      if (info.query.startsWith('?cut=')) {
+        // An answer that begins, and whose connection then goes away.
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{"cut":"');
+        setTimeout(() => res.socket.destroy(), 30);
+        return;
+      }
+      if (info.query.startsWith('?hold=')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{"held":"');
+        res.write(info.query.slice(6));
+        held.push({ number: info.query.slice(6), res });
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    },
+  });
+  // A teardown the bridge hears nothing from but `close`:  on the bridge's
+  // own connections to the harness, the events it otherwise learns a cut
+  // answer from are kept from it.
+  const emit = http.IncomingMessage.prototype.emit;
+  http.IncomingMessage.prototype.emit = function (event, ...args) {
+    if (this.socket?.remotePort === bridge.harness.port && (event === 'aborted' || event === 'error')) return true;
+    return emit.call(this, event, ...args);
+  };
+  try {
+    const device = await bridge.pair('phone-scrub-close');
+    const open = (path) => openProxied(bridge.port, path, ownerHeaders({ authorization: `Bearer ${device.credential}` }));
+    const cut = await Promise.race([open('/api/quotas?cut=1').promise,
+      new Promise((resolve) => setTimeout(() => resolve({ status: 'still waiting', text: '' }), 2000))]);
+    assert.equal(cut.status, 502);
+    assert.deepEqual(JSON.parse(cut.text), { error: 'the harness did not finish its answer' });
+    // The room that answer took is back: two more are held at once again.
+    const second = open('/api/quotas?hold=2');
+    const third = open('/api/quotas?hold=3');
+    assert.equal(await eventually(() => held.length, 2), true, 'two answers are held, so the room came back');
+    for (const entry of held.splice(0)) entry.res.end('"}');
+    assert.deepEqual(JSON.parse((await second.promise).text), { held: '2' });
+    assert.deepEqual(JSON.parse((await third.promise).text), { held: '3' });
+  } finally {
+    http.IncomingMessage.prototype.emit = emit;
+    for (const entry of held.splice(0)) entry.res.destroy();
+    await bridge.close();
+  }
+});
