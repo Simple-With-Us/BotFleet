@@ -388,6 +388,10 @@ extension Connection {
     /// protected replacement, the exact old route remains the first candidate
     /// instead of silently authorizing some other cleartext LAN address.
     public mutating func reconcile(_ metadata: CompanionConnectionMetadata) {
+        // Only the computer says which placement it runs. The server's bridge
+        // advertises none and an older computer says nothing, so both leave
+        // what was last read.
+        if let placement = metadata.placement { self.placement = placement }
         let cleanedName = metadata.serverName.trimmingCharacters(in: .whitespacesAndNewlines)
             .filter { (!$0.isASCII && !$0.isNewline) || $0.asciiValue.map { $0 >= 32 && $0 != 127 } == true }
         if !cleanedName.isEmpty { name = String(cleanedName.prefix(80)) }
