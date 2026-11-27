@@ -45,6 +45,9 @@ struct ChatListView: View {
     /// DEBUG `-store-preview -open-settings`: land on Settings, for the
     /// screenshot harness.
     @State private var showingDebugSettings = false
+    /// DEBUG `-store-preview -open-connection-security`: land on Connection
+    /// & Security, for the screenshot harness.
+    @State private var showingDebugConnection = false
 
     /// Room for the floating bar, so the last row can scroll clear of it.
     private static let barClearance: CGFloat = 96
