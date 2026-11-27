@@ -723,7 +723,10 @@ public struct CompanionConnectionMetadata: Decodable, Sendable {
         }.map(\.element)
         var seen = Set<String>()
         endpoints = stable.filter { seen.insert($0.url).inserted }.prefix(8).map { $0 }
-        guard !endpoints.isEmpty else {
+        // A snapshot with no route is refused, so the caller keeps the routes
+        // it has, with one exception. A Mac that advertises no route still
+        // says which placement it runs, and a phone has to hear that.
+        guard !endpoints.isEmpty || placement != nil else {
             throw DecodingError.dataCorruptedError(
                 forKey: .endpoints,
                 in: container,
