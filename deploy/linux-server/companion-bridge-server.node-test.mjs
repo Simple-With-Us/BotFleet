@@ -1783,3 +1783,364 @@ test('POST /api/pair refuses a wrong code, a spent window, an expired window and
     assert.equal(spent.status, 201);
     const used = await pairPhone(bridge.port, third.token, { pairRequestId: 'ANOTHER-REQUEST-ID-000000000001' });
     assert.equal(used.status, 401);
+    assert.equal(used.json.error, 'That pairing credential was already used. Start pairing again.');
+    assert.equal(bridge.state.registry.activeIds().length, 1);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('a replay of the same pairing request is refused by name and mints nothing', async () => {
+  const bridge = await startBridge();
+  try {
+    const opened = await openWindow(bridge.port);
+    const first = await pairPhone(bridge.port, opened.token);
+    assert.equal(first.status, 201);
+
+    // The same phone request, back after a lost response. The bridge hands
+    // a credential out once and keeps only its digest, so it cannot answer
+    // the pairing again; it says so instead of answering a body the app
+    // would store with an empty token.
+    const replay = await pairPhone(bridge.port, opened.token);
+    assert.equal(replay.status, 409);
+    assert.match(replay.json.error, /issued only once/);
+    assert.deepEqual(Object.keys(replay.json), ['error']);
+    assert.equal('token' in replay.json, false);
+    assert.equal('device' in replay.json, false);
+    assert.equal(bridge.state.registry.activeIds().length, 1);
+    assert.equal(bridge.state.window.replay.deviceId, first.json.device.id);
+    assert.equal(JSON.stringify(bridge.state.toState()).includes(first.json.token), false);
+
+    // The first credential still works; a lost response costs nothing that
+    // already succeeded.
+    const used = await call(bridge.port, { path: '/api/bots', headers: ownerHeaders({ authorization: `Bearer ${first.json.token}` }) });
+    assert.equal(used.status, 200);
+
+    // The same id with another credential, or the same credential under
+    // another id, is not a replay.
+    for (const other of [
+      pairBody('omb_pair_' + 'c'.repeat(43)),
+      pairBody('000000'),
+      pairBody(opened.token, "Jay's iPhone", 'ANOTHER-REQUEST-ID-000000000002'),
+    ]) {
+      const refused = await call(bridge.port, {
+        method: 'POST',
+        path: '/api/pair',
+        headers: ownerHeaders({ 'content-type': 'application/json' }),
+        body: other,
+      });
+      assert.equal(refused.status, 401, other);
+      assert.equal('token' in refused.json, false);
+    }
+
+    // A device the owner revoked is not brought back by a replay.
+    const revoked = await call(bridge.port, { method: 'DELETE', path: `/api/companion/devices/${first.json.device.id}` });
+    assert.equal(revoked.status, 200);
+    const afterRevoke = await pairPhone(bridge.port, opened.token);
+    assert.equal(afterRevoke.status, 401);
+    assert.equal('token' in afterRevoke.json, false);
+    assert.equal(bridge.state.registry.activeIds().length, 0);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('POST /api/pair refuses a body that is not the app\'s contract, and none of them costs an attempt', async () => {
+  const bridge = await startBridge();
+  try {
+    const opened = await openWindow(bridge.port);
+    for (const [body, error] of [
+      ['not json', 'the request body is not valid JSON'],
+      ['[]', 'the request body is not a JSON object'],
+      ['"omb_pair_' + 'a'.repeat(43) + '"', 'the request body is not a JSON object'],
+      ['{}', 'a pairing code or credential is required'],
+      ['{"credential":""}', 'a pairing code or credential is required'],
+      ['{"code":"","credential":""}', 'a pairing code or credential is required'],
+      ['{"deviceName":"No credential"}', 'a pairing code or credential is required'],
+      // The redeem route's field names are not the app's.
+      ['{"token":"' + opened.token + '","deviceId":"phone-1"}', 'the pairing request does not match the contract'],
+      ['{"code":"123456","unexpected":1}', 'the pairing request does not match the contract'],
+      ['{"code":"123456","requestId":"pairing-request-0001"}', 'the pairing request does not match the contract'],
+      // A number is not coerced into the code it spells.
+      ['{"code":123456}', 'the pairing request does not match the contract'],
+      ['{"credential":"' + opened.token + '","deviceName":5}', 'the pairing request does not match the contract'],
+      ['{"credential":"' + opened.token + '","pairRequestId":7}', 'the pairing request does not match the contract'],
+    ]) {
+      const refused = await call(bridge.port, {
+        method: 'POST',
+        path: '/api/pair',
+        headers: ownerHeaders({ 'content-type': 'application/json' }),
+        body,
+      });
+      assert.equal(refused.status, 400, body);
+      assert.equal(refused.json.error, error, body);
+      assert.deepEqual(Object.keys(refused.json), ['error']);
+    }
+    // A body over the size limit is refused the same way.
+    const oversized = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/pair',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ credential: 'x'.repeat(70 * 1024) }),
+    });
+    assert.equal(oversized.status, 400);
+    assert.equal(oversized.json.error, 'the request body is too large');
+
+    // The real credential still redeems afterwards: none of the refusals
+    // spent the window or burned an attempt.
+    assert.equal(bridge.state.window.spent, false);
+    assert.equal(bridge.state.window.attemptsLeft, BRIDGE_WINDOW_MAX_ATTEMPTS);
+    const paired = await pairPhone(bridge.port, opened.token);
+    assert.equal(paired.status, 201);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('no new pairing window opens while the durable state refuses a save', async () => {
+  let savesWork = true;
+  const bridge = await startBridge({ bridgeOptions: { persist: () => savesWork } });
+  try {
+    await openWindow(bridge.port);
+    const first = await bridge.pair('phone-before-saves-fail');
+    assert.ok(first.credential);
+
+    savesWork = false;
+    // `openWindow` asserts the 200, so this call is made by hand: a window
+    // that cannot be saved is not opened, and the refusal says why.
+    const refused = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/open',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: '{}',
+    });
+    assert.equal(refused.status, 503);
+    assert.match(refused.json.error, /could not be saved/);
+    assert.equal(bridge.state.registry.activeIds().length, 1);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('a pairing whose durable save fails is rolled back, confirms nothing, and works when saves recover (fresh window)', async () => {
+  let savesWork = true;
+  const bridge = await startBridge({ bridgeOptions: { persist: () => savesWork } });
+  try {
+    const opened = await openWindow(bridge.port);
+    assert.match(opened.code, /^\d{6}$/);
+    savesWork = false;
+    const refused = await pairPhone(bridge.port, opened.token);
+    // The phone is not told a pairing happened, no credential leaves the
+    // bridge, and the in-memory spend is rolled back: the window is unspent
+    // again and the device row is gone.
+    assert.equal(refused.status, 503);
+    assert.equal(refused.json.token, undefined);
+    assert.match(refused.json.error, /could not be saved/);
+    assert.equal(bridge.state.registry.activeIds().length, 0);
+    assert.equal(bridge.state.window.spent, false);
+
+    // Saves recover, and the SAME request pairs for real.
+    savesWork = true;
+    const paired = await pairPhone(bridge.port, opened.token);
+    assert.equal(paired.status, 201);
+    assert.match(paired.json.token, /^bf_brd_/);
+    assert.equal(bridge.state.registry.activeIds().length, 1);
+    assert.equal(bridge.state.window.spent, true);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('the advertisement carries the configured routes, and falls back to the route the request arrived on', async () => {
+  const configured = await startBridge({
+    bridgeOptions: { origins: ['https://box.example.ts.net:8800', 'https://cdn.example'] },
+  });
+  try {
+    const listed = await call(configured.port, { path: '/api/companion/endpoints' });
+    assert.equal(listed.status, 200);
+    assert.deepEqual(listed.json, {
+      serverName: 'BotFleet Server',
+      endpoints: [
+        { url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 },
+        { url: 'https://cdn.example', kind: 'hosted', priority: 100 },
+      ],
+    });
+    // `hosts` is the older builds' list of plain http addresses. The bridge
+    // answers on its advertised route alone, so it names none.
+    assert.equal('hosts' in listed.json, false);
+    // The advertisement needs the owner credential and no device.
+    const anonymous = await call(configured.port, { path: '/api/companion/endpoints', headers: {} });
+    assert.equal(anonymous.status, 403);
+  } finally {
+    await configured.close();
+  }
+
+  const derived = await startBridge();
+  try {
+    // What `tailscale serve` hands the loopback hop: the original Host, the
+    // same value as X-Forwarded-Host, and the scheme it terminated.
+    const viaServe = await rawCall(derived.port, {
+      path: '/api/companion/endpoints',
+      headers: ownerHeaders({ 'x-forwarded-proto': 'https', 'x-forwarded-host': 'box.example.ts.net:8800', host: 'box.example.ts.net:8800' }),
+    });
+    assert.deepEqual(JSON.parse(viaServe.buffer.toString('utf8')), {
+      serverName: 'BotFleet Server',
+      endpoints: [{ url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 }],
+    });
+    // A proxy that names no forwarded host leaves the Host to speak.
+    const byHost = await rawCall(derived.port, {
+      path: '/api/companion/endpoints',
+      headers: ownerHeaders({ 'x-forwarded-proto': 'http', host: 'box.example.ts.net:8080' }),
+    });
+    assert.deepEqual(JSON.parse(byHost.buffer.toString('utf8')).endpoints, [
+      { url: 'http://box.example.ts.net:8080', kind: 'tailnet', priority: 0 },
+    ]);
+    // A direct loopback call, such as a curl on the host, advertises
+    // nothing: a loopback address is no route a phone can dial.
+    const direct = await call(derived.port, { path: '/api/companion/endpoints' });
+    assert.deepEqual(direct.json, { serverName: 'BotFleet Server', endpoints: [] });
+    // A loopback address named in a forwarding header is no route either.
+    const loopback = await rawCall(derived.port, {
+      path: '/api/companion/endpoints',
+      headers: ownerHeaders({ 'x-forwarded-proto': 'https', 'x-forwarded-host': '127.0.0.1:8797' }),
+    });
+    assert.deepEqual(JSON.parse(loopback.buffer.toString('utf8')).endpoints, []);
+  } finally {
+    await derived.close();
+  }
+});
+
+test('the request-derived origin trusts the forwarding headers from a loopback peer only', () => {
+  const forwarded = { 'x-forwarded-proto': 'https', 'x-forwarded-host': 'box.example.ts.net:8800' };
+  assert.equal(bridgeRequestOrigin({ remoteAddress: '127.0.0.1', headers: forwarded }), 'https://box.example.ts.net:8800');
+  assert.equal(bridgeRequestOrigin({ remoteAddress: '::1', headers: forwarded }), 'https://box.example.ts.net:8800');
+  assert.equal(bridgeRequestOrigin({ remoteAddress: '::ffff:127.0.0.1', headers: forwarded }), 'https://box.example.ts.net:8800');
+  // A peer that is not on loopback names no route, whatever it sends.
+  for (const remoteAddress of ['192.168.1.44', '203.0.113.9', '100.64.0.1', '', undefined]) {
+    assert.equal(bridgeRequestOrigin({ remoteAddress, headers: forwarded }), '', String(remoteAddress));
+  }
+  // Without a proxy the socket speaks: plain http, or https on a TLS socket.
+  assert.equal(bridgeRequestOrigin({ remoteAddress: '127.0.0.1', headers: { host: 'box.example.ts.net:8080' } }), 'http://box.example.ts.net:8080');
+  assert.equal(
+    bridgeRequestOrigin({ remoteAddress: '127.0.0.1', encrypted: true, headers: { host: 'cdn.example' } }),
+    'https://cdn.example',
+  );
+  // A scheme that is neither, or a host that is not one, derives nothing.
+  assert.equal(
+    bridgeRequestOrigin({ remoteAddress: '127.0.0.1', headers: { 'x-forwarded-proto': 'wss', host: 'box.example.ts.net:8080' } }),
+    'http://box.example.ts.net:8080',
+  );
+  assert.equal(bridgeRequestOrigin({ remoteAddress: '127.0.0.1', headers: { host: 'localhost:8797' } }), '');
+  assert.equal(bridgeRequestOrigin({ remoteAddress: '127.0.0.1', headers: { 'x-forwarded-host': 'a b', 'x-forwarded-proto': 'https' } }), '');
+  assert.equal(bridgeRequestOrigin({ remoteAddress: '127.0.0.1', headers: {} }), '');
+  // The configured routes win over anything a request says.
+  assert.deepEqual(
+    bridgeAdvertisedEndpoints({ origins: ['https://cdn.example'], remoteAddress: '127.0.0.1', headers: forwarded }),
+    [{ url: 'https://cdn.example', kind: 'hosted', priority: 0 }],
+  );
+  assert.deepEqual(bridgeAdvertisedEndpoints({ origins: [], remoteAddress: '192.168.1.44', headers: forwarded }), []);
+});
+
+test('the advertised routes are read from Infisical by name, and an unusable value fails the start', () => {
+  assert.equal(BRIDGE_ORIGIN_SECRET_NAME, 'BOTFLEET_COMPANION_BRIDGE_ORIGIN');
+  assert.deepEqual([...BRIDGE_CONFIG_SECRET_NAMES], [
+    'BOTFLEET_OWNER_LOGINS',
+    'BOTFLEET_PUBLIC_ORIGIN',
+    'BOTFLEET_SERVER_GATE_TOKEN',
+    'BOTFLEET_COMPANION_BRIDGE_ORIGIN',
+  ]);
+  // Absent is no advertisement and not an error; the other names still read.
+  const absent = bridgeConfigFromSecrets({ BOTFLEET_SERVER_GATE_TOKEN: OWNER_TOKEN, BOTFLEET_OWNER_LOGINS: 'owner@example.com' });
+  assert.deepEqual(absent.origins, []);
+  assert.equal(absent.tokenSha256, sha256Hex(OWNER_TOKEN));
+  assert.deepEqual([...absent.owners], ['owner@example.com']);
+  assert.deepEqual(bridgeConfigFromSecrets({}).origins, []);
+  assert.deepEqual(bridgeConfigFromSecrets({ BOTFLEET_COMPANION_BRIDGE_ORIGIN: ' , ' }).origins, []);
+
+  const configured = bridgeConfigFromSecrets({
+    BOTFLEET_COMPANION_BRIDGE_ORIGIN: 'https://Box.Example.ts.net:8800, http://box.example.ts.net:8080',
+  });
+  assert.deepEqual(configured.origins, ['https://box.example.ts.net:8800', 'http://box.example.ts.net:8080']);
+
+  // A value that is present and unusable is refused, naming the rule and
+  // never the value.
+  for (const bad of ['box.example.ts.net:8800', 'https://box.example.ts.net:8800/path', 'ftp://box.example.ts.net', 'https://127.0.0.1:8800']) {
+    assert.throws(
+      () => bridgeConfigFromSecrets({ BOTFLEET_COMPANION_BRIDGE_ORIGIN: bad }),
+      (error) => {
+        assert.match(error.message, /^BOTFLEET_COMPANION_BRIDGE_ORIGIN is not usable: /);
+        assert.equal(error.message.includes(bad), false);
+        return true;
+      },
+      bad,
+    );
+  }
+});
+
+test('the pairing body is built from the Swift types it feeds, field for field', () => {
+  const response = bridgePairResponse({
+    credential: 'bf_brd_fixture',
+    device: { id: 'd-1', name: 'Phone', pairedAtMs: 1_700_000_000_000 },
+    advertised: [{ url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 }],
+  });
+  assert.deepEqual(response, {
+    token: 'bf_brd_fixture', // PairResponse.token
+    device: {
+      id: 'd-1', // PairedDevice.id
+      name: 'Phone', // PairedDevice.name
+      createdAt: 1_700_000_000_000, // PairedDevice.createdAt
+      lastSeenAt: 1_700_000_000_000, // PairedDevice.lastSeenAt
+    },
+    serverName: 'BotFleet Server', // PairResponse.serverName
+    endpoints: [{ url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 }], // PairResponse.endpoints
+  });
+  // No route to offer: the optional field is absent, not empty.
+  const bare = bridgePairResponse({ credential: 'bf_brd_fixture', device: { id: 'd-1', name: 'Phone', pairedAtMs: 1 }, advertised: [] });
+  assert.equal('endpoints' in bare, false);
+  // The advertisement is copied, so a later edit to it cannot change a body
+  // already built.
+  const advertised = [{ url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 }];
+  const copied = bridgePairResponse({ credential: 'c', device: { id: 'd-1', name: 'Phone', pairedAtMs: 1 }, advertised });
+  advertised[0].url = 'https://elsewhere.example';
+  assert.equal(copied.endpoints[0].url, 'https://box.example.ts.net:8800');
+});
+
+test('every forwarded route needs a paired device, and each one reaches the harness only with it', async () => {
+  const reached = [];
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      reached.push(`${req.method} ${info.path}`);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    },
+  });
+  try {
+    const rows = BRIDGE_ALLOWED_ROUTES.filter((route) => route.local === false && route.path !== '/api/health');
+    assert.ok(rows.length >= 80, `the mirrored list has ${rows.length} rows`);
+    const device = await bridge.pair('phone-every-route');
+
+    for (const route of rows) {
+      const path = samplePath(route.pattern);
+      assert.equal(route.pattern.test(path), true, `${route.method} ${path}`);
+      const checked = CHECKED_BODIES.find(([pattern]) => pattern.test(path));
+      const body = route.method === 'GET' || route.method === 'DELETE' ? undefined : (checked ? checked[1] : '{}');
+      const json = body === undefined ? {} : { 'content-type': 'application/json' };
+      const label = `${route.method} ${path}`;
+
+      // Without a device credential the bridge refuses before the harness
+      // is asked, and a credential it never issued is refused the same way.
+      const anonymous = await call(bridge.port, { method: route.method, path, headers: ownerHeaders(json), body });
+      assert.equal(anonymous.status, 403, label);
+      assert.equal(anonymous.json.error, 'device credential required', label);
+      const stranger = await call(bridge.port, {
+        method: route.method,
+        path,
+        headers: ownerHeaders({ ...json, authorization: `Bearer ${DEVICE_CREDENTIAL}` }),
+        body,
+      });
+      assert.equal(stranger.status, 403, label);
+      assert.equal(stranger.json.error, 'unknown device', label);
+    }
+    assert.equal(reached.length, 0, 'nothing reached the harness without a paired device');
+
+    // With the paired device every row is forwarded, to the same path.
