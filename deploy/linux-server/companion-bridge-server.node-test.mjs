@@ -2588,26 +2588,7 @@ test('an answer that finds no room to be held for checking is refused at once, a
   try {
     const device = await bridge.pair('phone-scrub-ceiling');
     const headers = ownerHeaders({ authorization: `Bearer ${device.credential}` });
-    const open = (path) => {
-      let request;
-      const promise = new Promise((resolve) => {
-        request = http.request({ hostname: '127.0.0.1', port: bridge.port, path, method: 'GET', headers }, (res) => {
-          const chunks = [];
-          res.on('data', (chunk) => chunks.push(chunk));
-          const finish = () => resolve({
-            status: res.statusCode,
-            text: Buffer.concat(chunks).toString('utf8'),
-            retryAfter: res.headers['retry-after'],
-          });
-          res.on('end', finish);
-          res.on('close', finish);
-          res.on('error', finish);
-        });
-        request.on('error', () => resolve({ status: 0, text: '' }));
-        request.end();
-      });
-      return { promise, abort: () => request.destroy() };
-    };
+    const open = (path) => openProxied(bridge.port, path, headers);
     const heldSoFar = () => held.length;
     const untilHeld = async (count) => {
       while (heldSoFar() < count) await new Promise((resolve) => setTimeout(resolve, 5));
