@@ -69,6 +69,15 @@ public final class ServersCoordinator: ObservableObject {
         self.loading = nil; isBusy = false
     }
 
+    /// The servers other than this Mac that are enrolled, once the saved
+    /// list has been read. Nil until then: a list that was not read does not
+    /// say that no server is enrolled, and what keeps or drops things per
+    /// server must not read it as empty.
+    public var enrolledServerIDs: Set<String>? {
+        guard isLoaded else { return nil }
+        return Set(hosts.filter { !$0.isLocal }.map(\.id))
+    }
+
     @discardableResult
     public func add(name: String, origin: String) async -> Bool {
         guard canMutate else { return false }
