@@ -171,7 +171,7 @@ test("mounting is refused off macOS unless the caller says not to", async () => 
 
 /** A private directory the way the verifier makes a mount point, holding whatever `entries` names. */
 function mountPoint(entries = []) {
-  const directory = mkdtempSync(join(tmpdir(), "bf-host-mount-"));
+  const directory = mkdtempSync(join(tmpdir(), "bf-native-host-mount-"));
   for (const entry of entries) writeFileSync(join(directory, entry), "x");
   return directory;
 }
