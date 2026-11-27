@@ -1731,7 +1731,7 @@ async function proxyRequest({ req, res, method, url, decision, host, port, upstr
     };
     const fail = (error, message) => {
       if (settled) return;
-      settled = true;
+      settle();
       logger(`[companion-bridge] ${method} ${pathOf(url)}: ${error.message}`);
       response.destroy();
       if (res.headersSent || res.writableEnded || res.destroyed) res.destroy();
