@@ -674,6 +674,9 @@ test('a proxied route needs a device the bridge knows; one it does not know, or 
   });
   try {
     // No device credential at all:  the bridge refuses before the harness.
+    // 401 is the status the app reads as "this phone is not paired"; a 403
+    // it reads as something that can only be done on the computer, and a
+    // phone that lost its pairing would never be offered a new one.
     const anonymous = await call(bridge.port, { path: '/api/bots' });
     assert.equal(anonymous.status, 403);
     assert.equal(reached, 0);
