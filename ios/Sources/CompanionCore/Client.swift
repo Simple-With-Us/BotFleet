@@ -38,6 +38,18 @@ public struct Connection: Codable, Hashable, Identifiable, Sendable {
     /// LAN or Bonjour origin for local pairing. Absent alongside a nil kind
     /// policy on connections saved before route consent existed.
     public var allowedLocalRouteURLs: Set<String>?
+    /// The last placement the paired Mac advertised. Nil until it says, on an
+    /// older Mac, and for a phone paired only with the server. It says which
+    /// side owns the work, and so whether the server's bridge leads the
+    /// route walk (`prefersBridge`).
+    public var placement: NativePlacementMode?
+    /// The phone's pairing with the server's companion bridge, held beside
+    /// this one. The bridge keeps its own device registry and shares no
+    /// secret with the Mac, so it is a pairing of its own: its own routes,
+    /// and its own token in the keychain under its own id. Nil until a
+    /// bridge invite is scanned. Read and write it through
+    /// `bridgeConnection`.
+    public var bridge: CompanionBridgePairing?
 
     public init(
         id: String = UUID().uuidString,
