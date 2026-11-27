@@ -10,6 +10,10 @@ import Foundation
 /// the same quit-time drain.  The stored bots are registered once, when the
 /// runtime opens.  A build that throws opens nothing, and the next call tries
 /// again.
+///
+/// An optional `prepare` step runs on the opened store before that
+/// registration (`BF-2710`): the Mac app passes the first-launch import of its
+/// legacy Node stores, so imported bots register in the same pass.
 public final class NativeMacRuntimeHost: @unchecked Sendable {
     /// The opened graph.
     public struct Opened: Sendable {
@@ -25,11 +29,16 @@ public final class NativeMacRuntimeHost: @unchecked Sendable {
     /// successfully.
     public typealias Build = @Sendable () throws -> (database: DatabaseService, runtime: NativeMacCompanionRuntime)
 
+    /// Runs once on the opened store, before the stored bots register.
+    public typealias Prepare = @Sendable (DatabaseService) async -> Void
+
     private let lock = NSLock()
     private var opened: Opened?
     private let build: Build
+    private let prepare: Prepare?
 
-    public init(build: @escaping Build) {
+    public init(prepare: Prepare? = nil, build: @escaping Build) {
+        self.prepare = prepare
         self.build = build
     }
 
@@ -40,10 +49,15 @@ public final class NativeMacRuntimeHost: @unchecked Sendable {
         if let opened { return opened }
         let built = try build()
         let runtime = built.runtime
+        let database = built.database
+        let prepare = self.prepare
         let value = Opened(
-            database: built.database,
+            database: database,
             runtime: runtime,
-            registration: Task { await runtime.registerStoredBots() }
+            registration: Task {
+                await prepare?(database)
+                return await runtime.registerStoredBots()
+            }
         )
         opened = value
         return value

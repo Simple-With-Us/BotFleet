@@ -306,7 +306,29 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         // under the Mac's data directory; where the native engine's store
         // finally lives is BF-2504's call, and this path is the provisional
         // one the BF-2590 PR named.  Workspaces are confined beside it.
-        let nativeRuntimeHost = NativeMacRuntimeHost {
+        //
+        // BF-2710: on the first launch with no harness plist under any label
+        // it has used, the legacy `bots.json` and `messages.db` are copied
+        // into that store before the stored bots register, so the window
+        // opens with the bots the harness had.  Beside an installed harness
+        // nothing is copied.
+        let legacyImport = NativeLegacyStoreImport.forMacDataDirectory(
+            policyStore.dataDir,
+            harnessPlists: Self.harnessAgentLabels.map { startupPolicyStore.launchAgentPlist(label: $0) }
+        )
+        let nativeRuntimeHost = NativeMacRuntimeHost(prepare: { database in
+            switch await legacyImport.runIfNeeded(into: database) {
+            case .imported(let bots, let threads, let messages, let parityVerified):
+                NSLog(
+                    "BF-2710: imported %ld bots, %ld threads and %ld messages from the legacy store (parity %@)",
+                    bots, threads, messages, parityVerified ? "verified" : "NOT verified"
+                )
+            case .failed(let reason):
+                NSLog("BF-2710: the legacy store import failed and will be tried again next launch: %@", reason)
+            case .skipped:
+                break
+            }
+        }) {
             try FileManager.default.createDirectory(
                 at: storeURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true
