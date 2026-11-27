@@ -107,7 +107,6 @@ struct MacPhoneSettings: View {
         await servers.load()
         await ServerBridgePairingBackend.retainOnly(servers.enrolledServerIDs)
         let remote = servers.hosts.filter { !$0.isLocal }
-        await ServerBridgePairingBackend.retainOnly(Set(remote.map(\.id)))
         let placed = servers.placement.saved.serverID
         guard let server = remote.first(where: { $0.id == placed }) ?? remote.first else {
             serverBackend = nil
