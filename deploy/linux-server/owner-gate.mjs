@@ -917,7 +917,7 @@ async function main() {
     defaultLog(
       `[owner-gate] listening on ${DEFAULT_GATE_HOST}:${boundPort} -> harness ` +
         `${DEFAULT_GATE_HOST}:${DEFAULT_HARNESS_PORT} ` +
-        `(owners: ${owners.size}, token: ${gateTokenSha256 ? 'yes' : 'no'})`,
+        `(owners: ${owners.size}, token: ${gateTokenSha256 ? 'yes' : 'no'}, bridge: ${bridgeEnabled ? 'yes' : 'no'})`,
     );
   });
 }
