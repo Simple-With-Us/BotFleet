@@ -1122,6 +1122,13 @@ public actor NativeCompanionServer {
         endpointAdvertisement = Self.sanitizedAdvertisement(advertisement)
     }
 
+    /// Says which placement the Mac app has applied. Sent beside the routes
+    /// from now on; nil, for an older app or a mode this build does not
+    /// know, sends nothing and leaves the phone what it last read.
+    public func setPlacement(_ mode: NativePlacementMode?) {
+        appliedPlacement = mode
+    }
+
     /// Opens a fresh pairing window with generated manual and QR credentials.
     @discardableResult
     public func openPairingWindow(
