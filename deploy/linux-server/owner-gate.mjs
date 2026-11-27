@@ -672,6 +672,21 @@ export function createOwnerGate({
       return;
     }
 
+    //  Only a host whose bridge is configured answers the prefix at all; on
+    //  any other host the path goes to the harness as before.
+    if (hasBridge) {
+      const target = bridgeAdminTarget(req.method, pathOf(req.url));
+      if (target === null) {
+        logger(`[owner-gate] refused ${req.method} ${pathOf(req.url)}: not a companion bridge route the gate answers`);
+        respondJson(res, 404, { error: 'no such companion bridge route' });
+        return;
+      }
+      if (target !== undefined) {
+        proxyToBridge(req, res, target, bridgedPort, upstreamAgent, logger);
+        return;
+      }
+    }
+
     proxyRequest(req, res, harnessHost, port, upstreamAgent, logger, worker.kind === 'worker');
   });
 
