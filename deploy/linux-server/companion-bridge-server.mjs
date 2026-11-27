@@ -1723,6 +1723,12 @@ async function proxyRequest({ req, res, method, url, decision, host, port, upstr
     const chunks = [];
     let size = 0;
     let settled = false;
+    // The room this answer took goes back exactly once, on whichever way it
+    // ends: forwarded, refused, cut off, or torn down with the request.
+    const settle = () => {
+      settled = true;
+      jsonScrubs.inFlight -= 1;
+    };
     const fail = (error, message) => {
       if (settled) return;
       settled = true;
