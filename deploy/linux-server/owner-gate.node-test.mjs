@@ -937,3 +937,37 @@ test("integration: a websocket upgrade carries the gate token too", async (t) =>
   sockets.push(refused.socket);
   assert.match(refused.head, /^HTTP\/1\.1 403/);
 });
+
+// ---------------------------------------------------------------------------
+// the companion bridge hop
+// ---------------------------------------------------------------------------
+
+test("bridgeAdminTarget names the five routes and refuses the rest of the prefix", () => {
+  assert.equal(
+    bridgeAdminTarget("GET", "/api/companion/bridge/endpoints"),
+    "/api/companion/endpoints",
+  );
+  assert.equal(
+    bridgeAdminTarget("POST", "/api/companion/bridge/pairing/open"),
+    "/api/companion/pairing/open",
+  );
+  assert.equal(bridgeAdminTarget("GET", "/api/companion/bridge/devices"), "/api/companion/devices");
+  assert.equal(
+    bridgeAdminTarget("POST", "/api/companion/bridge/pairing/close"),
+    "/api/companion/pairing/close",
+  );
+  assert.equal(
+    bridgeAdminTarget("DELETE", "/api/companion/bridge/devices/phone-1"),
+    "/api/companion/devices/phone-1",
+  );
+
+  // Under the prefix, but not one of the four: the bridge's other owner-only
+  // routes never see a request that came through the gate.
+  assert.equal(bridgeAdminTarget("POST", "/api/companion/bridge/pairing/redeem"), null);
+  assert.equal(bridgeAdminTarget("POST", "/api/companion/bridge/endpoints"), null);
+  assert.equal(bridgeAdminTarget("DELETE", "/api/companion/bridge/devices"), null);
+  assert.equal(bridgeAdminTarget("DELETE", "/api/companion/bridge/devices/"), null);
+  assert.equal(bridgeAdminTarget("DELETE", "/api/companion/bridge/devices/a/b"), null);
+  assert.equal(bridgeAdminTarget("DELETE", "/api/companion/bridge/devices/../pairing"), null);
+  assert.equal(bridgeAdminTarget("GET", "/api/companion/bridge/"), null);
+
