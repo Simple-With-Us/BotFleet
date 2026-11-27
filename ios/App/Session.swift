@@ -1431,7 +1431,7 @@ final class Session: ObservableObject {
         updated.resetRoutePolicy(selecting: endpoint)
         connection = updated
         CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
-        rotation = CandidateRotation(endpoints: updated.orderedEndpoints)
+        rotation = CandidateRotation(endpoints: updated.syncEndpoints)
         if let token {
             client = CompanionClient(connection: updated.dialing(endpoint), token: token)
         }
