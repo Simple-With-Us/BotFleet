@@ -1518,7 +1518,7 @@ function isUnroutableHostName(host) {
   if (host === '0.0.0.0' || host === '::' || host === '::1') return true;
   if (/^127(\.\d{1,3}){3}$/.test(host)) return true;
   if (/^169\.254(\.\d{1,3}){2}$/.test(host)) return true;
-  return /^fe[89ab]/.test(host);
+  return /^fe[89ab][0-9a-f]{0,4}:/.test(host);
 }
 
 /**
