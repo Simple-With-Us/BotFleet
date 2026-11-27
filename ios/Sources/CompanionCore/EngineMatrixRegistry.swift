@@ -327,7 +327,7 @@ public enum EngineMatrixRegistry {
             baseArguments: ["acp"],
             wireProtocol: .acpJSONRPC,
             authRequirement: .cliManagedLogin(cliBinary: "mcode"),
-            defaultModel: "MiniMax-M3.1-Flash"
+            defaultModel: "MiniMax-M3.1-Flash-thinking"
         ),
         .minimaxApi: EngineDriverDescriptor(
             id: .minimaxApi,
