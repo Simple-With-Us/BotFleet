@@ -1125,6 +1125,7 @@ export function createCompanionBridge({
       origins,
       sender,
       activeSseStreams,
+      jsonScrubs,
       disconnectDeviceSse,
     }).catch((error) => {
       logger(`[companion-bridge] request failed: ${error instanceof Error ? error.message : String(error)}`);
