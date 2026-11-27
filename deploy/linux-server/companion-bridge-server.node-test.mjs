@@ -1131,7 +1131,7 @@ test('a failing durable save pauses the trust-extending routes and a working sav
       path: '/api/bots',
       headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
     });
-    assert.equal(revokedProxy.status, 403);
+    assert.equal(revokedProxy.status, 401);
 
     // The save works again and the routes come back.
     savesWork = true;
