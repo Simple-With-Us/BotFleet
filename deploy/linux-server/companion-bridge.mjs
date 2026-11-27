@@ -271,6 +271,7 @@ export const BRIDGE_ALLOWED_ROUTES = [
   { method: 'POST', path: '/api/pair', local: true, requiresDevice: false, description: 'pair a phone: redeem a code or QR token for a device credential, in the shape the iOS app decodes' },
   { method: 'POST', path: '/api/companion/pairing/open', local: true, requiresDevice: false, description: 'open a pairing window' },
   { method: 'POST', path: '/api/companion/pairing/redeem', local: true, requiresDevice: false, description: 'redeem a pairing code or token once' },
+  { method: 'POST', path: '/api/companion/pairing/close', local: true, requiresDevice: false, description: 'close the open pairing window' },
   { method: 'GET', path: '/api/companion/devices', local: true, requiresDevice: false, description: 'public device list' },
   { method: 'DELETE', path: '/api/companion/devices/:id', local: true, requiresDevice: false, description: 'revoke one device' },
   { method: 'POST', path: '/api/companion/push-token', local: true, requiresDevice: true, description: 'register device APNs alert token' },
