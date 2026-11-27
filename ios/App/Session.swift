@@ -1513,7 +1513,14 @@ final class Session: ObservableObject {
             port: parsed.port,
             priority: 0
         ) else { return false }
-        updated.resetRoutePolicy(selecting: endpoint)
+        if updated.isBridgeRoute(endpoint), var server = updated.bridgeConnection {
+            // The typed address is the server's own: it moves the server's
+            // route, and the Mac's pairing, routes and token stay out of it.
+            server.resetRoutePolicy(selecting: endpoint)
+            updated.bridgeConnection = server
+        } else {
+            updated.resetRoutePolicy(selecting: endpoint)
+        }
         connection = updated
         CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
         rotation = CandidateRotation(endpoints: updated.syncEndpoints)
