@@ -82,8 +82,12 @@ public actor ServerBridgePairingBackend: PhonePairingBackend {
     }
 
     /// Forgets every server that is no longer enrolled, with its credential
-    /// and any window it remembers.
-    public static func retainOnly(_ hostIDs: Set<String>) async {
+    /// and any window it remembers, which is closed on the server first. A
+    /// list that was not read (`nil`) forgets nothing: it does not say that
+    /// no server is enrolled, and a window a forgotten backend remembered
+    /// would stay open on its server with nothing left to close it.
+    public static func retainOnly(_ hostIDs: Set<String>?) async {
+        guard let hostIDs else { return }
         await registry.retainOnly(hostIDs)
     }
 
