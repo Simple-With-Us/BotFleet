@@ -1,0 +1,321 @@
+# BF-2635: the two commits this seat could not publish
+
+Applies on the published branch zc/bf-2635-native-host-artifact-release (head 3b4ca3b7c6), whose copies of
+these two files are still the ones on main. After it lands the branch equals local commit e1bdc942f.
+
+    git fetch origin zc/bf-2635-native-host-artifact-release
+    git checkout zc/bf-2635-native-host-artifact-release
+    git apply --check bf-2635-remaining.patch
+    git apply bf-2635-remaining.patch
+    git commit -m "BF-2635: package the native host from the release token folder; build, sign, notarize and attach it in the native release (Refs BF-2635)"
+    git push origin zc/bf-2635-native-host-artifact-release
+
+Two files: scripts/package-native-host.mjs and .github/workflows/native-mac-release.yml.
+Why a hand patch: the workflow path needs the workflow permission this seat's App does not have (OPS-1127), and
+the hosted secret scan refuses any write of the packager file because an unchanged line on main names a PEM header.
+
+diff --git a/.github/workflows/native-mac-release.yml b/.github/workflows/native-mac-release.yml
+index 95f0b78c6..6bcbc2a4b 100644
+--- a/.github/workflows/native-mac-release.yml
++++ b/.github/workflows/native-mac-release.yml
+@@ -19,6 +19,18 @@
+ # When this workflow gains push triggers, their paths must cover
+ # ios/MacApp/**, ios/Sources/**, ios/project.yml and this file, or a
+ # native-only change becomes unshippable (the C-86 lesson BF-2486 records).
++#
++# The optional native headless host (BF-2635) rides the same dispatch as an
++# opt-in job and stays independent of the release above.  With the native-host
++# input ticked, mac-native-host builds, signs, notarizes and verifies
++# BotFleetNativeHost from the same pinned commit, with the same build number
++# and Developer ID as the app, and native-host-draft adds the disk image to the
++# same draft.  Nothing in the GUI release chain needs either job, so a skipped
++# or failed host job can neither fail nor skip the app's release.  The job runs
++# on its own clean checkout because the packager refuses to distribute a build
++# from a dirty tree.  The workflow produces the artifact only:  it never
++# installs the host, registers a LaunchAgent or LaunchDaemon, or touches a
++# live host.
+ name: Native Mac Release
+ 
+ on:
+@@ -38,6 +50,11 @@ on:
+         required: false
+         type: boolean
+         default: false
++      native-host:
++        description: "Also build, sign and notarize the optional native headless host as its own artifact; nothing is installed or registered"
++        required: false
++        type: boolean
++        default: false
+ 
+ permissions:
+   contents: read
+@@ -518,3 +535,178 @@ jobs:
+             gh release upload "$tag" "$f" --repo "$RELEASES_REPO" --clobber
+           done
+           echo "native assets on $tag: $(gh release view "$tag" --repo "$RELEASES_REPO" --json assets --jq '[.assets[].name | select(startswith("BotFleetMac") or . == "appcast.xml")] | join(", ")')"
++
++  mac-native-host:
++    name: BotFleetNativeHost (sign, notarize)
++    # Opt-in, and independent of the GUI release chain:  nothing in that chain
++    # needs this job, and this job needs nothing from it but the one pin
++    # `prepare` plans, so a skipped or failed host job can neither fail nor
++    # skip the app's release.
++    if: ${{ inputs.native-host }}
++    needs: prepare
++    runs-on: xcode-27
++    timeout-minutes: 60
++    env:
++      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
++    outputs:
++      artifact: ${{ steps.verify.outputs.artifact }}
++      artifact_sha256: ${{ steps.verify.outputs.artifact_sha256 }}
++    steps:
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        with:
++          ref: ${{ needs.prepare.outputs.sha }}
++          persist-credentials: false
++      - name: Assert the pinned Xcode
++        run: bash scripts/ios-assert-xcode.sh 27.0
++      - name: Refuse a beta Xcode
++        run: |
++          xcodebuild -version
++          if xcodebuild -version | grep -qi beta; then
++            echo "::error::xcodebuild reports a beta Xcode toolchain"
++            exit 1
++          fi
++      # The same certificate, the same binding and the same sanctioned GitHub
++      # fallback as the app's certificate step:  the host is signed by exactly
++      # the identity that signs the app beside it.
++      - name: Load the Developer ID certificate for the native host
++        uses: ./.github/actions/infisical-secrets
++        with:
++          names: MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
++          required: MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
++          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
++          token: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
++        env:
++          GH_FALLBACK_MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
++          GH_FALLBACK_MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
++      - name: Import the Developer ID certificate into a throwaway keychain
++        env:
++          MAC_CERT_P12_BASE64: ${{ env.MAC_CERT_P12_BASE64 }}
++          MAC_CERT_PASSWORD: ${{ env.MAC_CERT_PASSWORD }}
++        run: |
++          KEYCHAIN="$RUNNER_TEMP/native-host.keychain-db"
++          KEYCHAIN_PASSWORD="$(uuidgen)"
++          echo "$MAC_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/native-host-cert.p12"
++          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
++          security set-keychain-settings -lut 21600 "$KEYCHAIN"
++          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
++          security import "$RUNNER_TEMP/native-host-cert.p12" -P "$MAC_CERT_PASSWORD" -A \
++            -t cert -f pkcs12 -k "$KEYCHAIN"
++          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
++          security list-keychains -d user -s "$KEYCHAIN" login.keychain
++          rm "$RUNNER_TEMP/native-host-cert.p12"
++      # The packager builds both slices from an export of the committed ios/
++      # tree, stamps the binary with the pinned commit and build, signs it with
++      # the imported Developer ID and verifies that signature itself before it
++      # notarizes, staples and checks the disk image.  It refuses a dirty
++      # checkout for a distributable build, which is why nothing before this
++      # step writes into the workspace and the artifact goes to the runner's
++      # temp.  It reads the notarization credentials itself, from the folder
++      # the same read token covers for the app.
++      - name: Package, sign and notarize the native host
++        env:
++          INFISICAL_NATIVE_RELEASE_READ_TOKEN: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
++          BUILD: ${{ needs.prepare.outputs.build }}
++        run: |
++          set -euo pipefail
++          node scripts/package-native-host.mjs \
++            --repo-root . \
++            --output "$RUNNER_TEMP/native-host" \
++            --build "$BUILD" \
++            --sign-identity "Developer ID Application" \
++            --keychain "$RUNNER_TEMP/native-host.keychain-db"
++      # The packager's receipt is its own word for the result.  This step reads
++      # the bytes on disk again:  the receipt has to name the pinned commit and
++      # build, the image has to hash to the digest the receipt names, and the
++      # mounted image has to hold a binary whose signature, team, stamp and
++      # file set all verify.
++      - name: Verify the packaged native host against the pinned commit and build
++        id: verify
++        env:
++          SOURCE_COMMIT: ${{ needs.prepare.outputs.sha }}
++          BUILD: ${{ needs.prepare.outputs.build }}
++        run: |
++          set -euo pipefail
++          out="$(node scripts/verify-native-host-artifact.mjs release "$RUNNER_TEMP/native-host" \
++            --source "$SOURCE_COMMIT" --build "$BUILD")" || {
++              echo "::error::the packaged native host did not verify against the pinned commit and build"; exit 1; }
++          printf '%s\n' "$out"
++          artifact="$(printf '%s\n' "$out" | sed -n 's/^artifact=//p')"
++          artifact_sha256="$(printf '%s\n' "$out" | sed -n 's/^artifact_sha256=//p')"
++          [ -n "$artifact" ] && [ "${#artifact_sha256}" = 64 ] || {
++            echo "::error::the verifier printed no artifact and digest"; exit 1; }
++          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
++          echo "artifact_sha256=$artifact_sha256" >> "$GITHUB_OUTPUT"
++      - name: Stage the native host artifact and its receipt
++        env:
++          ARTIFACT: ${{ steps.verify.outputs.artifact }}
++        run: |
++          set -euo pipefail
++          mkdir "$RUNNER_TEMP/native-host-upload"
++          cp "$RUNNER_TEMP/native-host/$ARTIFACT" "$RUNNER_TEMP/native-host-upload/"
++          cp "$RUNNER_TEMP/native-host/artifact.json" "$RUNNER_TEMP/native-host-upload/"
++      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
++        with:
++          name: native-mac-host-release
++          path: ${{ runner.temp }}/native-host-upload/
++          if-no-files-found: error
++          retention-days: 14
++
++  native-host-draft:
++    name: Attach the native host artifact to the draft release
++    # `!cancelled()` is what lets this job be evaluated at all after a skipped
++    # draft job or host job.  It then runs only when the run asked for a draft
++    # that is not the unverified one, and only after BOTH the host job verified
++    # its artifact and the app's draft job succeeded:  a failed or skipped host
++    # job attaches nothing, and nothing is ever added to a release the app's
++    # own job did not prepare.
++    if: ${{ !cancelled() && inputs.native-host && inputs.draft && !inputs.unsigned-draft && needs.mac-native-host.result == 'success' && needs.draft.result == 'success' }}
++    needs: [prepare, mac-native-host, draft]
++    runs-on: ubuntu-26.04
++    timeout-minutes: 10
++    permissions:
++      contents: write
++    steps:
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        with:
++          ref: ${{ needs.prepare.outputs.sha }}
++          persist-credentials: false
++      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
++        with:
++          name: native-mac-host-release
++          path: host-assets
++      # This runner cannot mount the image or read a macOS signature.  What it
++      # can prove is that these bytes are the bytes the macOS job verified:  the
++      # receipt still names the pinned commit and build, the image hashes to the
++      # digest the receipt names, and that digest is the one the verifying step
++      # reported.
++      - name: Verify the downloaded bytes are the ones the macOS job verified
++        env:
++          SOURCE_COMMIT: ${{ needs.prepare.outputs.sha }}
++          BUILD: ${{ needs.prepare.outputs.build }}
++          ARTIFACT_SHA256: ${{ needs.mac-native-host.outputs.artifact_sha256 }}
++        run: |
++          node scripts/verify-native-host-artifact.mjs release host-assets \
++            --source "$SOURCE_COMMIT" --build "$BUILD" \
++            --expect-artifact-sha256 "$ARTIFACT_SHA256" --no-mount
++      - name: Attach the native host artifact to the draft
++        env:
++          GH_TOKEN: ${{ github.token }}
++          VERSION: ${{ needs.prepare.outputs.version }}
++          BUILD: ${{ needs.prepare.outputs.build }}
++          ARTIFACT: ${{ needs.mac-native-host.outputs.artifact }}
++        run: |
++          set -euo pipefail
++          cd host-assets
++          tag="v${VERSION}-${BUILD}${NATIVE_TAG_SUFFIX}"
++          # The draft guard is repeated here because the release can be
++          # published by hand between the app's attach job and this one.
++          if ! existing="$(gh api "repos/$RELEASES_REPO/releases/tags/$tag" 2>/dev/null)"; then
++            echo "::error::$tag does not exist on $RELEASES_REPO; the app's draft job creates it and this job only adds to it"
++            exit 1
++          fi
++          [ "$(jq -r .draft <<< "$existing")" = true ] || {
++            echo "::error::$tag is no longer a draft; refusing to add the native host artifact to it"; exit 1; }
++          # The BotFleetNativeHost- prefix cannot collide with the app's assets,
++          # so --clobber here can only replace this job's own earlier upload.
++          gh release upload "$tag" "$ARTIFACT" --repo "$RELEASES_REPO" --clobber
++          echo "native host artifact on $tag: $(gh release view "$tag" --repo "$RELEASES_REPO" --json assets --jq '[.assets[].name] | join(", ")')"
+diff --git a/scripts/package-native-host.mjs b/scripts/package-native-host.mjs
+index d48dfbfa7..0e57ab9de 100644
+--- a/scripts/package-native-host.mjs
++++ b/scripts/package-native-host.mjs
+@@ -4,7 +4,8 @@ import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, rea
+ import { basename, dirname, join, relative, resolve } from "node:path";
+ import { spawnSync } from "node:child_process";
+ import { fileURLToPath } from "node:url";
+-import { encodeHostIdentity, HOST_CAPABILITIES, HOST_CODE_ID, inspectHostMachO, sha256File, verifyNativeHostArtifact } from "./native-host-artifact.mjs";
++import { NATIVE_UPDATE_PROJECT as NATIVE_RELEASE_PROJECT } from "./native-update-release-config.mjs";
++import { encodeHostIdentity, HOST_CAPABILITIES, HOST_CODE_ID, hostArtifactName, inspectHostMachO, sha256File, verifyNativeHostArtifact } from "./native-host-artifact.mjs";
+ 
+ const UNPACKAGED_RUNTIME_PRODUCT = /\.(bundle|resources|framework|xcframework|dylib|so)$/i;
+ function refused() { throw new Error("Native host packaging refused; no distributable artifact was accepted."); }
+@@ -17,19 +18,31 @@ export function runHostPackagingCommand(command, args, options = {}) {
+   return result.stdout ?? "";
+ }
+ 
++// The notarization credentials are read where the native release lane's read
++// token can reach them.  INFISICAL_NATIVE_RELEASE_READ_TOKEN is scoped to
++// exactly prod /botfleet-server, and the fetcher refuses a token whose scope
++// does not match the folder it is asked for, so a read at the project root can
++// only be refused there.  The app's own notarization step loads the same trio
++// from this folder, so the host is notarized with what notarizes the app
++// beside it.
++// The project is the one the native update release already names, so the id
++// is read from there rather than written a second time here.
++const NATIVE_RELEASE_FOLDER = "/botfleet-server";
++
+ export async function nativeHostNotaryCredentials({ env = process.env, fetchImpl = fetch } = {}) {
+   const token = String(env.INFISICAL_NATIVE_RELEASE_READ_TOKEN ?? "").trim();
+   if (!token) {
+     console.error("INFISICAL_NATIVE_RELEASE_READ_TOKEN is not set; notarization credentials cannot be read.");
+     refused();
+   }
++  // The three names the app's own notarization step reads, kept local to this read.
++  const names = ["APPLE_API_KEY_P8_BASE64", "APPLE_API_KEY_ID", "APPLE_API_ISSUER_ID"];
+   try {
+     const helper = await import("./infisical-fetch.mjs");
+     // The dependency on published #1551 fails closed on the older unscoped helper.
+     if (!helper.verifyServiceTokenMetadata || !helper.isUnresolvedReference) refused();
+-    const names = ["APPLE_API_KEY_P8_BASE64", "APPLE_API_KEY_ID", "APPLE_API_ISSUER_ID"];
+     const values = await helper.listSecretsRaw({ siteUrl: "https://app.infisical.com", token,
+-      projectId: "836aebe2-c8f7-4e09-978e-7e3e82500bce", environment: "prod", secretPath: "/",
++      projectId: NATIVE_RELEASE_PROJECT, environment: "prod", secretPath: NATIVE_RELEASE_FOLDER,
+       names, fetchImpl, log: () => {} });
+     for (const name of names) {
+       if (values.get(name) && !helper.isUnresolvedReference(values.get(name))) continue;
+@@ -61,11 +74,18 @@ export async function packageNativeHost({ repoRoot, output, build, unsignedDevel
+     marketingVersion: "0.1.0", capabilities: HOST_CAPABILITIES,
+     distribution: unsignedDevelopment ? "unsigned-development" : "developer-id", sourceDirty };
+   const stamp = encodeHostIdentity(identity);
+-  const notaryCredentials = unsignedDevelopment ? null : await readCredentials();
++  // The credentials are read before anything is built, so a grant that does not
++  // reach the folder stops the job here and names the stage, instead of after
++  // two release builds and with nothing to say where it stopped.
++  let artifact, accepted = false, safeCleanup = true, stage = "source export", notaryCredentials = null;
++  if (!unsignedDevelopment) {
++    stage = "notarization credentials";
++    try { notaryCredentials = await readCredentials(); }
++    catch (error) { console.error(`Native host packaging stopped at ${stage}.`); throw error; }
++  }
+   mkdirSync(destination, { mode: 0o700 }); // Exclusive reservation: an existing destination is never replaced.
+   const owned = lstatSync(destination), work = mkdtempSync(join(destination, ".work-"));
+   const payload = join(destination, "payload"), binary = join(payload, "bin", HOST_CODE_ID);
+-  let artifact, accepted = false, safeCleanup = true, stage = "source export";
+   try {
+     mkdirSync(join(payload, "bin"), { recursive: true, mode: 0o755 });
+     const source = join(work, "source"); mkdirSync(source);
+@@ -111,10 +131,10 @@ export async function packageNativeHost({ repoRoot, output, build, unsignedDevel
+         unsignedDevelopment, inspectSignature });
+       if (JSON.stringify(relocated.files) !== JSON.stringify(verified.files)) refused();
+     };
+-    const stem = `BotFleetNativeHost-0.1.0-${build}`;
++    const name = hostArtifactName(build, unsignedDevelopment);
+     if (unsignedDevelopment) {
+       stage = "unsigned archive and relocation";
+-      artifact = join(destination, `${stem}-UNSIGNED.zip`);
++      artifact = join(destination, name);
+       run("/usr/bin/ditto", ["-c", "-k", "--keepParent", payload, artifact]);
+       const relocated = join(work, "relocated"); mkdirSync(relocated);
+       run("/usr/bin/ditto", ["-x", "-k", artifact, relocated]);
+@@ -122,7 +142,7 @@ export async function packageNativeHost({ repoRoot, output, build, unsignedDevel
+     } else {
+       stage = "signed disk image and notarization";
+       const credentials = notaryCredentials;
+-      artifact = join(destination, `${stem}.dmg`);
++      artifact = join(destination, name);
+       run("/usr/bin/hdiutil", ["create", "-volname", HOST_CODE_ID, "-srcfolder", payload, "-ov", "-format", "UDZO", artifact]);
+       const signing = ["--force", "--sign", signIdentity, "--timestamp"];
+       if (keychain) signing.push("--keychain", keychain);
