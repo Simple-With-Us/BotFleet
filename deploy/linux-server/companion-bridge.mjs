@@ -1201,7 +1201,7 @@ function isJsonObject(value) {
  * @param {unknown} body
  * @returns {{status: number, error: string}|null}
  */
-function bridgeBodyShapeRefusal(body) {
+function bridgeBodyRefusal(body) {
   return isJsonObject(body) ? null : { status: 400, error: 'body must be a JSON object' };
 }
 
