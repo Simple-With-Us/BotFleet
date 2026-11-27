@@ -17,8 +17,9 @@ import Foundation
 
 /// A refusal from the server that the caller can tell apart.
 public enum ServerBridgeError: Error, Equatable, LocalizedError, Sendable {
-    /// The gate answered 404: this server has no companion bridge.
-    case notConfigured
+    /// A 404: the gate's own says this server has no companion bridge behind
+    /// the prefix, and the bridge's names what it does not know.
+    case notConfigured(String?)
     case authentication
     /// The gate answered 502: the bridge is not answering.
     case unavailable
@@ -46,7 +47,7 @@ public enum ServerBridgeError: Error, Equatable, LocalizedError, Sendable {
 /// the origin this Mac is enrolled on.
 public actor ServerBridgePairingBackend: PhonePairingBackend {
     private let host: HostRecord
-    private let credential: HostGateCredential?
+    private var credential: HostGateCredential?
     private let session: URLSession
 
     /// The window this backend opened and the server has not closed. The
@@ -57,10 +58,37 @@ public actor ServerBridgePairingBackend: PhonePairingBackend {
     /// Why the last request failed, for the tab to show. Nil after a request that succeeded.
     public private(set) var lastError: ServerBridgeError?
 
+    /// The servers this process has a backend for, by record id.
+    private static let registry = ServerBridgePairingRegistry()
+
     public init(host: HostRecord, credential: HostGateCredential?, session: URLSession = .shared) {
         self.host = host
         self.credential = credential
         self.session = session
+    }
+
+    /// The one backend for one enrolled server, for the life of the process.
+    /// The bridge answers a window only when it opens one, so an open window
+    /// lives here alone: a backend made anew by a tab that closed and
+    /// reopened would know nothing about it, and its code could not be
+    /// closed from the app until it expired. The credential is refreshed on
+    /// every lookup, because a server can be enrolled again.
+    public static func shared(host: HostRecord, credential: HostGateCredential?, session: URLSession = .shared) async -> ServerBridgePairingBackend {
+        let backend = await registry.backend(for: host, session: session)
+        await backend.updateCredential(credential)
+        return backend
+    }
+
+    /// Forgets every server that is no longer enrolled, with its credential
+    /// and any window it remembers.
+    public static func retainOnly(_ hostIDs: Set<String>) async {
+        await registry.retainOnly(hostIDs)
+    }
+
+    /// A credential enrolled again for the same server replaces the old one;
+    /// the open window, if any, stays.
+    public func updateCredential(_ credential: HostGateCredential?) {
+        self.credential = credential
     }
 
     public func openPairingWindow() async -> NativePairingWindow? {
@@ -103,7 +131,9 @@ public actor ServerBridgePairingBackend: PhonePairingBackend {
     }
 
     public func closePairingWindow() async {
-        guard opened != nil else { return }
+        // Asked of the bridge whether or not this backend remembers a window.
+        // The bridge keeps one window at a time, and one this backend never
+        // saw, opened before the app last launched, closes the same way.
         do {
             _ = try await exchange(Request(path: "/api/companion/bridge/pairing/close", method: "POST", body: Data("{}".utf8)),
                                    as: CloseWire.self)
@@ -147,14 +177,15 @@ public actor ServerBridgePairingBackend: PhonePairingBackend {
         }
         do {
             let wire: RevokedWire = try await exchange(Request(path: "/api/companion/bridge/devices/\(id)", method: "DELETE", body: nil), as: RevokedWire.self)
-            // A device the bridge no longer knows is already not paired, which
-            // is what a revoke asks for; whether the bridge is set up at all
-            // is the next device list's answer to give.
-            guard wire.revoked else { throw ServerBridgeError.notConfigured }
-        } catch ServerBridgeError.notConfigured {
+            guard wire.revoked else { throw ServerBridgeError.invalidResponse }
+        } catch ServerBridgeError.notConfigured("unknown device") {
+            // The bridge knows the route and not the device: it is already not
+            // paired, which is what a revoke asks for.
             lastError = nil
             return true
         } catch {
+            // Any other 404 is the gate's: this server has no bridge, and the
+            // tab says so instead of calling that a revoke.
             lastError = Self.bridgeError(error)
             return false
         }
@@ -207,6 +238,10 @@ public actor ServerBridgePairingBackend: PhonePairingBackend {
         let revoked: Bool
     }
 
+    private struct RefusalWire: Decodable {
+        let error: String
+    }
+
     private struct AdvertisementWire: Decodable {
         let serverName: String
         let endpoints: [CompanionEndpoint]
@@ -244,7 +279,11 @@ public actor ServerBridgePairingBackend: PhonePairingBackend {
         case 401, 403:
             throw ServerBridgeError.authentication
         case 404:
-            throw ServerBridgeError.notConfigured
+            // The gate answers 404 for a server with no bridge behind the
+            // prefix and the bridge for a device it does not know; the reason
+            // travels with the answer so a caller can tell them apart.
+            let reason = (try? JSONDecoder().decode(RefusalWire.self, from: data))?.error
+            throw ServerBridgeError.notConfigured(reason)
         case 502:
             throw ServerBridgeError.unavailable
         case 503:
@@ -256,6 +295,23 @@ public actor ServerBridgePairingBackend: PhonePairingBackend {
 
     private static func bridgeError(_ error: Error) -> ServerBridgeError {
         (error as? ServerBridgeError) ?? .invalidResponse
+    }
+}
+
+/// One `ServerBridgePairingBackend` per enrolled server for the life of the
+/// process, so an open pairing window outlives the tab that opened it.
+private actor ServerBridgePairingRegistry {
+    private var backends: [String: ServerBridgePairingBackend] = [:]
+
+    func backend(for host: HostRecord, session: URLSession) -> ServerBridgePairingBackend {
+        if let existing = backends[host.id] { return existing }
+        let created = ServerBridgePairingBackend(host: host, credential: nil, session: session)
+        backends[host.id] = created
+        return created
+    }
+
+    func retainOnly(_ hostIDs: Set<String>) {
+        backends = backends.filter { hostIDs.contains($0.key) }
     }
 }
 #endif
