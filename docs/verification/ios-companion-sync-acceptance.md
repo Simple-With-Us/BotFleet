@@ -85,6 +85,8 @@ Prerequisites, all owner-side:
 | P5 | Background the app, then trigger a server-owned event | An APNs alert arrives from the Linux sender | Background wake — the row P3 cannot close |
 | P6 | Trigger an approval with the app terminated | The alert and Live Activity arrive; one device, one sender | The one-sender rule across the Mac-asleep seam |
 | P7 | Queue a Mac-only job while the Mac is asleep, then wake the Mac | The job visibly waits for the Mac secondary, then resumes exactly once, with no duplicate execution and no second authoritative writer | Primary and secondary stay in their lanes |
+| P8 | With the Mac in `serverFirst` and the phone paired with both, stop the bridge's route and let the phone reconnect, then bring the route back and reconnect again | The first reconnect falls back to the Mac's route with one hydrate and no duplicate frames, and the second leads with the server again | The phone prefers the bridge under `serverFirst` and falls back when it does not answer (BF-2714) |
+| P9 | Scan the server's code from the Mac app's Phone tab while the phone is already paired with the Mac | The phone offers to pair with the server beside the Mac, keeps its Mac pairing, and the Server section of Connection & Security names the server | Pairing with the server does not replace the Mac (BF-2714) |
 
 ## Non-Authorizations
 
