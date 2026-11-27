@@ -1523,8 +1523,20 @@ else
     log "version: fixed marketing version ${FIXED_MARKETING} from apps.json; it does not count up per ship"
     # A released App Store version closes its train:  a fixed version at or
     # below one is refused, never silently bumped.
-    _rel="$(asc_released_store_version "$ASC_PLATFORM")" \
-      || die "cannot read the released App Store version for ${BUNDLE_ID}, so fixedMarketingVersion ${FIXED_MARKETING} cannot be checked against a closed train.  Nothing was shipped or bumped."
+    _rel="$(asc_released_store_version "$ASC_PLATFORM")" || _rel_rc=$?
+    # Option A (owner, 2026-11): allow the first ship through when no prior
+    # App Store release exists. asc_released_store_version returns 0 with
+    # empty stdout when the app exists in ASC but has no released versions;
+    # a non-zero return means the store could not be consulted at all
+    # (auth, network, or client error) and fails closed here, even when a
+    # credential source is locally reachable: only an empty result with a
+    # zero return is "no prior release".  A non-empty result still triggers
+    # the version comparison below.
+    if [[ "${_rel_rc:-0}" -ne 0 ]]; then
+      die "cannot read the released App Store version for ${BUNDLE_ID}, so fixedMarketingVersion ${FIXED_MARKETING} cannot be checked against a closed train.  Nothing was shipped or bumped."
+    elif [[ -z "$_rel" ]]; then
+      log "version: no released App Store version for ${BUNDLE_ID}; allowing first fixedMarketingVersion ${FIXED_MARKETING} ship (Option A)"
+    fi
     if [[ -n "$_rel" ]]; then
       if ! python3 -c 'import sys
 a=[int(x) for x in sys.argv[1].split(".")]; b=[int(x) for x in sys.argv[2].split(".")]
