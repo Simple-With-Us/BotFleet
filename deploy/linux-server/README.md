@@ -226,6 +226,18 @@ The bridge speaks the shipped iOS app's own contract, so no new phone build is n
 
 - One absolute `http` or `https` origin, or a comma-separated list with the preferred one first, with no path, credentials, query or fragment.
 - A value that is present and unusable stops the bridge at start, naming the Infisical name and the rule it broke and never the value.
+- The owner gate reads the same name for one fact, whether this host has a bridge at all, and never for the value.
+
+### Setting A Phone Up From The Mac App
+
+The Mac app's gate credential is bound to the one origin it enrolled on, so the app never talks to the bridge's own route.   When `BOTFLEET_COMPANION_BRIDGE_ORIGIN` is set, the owner gate answers five paths on the server's origin by passing them to the bridge on loopback, and the Mac app's Settings → Phone tab shows the server's code, QR, phones and routes beside the Mac's own (`ServerBridgePairingBackend`).
+
+- The five paths sit under `/api/companion/bridge/`: `GET endpoints`, `POST pairing/open`, `POST pairing/close`, `GET devices` and `DELETE devices/<id>`.
+- The owner credential crosses this hop on purpose, and nothing else about the caller does: the bridge makes the same owner decision again on its own listener.
+- Any other path under that prefix is refused at the gate with `404`, so the bridge's other owner-only routes are never reached through it.
+- On a server where the origin is not set the gate does not answer the prefix, and the Mac app reports that the server has no phone pairing.
+- A bridge that is not answering is a `502` from the gate, and the harness is reached as before.
+- `POST pairing/close` forgets the bridge's open window whole, code and QR credential alike; a close the bridge's durable state cannot hold is answered `503` and the window stays open.
 
 ### What It Holds
 
