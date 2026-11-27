@@ -151,6 +151,13 @@ public struct CompanionEndpointAdvertisement: Sendable, Equatable {
     public var hosts: [String]
     /// Complete routes, each with its own scheme and port.
     public var endpoints: [CompanionEndpoint]
+    /// True when these are the server's routes, read from its companion
+    /// bridge, and not this computer's own. It is a mark for the app that
+    /// shows the advertisement: a pairing invite built from it is a bridge
+    /// invite, which a phone holds beside its Mac pairing instead of in its
+    /// place (`PairingInvite.role`). It is never sent on the wire from here;
+    /// this computer is never the bridge.
+    public var isBridge: Bool
 
     public init(serverName: String = "", hosts: [String] = [], endpoints: [CompanionEndpoint] = []) {
         self.serverName = serverName
