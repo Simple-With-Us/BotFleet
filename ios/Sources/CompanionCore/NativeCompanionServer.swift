@@ -671,6 +671,12 @@ public actor NativeCompanionServer {
     /// recover a reply lost in transit.
     private var pairingReplay: PairingReplay?
     private var endpointAdvertisement: CompanionEndpointAdvertisement
+    /// The placement the Mac app last applied, when it has told this server.
+    /// A phone reads it to learn which side owns the work: under
+    /// `serverFirst` a phone that is also paired with the server's bridge
+    /// follows the bridge first. It is the app's to set (`setPlacement`) and
+    /// outlives a socket stop, unlike the routes.
+    private var appliedPlacement: NativePlacementMode?
     private let clock: @Sendable () -> Date
     private var config: CompanionServerConfig
     private var bots: [CompanionBotRecord]
