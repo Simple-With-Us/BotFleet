@@ -397,6 +397,8 @@ final class ServerBridgePairingTests: XCTestCase {
         XCTAssertEqual(ServerBridgeURLProtocol.captured.last?.url.path, "/api/companion/bridge/pairing/close")
         let after = await again.activePairingWindow()
         XCTAssertNil(after)
+
+        await ServerBridgePairingBackend.retainOnly([])
     }
 
     // MARK: - Devices and the advertisement
