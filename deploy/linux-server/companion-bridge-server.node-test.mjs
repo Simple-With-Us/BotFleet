@@ -1224,7 +1224,8 @@ test('push-token, live-activity-token, and push-health routes enforce auth, vali
     const pushToken = 'Ab'.repeat(32);
     const laToken = 'Cd'.repeat(32);
 
-    // Device credential is required on all three routes.
+    // Device credential is required on all three routes, and its absence
+    // is 401 as on every other route that needs a device.
     for (const [method, path, body] of [
       ['POST', '/api/companion/push-token', JSON.stringify({ token: pushToken })],
       ['POST', '/api/companion/live-activity-token', JSON.stringify({ token: laToken, kind: 'push-to-start' })],
