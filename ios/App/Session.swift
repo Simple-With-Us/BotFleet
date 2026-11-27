@@ -1562,10 +1562,14 @@ final class Session: ObservableObject {
         }
         connection = updated
         CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
-        rotation = CandidateRotation(endpoints: updated.syncEndpoints)
-        // The token is the one that belongs to the typed route's own pairing.
-        if let rebuilt = makeClient(dialing: endpoint) {
-            client = rebuilt
+        // The typed route is dialed with the token of its own pairing. A
+        // route whose token is not in hand is not dialed: the walk then
+        // starts at its first route that has one, and the client follows it.
+        if makeClient(dialing: endpoint) != nil {
+            rotation = CandidateRotation(endpoints: [endpoint] + updated.syncEndpoints.filter { $0.url != endpoint.url })
+            client = makeClient(dialing: endpoint)
+        } else {
+            adoptWalk()
         }
         // Dial the new address now rather than on the next backoff tick —
         // someone who just typed an address is watching the banner.
