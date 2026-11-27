@@ -352,8 +352,16 @@ final class ServerBridgePairingTests: XCTestCase {
         let carried = await afterMove.activePairingWindow()
         XCTAssertNil(carried)
         _ = await afterMove.currentAdvertisement()
-        let sent = try XCTUnwrap(ServerBridgeURLProtocol.captured.last)
-        XCTAssertEqual(sent.url.host, "moved.fixture.test", "the request follows the record, not the backend made first")
+        let sent = try XCTUnwrap(ServerBridgeURLProtocol.captured.last { $0.url.host == "moved.fixture.test" })
+        XCTAssertEqual(sent.url.path, "/api/companion/bridge/endpoints", "the request follows the record, not the backend made first")
+        let oldClosed = try await eventually {
+            ServerBridgeURLProtocol.captured.contains {
+                $0.url.absoluteString == "\(self.origin)/api/companion/bridge/pairing/close" && $0.gate == "fixture-gate"
+            }
+        }
+        XCTAssertTrue(oldClosed, "the window opened at the old address is closed there, with the credential bound to that address")
+
+        await ServerBridgePairingBackend.retainOnly([])
     }
 
     func testALookupWithNoCredentialKeepsTheEnrolledOne() async throws {
