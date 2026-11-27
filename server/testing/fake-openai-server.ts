@@ -164,7 +164,7 @@ export async function startFakeOpenAiServer(): Promise<FakeOpenAiServer> {
       if (method === "GET" && url.startsWith("/v1/models")) {
         requests.push({ method, url, headers: recordHeaders(req), body: undefined });
         const body = modelsQueue.shift() ?? DEFAULT_MODELS_BODY;
-        res.writeHead(200, { "content-type": "application/json" });
+        res.writeHead(200, { ...CLOSE_CONNECTION, "content-type": "application/json" });
         res.end(JSON.stringify(body));
         return;
       }
