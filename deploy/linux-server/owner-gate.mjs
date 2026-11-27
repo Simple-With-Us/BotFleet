@@ -900,6 +900,8 @@ async function main() {
     tokenSha256: gateTokenSha256,
     harnessPort: DEFAULT_HARNESS_PORT,
     harnessHost: DEFAULT_GATE_HOST,
+    bridgeEnabled,
+    bridgePort: DEFAULT_BRIDGE_PORT,
   });
 
   server.on('error', (err) => {
