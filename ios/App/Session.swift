@@ -1161,6 +1161,16 @@ final class Session: ObservableObject {
                 log.notice("stream ended without an error")
                 offlineMessage = "Lost the connection."
             } catch let error as APIError where error.isUnauthorized {
+                // A refusal on a server route is the server's pairing gone,
+                // and says nothing about the Mac's: that pairing is dropped
+                // and the walk goes on. From the Mac it is the whole pairing.
+                if let failed = rotation.currentEndpoint,
+                   connection?.isBridgeRoute(failed) == true, connection?.bridgeConnection != nil {
+                    log.notice("server pairing refused: unauthorized, dropping it")
+                    dropServerPairing()
+                    adoptWalk()
+                    continue
+                }
                 log.error("stream refused: unauthorized")
                 status = .unauthorized
                 return
