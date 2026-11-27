@@ -247,7 +247,12 @@ public struct PairingInvite: Equatable, Sendable {
     /// Any other invite is a computer, and replaces the pairing as before.
     public let role: Role
 
-    public init(connection: Connection, credential: String) {
+    public enum Role: Equatable, Sendable {
+        case computer
+        case bridge
+    }
+
+    public init(connection: Connection, credential: String, role: Role = .computer) {
         self.connection = connection
         self.credential = credential
     }
