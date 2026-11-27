@@ -186,7 +186,7 @@ export async function startFakeOpenAiServer(): Promise<FakeOpenAiServer> {
           return;
         }
         if (script.kind === "json") {
-          res.writeHead(script.status ?? 200, { "content-type": "application/json" });
+          res.writeHead(script.status ?? 200, { ...CLOSE_CONNECTION, "content-type": "application/json" });
           res.end(JSON.stringify(script.body));
           return;
         }
