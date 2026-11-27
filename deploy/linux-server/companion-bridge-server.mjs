@@ -854,7 +854,7 @@ export function bridgeRedeemPairing({ state, presented, requestId = '', replayDe
  * thing to keep honest.
  *
  * @param {{credential: string, device: {id: string, name: string, pairedAtMs: number}, advertised: Array<{url: string, kind: string, priority: number}>}} input
- * @returns {{token: string, device: {id: string, name: string, createdAt: number, lastSeenAt: number}, serverName: string, endpoints?: Array<{url: string, kind: string, priority: number}>}}
+ * @returns {{token: string, device: {id: string, name: string, createdAt: number, lastSeenAt: number}, serverName: string, isBridge: boolean, endpoints?: Array<{url: string, kind: string, priority: number}>}}
  */
 export function bridgePairResponse({ credential, device, advertised }) {
   const response = {
