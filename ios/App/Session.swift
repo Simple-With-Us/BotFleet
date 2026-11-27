@@ -750,8 +750,11 @@ final class Session: ObservableObject {
             actionError = "That pairing invitation is not valid. Start pairing again on your computer."
             return
         }
-        guard let invite = PairingInvite.parse(url) else {
-            actionError = "That pairing invitation is not valid. Start pairing again on your computer."
+        // The server's code pairs the phone with the server beside the Mac
+        // it has, so it is offered rather than refused. Unpaired, or with a
+        // pairing the Mac has revoked, it is simply the first pairing.
+        if invite.role == .bridge, connection != nil, status != .unauthorized {
+            serverPairingOffer = invite
             return
         }
         pairingInvite = CompanionPairingInvitePolicy.nextInvite(
