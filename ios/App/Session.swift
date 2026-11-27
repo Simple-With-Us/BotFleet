@@ -1230,6 +1230,95 @@ final class Session: ObservableObject {
 
     // MARK: - Which address to dial
 
+    /// The client for one route of the walk: the pairing that owns the route
+    /// and the token that belongs to that pairing and to nothing else. Nil
+    /// when that token is not in hand.
+    private func makeClient(dialing candidate: CompanionEndpoint) -> CompanionClient? {
+        guard let connection else { return nil }
+        guard let routeToken = connection.isBridgeRoute(candidate) ? bridgeToken : token else { return nil }
+        return CompanionClient(connection: connection.dialing(candidate), token: routeToken)
+    }
+
+    /// Starts the walk again from its first route, which is the server's
+    /// when the Mac runs `serverFirst` and this phone is paired with one.
+    private func adoptWalk() {
+        guard let connection else { return }
+        rotation = CandidateRotation(endpoints: connection.syncEndpoints)
+        if let first = rotation.currentEndpoint, let made = makeClient(dialing: first) {
+            client = made
+        }
+    }
+
+    /// Forgets the pairing with the server and its token. The Mac's pairing
+    /// is untouched. The walk and the client are the caller's to rebuild.
+    private func dropServerPairing() {
+        guard var mac = connection, let server = mac.bridgeConnection else { return }
+        Keychain.remove(server.id)
+        bridgeToken = nil
+        mac.bridgeConnection = nil
+        connection = mac
+        CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(mac))
+    }
+
+    /// Holds a fresh pairing with the server's bridge beside the Mac's. The
+    /// walk follows the server from now on when the Mac runs `serverFirst`.
+    private func adoptServerPairing(_ server: Connection, token: String) throws {
+        guard var mac = connection else { return }
+        try Keychain.save(token, for: server.id)
+        bridgeToken = token
+        mac.bridgeConnection = server
+        connection = mac
+        CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(mac))
+        pairingInvite = CompanionPairingInvitePolicy.nextInvite(
+            current: pairingInvite,
+            after: .pairingSucceeded
+        )
+        // The walk starts again from its first route, which is the server's
+        // when the Mac runs server-first. A stream that moves to the server
+        // cannot resume the Mac's cursor: that costs one hydrate, as a
+        // restart does.
+        adoptWalk()
+        restartStream()
+        connect()
+    }
+
+    /// Pairs with the server whose code was offered. The Mac's pairing stays.
+    func pairWithOfferedServer() async {
+        guard let offer = serverPairingOffer else { return }
+        serverPairingOffer = nil
+        do {
+            try await pair(
+                with: offer.connection,
+                credential: offer.credential,
+                deviceName: PairingView.deviceName(),
+                pairRequestId: UUID().uuidString,
+                role: .bridge
+            )
+        } catch {
+            actionError = "\(error.localizedDescription)\u{00A0} Open BotFleet → Settings → Phone on your Mac and scan the server's code again."
+        }
+    }
+
+    /// Declines the server's code. Nothing is paired.
+    func declineServerPairing() {
+        serverPairingOffer = nil
+    }
+
+    /// Forgets the pairing with the server, and its token. The Mac's pairing
+    /// is untouched, and the walk goes back to the Mac's routes.
+    func forgetServerPairing() {
+        dropServerPairing()
+        adoptWalk()
+        restartStream()
+        connect()
+    }
+
+    /// Whether this phone would follow a server if it were paired with one:
+    /// the Mac has said it runs `serverFirst`, and no server is paired.
+    var suggestsServerPairing: Bool {
+        connection?.placement == .serverFirst && connection?.bridgeConnection == nil
+    }
+
     /// Turn a stream failure into advice a person can act on — and, when the
     /// failure is about the address rather than the pairing, move the dial to
     /// the next stored host so the retry that follows tries somewhere new.
