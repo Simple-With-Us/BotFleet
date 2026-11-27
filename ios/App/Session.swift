@@ -344,6 +344,27 @@ final class Session: ObservableObject {
             if ProcessInfo.processInfo.arguments.contains("-preview-off") {
                 seedOffPreview(&fleet)
             }
+            if ProcessInfo.processInfo.arguments.contains("-preview-server") {
+                // A phone paired with the server beside the Mac, under
+                // server-first, so Connection & Security has its Server
+                // section to show the screenshot harness.
+                var mac = Connection(name: "Preview Mac", host: "preview.tailnet.ts.net", port: 8810)
+                mac.placement = .serverFirst
+                if let route = CompanionEndpoint(url: "https://server.example.com", kind: .hosted, priority: 0) {
+                    mac.bridgeConnection = Connection(
+                        name: "BotFleet Server", host: route.host, port: route.port,
+                        activeEndpoint: route, endpoints: [route],
+                        allowedRouteKinds: [.hosted], allowedLocalRouteURLs: []
+                    )
+                }
+                connection = mac
+            }
+            if ProcessInfo.processInfo.arguments.contains("-preview-server-offer"),
+               // The offer a code from the Mac app's server card brings.
+               let url = URL(string: "botfleet-ios://pair?address=https://server.example.com&code=482913&role=bridge&name=BotFleet%20Server"),
+               let invite = PairingInvite.parse(url) {
+                serverPairingOffer = invite
+            }
             state.hydrate(fleet)
             // StorePreview bots all select instanceId "preview"; seed the
             // driver map so the chat-header provider mark appears in the
