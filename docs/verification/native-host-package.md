@@ -165,8 +165,14 @@ test -d "$mnt/bin"
 hdiutil detach "$mnt"
 touch "$mnt/left-behind"
 node --input-type=module -e 'import { unmountDiskImage } from "./scripts/verify-native-host-artifact.mjs";
-  unmountDiskImage(process.argv[1], { detached: () => true });' "$work/mnt"
-test ! -e "$work/mnt"
+  unmountDiskImage(process.argv[1], { detached: () => true });' "$mnt"
+test ! -e "$mnt"
+# The whole detach, hdiutil and the file system both, on a mounted image.
+mnt="$(node --input-type=module -e 'import { mountDiskImage } from "./scripts/verify-native-host-artifact.mjs";
+  console.log(mountDiskImage(process.argv[1]));' "$work/local.dmg")"
+node --input-type=module -e 'import { unmountDiskImage } from "./scripts/verify-native-host-artifact.mjs";
+  unmountDiskImage(process.argv[1]);' "$mnt"
+test ! -e "$mnt"
 rm -rf "$work"
 ```
 
