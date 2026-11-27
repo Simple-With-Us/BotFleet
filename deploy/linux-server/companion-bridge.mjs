@@ -1214,8 +1214,8 @@ function bridgeBodyRefusal(body) {
  * @returns {{status: number, error: string}|null}
  */
 export function bridgeProfilePatchDenial(body) {
-  const shape = bridgeBodyShapeRefusal(body);
-  if (shape) return shape;
+  const refusal = bridgeBodyRefusal(body);
+  if (refusal) return refusal;
   const unsupported = Object.keys(body).find((field) => !BRIDGE_PROFILE_PATCH_FIELD_SET.has(field));
   return unsupported
     ? { status: 403, error: `${unsupported} can only be changed in BotFleet on your computer` }
