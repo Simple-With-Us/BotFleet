@@ -181,7 +181,7 @@ export async function startFakeOpenAiServer(): Promise<FakeOpenAiServer> {
 
         const script = completionQueue.shift();
         if (!script) {
-          res.writeHead(500, { "content-type": "application/json" });
+          res.writeHead(500, { ...CLOSE_CONNECTION, "content-type": "application/json" });
           res.end(JSON.stringify({ error: "fake-openai-server: no scripted response queued for this request" }));
           return;
         }
