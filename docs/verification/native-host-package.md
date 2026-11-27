@@ -154,6 +154,11 @@ mkdir "$work/mnt"
 hdiutil attach -readonly -nobrowse -mountpoint "$work/mnt" "$work/local.dmg"
 node scripts/verify-native-host-artifact.mjs payload "$work/mnt" \
   --source "$source" --build "$build" --unsigned-development
+# The verifier's own detach removes nothing while the image is on the mount point.
+node --input-type=module -e 'import { unmountDiskImage } from "./scripts/verify-native-host-artifact.mjs";
+  unmountDiskImage(process.argv[1], { detached: () => true });' "$work/mnt" && exit 1
+test -d "$work/mnt/bin"
+# After a detach, it removes the mount point with anything left inside it.
 hdiutil detach "$work/mnt"
 rm -rf "$work"
 ```
