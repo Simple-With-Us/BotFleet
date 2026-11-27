@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import CoreVideo
+import Combine
 import CompanionCore
 #if os(macOS)
 import AppKit
