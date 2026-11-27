@@ -856,6 +856,7 @@ final class Session: ObservableObject {
         }
         // back before the grace period ran out: keep the stream, drop the task
         endLinger()
+        readTheServersTokenAgain()
         guard client != nil else { return }
         if let existing = streamTask {
             if case .offline = status {
