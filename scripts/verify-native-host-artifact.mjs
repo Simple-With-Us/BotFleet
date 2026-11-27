@@ -104,6 +104,14 @@ export function unmountDiskImage(mountpoint, { detached = detachDiskImage, mount
 const detachDiskImage = (mountpoint) =>
   spawnSync("/usr/bin/hdiutil", ["detach", mountpoint], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).status === 0;
 
+// Remove a mount point, and only one the file system says has nothing mounted
+// on it:  a tree that may still be mounted is never removed.
+function removeMountPoint(path, mounted = isMountPoint) {
+  if (mounted(path)) return false;
+  rmSync(path, { recursive: true, force: true });
+  return true;
+}
+
 // Whether anything is mounted at a path.  A mounted volume sits on a device of
 // its own and an ordinary directory on the device of its parent;  a path that
 // is not there has nothing on it.
