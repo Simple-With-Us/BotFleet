@@ -579,7 +579,7 @@ function gateRequest({ port, headers = {}, path = "/api/thing", method = "GET", 
       },
     );
     req.on("error", reject);
-    req.end();
+    req.end(body);
   });
 }
 
