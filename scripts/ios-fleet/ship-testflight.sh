@@ -1523,8 +1523,24 @@ else
     log "version: fixed marketing version ${FIXED_MARKETING} from apps.json; it does not count up per ship"
     # A released App Store version closes its train:  a fixed version at or
     # below one is refused, never silently bumped.
-    _rel="$(asc_released_store_version "$ASC_PLATFORM")" \
-      || die "cannot read the released App Store version for ${BUNDLE_ID}, so fixedMarketingVersion ${FIXED_MARKETING} cannot be checked against a closed train.  Nothing was shipped or bumped."
+    _rel="$(asc_released_store_version "$ASC_PLATFORM")" || _rel_rc=$?
+    # Option A (owner, 2026-11): allow the first ship through when no prior
+    # App Store release exists. asc_released_store_version returns 0 with
+    # empty stdout when the app exists in ASC but has no released versions;
+    # a non-zero return with empty output means the store could not be
+    # consulted at all.  When the credential is reachable and the result is
+    # empty, treat it as "no prior release" and proceed with the fixed
+    # version instead of dying.  A genuine credential error still dies, and
+    # a non-empty result still triggers the version comparison below.
+    if [[ -z "$_rel" ]]; then
+      if asc_credential_available; then
+        log "version: no released App Store version for ${BUNDLE_ID}; allowing first fixedMarketingVersion ${FIXED_MARKETING} ship (Option A)"
+      else
+        die "cannot read the released App Store version for ${BUNDLE_ID}, so fixedMarketingVersion ${FIXED_MARKETING} cannot be checked against a closed train.  Nothing was shipped or bumped."
+      fi
+    elif [[ "${_rel_rc:-0}" -ne 0 ]]; then
+      die "cannot read the released App Store version for ${BUNDLE_ID}, so fixedMarketingVersion ${FIXED_MARKETING} cannot be checked against a closed train.  Nothing was shipped or bumped."
+    fi
     if [[ -n "$_rel" ]]; then
       if ! python3 -c 'import sys
 a=[int(x) for x in sys.argv[1].split(".")]; b=[int(x) for x in sys.argv[2].split(".")]
