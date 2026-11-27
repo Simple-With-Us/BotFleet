@@ -1323,6 +1323,9 @@ final class Session: ObservableObject {
     /// Takes the offer itself and not the session's copy of it, which the
     /// alert that asked clears as it closes.
     func pairWithOfferedServer(_ offer: PairingInvite) async {
+        // A tap on an offer a newer one replaced is ignored; the newer one is
+        // still offered.
+        guard offer == newestServerOffer else { return }
         if serverPairingOffer == offer { serverPairingOffer = nil }
         do {
             try await pair(
