@@ -299,6 +299,24 @@ jobs:
       # is DEFAULT_MIN_INTERVAL_SEC=3600 (1 hour) in the fleet script. The
       # 30-minute cron picks up an unbuilt merge on the next eligible hour;
       # same-HEAD ticks still exit 0 without shipping.
+      # BF-2707: the ASC query consumers resolve their credential from the
+      # store through the job-level binding.  When that binding is missing
+      # the pre-check (asc_credential_available) fails silently and the ship
+      # dies with a reason-less "cannot read the released App Store version"
+      # (run 45939409796).  Fail loudly here instead, before any build work.
+      - name: Fail fast without the store bootstrap
+        if: steps.gate.outputs.should_ship == '1'
+        run: |
+          if [ -z "${INFISICAL_TOKEN:-}" ]; then
+            echo "::error::ship job has no INFISICAL_TOKEN binding; the ASC query consumers cannot resolve their credential from the store (BF-2707)"
+            exit 1
+          fi
+          if [ -z "${INFISICAL_PROJECT_ID:-}" ]; then
+            echo "::error::ship job has no INFISICAL_PROJECT_ID binding (BF-2707)"
+            exit 1
+          fi
+          echo "store bootstrap binding present"
+
       - name: Ship BotFleet to TestFlight
         id: ship
         if: steps.gate.outputs.should_ship == '1'
