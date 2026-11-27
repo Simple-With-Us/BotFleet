@@ -188,6 +188,7 @@ targets:
     platform: macOS
     sources:
     - path: MacApp
+    - path: MacApp/Assets.xcassets
     - path: MacUpdater
     - path: Assets.xcassets
     dependencies:
@@ -221,6 +222,7 @@ targets:
         # (scripts/mac-package.sh, native-mac-release.yml).
         ENABLE_HARDENED_RUNTIME: YES
         ENABLE_ON_DEMAND_RESOURCES: false
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         COMBINE_HIDPI_IMAGES: YES
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
         INFOPLIST_KEY_CFBundleDisplayName: BotFleet

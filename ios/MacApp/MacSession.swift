@@ -241,6 +241,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     private var notificationAuthorizationTask: Task<Bool, Never>?
     #if os(macOS)
     private var voiceCaptureCoordinator: MacVoiceCaptureCoordinator?
+    private var settingsSceneOpener: (() -> Void)?
     #endif
 
     public init(
@@ -590,15 +591,70 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         }
     }
 
+    #if os(macOS)
+    /// Registers SwiftUI's `@Environment(\.openSettings)` action so every
+    /// programmatic Settings trigger opens the native macOS 14+ `Settings`
+    /// scene instead of relying on removed AppKit selectors.
+    public func registerSettingsSceneOpener(_ opener: @escaping () -> Void) {
+        settingsSceneOpener = opener
+    }
+    #endif
+
     /// Presents the app's Settings scene.
     public func presentSettingsScene() {
         #if os(macOS)
+        NSApp.activate(ignoringOtherApps: true)
+        if let opener = settingsSceneOpener {
+            opener()
+            Self.focusSettingsWindowIfPresent()
+            return
+        }
+        if Self.triggerMainMenuSettingsItem() {
+            Self.focusSettingsWindowIfPresent()
+            return
+        }
         let settingsSelector = NSSelectorFromString("showSettingsWindow:")
-        if NSApp.sendAction(settingsSelector, to: nil, from: nil) { return }
+        if NSApp.sendAction(settingsSelector, to: nil, from: nil) {
+            Self.focusSettingsWindowIfPresent()
+            return
+        }
         let preferencesSelector = NSSelectorFromString("showPreferencesWindow:")
-        NSApp.sendAction(preferencesSelector, to: nil, from: nil)
+        _ = NSApp.sendAction(preferencesSelector, to: nil, from: nil)
+        Self.focusSettingsWindowIfPresent()
         #endif
     }
+
+    #if os(macOS)
+    private static func triggerMainMenuSettingsItem() -> Bool {
+        guard let appMenu = NSApp.mainMenu?.items.first?.submenu else {
+            return false
+        }
+        let relevantModifiers: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
+        guard let index = appMenu.items.firstIndex(where: { item in
+            item.isEnabled
+                && item.keyEquivalent == ","
+                && item.keyEquivalentModifierMask.intersection(relevantModifiers) == .command
+        }) else {
+            return false
+        }
+        appMenu.performActionForItem(at: index)
+        return true
+    }
+
+    private static func focusSettingsWindowIfPresent() {
+        let focus = {
+            if let settingsWindow = NSApp.windows.first(where: { window in
+                let identifier = window.identifier?.rawValue ?? ""
+                return identifier == "com_apple_SwiftUI_Settings_window"
+                    || identifier.localizedCaseInsensitiveContains("settings")
+            }) {
+                settingsWindow.makeKeyAndOrderFront(nil)
+            }
+        }
+        focus()
+        DispatchQueue.main.async(execute: focus)
+    }
+    #endif
 
     /// Opens the app's Settings on the section that resolves a voice failure,
     /// and the system privacy pane when the failure needs one.
