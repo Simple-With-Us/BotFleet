@@ -777,6 +777,7 @@ final class Session: ObservableObject {
         // pairing the Mac has revoked, it is simply the first pairing.
         if invite.role == .bridge, connection != nil, status != .unauthorized {
             serverPairingOffer = invite
+            newestServerOffer = invite
             return
         }
         pairingInvite = CompanionPairingInvitePolicy.nextInvite(
