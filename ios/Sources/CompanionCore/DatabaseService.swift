@@ -746,6 +746,38 @@ public actor DatabaseService {
             sqlite3_bind_double(stmt, 3, before)
         }
 
+        return readMessageRows(stmt)
+    }
+
+    /// The newest `limit` messages of a thread, oldest first, and whether older
+    /// ones exist (`BF-2705`).  `loadMessages(forThread:limit:)` pages from the
+    /// start of a thread, so on a long thread it returns the oldest page and
+    /// drops the latest messages; a window opens on the end of a conversation.
+    public func loadRecentMessages(forThread threadId: String, limit: Int = 100) throws -> (messages: [MessageRecord], hasMore: Bool) {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let pageSize = min(max(limit, 0), Int(Int32.max) - 1)
+        let sql = "SELECT id, thread_id, role, kind, content, created_at, model, active_leaf_id, metadata_json FROM messages WHERE thread_id = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, (threadId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        // One row past the page says whether older messages exist.
+        sqlite3_bind_int(stmt, 2, Int32(pageSize + 1))
+
+        var newestFirst = readMessageRows(stmt)
+        let hasMore = newestFirst.count > pageSize
+        if hasMore { newestFirst.removeLast() }
+        return (Array(newestFirst.reversed()), hasMore)
+    }
+
+    /// Every row of a prepared `messages` SELECT whose columns are, in order,
+    /// id, thread_id, role, kind, content, created_at, model, active_leaf_id
+    /// and metadata_json.
+    private func readMessageRows(_ stmt: OpaquePointer?) -> [MessageRecord] {
         var results: [MessageRecord] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             let id = String(cString: sqlite3_column_text(stmt, 0))
