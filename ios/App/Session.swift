@@ -588,9 +588,9 @@ final class Session: ObservableObject {
             // New connections honor the desktop's transport policy.  Automatic
             // walking is credential-safe: protected routes stay protected, while
             // a legacy/local route is only tried when it was the exact saved route.
-            rotation = CandidateRotation(endpoints: saved.orderedEndpoints)
-            let first = rotation.currentEndpoint.map(saved.dialing) ?? saved
-            client = CompanionClient(connection: first, token: stored)
+            // The server's routes lead it when the Mac runs server-first.
+            adoptWalk()
+            if client == nil, let connection { client = CompanionClient(connection: connection, token: stored) }
             pairingGeneration += 1
             cancelPendingSettingsMutations()
             cachedInstances = []
