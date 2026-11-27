@@ -19,8 +19,11 @@ import Foundation
 /// misses parity after `maxUnverifiedRuns` launches (a bot made natively
 /// after a partial import keeps the counts apart for good) gets the marker
 /// anyway, recording the mismatches, so it does not repeat the whole copy on
-/// every launch.  A marker beside a native store that holds no bots is not
-/// trusted: the store was reset, so the import runs again.
+/// every launch.  The marker alone decides that the import is done, whatever
+/// the store holds afterwards: a user who deletes every bot must not see the
+/// legacy ones come back on the next launch.  The app never deletes
+/// `companion.sqlite` by itself, and resetting the native store means
+/// removing the `native` folder, which takes the marker with it.
 public struct NativeLegacyStoreImport: Sendable {
     /// What one call of `runIfNeeded` did.
     public enum Outcome: Equatable, Sendable {
@@ -119,17 +122,8 @@ public struct NativeLegacyStoreImport: Sendable {
     /// installed, the import already finished, or there is nothing to import.
     public func runIfNeeded(into database: DatabaseService) async -> Outcome {
         guard harnessIsGone() else { return .skipped(.harnessPresent) }
-        if FileManager.default.fileExists(atPath: markerURL.path) {
-            // A marker beside a store with no bots means the store was reset,
-            // so the import runs again.  When the store can't be read, the
-            // marker is trusted: an import into that store would fail too,
-            // and a passing lock should not cost a whole second copy.
-            do {
-                let bots = try await database.loadBots()
-                if !bots.isEmpty { return .skipped(.alreadyImported) }
-            } catch {
-                return .skipped(.alreadyImported)
-            }
+        guard !FileManager.default.fileExists(atPath: markerURL.path) else {
+            return .skipped(.alreadyImported)
         }
         guard FileManager.default.fileExists(
             atPath: sourceDirectory.appendingPathComponent("bots.json").path
@@ -174,11 +168,15 @@ public struct NativeLegacyStoreImport: Sendable {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(marker).write(to: markerURL, options: .atomic)
-            try? FileManager.default.removeItem(at: attemptsURL)
         } catch {
             // The rows are in.  Without a marker the next launch runs the
             // import again, which adds nothing because the importer is
             // idempotent, so this is not a failure of the import.
+        }
+        // A verified run starts the count over even when its marker could not
+        // be written, so a later unverified run is not sealed early.
+        if report.isParityVerified || FileManager.default.fileExists(atPath: markerURL.path) {
+            try? FileManager.default.removeItem(at: attemptsURL)
         }
         return outcome
     }

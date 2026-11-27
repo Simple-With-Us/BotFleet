@@ -44,8 +44,8 @@ struct NativeLegacyStoreImportTests {
         #expect(try await database.loadMessages(forThread: "thread-bot-1").count == 2)
     }
 
-    @Test("A marker beside a reset native store is not trusted, so the import runs again")
-    func markerBesideEmptyStoreReimports() async throws {
+    @Test("Once the marker is written, a store emptied of bots stays empty")
+    func deletedBotsStayDeleted() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanup() }
         try fixture.writeLegacyStore()
@@ -54,11 +54,12 @@ struct NativeLegacyStoreImportTests {
         _ = await importer.runIfNeeded(into: first)
         #expect(FileManager.default.fileExists(atPath: fixture.markerURL.path))
 
-        let reset = try DatabaseService(path: ":memory:")
-        let outcome = await importer.runIfNeeded(into: reset)
+        // A store with no bots, as after the user deletes every bot.
+        let emptied = try DatabaseService(path: ":memory:")
+        let outcome = await importer.runIfNeeded(into: emptied)
 
-        #expect(outcome == .imported(bots: 1, threads: 1, messages: 2, parityVerified: true))
-        #expect(try await reset.loadBots().map(\.id) == ["bot-1"])
+        #expect(outcome == .skipped(.alreadyImported))
+        #expect(try await emptied.loadBots().isEmpty)
     }
 
     @Test("Nothing is imported while a harness LaunchAgent is installed")
