@@ -1489,6 +1489,11 @@ final class Session: ObservableObject {
                     [route] + updated.syncEndpoints.filter { $0.url != route.url }
                 } ?? updated.syncEndpoints
                 self.rotation = CandidateRotation(endpoints: liveRoutes)
+                // While the phone follows the server, the Mac is asked once
+                // which placement it runs: the server's answer never says.
+                if let workingEndpoint, updated.isBridgeRoute(workingEndpoint) {
+                    self.askTheMacItsPlacement()
+                }
                 log.info("refreshed \(metadata.endpoints.count, privacy: .public) companion routes")
             } catch is CancellationError {
                 return
