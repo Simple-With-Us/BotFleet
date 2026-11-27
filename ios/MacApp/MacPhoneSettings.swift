@@ -327,6 +327,9 @@ private struct ServerPairingCard: View {
                     Button("Close Code") {
                         Task {
                             await backend.closePairingWindow()
+                            // The code stays on screen when the server did not
+                            // confirm the close, so the reason is what the tab shows.
+                            errorMessage = await backend.lastError?.errorDescription
                             await reload()
                         }
                     }
