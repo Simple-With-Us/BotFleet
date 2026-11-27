@@ -1637,7 +1637,8 @@ public actor NativeCompanionServer {
             device: device,
             serverName: advertisement.serverName,
             hosts: advertisement.hosts.isEmpty ? nil : advertisement.hosts,
-            endpoints: advertisement.endpoints.isEmpty ? nil : advertisement.endpoints
+            endpoints: advertisement.endpoints.isEmpty ? nil : advertisement.endpoints,
+            placement: appliedPlacement
         ))
     }
 
