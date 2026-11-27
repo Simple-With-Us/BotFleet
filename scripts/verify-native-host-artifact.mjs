@@ -86,12 +86,27 @@ function mountDiskImage(image) {
   return mountpoint;
 }
 
-// Detach, then remove the mount point, and only once the detach is confirmed:
-// a tree that may still be mounted is never removed.
-function unmountDiskImage(mountpoint) {
-  const detached = spawnSync("/usr/bin/hdiutil", ["detach", mountpoint], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-  if (detached.status !== 0) refuse("the disk image did not detach");
-  rmdirSync(mountpoint);
+// Detach, then remove the mount point, and only once the detach is confirmed
+// twice:  by hdiutil's exit status and by the file system.  A tree that may
+// still be mounted is never removed.  Once the path is back on its parent's
+// device nothing is mounted there, and what remains is a private directory
+// this script created, whatever was left inside it:  removing only an empty
+// directory let one stray entry fail a verification that had passed.
+export function unmountDiskImage(mountpoint, { detached = detachDiskImage, mounted = isMountPoint } = {}) {
+  if (!detached(mountpoint)) refuse("the disk image did not detach");
+  if (mounted(mountpoint)) refuse("the disk image is still mounted after the detach");
+  rmSync(mountpoint, { recursive: true, force: true });
+}
+
+const detachDiskImage = (mountpoint) =>
+  spawnSync("/usr/bin/hdiutil", ["detach", mountpoint], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).status === 0;
+
+// Whether anything is mounted at a path.  A mounted volume sits on a device of
+// its own and an ordinary directory on the device of its parent;  a path that
+// is not there has nothing on it.
+function isMountPoint(path) {
+  const own = statSync(path, { throwIfNoEntry: false });
+  return own !== undefined && own.dev !== statSync(dirname(path)).dev;
 }
 
 /**
