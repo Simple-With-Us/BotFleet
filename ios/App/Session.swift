@@ -1383,8 +1383,11 @@ final class Session: ObservableObject {
         }
     }
 
-    private func heardTheMacsPlacement(_ metadata: CompanionConnectionMetadata) {
-        guard var updated = connection, let placement = metadata.placement,
+    private func heardTheMacsPlacement(_ metadata: CompanionConnectionMetadata, askedFor: String) {
+        // The pairing can change while the Mac answers. An answer about
+        // another pairing is dropped, and so is one that says what is already
+        // known, so nothing moves unless the mode did.
+        guard var updated = connection, updated.id == askedFor, let placement = metadata.placement,
               placement != updated.placement else { return }
         let followed = updated.prefersBridge
         updated.reconcile(metadata)
