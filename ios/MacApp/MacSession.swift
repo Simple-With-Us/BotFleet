@@ -606,12 +606,40 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         NSApp.activate(ignoringOtherApps: true)
         if let opener = settingsSceneOpener {
             opener()
-            if NSApp.windows.contains(where: { $0.identifier?.rawValue == "com_apple_SwiftUI_Settings_window" }) {
+            if Self.settingsWindowIsPresent {
                 Self.focusSettingsWindowIfPresent()
                 return
             }
-            settingsSceneOpener = nil
+            // SwiftUI presents the Settings scene asynchronously, so a
+            // window missing in this same runloop turn may still be on its
+            // way.  Verify on the next main-queue turn; only discard the
+            // opener and fall through to the AppKit fallbacks if the window
+            // is still absent then.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if Self.settingsWindowIsPresent {
+                    Self.focusSettingsWindowIfPresent()
+                } else {
+                    self.settingsSceneOpener = nil
+                    self.presentSettingsViaAppKitFallbacks()
+                }
+            }
+            return
         }
+        presentSettingsViaAppKitFallbacks()
+        #endif
+    }
+
+    #if os(macOS)
+    private static var settingsWindowIsPresent: Bool {
+        NSApp.windows.contains { $0.identifier?.rawValue == "com_apple_SwiftUI_Settings_window" }
+    }
+
+    /// The AppKit fallback chain for presenting Settings when no SwiftUI
+    /// scene opener produced a window: the main-menu Settings item first,
+    /// then the legacy `showSettingsWindow:` / `showPreferencesWindow:`
+    /// selectors.
+    private func presentSettingsViaAppKitFallbacks() {
         if Self.triggerMainMenuSettingsItem() {
             Self.focusSettingsWindowIfPresent()
             return
@@ -624,8 +652,8 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         let preferencesSelector = NSSelectorFromString("showPreferencesWindow:")
         _ = NSApp.sendAction(preferencesSelector, to: nil, from: nil)
         Self.focusSettingsWindowIfPresent()
-        #endif
     }
+    #endif
 
     #if os(macOS)
     private static func triggerMainMenuSettingsItem() -> Bool {
