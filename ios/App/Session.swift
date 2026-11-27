@@ -1379,7 +1379,7 @@ final class Session: ObservableObject {
         placementProbe?.cancel()
         placementProbe = Task { [weak self] in
             guard let metadata = try? await asking.connectionMetadata() else { return }
-            self?.heardTheMacsPlacement(metadata)
+            self?.heardTheMacsPlacement(metadata, askedFor: askedFor)
         }
     }
 
