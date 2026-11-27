@@ -673,6 +673,14 @@ final class Session: ObservableObject {
             stored.hosts = Array(stored.orderedHosts.prefix(8))
         }
 
+        // A code the server opened pairs this phone with the server beside
+        // the Mac it is already paired with. The Mac's pairing stays.
+        if role == .bridge, self.connection != nil {
+            stored.bridge = nil
+            try adoptServerPairing(stored, token: paired.token)
+            return
+        }
+
         try Keychain.save(paired.token, for: stored.id)
         // Write the first-pair education marker before making the connection
         // restorable. If the process stops between these writes, an orphan
