@@ -338,5 +338,11 @@ private actor ServerBridgePairingRegistry {
         backends.values.filter { !hostIDs.contains($0.host.id) }.map(\.backend).forEach(forget)
         backends = backends.filter { hostIDs.contains($0.key) }
     }
+
+    /// A forgotten backend's window is closed off this actor: the server may
+    /// take a while to answer, and a lookup must not wait behind it.
+    private func forget(_ backend: ServerBridgePairingBackend) {
+        Task.detached(priority: .utility) { await backend.closeRememberedWindow() }
+    }
 }
 #endif
