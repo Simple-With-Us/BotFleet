@@ -983,7 +983,8 @@ public actor NativeCompanionServer {
         return CompanionEndpointAdvertisement(
             serverName: String(raw.serverName.prefix(maxAdvertisedServerNameLength)),
             hosts: Array(hosts.prefix(maxAdvertisedEndpoints)),
-            endpoints: Array(endpoints.prefix(maxAdvertisedEndpoints))
+            endpoints: Array(endpoints.prefix(maxAdvertisedEndpoints)),
+            isBridge: raw.isBridge
         )
     }
 
