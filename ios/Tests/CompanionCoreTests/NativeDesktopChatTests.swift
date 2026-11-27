@@ -54,9 +54,9 @@ struct NativeDesktopChatTests {
         #expect(start.nativeBots == ["bot-a"])
         #expect(start.cutoverSkipped.isEmpty)
         #expect(start.snapshot.fleet.bots.map(\.id).sorted() == ["bot-a", "bot-b"])
-        #expect(await fixture.engineSwitch.owner(for: "bot-a") == .nativeSwift)
+        #expect(await fixture.owner("bot-a") == .nativeSwift)
         // A stored bot that did not register is never moved.
-        #expect(await fixture.engineSwitch.owner(for: "bot-b") == .nodeHarness)
+        #expect(await fixture.owner("bot-b") == .nodeHarness)
     }
 
     @Test("A registered bot whose thread is missing stays fenced and is named")
@@ -72,7 +72,7 @@ struct NativeDesktopChatTests {
         #expect(start.cutoverSkipped == [
             NativeDesktopCutoverSkip(botId: "bot-b", reason: "its thread is not in the native store"),
         ])
-        #expect(await fixture.engineSwitch.owner(for: "bot-b") == .nodeHarness)
+        #expect(await fixture.owner("bot-b") == .nodeHarness)
     }
 
     @Test("A report naming a bot with no profile leaves it fenced")
@@ -84,7 +84,7 @@ struct NativeDesktopChatTests {
 
         #expect(start.nativeBots.isEmpty)
         #expect(start.cutoverSkipped.map(\.botId) == ["bot-a"])
-        #expect(await fixture.engineSwitch.owner(for: "bot-a") == .nodeHarness)
+        #expect(await fixture.owner("bot-a") == .nodeHarness)
     }
 
     @Test("Starting twice keeps a moved bot on the native runtime")
@@ -154,7 +154,9 @@ struct NativeDesktopChatTests {
         let runtime: NativeMacCompanionRuntime
         let engine: ChatFixtureEngine
 
-        var engineSwitch: BotNativeEngineSwitchActor { runtime.runtime.engineSwitch }
+        func owner(_ botId: String) async -> BotRuntimeOwner {
+            await runtime.runtime.engineSwitch.owner(for: botId)
+        }
 
         func register(_ botId: String, thread threadId: String) async throws {
             try await runtime.registerBot(
@@ -164,8 +166,11 @@ struct NativeDesktopChatTests {
         }
 
         func chat(registered: [String]) -> NativeDesktopChat {
-            var report = MacBotRegistrationReport()
-            report.registered = registered
+            let report: MacBotRegistrationReport = {
+                var report = MacBotRegistrationReport()
+                report.registered = registered
+                return report
+            }()
             return NativeDesktopChat(database: database, runtime: runtime, registration: { report })
         }
 
