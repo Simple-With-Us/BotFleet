@@ -526,7 +526,7 @@ final class Session: ObservableObject {
             let serverId = saved.connection.bridgeConnection?.id
             let reads = await Task.detached(priority: .userInitiated) { () -> (CompanionLaunchTokenRead, CompanionLaunchTokenRead) in
                 assert(!Thread.isMainThread)
-                return Self.readLaunchToken(connectionId)
+                return (Self.readLaunchToken(connectionId), serverId.map { Self.readLaunchToken($0) } ?? .missing)
             }.value
         } else {
             tokenRead = .missing
