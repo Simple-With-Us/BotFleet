@@ -38,6 +38,7 @@ The harness binds loopback and treats every loopback caller as the owner.  That 
 - `tailscale serve` is tailnet only.  Never enable Funnel: Funnel is public and adds no identity header, which would leave the gate with no owner check at all.
 - No port is exposed to the public internet, and nothing listens on a routable address.
 - The unit templates configure ordinary root paths read-only and put application data and literal temporary paths on the volume.  `/run`, `/dev/shm` and live namespace behavior still need recipe 12's write attempts; configuration text alone proves no isolation.  Private volume propagation keeps the volume busy until both services stop.
+- The companion bridge is one more hop behind the same gate: when Infisical names the bridge's advertised origin, the gate answers five paths under `/api/companion/bridge/` by passing them to the bridge on loopback, with the owner credential and nothing else about the caller.
 - Any local process on the host can still reach `127.0.0.1:8799` directly, the same as on the Mac today.  Only trusted users should have shell access on the host, and every bot shell runs as the service user.
 
 ## Where The Configuration Lives
