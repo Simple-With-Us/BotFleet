@@ -544,7 +544,8 @@ final class Session: ObservableObject {
             )
         }
         applyLaunchDecision(
-            CompanionLaunchRestore.decide(saved: saved?.connection, token: tokenRead)
+            CompanionLaunchRestore.decide(saved: saved?.connection, token: tokenRead),
+            serverToken: serverTokenRead
         )
     }
 
