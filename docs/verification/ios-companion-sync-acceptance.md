@@ -70,7 +70,8 @@ What the phone does with all of this is Slot 3, and it is not claimed here.
 
 Prerequisites, all owner-side:
 
-- A named TestFlight build of the iOS companion (bundle `app.botfleet.ios`).  The latest BotFleet planner failed before upload, so no current build is claimed here; the exact build number is recorded at run time, never assumed.
+- A named TestFlight build of the iOS companion (bundle `app.botfleet.ios`).  TestFlight `202611270252` shipped from the hosted run on 2026-11-27 and carries the pairing contract the bridge serves; the build number is recorded at run time, never assumed.
+- A way to open a pairing window on the server.  No app opens one today, and a code lives 300 seconds, so for now a seat opens the window at the moment of the run; BF-2713 gives the Mac app that screen, and until it ships the QR half of P1 waits on it.
 - A physical iPhone paired with the **server** bridge (not the Mac), with the Mac asleep for the server-first rows.
 - The scoped APNs grant for the Linux sender, by name only: `APNS_KEY_P8`, `APNS_KEY_ID`, and `APNS_TEAM_ID` (or a per-key `AUTHKEY_<key id>`).  Values are never written in this checklist, in Linear, or in chat.
 
