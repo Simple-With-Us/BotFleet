@@ -986,3 +986,10 @@ test("bridgeUpstreamHeaders keeps only what the bridge needs for its own owner d
     {
       host: "box.tailnet.ts.net:8799",
       accept: "application/json",
+      "content-type": "application/json",
+      "content-length": "17",
+      "x-botfleet-gate-token": DESKTOP_TOKEN,
+      "tailscale-user-login": OWNER,
+      "tailscale-user-name": "Owner",
+      origin: PUBLIC_ORIGIN,
+      referer: `${PUBLIC_ORIGIN}/`,
