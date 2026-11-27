@@ -43,7 +43,7 @@ function lint(file) {
     if (result.error?.code === "ETIMEDOUT") return { status: null, output: "oxlint did not finish within a minute." };
     return { status: result.status, output: `${result.stdout}${result.stderr}` };
   }
-  return { status: null, output: "oxlint was not found" };
+  return { status: null, output: "oxlint was not found." };
 }
 
 test("a Node script that calls a name it never defines is refused, and one that defines it is not", () => {
