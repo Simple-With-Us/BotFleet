@@ -911,7 +911,14 @@ asc_released_store_version() {
   # Not load_secrets: both helpers run inside command substitutions, where a
   # secrets temp dir and its EXIT trap die with the subshell and leave the
   # key behind.  asc-api.mjs resolves its own credential.
-  asc_credential_available || return 1
+  # A silent return 1 here is what made run 45939409796 die with a
+  # reason-less "cannot read the released App Store version": the caller
+  # only sees the rc.  Name the sources that were checked before giving up
+  # (BF-2707), so a missing binding is diagnosable from the log alone.
+  if ! asc_credential_available; then
+    logerr "asc-released: no ASC credential source is reachable for the version queries (no INFISICAL_TOKEN binding, no FLEET_INFISICAL_READER, no Mac scoped reader); bind the store bootstrap on this job (BF-2707)"
+    return 1
+  fi
   # Keep the client's stderr: it carries the reason (HTTP status, unknown
   # state).  Only the labelled lines are logged, never key material, and an
   # auth failure keeps its own status 4.
