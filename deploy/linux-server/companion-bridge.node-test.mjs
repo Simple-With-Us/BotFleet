@@ -1389,3 +1389,40 @@ test("a retried pairing is refused by name and never answers a body the app woul
   assert.equal("device" in BRIDGE_PAIR_REPLAY_REFUSAL, false);
   assert.equal("serverName" in BRIDGE_PAIR_REPLAY_REFUSAL, false);
 });
+
+test("a device name loses every Unicode line terminator, not only the C0 controls", () => {
+  // NEL, LINE SEPARATOR and PARAGRAPH SEPARATOR each end a line for a parser
+  // that reads the device list, so none may survive inside a name.
+  assert.equal(bridgeCleanDeviceName("Ping\u0085Pong"), "Ping Pong");
+  assert.equal(bridgeCleanDeviceName("Ping\u2028Pong"), "Ping Pong");
+  assert.equal(bridgeCleanDeviceName("Ping\u2029Pong"), "Ping Pong");
+  // The rest of the C1 block is control characters too.
+  assert.equal(bridgeCleanDeviceName("Ping\u009fPong"), "Ping Pong");
+  assert.equal(bridgeCleanDeviceName("Ping\u0007Pong"), "Ping Pong");
+  assert.equal(bridgeCleanDeviceName("Plain name"), "Plain name");
+});
+
+test("a link-local host is an IPv6 address and carries a colon; a name that merely starts fe8 is a host", () => {
+  assert.equal(bridgeCleanOrigin("https://feat.example.com"), "https://feat.example.com");
+  assert.equal(bridgeCleanOrigin("https://fear.example.com:8443"), "https://fear.example.com:8443");
+  assert.equal(bridgeCleanOrigin("https://[fe80::1]"), "");
+  assert.equal(bridgeCleanOrigin("https://[fe80::1%en0]:8443"), "");
+  assert.equal(bridgeCleanOrigin("https://[febf::1]"), "");
+  assert.equal(bridgeCleanOrigin("http://[::1]"), "");
+  assert.equal(bridgeCleanOrigin("http://169.254.1.1"), "");
+});
+
+test("a withheld key spelled with escapes is withheld too", () => {
+  // `\u0073shAlias` decodes to sshAlias downstream while naming none of the
+  // withheld keys literally, so the fast path may not pass it on.
+  assert.equal(bridgeScrubWireJson('{"\\u0073shAlias":"edge","ok":1}'), '{"ok":1}');
+  assert.equal(
+    bridgeScrubWireJson('{"vps":{"configured":true,"ssh\\u0041lias":"edge"}}'),
+    '{"vps":{"configured":true}}',
+  );
+  // A payload with no withheld key and no escape is still the same string.
+  const plain = '{"ok":1,"n":1.50}';
+  assert.equal(bridgeScrubWireJson(plain), plain);
+  // Escapes that name no withheld key keep their meaning.
+  assert.deepEqual(JSON.parse(bridgeScrubWireJson('{"text":"\\u001b[0m"}')), { text: "\u001b[0m" });
+});
