@@ -269,7 +269,7 @@ struct MacPhoneSettings: View {
     /// fetches, toggles, and Refresh never stall interaction. The context
     /// is created per render because the shared one lives on the MainActor;
     /// renders happen once per pairing window, so setup cost is negligible.
-    private nonisolated static func makeQRImage(from string: String) -> NSImage? {
+    nonisolated static func makeQRImage(from string: String) -> NSImage? {
         #if canImport(CoreImage.CIFilterBuiltins)
         let context = CIContext()
         let filter = CIFilter.qrCodeGenerator()
