@@ -408,6 +408,48 @@ export function downstreamHeaders(headers) {
 }
 
 /**
+ * The bridge path one gate path stands for.  `undefined` when the path is not
+ * under the bridge prefix, `null` when it is under the prefix and is not one
+ * of the five the gate answers.  The bridge has other owner-only routes; a
+ * request for them through this prefix is refused here and never reaches it.
+ *
+ * @param {string|undefined} method
+ * @param {string} path
+ * @returns {string|null|undefined}
+ */
+export function bridgeAdminTarget(method, path) {
+  const route = String(path ?? '');
+  if (!route.startsWith(BRIDGE_ADMIN_PREFIX)) return undefined;
+  const rest = route.slice(BRIDGE_ADMIN_PREFIX.length);
+  const verb = String(method ?? '').toUpperCase();
+  if (verb === 'GET' && rest === 'endpoints') return '/api/companion/endpoints';
+  if (verb === 'POST' && rest === 'pairing/open') return '/api/companion/pairing/open';
+  if (verb === 'POST' && rest === 'pairing/close') return '/api/companion/pairing/close';
+  if (verb === 'GET' && rest === 'devices') return '/api/companion/devices';
+  if (verb === 'DELETE' && rest.startsWith('devices/') && BRIDGE_DEVICE_ID.test(rest.slice('devices/'.length))) {
+    return `/api/companion/${rest}`;
+  }
+  return null;
+}
+
+/**
+ * The header set sent to the bridge: a loopback Host and only what the bridge
+ * needs to reach the same owner decision the gate reached.
+ *
+ * @param {Record<string, string|string[]|undefined>|undefined} headers
+ * @param {number|string} bridgePort
+ * @returns {Record<string, string>}
+ */
+export function bridgeUpstreamHeaders(headers, bridgePort) {
+  const out = { host: `127.0.0.1:${bridgePort}` };
+  for (const name of BRIDGE_FORWARDED_HEADERS) {
+    const value = headerValue(headers, name);
+    if (value !== undefined) out[name] = value;
+  }
+  return out;
+}
+
+/**
  * Parse the path out of a request URL.
  *
  * @param {string|undefined} url
