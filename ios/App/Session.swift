@@ -639,7 +639,8 @@ final class Session: ObservableObject {
         with connection: Connection,
         credential: String,
         deviceName: String,
-        pairRequestId: String
+        pairRequestId: String,
+        role: PairingInvite.Role = .computer
     ) async throws {
         cancelLaunchRestore()
         var invited = connection
