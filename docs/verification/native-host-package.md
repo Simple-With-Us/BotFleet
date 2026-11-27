@@ -159,8 +159,8 @@ node scripts/verify-native-host-artifact.mjs payload "$mnt" \
   --source "$source" --build "$build" --unsigned-development
 # While the image is on it, the verifier's own detach removes nothing.
 node --input-type=module -e 'import { unmountDiskImage } from "./scripts/verify-native-host-artifact.mjs";
-  unmountDiskImage(process.argv[1], { detached: () => true });' "$work/mnt" && exit 1
-test -d "$work/mnt/bin"
+  unmountDiskImage(process.argv[1], { detached: () => true });' "$mnt" && exit 1
+test -d "$mnt/bin"
 # After a detach, it removes the mount point with anything left inside it.
 hdiutil detach "$work/mnt"
 touch "$work/mnt/left-behind"
