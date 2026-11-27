@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { hostArtifactName, sha256 } from "./native-host-artifact.mjs";
 import { build, identity, source, thin, universal } from "./native-host-macho.fixture.mjs";
-import { readHostReceipt, unmountDiskImage, verifyHostPayload, verifyHostRelease } from "./verify-native-host-artifact.mjs";
+import { mountDiskImage, readHostReceipt, unmountDiskImage, verifyHostPayload, verifyHostRelease } from "./verify-native-host-artifact.mjs";
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "verify-native-host-artifact.mjs");
 const REFUSAL = /Native host artifact verification refused/;
