@@ -845,6 +845,27 @@ struct ConnectionSecurityView: View {
                     }
                 }
 
+                Section("Server") {
+                    if let server = connection.bridgeConnection {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(server.name)
+                                .font(.headline)
+                            Text(connection.prefersBridge
+                                 ? "This iPhone follows the server and falls back to \(connection.name) when the server does not answer."
+                                 : "Paired, and waiting: \(connection.name) is not running server-first.")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        Button("Remove server pairing from this iPhone", role: .destructive) {
+                            confirmingServerRemoval = true
+                        }
+                    } else {
+                        Text("Pair with the server too, from BotFleet → Settings → Phone on the Mac.\u{00A0} This iPhone then follows it whenever \(connection.name) runs server-first.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 Section("Troubleshooting") {
                     Text(troubleshootingText)
                         .font(.subheadline)
