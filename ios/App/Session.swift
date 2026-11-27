@@ -1313,6 +1313,7 @@ final class Session: ObservableObject {
         // when the Mac runs server-first. A stream that moves to the server
         // cannot resume the Mac's cursor: that costs one hydrate, as a
         // restart does.
+        newestServerOffer = nil
         adoptWalk()
         restartStream()
         connect()
