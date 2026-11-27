@@ -1581,6 +1581,17 @@ async function handleLocalRoute({
 const MAX_BRIDGE_JSON_BODY_BYTES = 32 * 1024 * 1024;
 
 /**
+ * How many JSON answers one bridge holds whole at the same time. Each is
+ * held up to MAX_BRIDGE_JSON_BODY_BYTES before any of it is forwarded, so
+ * without a ceiling a burst of large answers would multiply that much memory
+ * and hold back every first byte behind it. A phone makes a handful of calls
+ * at a time, so the ceiling costs nothing ordinary. The answer that finds no
+ * room is refused at once, with a retry hint, instead of queued behind the
+ * others.
+ */
+const MAX_BRIDGE_JSON_SCRUBS = 2;
+
+/**
  * The transform one event-stream response passes through on its way to the
  * phone.  Bytes are decoded as UTF-8 across chunk boundaries, so a character
  * split between two chunks is not corrupted, and each chunk is handed to the
