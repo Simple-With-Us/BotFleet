@@ -1389,7 +1389,15 @@ final class Session: ObservableObject {
                       var updated = self.connection
                 else { return }
 
-                updated.reconcile(metadata)
+                // The answer belongs to the pairing that gave it: the Mac
+                // says its placement and its routes, the server its routes.
+                if let server = updated.bridgeConnection, server.id == sourceClient.connection.id {
+                    var refreshed = server
+                    refreshed.reconcile(metadata)
+                    updated.bridgeConnection = refreshed
+                } else {
+                    updated.reconcile(metadata)
+                }
                 self.connection = updated
                 CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
 
