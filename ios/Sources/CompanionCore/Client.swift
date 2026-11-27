@@ -298,6 +298,10 @@ public struct PairingInvite: Equatable, Sendable {
             connection.endpoints = endpoints
             connection = connection.dialing(endpoints[0])
         }
+        // Absent is a computer. Anything present but the one word the Mac
+        // app writes for the server rejects the invite, as a bad route list
+        // does, rather than guessing who it pairs with.
+        if let role = values["role"], role != "bridge" { return nil }
         connection.establishRoutePolicyFromInvite()
         return PairingInvite(connection: connection, credential: credential)
     }
