@@ -1629,6 +1629,7 @@ public actor NativeCompanionServer {
             let serverName: String
             let hosts: [String]?
             let endpoints: [CompanionEndpoint]?
+            let placement: NativePlacementMode?
         }
         let advertisement = endpointAdvertisement
         return .json(200, PairEnvelope(
