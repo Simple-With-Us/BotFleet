@@ -17,7 +17,13 @@ name: iOS TestFlight ship (GitHub-hosted macOS)
 #   without them), plus SENTRY_DSN and SENTRY_AUTH_TOKEN (best-effort, with
 #   a synced GitHub secret as GH_FALLBACK_*; an inert Sentry beats a red ship).
 # scripts/ios-appstore-gm-prepare.sh checks the five signing names and imports
-# the Distribution identity;  the ship step reads the APPLE_API_* names directly.
+# the Distribution identity for the Apple tools.  The ASC API queries
+# (asc-api.mjs: version plan, build floors, standing testers, TF readiness)
+# do NOT read those exported names -- the environment is not a credential
+# source (owner ruling Nov 22, 2026) -- so the ship job itself binds the same
+# two-name bootstrap binding as the plan job (BF-2707, following #2230/#2223):
+# INFISICAL_TOKEN + INFISICAL_PROJECT_ID at job env, and the credential
+# arrives as a short-lived in-memory store read, never a stored copy.
 # Hosted ships use MANUAL Release signing: scripts/ios-install-appstore-profiles.sh
 # reuses or creates IOS_APP_STORE profiles over the App Store Connect API
 # (asc-api.mjs ensure-appstore-profiles), installs them, and archives with the
@@ -148,6 +154,17 @@ jobs:
       sentry_receipt_error: ${{ steps.post_sync_tf.outputs.sentry_receipt_error }}
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+      # BF-2707: the ASC query consumers in this job resolve their credential
+      # from the store, not from the exported APPLE_API_* names (asc-api.mjs
+      # ignores env copies per the owner ruling of Nov 22, 2026).  Bind the
+      # same read-only service token the plan job and the infisical-secrets
+      # action use, at job level so every step here inherits it.  Without
+      # this, asc_credential_available fails silently and the version plan
+      # dies with "cannot read the released App Store version" (run
+      # 45939409796).  Bootstrap binding, not a value copy: the token reaches
+      # Infisical, the VALUE comes back in-memory (INFISICAL.md).
+      INFISICAL_TOKEN: ${{ secrets.INFISICAL_IOS_SHIP_READ_TOKEN }}
+      INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
     steps:
       # fetch-depth: 0 is load-bearing, not hygiene. The default depth-1
       # checkout leaves the runner workspace with exactly ONE commit, so
@@ -282,6 +299,24 @@ jobs:
       # is DEFAULT_MIN_INTERVAL_SEC=3600 (1 hour) in the fleet script. The
       # 30-minute cron picks up an unbuilt merge on the next eligible hour;
       # same-HEAD ticks still exit 0 without shipping.
+      # BF-2707: the ASC query consumers resolve their credential from the
+      # store through the job-level binding.  When that binding is missing
+      # the pre-check (asc_credential_available) fails silently and the ship
+      # dies with a reason-less "cannot read the released App Store version"
+      # (run 45939409796).  Fail loudly here instead, before any build work.
+      - name: Fail fast without the store bootstrap
+        if: steps.gate.outputs.should_ship == '1'
+        run: |
+          if [ -z "${INFISICAL_TOKEN:-}" ]; then
+            echo "::error::ship job has no INFISICAL_TOKEN binding; the ASC query consumers cannot resolve their credential from the store (BF-2707)"
+            exit 1
+          fi
+          if [ -z "${INFISICAL_PROJECT_ID:-}" ]; then
+            echo "::error::ship job has no INFISICAL_PROJECT_ID binding (BF-2707)"
+            exit 1
+          fi
+          echo "store bootstrap binding present"
+
       - name: Ship BotFleet to TestFlight
         id: ship
         if: steps.gate.outputs.should_ship == '1'
