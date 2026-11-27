@@ -116,8 +116,16 @@ const detachDiskImage = (mountpoint) =>
 // temporary directory once written out in full, which a link placed there
 // under that name is not.
 function removeMountPoint(path, mounted = isMountPoint) {
-  if (mounted(path)) return false;
-  rmSync(path, { recursive: true, force: true });
+  const temporary = realpathSync(tmpdir());
+  const given = String(path ?? "");
+  const foreign = () => refuse("the mount point is not a directory this script made");
+  if (!basename(given).startsWith(MOUNT_PREFIX) || ![tmpdir(), temporary].includes(dirname(given))) foreign();
+  let real;
+  try { real = realpathSync(given); }
+  catch { return true; } // Already gone: nothing to remove.
+  if (dirname(real) !== temporary || !basename(real).startsWith(MOUNT_PREFIX)) foreign();
+  if (mounted(real)) return false;
+  rmSync(real, { recursive: true, force: true });
   return true;
 }
 
