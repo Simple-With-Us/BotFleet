@@ -807,6 +807,7 @@ final class Session: ObservableObject {
         if let id = connection?.id { Keychain.remove(id) }
         if let server = connection?.bridgeConnection { Keychain.remove(server.id) }
         bridgeToken = nil
+        serverTokenUnread = false
         serverPairingOffer = nil
         CompanionConnectionStore.saveConnectionData(nil)
         UserDefaults.standard.removeObject(
