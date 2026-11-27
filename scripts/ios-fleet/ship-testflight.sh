@@ -1527,19 +1527,15 @@ else
     # Option A (owner, 2026-11): allow the first ship through when no prior
     # App Store release exists. asc_released_store_version returns 0 with
     # empty stdout when the app exists in ASC but has no released versions;
-    # a non-zero return with empty output means the store could not be
-    # consulted at all.  When the credential is reachable and the result is
-    # empty, treat it as "no prior release" and proceed with the fixed
-    # version instead of dying.  A genuine credential error still dies, and
-    # a non-empty result still triggers the version comparison below.
-    if [[ -z "$_rel" ]]; then
-      if asc_credential_available; then
-        log "version: no released App Store version for ${BUNDLE_ID}; allowing first fixedMarketingVersion ${FIXED_MARKETING} ship (Option A)"
-      else
-        die "cannot read the released App Store version for ${BUNDLE_ID}, so fixedMarketingVersion ${FIXED_MARKETING} cannot be checked against a closed train.  Nothing was shipped or bumped."
-      fi
-    elif [[ "${_rel_rc:-0}" -ne 0 ]]; then
+    # a non-zero return means the store could not be consulted at all
+    # (auth, network, or client error) and fails closed here, even when a
+    # credential source is locally reachable: only an empty result with a
+    # zero return is "no prior release".  A non-empty result still triggers
+    # the version comparison below.
+    if [[ "${_rel_rc:-0}" -ne 0 ]]; then
       die "cannot read the released App Store version for ${BUNDLE_ID}, so fixedMarketingVersion ${FIXED_MARKETING} cannot be checked against a closed train.  Nothing was shipped or bumped."
+    elif [[ -z "$_rel" ]]; then
+      log "version: no released App Store version for ${BUNDLE_ID}; allowing first fixedMarketingVersion ${FIXED_MARKETING} ship (Option A)"
     fi
     if [[ -n "$_rel" ]]; then
       if ! python3 -c 'import sys
