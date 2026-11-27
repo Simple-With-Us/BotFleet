@@ -784,6 +784,7 @@ struct ConnectionSecurityView: View {
     @State private var showingFullAddress = false
     @State private var copiedAddress = false
     @State private var refreshing = false
+    @State private var confirmingServerRemoval = false
 
     var body: some View {
         Form {
