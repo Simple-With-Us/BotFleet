@@ -107,7 +107,7 @@ export function matchCursorAcpModel(
 }
 
 export const STATIC_CURSOR_MODELS: ModelCatalog = {
-  default: "auto",
+  default: "composer-2.5",
   options: [
     { id: "auto", label: "Auto" },
     { id: "composer-2.5", label: "Composer 2.5" },
