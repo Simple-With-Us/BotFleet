@@ -802,7 +802,7 @@ export function parseArgs(argv) {
  * gate keeps only that fact; the bridge reads the origin itself.
  *
  * @param {Record<string, string>|undefined} secrets
- * @returns {{owners: Set<string>, publicOrigin: string, tokenSha256: string|null}}
+ * @returns {{owners: Set<string>, publicOrigin: string, tokenSha256: string|null, bridgeEnabled: boolean}}
  */
 export function gateConfigFromSecrets(secrets) {
   const ownerLogins = isText(secrets?.BOTFLEET_OWNER_LOGINS) ? secrets.BOTFLEET_OWNER_LOGINS : '';
