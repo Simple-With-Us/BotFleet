@@ -107,6 +107,43 @@ struct NativeLegacyStoreImportTests {
         #expect(second == .imported(bots: 1, threads: 1, messages: 2, parityVerified: true))
     }
 
+    @Test("A source that never reaches parity is retried for a few launches, then sealed")
+    func unverifiedImportStopsRetrying() async throws {
+        let seed = try Fixture()
+        let fixture = try Fixture()
+        defer {
+            seed.cleanup()
+            fixture.cleanup()
+        }
+        try seed.writeLegacyStore()
+        try fixture.writeLegacyStore(botId: "bot-2")
+        let database = try DatabaseService(path: ":memory:")
+        // A bot the second source doesn't hold keeps the counts apart on every run.
+        _ = await seed.importer(harnessIsGone: true).runIfNeeded(into: database)
+        let importer = fixture.importer(harnessIsGone: true)
+
+        for run in 1...NativeLegacyStoreImport.maxUnverifiedRuns {
+            let outcome = await importer.runIfNeeded(into: database)
+            guard case .imported(_, _, _, let parityVerified) = outcome else {
+                Issue.record("run \(run): expected an import, got \(outcome)")
+                return
+            }
+            #expect(!parityVerified)
+            let sealed = FileManager.default.fileExists(atPath: fixture.markerURL.path)
+            #expect(sealed == (run == NativeLegacyStoreImport.maxUnverifiedRuns))
+        }
+
+        let marker = try JSONDecoder().decode(
+            NativeLegacyStoreImport.Marker.self,
+            from: Data(contentsOf: fixture.markerURL)
+        )
+        #expect(!marker.parityVerified)
+        #expect(!marker.mismatches.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: importer.attemptsURL.path))
+        let after = await importer.runIfNeeded(into: database)
+        #expect(after == .skipped(.alreadyImported))
+    }
+
     @Test("The Mac app's import reads the data directory and checks every harness plist")
     func macDataDirectoryWiring() async throws {
         let fixture = try Fixture()
@@ -175,13 +212,13 @@ struct NativeLegacyStoreImportTests {
 
         /// One bot with its thread in `bots.json` and two messages on that
         /// thread in `messages.db`, in the Node harness's schema.
-        func writeLegacyStore(extraBotKey: String? = nil) throws {
+        func writeLegacyStore(botId: String = "bot-1", extraBotKey: String? = nil) throws {
             let extra = extraBotKey.map { ",\n    \"\($0)\": true" } ?? ""
             let botsJSON = """
             [
               {
-                "id": "bot-1",
-                "threadId": "thread-bot-1",
+                "id": "\(botId)",
+                "threadId": "thread-\(botId)",
                 "name": "Builder",
                 "title": "Assistant",
                 "description": "",
@@ -196,12 +233,12 @@ struct NativeLegacyStoreImportTests {
             try Data(botsJSON.utf8).write(to: dataDir.appendingPathComponent("bots.json"))
             let dbURL = dataDir.appendingPathComponent("messages.db")
             if FileManager.default.fileExists(atPath: dbURL.path) { return }
-            try Self.writeMessagesDB(at: dbURL.path)
+            try Self.writeMessagesDB(at: dbURL.path, threadId: "thread-\(botId)")
         }
 
         func cleanup() { try? FileManager.default.removeItem(at: base) }
 
-        private static func writeMessagesDB(at path: String) throws {
+        private static func writeMessagesDB(at path: String, threadId: String) throws {
             var db: OpaquePointer?
             guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK else {
                 throw DatabaseError.openFailed("could not create the legacy messages.db")
@@ -228,11 +265,11 @@ struct NativeLegacyStoreImportTests {
                 started_at INTEGER NOT NULL,
                 PRIMARY KEY (thread_id, message_id)
             );
-            INSERT INTO messages VALUES ('thread-bot-1', 'm-1', 1700000100000, 'user', 'text', 'Hello',
-                '{"id":"m-1","role":"user","kind":"text","at":1700000100000,"text":"Hello"}');
-            INSERT INTO messages VALUES ('thread-bot-1', 'm-2', 1700000200000, 'bot', 'text', 'Hi there',
-                '{"id":"m-2","role":"bot","kind":"text","at":1700000200000,"text":"Hi there"}');
-            INSERT INTO thread_state VALUES ('thread-bot-1', 'm-2');
+            INSERT INTO messages VALUES ('\(threadId)', '\(threadId)-m-1', 1700000100000, 'user', 'text', 'Hello',
+                '{"id":"\(threadId)-m-1","role":"user","kind":"text","at":1700000100000,"text":"Hello"}');
+            INSERT INTO messages VALUES ('\(threadId)', '\(threadId)-m-2', 1700000200000, 'bot', 'text', 'Hi there',
+                '{"id":"\(threadId)-m-2","role":"bot","kind":"text","at":1700000200000,"text":"Hi there"}');
+            INSERT INTO thread_state VALUES ('\(threadId)', '\(threadId)-m-2');
             """
             guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
                 throw DatabaseError.executionFailed("could not fill the legacy messages.db")

@@ -15,9 +15,12 @@ import Foundation
 /// copy would go stale.  A marker beside the native store records a finished
 /// import, so later launches skip it.  The marker is written only when the
 /// importer returns with row and content parity, so a failed, interrupted or
-/// unverified run is tried again on the next launch.  A marker beside a
-/// native store that holds no bots is not trusted: the store was reset, so
-/// the import runs again.
+/// unverified run is tried again on the next launch.  A source that still
+/// misses parity after `maxUnverifiedRuns` launches (a bot made natively
+/// after a partial import keeps the counts apart for good) gets the marker
+/// anyway, recording the mismatches, so it does not repeat the whole copy on
+/// every launch.  A marker beside a native store that holds no bots is not
+/// trusted: the store was reset, so the import runs again.
 public struct NativeLegacyStoreImport: Sendable {
     /// What one call of `runIfNeeded` did.
     public enum Outcome: Equatable, Sendable {
@@ -54,6 +57,10 @@ public struct NativeLegacyStoreImport: Sendable {
         let warnings: [String]
     }
 
+    /// How many launches in a row may finish an import without parity before
+    /// the marker is written anyway.
+    static let maxUnverifiedRuns = 3
+
     /// The folder holding the legacy `bots.json` and `messages.db`.
     public let sourceDirectory: URL
     /// The file whose presence means the import already finished.
@@ -61,6 +68,9 @@ public struct NativeLegacyStoreImport: Sendable {
     /// Whether no Node harness is installed on this Mac.
     public let harnessIsGone: @Sendable () -> Bool
     let importer: StoreImporter
+
+    /// Counts the launches that finished an import without parity.
+    var attemptsURL: URL { markerURL.appendingPathExtension("attempts") }
 
     public init(
         sourceDirectory: URL,
@@ -109,9 +119,17 @@ public struct NativeLegacyStoreImport: Sendable {
     /// installed, the import already finished, or there is nothing to import.
     public func runIfNeeded(into database: DatabaseService) async -> Outcome {
         guard harnessIsGone() else { return .skipped(.harnessPresent) }
-        if FileManager.default.fileExists(atPath: markerURL.path),
-           let bots = try? await database.loadBots(), !bots.isEmpty {
-            return .skipped(.alreadyImported)
+        if FileManager.default.fileExists(atPath: markerURL.path) {
+            // A marker beside a store with no bots means the store was reset,
+            // so the import runs again.  When the store can't be read, the
+            // marker is trusted: an import into that store would fail too,
+            // and a passing lock should not cost a whole second copy.
+            do {
+                let bots = try await database.loadBots()
+                if !bots.isEmpty { return .skipped(.alreadyImported) }
+            } catch {
+                return .skipped(.alreadyImported)
+            }
         }
         guard FileManager.default.fileExists(
             atPath: sourceDirectory.appendingPathComponent("bots.json").path
@@ -131,10 +149,13 @@ public struct NativeLegacyStoreImport: Sendable {
             parityVerified: report.isParityVerified
         )
         // Without parity a later launch must try again, so the marker that
-        // would stop it is not written.  Warnings alone do not hold it back:
-        // they name source data the importer cannot map (a snooze for a bot
-        // that is gone), which another run would only report again.
-        guard report.isParityVerified else { return outcome }
+        // would stop it is not written, up to `maxUnverifiedRuns` launches.
+        // Warnings alone do not hold it back: they name source data the
+        // importer cannot map (a snooze for a bot that is gone), which another
+        // run would only report again.
+        guard report.isParityVerified || recordUnverifiedRun() >= Self.maxUnverifiedRuns else {
+            return outcome
+        }
         let marker = Marker(
             importedAt: Date().timeIntervalSince1970,
             bots: report.targetBotCount,
@@ -153,11 +174,26 @@ public struct NativeLegacyStoreImport: Sendable {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(marker).write(to: markerURL, options: .atomic)
+            try? FileManager.default.removeItem(at: attemptsURL)
         } catch {
             // The rows are in.  Without a marker the next launch runs the
             // import again, which adds nothing because the importer is
             // idempotent, so this is not a failure of the import.
         }
         return outcome
+    }
+
+    /// Adds one to the count of launches that finished without parity and
+    /// returns the new count.
+    private func recordUnverifiedRun() -> Int {
+        let previous = (try? String(contentsOf: attemptsURL, encoding: .utf8))
+            .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) } ?? 0
+        let count = previous + 1
+        try? FileManager.default.createDirectory(
+            at: attemptsURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? String(count).write(to: attemptsURL, atomically: true, encoding: .utf8)
+        return count
     }
 }
