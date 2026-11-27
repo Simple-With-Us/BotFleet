@@ -228,8 +228,10 @@ struct RootView: View {
                 set: { if !$0 { session.declineServerPairing() } }
             ),
             presenting: session.serverPairingOffer
-        ) { _ in
-            Button("Pair With The Server") { Task { await session.pairWithOfferedServer() } }
+        ) { offer in
+            // The offer itself goes with the tap: the alert clears the
+            // session's copy as it closes, before the task gets to run.
+            Button("Pair With The Server") { Task { await session.pairWithOfferedServer(offer) } }
             Button("Not Now", role: .cancel) { session.declineServerPairing() }
         } message: { offer in
             Text("\(offer.connection.name) will be paired beside \(session.connection?.name ?? "this Mac").\u{00A0} This iPhone follows the server when the Mac runs server-first, and falls back to the Mac when the server does not answer.")
