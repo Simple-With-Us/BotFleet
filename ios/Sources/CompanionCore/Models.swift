@@ -707,6 +707,8 @@ public struct CompanionConnectionMetadata: Decodable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         serverName = try container.decode(String.self, forKey: .serverName)
         hosts = try container.decodeIfPresent([String].self, forKey: .hosts)
+        placement = try? container.decode(NativePlacementMode.self, forKey: .placement)
+        isBridge = (try? container.decode(Bool.self, forKey: .isBridge)) ?? false
 
         // Endpoint metadata is a replacement snapshot, not an optional hint.
         // Keep a future malformed kind from discarding valid routes beside it,
