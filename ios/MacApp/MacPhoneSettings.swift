@@ -101,6 +101,8 @@ struct MacPhoneSettings: View {
     /// the one enrolled for that host and no other. The backend is the one
     /// this process keeps for that server, so a pairing window it opened
     /// survives this tab closing and can still be closed when it reopens.
+    /// Only a server list that was read says which backends to drop; one
+    /// that was not read leaves them all where they are.
     private func prepareServerPairing() async {
         await servers.load()
         let remote = servers.hosts.filter { !$0.isLocal }
