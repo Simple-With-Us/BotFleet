@@ -169,6 +169,51 @@ test("mounting is refused off macOS unless the caller says not to", async () => 
   } finally { f.remove(); }
 });
 
+/** A private directory the way the verifier makes a mount point, holding whatever `entries` names. */
+function mountPoint(entries = []) {
+  const directory = mkdtempSync(join(tmpdir(), "bf-host-mount-"));
+  for (const entry of entries) writeFileSync(join(directory, entry), "x");
+  return directory;
+}
+
+test("a mount point is removed with whatever was left inside it, once the detach is confirmed twice", () => {
+  // The ordinary case: detached, and nothing left behind.
+  const empty = mountPoint();
+  unmountDiskImage(empty, { detached: () => true, mounted: () => false });
+  assert.equal(existsSync(empty), false);
+  // Detached, and something left an entry behind: a verification that passed
+  // is not failed by the cleaning up.
+  const stray = mountPoint(["left-behind"]);
+  unmountDiskImage(stray, { detached: () => true, mounted: () => false });
+  assert.equal(existsSync(stray), false);
+  // With no stand-in, the file system's own answer for an ordinary directory
+  // is that nothing is mounted there.
+  const ordinary = mountPoint();
+  unmountDiskImage(ordinary, { detached: () => true });
+  assert.equal(existsSync(ordinary), false);
+  // A mount point that is already gone is nothing to remove.
+  const gone = mountPoint();
+  rmSync(gone, { recursive: true, force: true });
+  unmountDiskImage(gone, { detached: () => true });
+  assert.equal(existsSync(gone), false);
+});
+
+test("a tree that may still be mounted is never removed", () => {
+  // hdiutil answers that the detach worked, and the file system answers otherwise.
+  const stillMounted = mountPoint(["volume-content"]);
+  try {
+    assert.throws(() => unmountDiskImage(stillMounted, { detached: () => true, mounted: () => true }), /still mounted after the detach/);
+    assert.deepEqual(readdirSync(stillMounted), ["volume-content"]);
+  } finally { rmSync(stillMounted, { recursive: true, force: true }); }
+  // hdiutil could not detach, so the file system is not asked.
+  const busy = mountPoint(["volume-content"]);
+  try {
+    assert.throws(() => unmountDiskImage(busy, { detached: () => false,
+      mounted: () => assert.fail("A failed detach was asked whether anything was still mounted") }), /did not detach/);
+    assert.deepEqual(readdirSync(busy), ["volume-content"]);
+  } finally { rmSync(busy, { recursive: true, force: true }); }
+});
+
 test("a receipt is checked field by field before it is believed", () => {
   const f = releaseFixture();
   const rewrite = (text) => writeFileSync(join(f.root, "artifact.json"), text);
