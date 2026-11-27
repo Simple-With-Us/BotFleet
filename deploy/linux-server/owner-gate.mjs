@@ -22,6 +22,16 @@
  * does not hand over the token itself.  Either credential opens the gate; the
  * token header is dropped before the request reaches the harness.
  *
+ * The companion bridge gets one more hop.  When Infisical names the bridge's
+ * advertised origin (`BOTFLEET_COMPANION_BRIDGE_ORIGIN`), the gate also
+ * answers five paths under `/api/companion/bridge/` by passing them to the
+ * bridge on loopback: its advertisement, opening and closing a pairing
+ * window, and listing and revoking devices.  That is how the desktop app, whose gate
+ * credential is bound to this one origin, sets a phone up with the server.
+ * The owner credential crosses this hop on purpose, because the bridge makes
+ * the same owner decision again on its own loopback listener; nothing else
+ * about the caller does.
+ *
  * The gate also rewrites the upstream request head: the Host becomes the
  * loopback harness address, and every identity, edge, forwarding and
  * hop-by-hop header is dropped so the harness only ever sees a plain loopback
