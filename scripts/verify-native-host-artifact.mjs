@@ -77,10 +77,10 @@ export function verifyHostPayload(directory, { expectedSource, expectedBuild, un
 // Mount an image read-only at a private mount point and hand back that path.
 export function mountDiskImage(image, { attached = attachDiskImage } = {}) {
   const mountpoint = mkdtempSync(join(realpathSync(tmpdir()), "bf-native-host-mount-"));
-  const attached = spawnSync("/usr/bin/hdiutil", ["attach", "-readonly", "-nobrowse", "-mountpoint", mountpoint, image],
-    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-  if (attached.status !== 0) {
-    rmdirSync(mountpoint);
+  if (!attached(image, mountpoint)) {
+    // Nothing was mounted, so the directory goes, unless the file system says
+    // otherwise.
+    removeMountPoint(mountpoint);
     refuse("the disk image did not mount");
   }
   return mountpoint;
