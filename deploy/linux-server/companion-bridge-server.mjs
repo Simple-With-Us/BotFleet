@@ -1640,7 +1640,7 @@ function createBridgeSseScrubStream() {
  * @param {object} input
  * @returns {Promise<void>}
  */
-async function proxyRequest({ req, res, method, url, decision, host, port, upstreamAgent, logger, deviceId = '', activeSseStreams }) {
+async function proxyRequest({ req, res, method, url, decision, host, port, upstreamAgent, logger, deviceId = '', activeSseStreams, jsonScrubs }) {
   const target = new URL(decision.upstream, `http://${host}:${port}`);
 
   let forwardedBody = null;
