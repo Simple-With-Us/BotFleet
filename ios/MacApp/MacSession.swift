@@ -641,7 +641,10 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
             return false
         }
         appMenu.performActionForItem(at: index)
-        return true
+        // Report success only when a Settings window actually opened; a
+        // menu item that handles the action without opening Settings must
+        // not suppress the selector fallbacks in the caller.
+        return Self.settingsWindowIsPresent
     }
 
     private static func focusSettingsWindowIfPresent() {
