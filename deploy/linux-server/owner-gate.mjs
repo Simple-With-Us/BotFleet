@@ -625,6 +625,8 @@ export function createOwnerGate({
   tokenSha256,
   harnessPort = DEFAULT_HARNESS_PORT,
   harnessHost = DEFAULT_GATE_HOST,
+  bridgeEnabled = false,
+  bridgePort = DEFAULT_BRIDGE_PORT,
   log,
 } = {}) {
   const allowlist = owners instanceof Set ? owners : parseOwnerLogins(owners);
