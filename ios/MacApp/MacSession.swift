@@ -809,7 +809,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         // where the client would connect, so This Mac's chat runs on the
         // native engine instead.  Only then: beside an installed harness
         // the native runtime must not answer the harness's bots.
-        if installedServerState == .notInstalled {
+        if harnessIsUninstalled {
             connectNative(record: record)
             return
         }
@@ -1135,6 +1135,21 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// What the status pill names while the chat runs on the native engine.
     static let nativeEndpointLabel = "native engine on this Mac"
 
+    /// Every LaunchAgent label the Node harness has been installed under:
+    /// today's, and the one from before the 2026-09-22 bundle-id migration
+    /// that older installs and `scripts/botfleet-server-start.sh` still use.
+    static let harnessAgentLabels = [MacStartupPolicyStore.serverAgentLabel, "com.jay.botfleet-server"]
+
+    /// Whether the Node harness is gone from This Mac: launchd reported its
+    /// LaunchAgent not installed, and no plist remains under any label it
+    /// has used.  Only then may the native runtime answer its bots.
+    private var harnessIsUninstalled: Bool {
+        guard installedServerState == .notInstalled else { return false }
+        return !Self.harnessAgentLabels.contains { label in
+            FileManager.default.fileExists(atPath: startupPolicyStore.launchAgentPlist(label: label).path)
+        }
+    }
+
     private func connectNative(record: HostRecord) {
         isNativeConnection = true
         status = .connecting
@@ -1153,11 +1168,16 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         let chat: NativeDesktopChat
         let start: NativeDesktopChatStart
         do {
-            let opened = try host.open()
+            // Opening creates the store's directory and opens SQLite, so it
+            // runs off the main actor rather than holding the window.
+            let opened = try await Task.detached { try host.open() }.value
             chat = NativeDesktopChat(opened: opened)
             start = try await chat.start()
         } catch {
             guard !Task.isCancelled, connectionGeneration == generation else { return }
+            // Not native after all: a later installed-state read may try
+            // again instead of finding a native connection with no chat.
+            isNativeConnection = false
             status = .failed("The native store could not be read: \(error.localizedDescription)")
             syncSystemSurfaces(force: true)
             return
@@ -1189,6 +1209,13 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let threadId = activeThreadId,
               let bot = activeBot else { return false }
+        // One turn per thread, as the engine coordinator enforces: until
+        // the window has read the last turn to its end, a second message
+        // would fold its reply into the same live bubble.
+        guard nativeTurns[threadId] == nil else {
+            status = .failed("Send failed: \(NativeDesktopChatError.turnAlreadyActive(threadId: threadId).localizedDescription)")
+            return false
+        }
         isSending = true
         defer { isSending = false }
 
@@ -1198,6 +1225,11 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         } catch {
             status = .failed("Send failed: \(error.localizedDescription)")
             return false
+        }
+        // A refused send says so in the status; the next one that starts
+        // puts the connection back, since nothing else would.
+        if case .failed = status, nativeChat != nil {
+            status = .connected(endpoint: Self.nativeEndpointLabel)
         }
         let turnId = UUID()
         let task = Task { [weak self] in
@@ -1452,7 +1484,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         installedServerState = state
         // BF-2705: a harness found uninstalled after the window connected
         // (or failed to) moves This Mac's chat onto the native engine.
-        if state == .notInstalled, !isNativeConnection, servers.connectedRecordID != nil {
+        if harnessIsUninstalled, !isNativeConnection, servers.connectedRecordID != nil {
             connect()
         }
     }
