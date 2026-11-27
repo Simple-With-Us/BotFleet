@@ -1009,3 +1009,367 @@ test("an organize body may carry the six roster fields and nothing else", () => 
   assert.equal(bridgeBotOrganizeDenial({ pinnedMessageId: "" }), null);
   // Execution policy, computer grants and the persona fields never pass.
   for (const field of ["autoApprove", "bypassPermissions", "computers", "cwd", "name", "color", "off"]) {
+    assert.deepEqual(bridgeBotOrganizeDenial({ hidden: true, [field]: true }), {
+      status: 403,
+      error: `${field} can only be changed in BotFleet on your computer`,
+    });
+  }
+  // The harness stores four of these as sent, so the types are checked too.
+  for (const field of ["hidden", "pinned", "unread", "chiefOfStaff"]) {
+    assert.deepEqual(bridgeBotOrganizeDenial({ [field]: "yes" }), { status: 400, error: `${field} must be true or false` });
+    assert.deepEqual(bridgeBotOrganizeDenial({ [field]: 1 }), { status: 400, error: `${field} must be true or false` });
+  }
+  assert.deepEqual(bridgeBotOrganizeDenial({ section: 7 }), { status: 400, error: "section must be a string or null" });
+  assert.deepEqual(bridgeBotOrganizeDenial({ section: true }), { status: 400, error: "section must be a string or null" });
+  assert.deepEqual(bridgeBotOrganizeDenial({ pinnedMessageId: "m 1" }), {
+    status: 400,
+    error: "pinnedMessageId must be a message id or null",
+  });
+  assert.deepEqual(bridgeBotOrganizeDenial({ pinnedMessageId: "../m-1" }), {
+    status: 400,
+    error: "pinnedMessageId must be a message id or null",
+  });
+  assert.deepEqual(bridgeBotOrganizeDenial({ pinnedMessageId: 5 }), {
+    status: 400,
+    error: "pinnedMessageId must be a message id or null",
+  });
+  for (const bad of [[], "hidden", null, undefined]) {
+    assert.deepEqual(bridgeBotOrganizeDenial(bad), { status: 400, error: "body must be a JSON object" });
+  }
+});
+
+test("the body check is attached to its two routes and to nothing else", () => {
+  assert.equal(bridgeBodyCheck("PATCH", "/api/bots/b-1/profile"), bridgeProfilePatchDenial);
+  assert.equal(bridgeBodyCheck("PATCH", "/api/bots/b-1"), bridgeBotOrganizeDenial);
+  for (const [method, path] of [
+    ["PATCH", "/api/groups/g-1"],
+    ["PATCH", "/api/profile"],
+    ["PATCH", "/api/bots/b-1/tasks/t-1"],
+    ["PATCH", "/api/bots/b-1/skills/s-1"],
+    ["PATCH", "/api/config"],
+    ["POST", "/api/bots/b-1"],
+    ["DELETE", "/api/bots/b-1"],
+    ["PUT", "/api/bots/b-1/profile"],
+    ["POST", "/api/bots/apply-model-defaults"],
+    // An encoded id never reaches a check, because it never reaches a route.
+    ["PATCH", "/api/bots/b%2D1"],
+  ]) {
+    assert.equal(bridgeBodyCheck(method, path), null, `${method} ${path}`);
+  }
+  // The check follows the path pattern, as it does on the sidecar, so a
+  // PATCH that names a literal in the id position is held to the six fields.
+  assert.equal(bridgeBodyCheck("PATCH", "/api/bots/apply-model-defaults"), bridgeBotOrganizeDenial);
+});
+
+test("the scrubber removes the withheld keys wherever they are nested, and nothing else", () => {
+  const bot = {
+    id: "b1",
+    name: "Rio",
+    resumeCursors: { ghost: "session-abc" },
+    tasks: [
+      { threadId: "t1", title: "One", resumeCursors: { ghost: "session-def" } },
+      { threadId: "t2", title: "Two" },
+    ],
+  };
+  const cleaned = bridgeScrub({ bots: [bot], groups: [] });
+  assert.equal(JSON.stringify(cleaned).includes("resumeCursors"), false);
+  assert.equal(JSON.stringify(cleaned).includes("session-abc"), false);
+  assert.equal(JSON.stringify(cleaned).includes("session-def"), false);
+  assert.deepEqual(JSON.parse(JSON.stringify(cleaned)), {
+    bots: [{ id: "b1", name: "Rio", tasks: [{ threadId: "t1", title: "One" }, { threadId: "t2", title: "Two" }] }],
+    groups: [],
+  });
+  // The VPS host label goes and the configured signal stays: that is all the
+  // phone renders.
+  const status = { box: { configured: false }, vps: { configured: true, sshAlias: "prod-vps" } };
+  const cleanedStatus = JSON.parse(JSON.stringify(bridgeScrub(status)));
+  assert.deepEqual(cleanedStatus, { box: { configured: false }, vps: { configured: true } });
+  // A value that is not a key is left alone.
+  assert.equal(bridgeScrub(null), null);
+  assert.equal(bridgeScrub(42), 42);
+  assert.equal(bridgeScrub("resumeCursors"), "resumeCursors");
+  assert.deepEqual(bridgeScrub([1, [2, [3]]]), [1, [2, [3]]]);
+  // The input is not mutated.
+  assert.deepEqual(status.vps, { configured: true, sshAlias: "prod-vps" });
+});
+
+test("a payload that names no withheld key comes back as the exact string, not a re-serialization", () => {
+  // Spacing, key order and number spelling all survive, which proves the
+  // text was never parsed and written back.
+  const spaced = '{ "bots" : [ { "id" : "b1" , "n" : 1.0 } ] }';
+  assert.equal(bridgeScrubWireJson(spaced), spaced);
+  assert.equal(bridgeScrubWireJson('{"a":"a resume cursor is not a key"}'), '{"a":"a resume cursor is not a key"}');
+  assert.equal(bridgeScrubWireJson(""), "");
+  // Where it is named, the key goes and the rest is re-serialized.
+  assert.equal(bridgeScrubWireJson('{ "vps" : { "configured" : true , "sshAlias" : "prod-vps" } }'), '{"vps":{"configured":true}}');
+  assert.equal(bridgeScrubWireJson('{"tasks":[{"resumeCursors":{"g":"s"}}]}'), '{"tasks":[{}]}');
+});
+
+test("a payload that is not JSON passes, and one that cannot be scrubbed throws instead of passing", () => {
+  assert.equal(bridgeScrubWireJson("not json at all sshAlias"), "not json at all sshAlias");
+  // `JSON.parse` handles a depth the recursive scrubber cannot. Forwarding
+  // that body would send exactly the key the scrubber exists to withhold, so
+  // the failure is loud and the caller ends the response.
+  const depth = 20_000;
+  const deep = `${"[".repeat(depth)}{"sshAlias":"prod-vps"}${"]".repeat(depth)}`;
+  assert.doesNotThrow(() => JSON.parse(deep));
+  assert.throws(() => bridgeScrubWireJson(deep), RangeError);
+  // and the same depth with no withheld key is forwarded untouched
+  const clean = `${"[".repeat(depth)}1${"]".repeat(depth)}`;
+  assert.equal(bridgeScrubWireJson(clean), clean);
+});
+
+test("a payload key spelled like the prototype accessor cannot change the scrubber's output", () => {
+  const parsed = JSON.parse('{"sshAlias":"prod-vps","__proto__":{"polluted":true},"a":1}');
+  const out = JSON.stringify(bridgeScrub(parsed));
+  assert.equal(out, '{"__proto__":{"polluted":true},"a":1}');
+  assert.equal({}.polluted, undefined);
+  assert.equal(Object.getPrototypeOf(bridgeScrub(parsed)), null);
+});
+
+test("only real JSON content types are read for their keys", () => {
+  assert.equal(bridgeIsJson("application/json"), true);
+  assert.equal(bridgeIsJson("application/json; charset=utf-8"), true);
+  assert.equal(bridgeIsJson("APPLICATION/JSON"), true);
+  assert.equal(bridgeIsJson("image/png"), false);
+  assert.equal(bridgeIsJson("text/event-stream"), false);
+  assert.equal(bridgeIsJson(undefined), false);
+  assert.equal(bridgeIsJson(""), false);
+  // The structured suffix is the registered way to say "JSON underneath",
+  // and one error answered that way would otherwise skip the scrubber.
+  assert.equal(bridgeIsJson("application/problem+json"), true);
+  assert.equal(bridgeIsJson("application/vnd.botfleet.bot+json; charset=utf-8"), true);
+  assert.equal(bridgeIsJson("APPLICATION/PROBLEM+JSON"), true);
+  assert.equal(bridgeIsJson("text/notjson"), false);
+  assert.equal(bridgeIsJson("text/x-json"), false);
+});
+
+test("the SSE scrubber keeps the blank-line terminator that ends an event", () => {
+  // The failure this guards against is silent: a stream that never
+  // terminates an event parses to nothing while both ends look healthy.
+  const out = createBridgeSseScrubber()('data: {"kind":"hello"}\n\n');
+  assert.equal(out, 'data: {"kind":"hello"}\n\n');
+  assert.equal(out.endsWith("\n\n"), true);
+});
+
+test("the SSE scrubber scrubs the payload but never the id: line", () => {
+  const frame = 'id: abc123:7\ndata: {"kind":"bot","bot":{"id":"b1","resumeCursors":{"g":"s"}}}\n\n';
+  const out = createBridgeSseScrubber()(frame);
+  assert.ok(out.startsWith("id: abc123:7\n"));
+  assert.equal(out.includes("resumeCursors"), false);
+  assert.equal(out.includes('"g":"s"'), false);
+  assert.equal(out, 'id: abc123:7\ndata: {"kind":"bot","bot":{"id":"b1"}}\n\n');
+});
+
+test("an SSE event that names no withheld key is returned as the exact bytes that arrived", () => {
+  // No space after the colon, two events, a comment and an id: line all
+  // cross unchanged, so an ordinary frame is byte for byte what the harness
+  // wrote and the `id:` cursor is never rewritten.
+  const stream = 'id: a:1\ndata:{"kind":"bot","bot":{"id":"b1"}}\n\n: keepalive\n\nid: a:2\ndata: {"kind":"message"}\n\n';
+  assert.equal(createBridgeSseScrubber()(stream), stream);
+});
+
+test("the SSE scrubber emits an event as soon as it is complete, not when the chunk ends", () => {
+  const scrubStream = createBridgeSseScrubber();
+  // one event split across three arbitrary chunk boundaries
+  assert.equal(scrubStream('id: a:1\nda'), "");
+  assert.equal(scrubStream('ta: {"kind":"bot","resumeCursors":{"g":"s"}}'), "");
+  assert.equal(scrubStream("\n\nid: a:2\n"), 'id: a:1\ndata: {"kind":"bot"}\n\n');
+  // the second event is still incomplete and correctly withheld
+  assert.equal(scrubStream('data: {"kind":"message"}\n\n'), 'id: a:2\ndata: {"kind":"message"}\n\n');
+});
+
+test("the SSE scrubber passes keepalive comments and unparseable data through untouched", () => {
+  const scrubStream = createBridgeSseScrubber();
+  assert.equal(scrubStream(": keepalive\n\n"), ": keepalive\n\n");
+  assert.equal(scrubStream("data: not json at all\n\n"), "data: not json at all\n\n");
+  // The harness's own keepalive, the one it writes every 25 seconds.
+  assert.equal(scrubStream(": keepalive\n\n"), ": keepalive\n\n");
+});
+
+test("the SSE scrubber refuses to buffer an event that never terminates", () => {
+  // "Buffer to the frame boundary" is bounded only by the sender behaving.
+  const scrubStream = createBridgeSseScrubber();
+  const chunk = "x".repeat(256 * 1024);
+  let sent = 0;
+  assert.throws(
+    () => {
+      for (;;) {
+        scrubStream(chunk);
+        sent += chunk.length;
+        if (sent > MAX_BRIDGE_SSE_EVENT_BYTES * 2) throw new Error("buffered without limit");
+      }
+    },
+    /without a terminator/,
+  );
+  assert.ok(sent <= MAX_BRIDGE_SSE_EVENT_BYTES + 4 * 256 * 1024, "the ceiling is the event cap, not twice it");
+});
+
+test("the SSE scrubber does not drop a large but well-formed event", () => {
+  // The cap must sit clear of anything real, or a big-but-legitimate frame
+  // would vanish and look exactly like a bug in the harness.
+  const big = JSON.stringify({ kind: "bot", blob: "y".repeat(200 * 1024) });
+  const out = createBridgeSseScrubber()(`data: ${big}\n\n`);
+  assert.equal(out, `data: ${big}\n\n`);
+});
+
+test("the SSE scrubber handles several events arriving in one chunk", () => {
+  const out = createBridgeSseScrubber()('id: a:1\ndata: {"a":1,"resumeCursors":{}}\n\nid: a:2\ndata: {"b":2}\n\n');
+  assert.equal(out, 'id: a:1\ndata: {"a":1}\n\nid: a:2\ndata: {"b":2}\n\n');
+});
+
+test("the SSE scrubber terminates CRLF events and keeps them CRLF", () => {
+  // A CRLF producer is legal SSE, and an LF-only scrubber buffers the whole
+  // stream waiting for a boundary that never comes.
+  const out = createBridgeSseScrubber()('id: a:1\r\ndata: {"a":1,"resumeCursors":{"g":"s"}}\r\n\r\n');
+  assert.equal(out, 'id: a:1\r\ndata: {"a":1}\r\n\r\n');
+  assert.equal(out.includes("resumeCursors"), false);
+});
+
+test("the SSE scrubber splits a CRLF stream across chunks without cutting an event short", () => {
+  const scrubStream = createBridgeSseScrubber();
+  // the chunk ends inside the terminator itself, the boundary a naive
+  // indexOf gets wrong
+  assert.equal(scrubStream('id: a:1\r\ndata: {"a":1}\r\n\r'), "");
+  assert.equal(
+    scrubStream('\nid: a:2\r\ndata: {"b":2}\r\n\r\n'),
+    'id: a:1\r\ndata: {"a":1}\r\n\r\nid: a:2\r\ndata: {"b":2}\r\n\r\n',
+  );
+});
+
+test("the SSE scrubber still handles a bare CR, which the spec also allows", () => {
+  assert.equal(createBridgeSseScrubber()('data: {"a":1,"resumeCursors":{}}\r\r'), 'data: {"a":1}\r\r');
+});
+
+test("the configured advertisement is read as clean origins, first entry first", () => {
+  const parsed = bridgeParseOrigins("https://Box.Example.ts.net:8800, http://box.example.ts.net:8080 , https://cdn.example");
+  assert.equal(parsed.ok, true);
+  assert.deepEqual(parsed.origins, [
+    "https://box.example.ts.net:8800",
+    "http://box.example.ts.net:8080",
+    "https://cdn.example",
+  ]);
+  assert.deepEqual(
+    bridgeEndpoints(parsed.origins),
+    [
+      // `tailscale serve --https` publishes the tailnet route as https, and
+      // the shipped decoder accepts exactly one kind for an https URL.
+      { url: "https://box.example.ts.net:8800", kind: "hosted", priority: 0 },
+      { url: "http://box.example.ts.net:8080", kind: "tailnet", priority: 100 },
+      { url: "https://cdn.example", kind: "hosted", priority: 200 },
+    ],
+  );
+  // An absent or blank value is no advertisement, and not an error.
+  assert.deepEqual(bridgeParseOrigins(undefined), { ok: true, origins: [] });
+  assert.deepEqual(bridgeParseOrigins(""), { ok: true, origins: [] });
+  assert.deepEqual(bridgeParseOrigins(" , "), { ok: true, origins: [] });
+  // A duplicate costs nothing, and a default port is dropped as the phone
+  // drops it.
+  assert.deepEqual(bridgeParseOrigins("https://a.example, https://A.example/, https://b.example:443"), {
+    ok: true,
+    origins: ["https://a.example", "https://b.example"],
+  });
+});
+
+test("an advertisement entry that is not a clean origin is refused by name and never skipped", () => {
+  // A skipped entry is a route the owner believes is advertised and is not.
+  for (const bad of [
+    "a.example",
+    "https://a.example/path",
+    "https://a.example/deep/path",
+    "https://user:secret@a.example",
+    "https://a.example?x=1",
+    "https://a.example#fragment",
+    "ftp://a.example",
+    "file:///tmp",
+    "https://127.0.0.1:8800",
+    "https://127.53.1.9",
+    "https://localhost:8800",
+    "https://bridge.localhost",
+    "http://[::1]:8800",
+    "https://0.0.0.0",
+    "http://169.254.10.20:8800",
+    "https://a.example:99999",
+    "https://a b.example",
+  ]) {
+    const parsed = bridgeParseOrigins(`https://a.example, ${bad}`);
+    assert.equal(parsed.ok, false, bad);
+    assert.equal(Object.prototype.toString.call(parsed.reason), "[object String]");
+    // The refusal names the rule, never the value.
+    assert.equal(parsed.reason.includes(bad), false, bad);
+  }
+  // A trailing slash is the same origin with no path, so it is accepted.
+  assert.deepEqual(bridgeParseOrigins("https://a.example:8800/"), { ok: true, origins: ["https://a.example:8800"] });
+  // and the cap
+  const hosts = Array.from({ length: BRIDGE_MAX_ENDPOINTS }, (_, index) => `https://h${index}.example`);
+  assert.equal(bridgeParseOrigins(hosts.join(",")).ok, true);
+  assert.equal(bridgeParseOrigins([...hosts, "https://h-over.example"].join(",")).ok, false);
+  assert.equal(bridgeEndpoints([...hosts, "https://h-over.example"]).length, BRIDGE_MAX_ENDPOINTS);
+});
+
+test("the endpoint kind is the one the shipped decoder accepts for the scheme", () => {
+  assert.equal(bridgeEndpointKind("https://box.example.ts.net:8800"), "hosted");
+  assert.equal(bridgeEndpointKind("https://cdn.example"), "hosted");
+  assert.equal(bridgeEndpointKind("http://box.example.ts.net:8080"), "tailnet");
+  assert.equal(bridgeEndpointKind("http://box.example.ts.net."), "tailnet");
+  assert.equal(bridgeEndpointKind("http://ts.net"), "lan");
+  assert.equal(bridgeEndpointKind("http://192.168.1.20:8797"), "lan");
+  assert.equal(bridgeEndpointKind("http://box.local:8797"), "lan");
+  assert.equal(bridgeEndpointKind("ftp://box.example"), "");
+  assert.equal(bridgeEndpointKind("not a url"), "");
+  assert.equal(bridgeEndpointKind(undefined), "");
+});
+
+test("the advertisement holds at most eight routes and skips what is not a route", () => {
+  const endpoints = bridgeEndpoints([
+    "https://a.example",
+    "not a url",
+    "https://a.example",
+    "https://127.0.0.1",
+    "https://a.example/path",
+    ...Array.from({ length: 9 }, (_, index) => `https://h${index}.example`),
+  ]);
+  assert.equal(endpoints.length, BRIDGE_MAX_ENDPOINTS);
+  assert.deepEqual(
+    endpoints.map((entry) => entry.priority),
+    Array.from({ length: BRIDGE_MAX_ENDPOINTS }, (_, index) => index * 100),
+  );
+  assert.equal(new Set(endpoints.map((entry) => entry.url)).size, BRIDGE_MAX_ENDPOINTS);
+  assert.deepEqual(endpoints[0], { url: "https://a.example", kind: "hosted", priority: 0 });
+  for (const entry of endpoints) {
+    assert.deepEqual(Object.keys(entry).sort(), ["kind", "priority", "url"]);
+    assert.ok(entry.priority >= 0 && entry.priority <= 1_000_000);
+  }
+  assert.deepEqual(bridgeEndpoints(undefined), []);
+  assert.deepEqual(bridgeEndpoints("https://a.example"), []);
+  assert.deepEqual(bridgeCleanOrigin("https://a.example"), "https://a.example");
+  assert.equal(BRIDGE_SERVER_NAME.length > 0, true);
+});
+
+test("a device name from the phone is display text and nothing more", () => {
+  assert.equal(bridgeCleanDeviceName("  Jay\u0027s\u001fiPhone\u0007 \n"), "Jay's iPhone");
+  assert.equal(bridgeCleanDeviceName("x".repeat(80)).length, 60);
+  assert.equal(bridgeCleanDeviceName("   "), "Companion");
+  assert.equal(bridgeCleanDeviceName(undefined), "Companion");
+  assert.equal(bridgeCleanDeviceName(42), "42");
+  // A long name with control characters is cleaned before it is cut.
+  assert.equal(bridgeCleanDeviceName("\u0000" + "y".repeat(70)), "y".repeat(60));
+});
+
+test("every pairing refusal the core can name has a sentence for the person", () => {
+  const sentences = new Set();
+  for (const reason of [
+    "no pairing window is open",
+    "window expired",
+    "window already spent",
+    "no attempts left",
+    "bad credential",
+    "the device limit is reached",
+  ]) {
+    const sentence = bridgePairRefusalSentence(reason);
+    assert.equal(Object.prototype.toString.call(sentence), "[object String]", reason);
+    assert.ok(sentence.endsWith("."), reason);
+    assert.equal(sentence.includes(reason), false, `${reason} stays as wording for the log`);
+    sentences.add(sentence);
+  }
+  // Each reason reads differently, so a person can tell what to do next.
