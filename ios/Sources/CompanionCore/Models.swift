@@ -667,6 +667,10 @@ public struct PairResponse: Codable, Sendable {
         } else {
             endpoints = nil
         }
+        // A mode this build does not know is not an error either: by the time
+        // this is read, the credential has been redeemed.
+        placement = try? container.decode(NativePlacementMode.self, forKey: .placement)
+        isBridge = (try? container.decode(Bool.self, forKey: .isBridge)) ?? false
     }
 
     public func encode(to encoder: Encoder) throws {
