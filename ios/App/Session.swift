@@ -585,10 +585,22 @@ final class Session: ObservableObject {
         case .connect(let saved, let stored):
             connection = saved
             token = stored
-            if case let .token(server) = serverToken { bridgeToken = server } else { bridgeToken = nil }
-            // A server pairing whose token is gone from the keychain cannot
-            // be dialed, so it is not kept: the Mac's pairing is what restores.
-            if saved.bridgeConnection != nil, bridgeToken == nil { dropServerPairing() }
+            switch serverToken {
+            case let .token(server):
+                bridgeToken = server
+            case .missing:
+                // A server pairing whose token is gone from the keychain
+                // cannot be dialed, so it is not kept: the Mac's pairing is
+                // what restores.
+                bridgeToken = nil
+                if saved.bridgeConnection != nil { dropServerPairing() }
+            case .unavailable:
+                // The keychain was locked for that read. The pairing stays,
+                // and the token is read again when the app next comes to the
+                // front.
+                bridgeToken = nil
+                serverTokenUnread = saved.bridgeConnection != nil
+            }
             // New connections honor the desktop's transport policy.  Automatic
             // walking is credential-safe: protected routes stay protected, while
             // a legacy/local route is only tried when it was the exact saved route.
