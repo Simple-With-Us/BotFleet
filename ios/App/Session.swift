@@ -1354,6 +1354,12 @@ final class Session: ObservableObject {
             let onServer = rotation.currentEndpoint.map { connection?.isBridgeRoute($0) == true } == true
             dropServerPairing()
             adoptWalk()
+            // A stream that was on the server's route moves at once; one on
+            // the Mac's, which is the usual case with no token in hand, goes on.
+            if onServer {
+                restartStream()
+                connect()
+            }
         case .unavailable:
             // Still locked: tried again the next time the app comes forward.
             break
