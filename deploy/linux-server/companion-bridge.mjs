@@ -1346,7 +1346,10 @@ export function bridgeScrub(value) {
  */
 export function bridgeScrubWireJson(jsonString) {
   const text = String(jsonString ?? '');
-  if (!holdsWithheldKey(text)) return text;
+  // A key can also arrive spelled with escapes, `\u0073shAlias`, which
+  // decodes to a withheld name downstream while naming none here. A payload
+  // that carries any escape is parsed for its keys instead of passed on.
+  if (!holdsWithheldKey(text) && !text.includes('\\u')) return text;
   let parsed;
   try {
     parsed = JSON.parse(text);
