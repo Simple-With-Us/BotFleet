@@ -797,6 +797,10 @@ export function parseArgs(argv) {
  * by the gate, so a leaked configuration cannot be replayed as a credential.
  * No value is logged here.
  *
+ * Whether this host has a companion bridge is read here too: the gate routes
+ * the bridge prefix when Infisical names the bridge's advertised origin.  The
+ * gate keeps only that fact; the bridge reads the origin itself.
+ *
  * @param {Record<string, string>|undefined} secrets
  * @returns {{owners: Set<string>, publicOrigin: string, tokenSha256: string|null}}
  */
