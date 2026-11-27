@@ -546,6 +546,51 @@ function proxyRequest(req, res, harnessHost, harnessPort, agent, log, worker = f
 }
 
 /**
+ * Proxy one request to the companion bridge on loopback.  The path is the one
+ * `bridgeAdminTarget` named and the headers are the few the bridge needs.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {import('node:http').ServerResponse} res
+ * @param {string} target
+ * @param {number} bridgePort
+ * @param {import('node:http').Agent} agent
+ * @param {(message: string) => void} log
+ */
+function proxyToBridge(req, res, target, bridgePort, agent, log) {
+  const upstream = http.request(
+    {
+      host: DEFAULT_GATE_HOST,
+      port: bridgePort,
+      method: req.method,
+      path: target,
+      headers: bridgeUpstreamHeaders(req.headers, bridgePort),
+      agent,
+    },
+    (upstreamRes) => {
+      upstreamRes.on('error', () => res.destroy());
+      res.writeHead(upstreamRes.statusCode ?? 502, downstreamHeaders(upstreamRes.headers));
+      upstreamRes.pipe(res);
+    },
+  );
+
+  upstream.on('error', (err) => {
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    log(`[owner-gate] companion bridge unreachable on ${DEFAULT_GATE_HOST}:${bridgePort}: ${err.code ?? err.message}`);
+    respondJson(res, 502, { error: 'companion bridge unavailable' });
+  });
+
+  res.on('close', () => {
+    if (!res.writableFinished) upstream.destroy();
+  });
+  req.on('error', () => upstream.destroy());
+
+  req.pipe(upstream);
+}
+
+/**
  * Write the rewritten request head for an upgraded connection.
  *
  * @param {import('node:http').IncomingMessage} req
