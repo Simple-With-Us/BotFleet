@@ -1406,8 +1406,8 @@ final class Session: ObservableObject {
                 // by pairing, while the saved connection uses advertised
                 // security priorities on the next launch.
                 let liveRoutes = workingEndpoint.map { route in
-                    [route] + updated.orderedEndpoints.filter { $0.url != route.url }
-                } ?? updated.orderedEndpoints
+                    [route] + updated.syncEndpoints.filter { $0.url != route.url }
+                } ?? updated.syncEndpoints
                 self.rotation = CandidateRotation(endpoints: liveRoutes)
                 log.info("refreshed \(metadata.endpoints.count, privacy: .public) companion routes")
             } catch is CancellationError {
