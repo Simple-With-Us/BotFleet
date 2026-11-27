@@ -2028,6 +2028,7 @@ test('the advertisement carries the configured routes, and falls back to the rou
     });
     assert.deepEqual(JSON.parse(viaServe.buffer.toString('utf8')), {
       serverName: 'BotFleet Server',
+      isBridge: true,
       endpoints: [{ url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 }],
     });
     // A proxy that names no forwarded host leaves the Host to speak.
