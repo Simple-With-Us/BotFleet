@@ -208,7 +208,7 @@ export async function startFakeOpenAiServer(): Promise<FakeOpenAiServer> {
       }
 
       requests.push({ method, url, headers: recordHeaders(req), body: undefined });
-      res.writeHead(404, { "content-type": "application/json" });
+      res.writeHead(404, { ...CLOSE_CONNECTION, "content-type": "application/json" });
       res.end(JSON.stringify({ error: `fake-openai-server: no route for ${method} ${url}` }));
     })().catch((error) => {
       // A thrown error inside the async handler must still answer the
