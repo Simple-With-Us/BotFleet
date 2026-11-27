@@ -60,7 +60,9 @@ public struct Connection: Codable, Hashable, Identifiable, Sendable {
         activeEndpoint: CompanionEndpoint? = nil,
         endpoints: [CompanionEndpoint]? = nil,
         allowedRouteKinds: Set<CompanionEndpointKind>? = nil,
-        allowedLocalRouteURLs: Set<String>? = nil
+        allowedLocalRouteURLs: Set<String>? = nil,
+        placement: NativePlacementMode? = nil,
+        bridge: Connection? = nil
     ) {
         self.id = id
         self.name = name
