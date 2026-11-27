@@ -616,7 +616,7 @@ function upgradeHead(req, harnessPort) {
 /**
  * Create the gate server.  The returned server is not listening yet.
  *
- * @param {{owners?: Set<string>|string, publicOrigin?: string, tokenSha256?: string|null, harnessPort?: number|string, harnessHost?: string, log?: (message: string) => void}} options
+ * @param {{owners?: Set<string>|string, publicOrigin?: string, tokenSha256?: string|null, harnessPort?: number|string, harnessHost?: string, bridgeEnabled?: boolean, bridgePort?: number|string, log?: (message: string) => void}} options
  * @returns {import('node:http').Server}
  */
 export function createOwnerGate({
