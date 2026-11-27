@@ -734,11 +734,20 @@ final class Session: ObservableObject {
     }
 
     func receivePairingURL(_ url: URL) {
-        guard CompanionPairingInvitePolicy.allowsIncomingInvite(
-            hasConnection: connection != nil,
-            pairingStateIsUnpaired: status == .unpaired
-        ) else {
-            actionError = "This phone is already paired. Unpair it in Settings before connecting it to another computer."
+        let invite = PairingInvite.parse(url)
+        // Anything but the server's code still replaces the pairing, so a
+        // phone that is paired refuses it as ever.
+        if invite?.role != .bridge {
+            guard CompanionPairingInvitePolicy.allowsIncomingInvite(
+                hasConnection: connection != nil,
+                pairingStateIsUnpaired: status == .unpaired
+            ) else {
+                actionError = "This phone is already paired. Unpair it in Settings before connecting it to another computer."
+                return
+            }
+        }
+        guard let invite else {
+            actionError = "That pairing invitation is not valid. Start pairing again on your computer."
             return
         }
         guard let invite = PairingInvite.parse(url) else {
