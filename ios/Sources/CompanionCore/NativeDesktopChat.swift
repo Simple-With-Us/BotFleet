@@ -321,6 +321,7 @@ public struct NativeDesktopChat: Sendable {
         do {
             try await database.upsertThread(threadRecord)
             try await database.upsertBot(botRecord)
+            await runtime.macExecutionContext.invalidateCredentialsCache()
             try await runtime.runtime.engineSwitch.switchToNativeSwift(
                 botId: botId,
                 historySnapshot: BotHistoryImportSnapshot(botId: botId, threads: [threadRecord], messagesByThread: [:])

@@ -235,7 +235,7 @@ struct NativeDesktopChatTests {
         #expect(countAfterFailure == countBeforeFailure)
     }
 
-    @Test("DatabaseCliLoginCredentials caches negative lookups and reloads when invalidated")
+    @Test("DatabaseCliLoginCredentials reloads on miss after direct store insert and invalidates on unregister")
     func credentialCacheReloadsOnNewBot() async throws {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("cred-cache-miss-\(UUID().uuidString)", isDirectory: true)
@@ -249,13 +249,14 @@ struct NativeDesktopChatTests {
             credentials: credentials
         )
 
-        // Populate negative-lookup cache while table is empty.
+        // Populate cache while table is empty.
         let beforeInsert = try await credentials.credentials(forBotId: "bot-new")
         guard case .unavailable = beforeInsert else {
             Issue.record("Expected unavailable credentials before inserting the bot")
             return
         }
 
+        // Direct SQLite insert (importer / headless path) must resolve immediately on miss.
         let record = StoredBotRecord(
             id: "bot-new",
             name: "Bot 1",
@@ -265,22 +266,29 @@ struct NativeDesktopChatTests {
         )
         try await database.upsertBot(record)
 
-        // Repeated missing-bot lookup within TTL hits cache without rescanning SQLite.
-        let cachedMiss = try await credentials.credentials(forBotId: "bot-new")
-        guard case .unavailable = cachedMiss else {
-            Issue.record("Expected TTL cache to keep negative lookup cached until invalidated")
+        let afterInsert = try await credentials.credentials(forBotId: "bot-new")
+        guard case .available = afterInsert else {
+            Issue.record("Expected credentials to reload on miss after direct store insert")
             return
         }
 
-        // Registering the bot profile invalidates the cache immediately.
+        // Deleting from SQLite + unregistering must invalidate positive cache hits immediately.
         try await runtime.macExecutionContext.register(MacBotExecutionProfile(
             id: "bot-new",
             threadId: "thread-new",
             engineId: "claude"
         ))
-        let result = try await credentials.credentials(forBotId: "bot-new")
-        guard case .available = result else {
-            Issue.record("Expected credentials to reload and resolve .available after registration invalidation")
+        let warmedHit = try await credentials.credentials(forBotId: "bot-new")
+        guard case .available = warmedHit else {
+            Issue.record("Expected registered bot credentials to be available")
+            return
+        }
+        try await database.deleteBot(id: "bot-new")
+        await runtime.macExecutionContext.unregister(botId: "bot-new")
+
+        let afterDelete = try await credentials.credentials(forBotId: "bot-new")
+        guard case .unavailable = afterDelete else {
+            Issue.record("Expected unregister after deleteBot to invalidate cached credentials immediately")
             return
         }
     }

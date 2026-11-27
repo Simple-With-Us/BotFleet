@@ -70,10 +70,19 @@ public actor MacExecutionContext: NativeExecutionContextSource {
         }
     }
 
-    /// Removes a bot's execution profile so future waits remain admission-held.
-    public func unregister(botId: String) {
+    /// Removes a bot's execution profile so future waits remain admission-held,
+    /// and invalidates cached CLI credentials for deleted or rolled-back bots.
+    public func unregister(botId: String) async {
         profiles.removeValue(forKey: botId)
         generation &+= 1
+        await invalidateCredentialsCache()
+    }
+
+    /// Invalidates cached CLI credentials (for example right after persistence).
+    public func invalidateCredentialsCache() async {
+        if let cliCredentials = credentials as? DatabaseCliLoginCredentials {
+            await cliCredentials.invalidateCache()
+        }
     }
 
     /// Returns the registered execution profile for `botId`, if present.
