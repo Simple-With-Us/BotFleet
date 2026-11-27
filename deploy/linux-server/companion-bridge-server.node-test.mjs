@@ -2144,3 +2144,381 @@ test('every forwarded route needs a paired device, and each one reaches the harn
     assert.equal(reached.length, 0, 'nothing reached the harness without a paired device');
 
     // With the paired device every row is forwarded, to the same path.
+    for (const route of rows) {
+      const path = samplePath(route.pattern);
+      const checked = CHECKED_BODIES.find(([pattern]) => pattern.test(path));
+      const body = route.method === 'GET' || route.method === 'DELETE' ? undefined : (checked ? checked[1] : '{}');
+      const json = body === undefined ? {} : { 'content-type': 'application/json' };
+      const allowed = await call(bridge.port, {
+        method: route.method,
+        path,
+        headers: ownerHeaders({ ...json, authorization: `Bearer ${device.credential}` }),
+        body,
+      });
+      assert.equal(allowed.status, 200, `${route.method} ${path}`);
+    }
+    assert.deepEqual(reached, rows.map((route) => `${route.method} ${samplePath(route.pattern)}`));
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('the forwarded request carries the companion stamp and neither credential', async () => {
+  const seen = [];
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      seen.push({ info, headers: { ...req.headers } });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    },
+  });
+  try {
+    const device = await bridge.pair('phone-stamp');
+    await call(bridge.port, {
+      method: 'POST',
+      path: '/api/bots/b-1/messages',
+      headers: ownerHeaders({
+        'content-type': 'application/json',
+        authorization: `Bearer ${device.credential}`,
+        'x-botfleet-device': 'phone-stamp',
+        'tailscale-user-login': 'owner@example.com',
+        'x-forwarded-for': '203.0.113.9',
+        'x-botfleet-owner-challenge': 'a'.repeat(64),
+      }),
+      body: '{"text":"hello"}',
+    });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].info.path, '/api/bots/b-1/messages');
+    assert.equal(seen[0].info.body, '{"text":"hello"}');
+    assert.equal(seen[0].headers['x-botfleet-companion'], '1');
+    // The phone's device credential is the bridge's business and the owner
+    // credential is the gate's: neither means anything to the harness, so
+    // neither travels. The stamp is what tells the harness a phone asked.
+    for (const name of ['authorization', 'x-botfleet-device', 'x-botfleet-gate-token', 'tailscale-user-login', 'x-forwarded-for', 'x-botfleet-owner-challenge']) {
+      assert.equal(seen[0].headers[name], undefined, name);
+    }
+    assert.equal(seen[0].headers.host, `127.0.0.1:${bridge.harness.port}`);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('a route that must stay closed never reaches the harness, with a paired device or without', async () => {
+  let reached = 0;
+  const bridge = await startBridge({
+    harnessHandler: (req, res) => {
+      reached += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    },
+  });
+  try {
+    const device = await bridge.pair('phone-closed-routes');
+    for (const [method, path, status] of [
+      // The sidecar's cloud desktop route, which needs a per-device grant
+      // the bridge cannot give.
+      ['POST', '/api/bots/b-1/computer/join', 404],
+      ['POST', '/api/bots/x/y/computer/join', 404],
+      // A route the harness has and the sidecar keeps off the phone.
+      ['POST', '/api/bots/b-1/always-allow', 404],
+      ['POST', '/api/bots/b-1/skills', 405],
+      ['POST', '/api/bots/apply-defaults', 405],
+      ['POST', '/api/webhooks', 404],
+      ['DELETE', '/api/connectors/github', 404],
+      ['GET', '/api/runtime', 404],
+      ['GET', '/api/host/resources', 404],
+      ['GET', '/api/placement/identity', 404],
+      ['POST', '/api/system/control/stop', 404],
+      ['GET', '/api/fleet', 404],
+      ['GET', '/api/threads/t-1', 404],
+      // An id with an encoded character in it.
+      ['POST', '/api/bots/b%2D1/messages', 404],
+      ['GET', '/api/bots/%252e', 404],
+      ['GET', '/api/threads/t-1/messages/m%2E1/image', 404],
+    ]) {
+      const label = `${method} ${path}`;
+      const body = method === 'GET' ? undefined : '{}';
+      const json = body === undefined ? {} : { 'content-type': 'application/json' };
+      const withDevice = await call(bridge.port, { method, path, headers: ownerHeaders({ ...json, authorization: `Bearer ${device.credential}` }), body });
+      assert.equal(withDevice.status, status, label);
+      assert.equal(withDevice.json.ok, undefined, label);
+      const withoutDevice = await call(bridge.port, { method, path, headers: ownerHeaders(json), body });
+      assert.equal(withoutDevice.status, status, label);
+    }
+    assert.equal(reached, 0);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('the profile and organize bodies are checked before they reach the harness, and forwarded re-serialized', async () => {
+  const seen = [];
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      seen.push(info);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    },
+  });
+  try {
+    const device = await bridge.pair('phone-body-check');
+    const auth = ownerHeaders({ 'content-type': 'application/json', authorization: `Bearer ${device.credential}` });
+
+    for (const [path, body, status, error] of [
+      ['/api/bots/b-1/profile', '{"name":"Rio","ownMcpServers":{"a":{"command":"x"}}}', 403, 'ownMcpServers can only be changed in BotFleet on your computer'],
+      ['/api/bots/b-1/profile', '{"mcpServers":["a"]}', 403, 'mcpServers can only be changed in BotFleet on your computer'],
+      ['/api/bots/b-1/profile', '{"composio":{"connected":true}}', 403, 'composio can only be changed in BotFleet on your computer'],
+      ['/api/bots/b-1/profile', '{"cloudBackend":"x"}', 403, 'cloudBackend can only be changed in BotFleet on your computer'],
+      ['/api/bots/b-1/profile', '{"extraCwds":["/"]}', 403, 'extraCwds can only be changed in BotFleet on your computer'],
+      ['/api/bots/b-1', '{"hidden":true,"autoApprove":true}', 403, 'autoApprove can only be changed in BotFleet on your computer'],
+      ['/api/bots/b-1', '{"computers":["local"]}', 403, 'computers can only be changed in BotFleet on your computer'],
+      ['/api/bots/b-1', '{"name":"Rio"}', 403, 'name can only be changed in BotFleet on your computer'],
+      ['/api/bots/b-1', '{"hidden":"yes"}', 400, 'hidden must be true or false'],
+      ['/api/bots/b-1', '{"pinnedMessageId":"../m-1"}', 400, 'pinnedMessageId must be a message id or null'],
+      ['/api/bots/b-1', '{}', 400, 'nothing to save'],
+      ['/api/bots/b-1', 'nope', 400, 'the request body is not valid JSON'],
+      ['/api/bots/b-1/profile', '[]', 400, 'the request body is not a JSON object'],
+    ]) {
+      const refused = await call(bridge.port, { method: 'PATCH', path, headers: auth, body });
+      assert.equal(refused.status, status, `${path} ${body}`);
+      assert.deepEqual(refused.json, { error }, `${path} ${body}`);
+    }
+    assert.equal(seen.length, 0, 'none of them reached the harness');
+
+    // A body that passes crosses as the validated object: re-serialized, so
+    // the bytes the harness reads are the bytes the bridge checked.
+    await call(bridge.port, { method: 'PATCH', path: '/api/bots/b-1/profile', headers: auth, body: '{ "name" :  "Rio" , "autoApprove": false }' });
+    await call(bridge.port, { method: 'PATCH', path: '/api/bots/b-1', headers: auth, body: '{"pinned":true,"section":"Work"}' });
+    assert.deepEqual(
+      seen.map((info) => `${info.path} ${info.body}`),
+      ['/api/bots/b-1/profile {"name":"Rio","autoApprove":false}', '/api/bots/b-1 {"pinned":true,"section":"Work"}'],
+    );
+
+    // Without a device credential the body is refused before it is read.
+    const anonymous = await call(bridge.port, {
+      method: 'PATCH',
+      path: '/api/bots/b-1/profile',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: '{"name":"Rio"}',
+    });
+    assert.equal(anonymous.status, 403);
+    assert.equal(seen.length, 2);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('a checked body that is too large is refused before it is read', async () => {
+  const bridge = await startBridge();
+  try {
+    const device = await bridge.pair('phone-big-body');
+    const refused = await call(bridge.port, {
+      method: 'PATCH',
+      path: '/api/bots/b-1/profile',
+      headers: ownerHeaders({ 'content-type': 'application/json', authorization: `Bearer ${device.credential}` }),
+      body: JSON.stringify({ name: 'x'.repeat(70 * 1024) }),
+    });
+    assert.equal(refused.status, 400);
+    assert.equal(refused.json.error, 'the request body is too large');
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('JSON responses reach the phone without the withheld keys, and everything else byte for byte', async () => {
+  // Spacing, number spelling and key order that a re-serialization would
+  // not give back: proof that a clean body is never parsed.
+  const clean = '{ "app": "botfleet", "ready": true, "n": 1.50, "bots": [ ] }';
+  const dirty = '{ "vps": { "configured": true, "sshAlias": "prod-vps" }, "bots": [ { "id": "b1", "resumeCursors": { "g": "s" } } ] }';
+  const image = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0xc3, 0xa9, 0x00]);
+  // A body that names a withheld key nested past any plausible stack: it
+  // parses, and the scrubber's recursion gives out.
+  const deep = `${'['.repeat(20_000)}{"sshAlias":"prod-vps"}${']'.repeat(20_000)}`;
+  const answers = {
+    '/api/instances': { type: 'application/json', body: Buffer.from(clean, 'utf8') },
+    '/api/config': { type: 'application/json', body: Buffer.from(dirty, 'utf8') },
+    '/api/quotas': { type: 'application/problem+json; charset=utf-8', body: Buffer.from(dirty, 'utf8') },
+    '/api/attachments/a.png': { type: 'image/png', body: image },
+    '/api/search?q=a%20b': { type: 'application/json', body: Buffer.from('{ "hits": [ { "text": "resume cursors and an ssh alias in prose" } ] }', 'utf8') },
+    '/api/jobs': { type: 'application/json', body: Buffer.from(deep, 'utf8') },
+  };
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      const answer = answers[`${info.path}${info.query}`];
+      assert.ok(answer, `unexpected ${info.path}${info.query}`);
+      res.writeHead(200, { 'content-type': answer.type, 'content-length': String(answer.body.length) });
+      res.end(answer.body);
+    },
+  });
+  try {
+    const device = await bridge.pair('phone-scrub');
+    const get = async (path) => {
+      const response = await rawCall(bridge.port, { path, headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }) });
+      return { ...response, text: response.buffer.toString('utf8') };
+    };
+
+    const cleanAnswer = await get('/api/instances');
+    assert.equal(cleanAnswer.status, 200);
+    assert.equal(cleanAnswer.text, clean);
+    assert.equal(cleanAnswer.headers['content-length'], String(Buffer.byteLength(clean)));
+    assert.equal(cleanAnswer.headers['content-type'], 'application/json');
+
+    const scrubbed = await get('/api/config');
+    assert.equal(scrubbed.status, 200);
+    assert.equal(scrubbed.text.includes('sshAlias'), false);
+    assert.equal(scrubbed.text.includes('prod-vps'), false);
+    assert.equal(scrubbed.text.includes('resumeCursors'), false);
+    assert.deepEqual(JSON.parse(scrubbed.text), { vps: { configured: true }, bots: [{ id: 'b1' }] });
+    assert.equal(scrubbed.headers['content-length'], String(Buffer.byteLength(scrubbed.text)));
+    assert.equal(scrubbed.headers['content-type'], 'application/json');
+
+    // The structured suffix counts as JSON, so an error body cannot carry
+    // a withheld key past the scrubber.
+    const problem = await get('/api/quotas');
+    assert.equal(problem.status, 200);
+    assert.equal(problem.text.includes('sshAlias'), false);
+    assert.deepEqual(JSON.parse(problem.text), { vps: { configured: true }, bots: [{ id: 'b1' }] });
+    assert.equal(problem.headers['content-type'], 'application/problem+json; charset=utf-8');
+
+    // Prose that merely resembles a withheld key is not touched.
+    const prose = await get('/api/search?q=a%20b');
+    assert.equal(prose.text, answers['/api/search?q=a%20b'].body.toString('utf8'));
+
+    // Anything that is not JSON is not parsed: the bytes are the bytes.
+    const picture = await get('/api/attachments/a.png');
+    assert.equal(picture.status, 200);
+    assert.ok(picture.buffer.equals(image));
+
+    // A body the scrubber cannot finish is not forwarded at all.
+    const unfinished = await get('/api/jobs');
+    assert.equal(unfinished.status, 502);
+    assert.deepEqual(JSON.parse(unfinished.text), { error: 'the response could not be prepared for this device' });
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('an event stream is scrubbed frame by frame, keeps its framing, and still ends when the device is revoked', async () => {
+  const streams = [];
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      if (info.path !== '/api/events') {
+        res.writeHead(200);
+        res.end('{}');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      res.socket?.setNoDelay(true);
+      res.write(': keepalive\n\n');
+      res.write('id: a:1\ndata: {"kind":"bot","bot":{"id":"b1","resumeCursors":{"g":"s"}}}\n\n');
+      // One event in three writes, the first cut inside a two-byte character
+      // and the second cut inside the terminator.
+      const frame = Buffer.from(
+        'id: a:2\ndata: {"kind":"config","text":"caf\u00e9","vps":{"sshAlias":"prod-vps","configured":true}}\n\n',
+        'utf8',
+      );
+      const accent = frame.indexOf(Buffer.from('\u00e9', 'utf8'));
+      res.write(frame.subarray(0, accent + 1));
+      setTimeout(() => res.write(frame.subarray(accent + 1, frame.length - 1)), 10);
+      setTimeout(() => res.write(frame.subarray(frame.length - 1)), 20);
+      streams.push(res);
+    },
+  });
+  try {
+    const device = await bridge.pair('phone-sse-scrub');
+    const collected = [];
+    let ended = false;
+    const stream = http.request(
+      {
+        hostname: '127.0.0.1',
+        port: bridge.port,
+        path: '/api/events?screens=off&since=%3Ccursor%3A1%3E',
+        method: 'GET',
+        headers: ownerHeaders({ authorization: `Bearer ${device.credential}`, accept: 'text/event-stream' }),
+      },
+      (response) => {
+        assert.equal(response.statusCode, 200);
+        assert.ok(String(response.headers['content-type']).includes('text/event-stream'));
+        response.on('data', (chunk) => collected.push(chunk));
+        for (const event of ['end', 'close', 'error']) response.on(event, () => { ended = true; });
+      },
+    );
+    stream.on('error', () => { ended = true; });
+    stream.end();
+
+    const text = () => Buffer.concat(collected).toString('utf8');
+    const frames = () => text().split('\n\n').length - 1;
+    const deadline = Date.now() + 3000;
+    while (frames() < 3 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const streamed = text();
+    // The comment, both ids and both terminators crossed, and nothing was
+    // rewritten: one blank line after each event and no extra bytes.
+    assert.ok(streamed.startsWith(': keepalive\n\n'));
+    assert.ok(streamed.includes('id: a:1\ndata: '));
+    assert.ok(streamed.includes('id: a:2\ndata: '));
+    assert.equal(frames(), 3);
+    // The withheld keys did not cross, under either spelling or nesting.
+    assert.equal(streamed.includes('resumeCursors'), false);
+    assert.equal(streamed.includes('"g":"s"'), false);
+    assert.equal(streamed.includes('sshAlias'), false);
+    assert.equal(streamed.includes('prod-vps'), false);
+    // What the phone renders survived, and the character split across two
+    // chunks arrived whole.
+    const data = streamed.split('\n').filter((line) => line.startsWith('data: ')).map((line) => JSON.parse(line.slice('data: '.length)));
+    assert.deepEqual(data, [
+      { kind: 'bot', bot: { id: 'b1' } },
+      { kind: 'config', text: 'caf\u00e9', vps: { configured: true } },
+    ]);
+
+    // Revoking the device still ends the stream at once.
+    const revoked = await call(bridge.port, { method: 'DELETE', path: `/api/companion/devices/${device.deviceId}` });
+    assert.equal(revoked.status, 200);
+    const closeDeadline = Date.now() + 3000;
+    while (!ended && Date.now() < closeDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(ended, true, 'the stream ended after the revoke');
+    stream.destroy();
+  } finally {
+    for (const stream of streams) stream.destroy();
+    await bridge.close();
+  }
+});
+
+test('an event stream the scrubber cannot hold is ended, never forwarded half an event', async () => {
+  const streams = [];
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      if (info.path !== '/api/events') {
+        res.writeHead(200);
+        res.end('{}');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      // One megabyte and more of an event that never ends.
+      res.write(`data: ${'x'.repeat(1024 * 1024 + 4096)}`);
+      streams.push(res);
+    },
+  });
+  try {
+    const device = await bridge.pair('phone-sse-overflow');
+    const response = await new Promise((resolve) => {
+      const request = http.request(
+        {
+          hostname: '127.0.0.1',
+          port: bridge.port,
+          path: '/api/events',
+          method: 'GET',
+          headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
+        },
+        (res) => {
+          const chunks = [];
+          res.on('data', (chunk) => chunks.push(chunk));
+          const finish = () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString('utf8') });
+          res.on('end', finish);
+          res.on('close', finish);
+          res.on('error', finish);
+        },
+      );
