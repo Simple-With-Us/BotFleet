@@ -198,6 +198,19 @@ test("a mount point is removed with whatever was left inside it, once the detach
   assert.equal(existsSync(gone), false);
 });
 
+test("a mount that fails leaves no mount point behind, and one that succeeds hands its path back", () => {
+  // The verifier's own mount points in the temporary directory, by name.
+  const mountPoints = () => readdirSync(realpathSync(tmpdir())).filter((name) => name.startsWith("bf-native-host-mount-"));
+  const before = mountPoints();
+  assert.throws(() => mountDiskImage("/nowhere/no-such-image.dmg", { attached: () => false }), /did not mount/);
+  assert.deepEqual(mountPoints(), before);
+  const mountpoint = mountDiskImage("/nowhere/an-image.dmg", { attached: () => true });
+  try {
+    assert.equal(basename(mountpoint).startsWith("bf-native-host-mount-"), true);
+    assert.equal(existsSync(mountpoint), true);
+  } finally { rmSync(mountpoint, { recursive: true, force: true }); }
+});
+
 test("a tree that may still be mounted is never removed", () => {
   // hdiutil answers that the detach worked, and the file system answers otherwise.
   const stillMounted = mountPoint(["volume-content"]);
