@@ -846,8 +846,8 @@ export function bridgeRedeemPairing({ state, presented, requestId = '', replayDe
 /**
  * The body `POST /api/pair` answers, in the shape the iOS app decodes as
  * `PairResponse` (`ios/Sources/CompanionCore/Models.swift`). The app
- * requires `token`, `device` and `serverName`, and reads `endpoints` when it
- * is there.
+ * requires `token`, `device` and `serverName`, and reads `endpoints` and
+ * `isBridge` when they are there.
  *
  * Every field names the Swift type it feeds. Nothing else is sent: the app
  * ignores what it does not know, and a field it did not ask for is one more
