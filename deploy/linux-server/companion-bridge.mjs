@@ -1234,8 +1234,8 @@ export function bridgeProfilePatchDenial(body) {
  * @returns {{status: number, error: string}|null}
  */
 export function bridgeBotOrganizeDenial(body) {
-  const shape = bridgeBodyShapeRefusal(body);
-  if (shape) return shape;
+  const refusal = bridgeBodyRefusal(body);
+  if (refusal) return refusal;
   const fields = Object.keys(body);
   if (fields.length === 0) return { status: 400, error: 'nothing to save' };
   const unsupported = fields.find((field) => !BRIDGE_BOT_ORGANIZE_FIELD_SET.has(field));
