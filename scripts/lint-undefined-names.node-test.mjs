@@ -34,8 +34,10 @@ function lint(file) {
     { cmd: "npx", args: ["--no-install", "oxlint", "-c", config, file] },
   ];
   for (const { cmd, args } of attempts) {
-    // oxlint exits non-zero when diagnostics exist, so an error here is an answer.
-    const result = spawnSync(cmd, args, { cwd: repoRoot, encoding: "utf8",
+    // oxlint exits non-zero when diagnostics exist, so only a binary that is
+    // not there moves on to the next attempt. A linter that hangs is a
+    // failure, not a retry.
+    const result = spawnSync(cmd, args, { cwd: repoRoot, encoding: "utf8", timeout: 60000,
       env: { ...process.env, NODE_OPTIONS: "--experimental-strip-types" } });
     if (result.error?.code === "ENOENT" || (result.status === null && !result.stdout && !result.stderr)) continue;
     return { status: result.status, output: `${result.stdout}${result.stderr}` };
