@@ -377,6 +377,15 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
         lastAdvertisement = CompanionEndpointAdvertisement()
     }
 
+    /// Says which placement the Mac app has applied. Told to a server that is
+    /// up, and kept for one built on a later start, so it is said from that
+    /// server's first answer.
+    public func setPlacement(_ mode: NativePlacementMode?) async {
+        placement = mode
+        guard let server else { return }
+        await server.setPlacement(mode)
+    }
+
     /// Sets the gate `POST /api/desktop/open` keeps after its loopback check.
     /// A server built later is built with it, and a server that is already up
     /// is told now.  Owner-side only, like the server's own setter: the
