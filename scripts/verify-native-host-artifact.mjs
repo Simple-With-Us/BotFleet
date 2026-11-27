@@ -74,6 +74,9 @@ export function verifyHostPayload(directory, { expectedSource, expectedBuild, un
     expectedSource, expectedBuild, unsignedDevelopment, inspectSignature });
 }
 
+/** What every mount point this script makes is called, under the temporary directory. */
+const MOUNT_PREFIX = "bf-native-host-mount-";
+
 // Mount an image read-only at a private mount point and hand back that path.
 export function mountDiskImage(image, { attached = attachDiskImage } = {}) {
   const mountpoint = mkdtempSync(join(realpathSync(tmpdir()), "bf-native-host-mount-"));
