@@ -343,7 +343,8 @@ final class ServerBridgePairingTests: XCTestCase {
         XCTAssertTrue(first === afterRename)
 
         // The same record enrolled again at another address is another server:
-        // a new backend, and nothing of the old window travels with it.
+        // a new backend, the old window closed where it is still open, and
+        // nothing of it travelling with the new one.
         let moved = HostRecord(id: host.id, name: renamed.name, origin: try HostOrigin("https://moved.fixture.test"), hostId: host.hostId)
         let movedCredential = try HostGateCredential(origin: moved.origin, token: RedactedSecret("fixture-gate"))
         let afterMove = await ServerBridgePairingBackend.shared(host: moved, credential: movedCredential, session: session())
