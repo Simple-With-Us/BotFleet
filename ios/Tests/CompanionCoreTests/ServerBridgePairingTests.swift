@@ -497,6 +497,24 @@ final class ServerBridgePairingTests: XCTestCase {
         XCTAssertNil(error)
     }
 
+    func testTheAdvertisementIsMarkedAsTheServersSoItsCodePairsAPhoneBesideItsMac() async throws {
+        let backend = try backend()
+        ServerBridgeURLProtocol.handler = { _ in
+            (200, ["serverName": "BotFleet Server", "endpoints": [["url": "https://server.example.com", "kind": "hosted", "priority": 0]]])
+        }
+        let advertisement = await backend.currentAdvertisement()
+        XCTAssertTrue(advertisement.isBridge)
+
+        // The card draws its code from this advertisement, so the invite
+        // that comes out of it names the server rather than a computer.
+        let window = NativePairingWindow(
+            code: "123456", qrCredential: qrToken,
+            expiresAt: Date().addingTimeInterval(240), attemptsRemaining: 5
+        )
+        let invite = try XCTUnwrap(NativeCompanionServer.makePairingInviteURL(window: window, advertisement: advertisement))
+        XCTAssertEqual(PairingInvite.parse(invite)?.role, .bridge)
+    }
+
     // MARK: - What the answers mean
 
     func testEachRefusalIsNamedForTheTab() async throws {
