@@ -17,6 +17,10 @@ const STEP_CONSUMERS = {
     "Load the Developer ID certificate": "native-mac-developer-id-certificate",
     "Load the Sentry DSN (optional)": "native-mac-sentry",
     "Load the notarization credentials": "native-mac-notarization",
+    // The optional native host job (BF-2635) signs with the app's certificate
+    // through the same binding;  it reads its notarization credentials itself
+    // through the packager, so it adds no second notarization step.
+    "Load the Developer ID certificate for the native host": "native-mac-developer-id-certificate",
     // The EdDSA key step is required now (native-mac-release.yml renames it
     // and passes a conditional `required`); the binding stays tolerant for
     // the explicitly unverified unsigned draft.
