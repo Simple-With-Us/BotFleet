@@ -284,3 +284,142 @@ struct MacPhoneSettings: View {
         #endif
     }
 }
+
+/// The server's half of the Phone tab (BF-2713): what `MacPhoneSettings`
+/// shows for this Mac, answered by the server's companion bridge. It owns
+/// its own snapshot because the server's window and devices live there and
+/// not in `MacSession`; like the Mac's cards it renders a credential only
+/// while its window is open.
+private struct ServerPairingCard: View {
+    let backend: ServerBridgePairingBackend
+    let title: String
+
+    @State private var snapshot = PhoneSettingsSnapshot()
+    @State private var errorMessage: String?
+    @State private var renderedQR: NSImage? = nil
+    @State private var renderedQRKey: String? = nil
+
+    var body: some View {
+        GroupBox("Pair With \(title.isEmpty ? "The Server" : title)") {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("A phone paired here syncs with the server, not with this Mac.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                if let window = snapshot.window, snapshot.inviteURL != nil {
+                    if let qr = renderedQR {
+                        Image(nsImage: qr)
+                            .resizable()
+                            .interpolation(.none)
+                            .frame(width: 180, height: 180)
+                            .accessibilityLabel("Server Pairing Code QR")
+                    }
+                    Text(PhoneSettingsDisplay.groupedCode(window.code))
+                        .font(.system(size: 32, weight: .semibold, design: .monospaced))
+                    Text("Expires \(window.expiresAt, format: Date.FormatStyle(date: .omitted, time: .shortened)) · \(window.attemptsRemaining) attempts left")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Button("Close Code") {
+                        Task {
+                            await backend.closePairingWindow()
+                            await reload()
+                        }
+                    }
+                } else {
+                    Button("Show Server Pairing Code") {
+                        Task {
+                            if await backend.openPairingWindow() == nil {
+                                errorMessage = (await backend.lastError)?.errorDescription
+                                    ?? "Could not open a pairing window on the server.\u{00A0} Try again."
+                            }
+                            await reload()
+                        }
+                    }
+                }
+
+                Divider()
+                Text(snapshot.devices.isEmpty ? "No phones paired with the server." : "Phones Paired With The Server")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                ForEach(snapshot.devices) { device in
+                    HStack {
+                        VStack(alignment: .leading) {
+                            Text(device.name).font(.body)
+                            Text("Added \(MacPhoneSettings.phoneDateString(device.createdAt))")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        Button("Revoke") {
+                            Task {
+                                if await backend.revokeDevice(id: device.id) {
+                                    await reload()
+                                } else {
+                                    errorMessage = (await backend.lastError)?.errorDescription
+                                        ?? "Could not revoke \(device.name). Try again."
+                                }
+                            }
+                        }
+                    }
+                    Divider()
+                }
+
+                Text(snapshot.routes.isEmpty
+                     ? (snapshot.serverName.isEmpty ? "No routes advertised yet." : "\(snapshot.serverName) advertises no routes yet.")
+                     : "Advertised Routes (Read-Only)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                ForEach(snapshot.routes) { route in
+                    HStack {
+                        Text(route.url).font(.body)
+                        Spacer()
+                        Label(route.kindLabel, systemImage: route.protected ? "lock.fill" : "house")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    Divider()
+                }
+
+                if let errorMessage {
+                    Text(errorMessage)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
+                Button("Refresh") {
+                    Task { await reload() }
+                }
+                .font(.caption)
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .task { await reload() }
+    }
+
+    private func reload() async {
+        snapshot = await PhoneSettingsSnapshotLoader(backend: backend).loadConsistent()
+        if let inviteURL = snapshot.inviteURL {
+            let key = inviteURL.absoluteString
+            if renderedQRKey != key {
+                // The same rule as the Mac's card: the previous window's QR
+                // leaves before the new one's is drawn.
+                renderedQR = nil
+                let image = await Task.detached(priority: .userInitiated) {
+                    MacPhoneSettings.makeQRImage(from: key)
+                }.value
+                guard snapshot.inviteURL?.absoluteString == key else { return }
+                if let image {
+                    renderedQRKey = key
+                    renderedQR = image
+                } else {
+                    renderedQRKey = nil
+                    renderedQR = nil
+                    errorMessage = "Could not draw the pairing code.\u{00A0} Select Refresh to try again."
+                }
+            }
+        } else {
+            renderedQRKey = nil
+            renderedQR = nil
+        }
+    }
+}
