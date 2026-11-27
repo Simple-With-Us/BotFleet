@@ -1759,7 +1759,7 @@ async function proxyRequest({ req, res, method, url, decision, host, port, upstr
         fail(error, 'the response could not be prepared for this device');
         return;
       }
-      settled = true;
+      settle();
       const headers = bridgeDownstreamHeaders(response.headers);
       // A body that named no withheld key is the harness's own answer, byte
       // for byte, with the length the harness stated.
