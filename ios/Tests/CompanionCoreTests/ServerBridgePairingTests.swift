@@ -224,10 +224,52 @@ final class ServerBridgePairingTests: XCTestCase {
         XCTAssertEqual(error, .notSaved, "a 503 from the bridge is its own refusal, not an unreachable bridge")
     }
 
-    func testClosingWithNothingOpenSendsNothing() async throws {
+    func testClosingWithNothingOpenStillAsksTheBridge() async throws {
         let backend = try backend()
+        ServerBridgeURLProtocol.handler = { _ in (200, ["closed": false]) }
         await backend.closePairingWindow()
-        XCTAssertTrue(ServerBridgeURLProtocol.captured.isEmpty)
+        let close = try XCTUnwrap(ServerBridgeURLProtocol.captured.first)
+        XCTAssertEqual(close.url.path, "/api/companion/bridge/pairing/close", "a window this backend never saw closes the same way")
+        let error = await backend.lastError
+        XCTAssertNil(error)
+    }
+
+    // MARK: - One backend per server
+
+    func testAServerKeepsOneBackendForTheLifeOfTheProcess() async throws {
+        let (host, enrolled) = try host()
+        let first = await ServerBridgePairingBackend.shared(host: host, credential: enrolled, session: session())
+        let again = await ServerBridgePairingBackend.shared(host: host, credential: enrolled, session: session())
+        XCTAssertTrue(first === again)
+
+        let other = HostRecord(name: "Other server", origin: try HostOrigin("https://other.fixture.test"))
+        let second = await ServerBridgePairingBackend.shared(host: other, credential: nil, session: session())
+        XCTAssertFalse(first === second)
+
+        await ServerBridgePairingBackend.retainOnly([host.id])
+        let afterForgetting = await ServerBridgePairingBackend.shared(host: other, credential: nil, session: session())
+        XCTAssertFalse(second === afterForgetting, "a server no longer enrolled gets a fresh backend, with no window and no credential")
+        let kept = await ServerBridgePairingBackend.shared(host: host, credential: enrolled, session: session())
+        XCTAssertTrue(first === kept)
+    }
+
+    func testAWindowOpenedBeforeTheTabReopenedIsStillShownAndCanBeClosed() async throws {
+        let (host, enrolled) = try host()
+        ServerBridgeURLProtocol.handler = { request in
+            request.url!.path.hasSuffix("/close") ? (200, ["closed": true]) : (200, self.windowBody())
+        }
+        let first = await ServerBridgePairingBackend.shared(host: host, credential: enrolled, session: session())
+        _ = await first.openPairingWindow()
+
+        // The tab closed and opened again, and asks for the server's backend anew.
+        let again = await ServerBridgePairingBackend.shared(host: host, credential: enrolled, session: session())
+        let shown = await again.activePairingWindow()
+        XCTAssertEqual(shown?.code, "123456")
+
+        await again.closePairingWindow()
+        XCTAssertEqual(ServerBridgeURLProtocol.captured.last?.url.path, "/api/companion/bridge/pairing/close")
+        let after = await again.activePairingWindow()
+        XCTAssertNil(after)
     }
 
     // MARK: - Devices and the advertisement
@@ -278,6 +320,19 @@ final class ServerBridgePairingTests: XCTestCase {
         XCTAssertNil(error)
     }
 
+    func testRevokeOnAServerWithNoBridgeIsNotARevokeAndSaysSo() async throws {
+        let backend = try backend()
+        // The gate's 404, or the harness's own: the reason is not the bridge's.
+        for body in [["error": "no such companion bridge route"], ["error": "not found"]] {
+            ServerBridgeURLProtocol.reset()
+            ServerBridgeURLProtocol.handler = { _ in (404, body) }
+            let revoked = await backend.revokeDevice(id: "phone-1")
+            XCTAssertFalse(revoked, body["error"]!)
+            let error = await backend.lastError
+            XCTAssertEqual(error, .notConfigured(body["error"]), "the tab must say the server has no phone pairing")
+        }
+    }
+
     func testRevokeRefusedByTheOwnerCheckIsNotARevoke() async throws {
         let backend = try backend()
         ServerBridgeURLProtocol.handler = { _ in (403, ["error": "owner identity required"]) }
@@ -317,7 +372,8 @@ final class ServerBridgePairingTests: XCTestCase {
 
     func testEachRefusalIsNamedForTheTab() async throws {
         let cases: [(Int, [String: Any], ServerBridgeError, String)] = [
-            (404, ["error": "no such companion bridge route"], .notConfigured, "a server without the bridge"),
+            (404, ["error": "no such companion bridge route"], .notConfigured("no such companion bridge route"), "a server without the bridge"),
+            (404, ["unrelated": true], .notConfigured(nil), "a 404 with no reason in it"),
             (502, ["error": "companion bridge unavailable"], .unavailable, "a bridge that is not answering"),
             (401, ["error": "owner identity required"], .authentication, "a credential the gate refused"),
             (403, ["error": "owner identity required"], .authentication, "a credential the gate refused"),
