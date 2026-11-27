@@ -22,7 +22,7 @@
 
 import { lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { encodeHostIdentity, HOST_CODE_ID, hostArtifactName, sha256File, verifyNativeHostArtifact } from "./native-host-artifact.mjs";
