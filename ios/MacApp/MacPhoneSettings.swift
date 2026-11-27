@@ -112,7 +112,7 @@ struct MacPhoneSettings: View {
             return
         }
         let credential = await servers.credential(for: server)
-        serverBackend = ServerBridgePairingBackend(host: server, credential: credential)
+        serverBackend = await ServerBridgePairingBackend.shared(host: server, credential: credential)
         serverLabel = server.name
     }
 
