@@ -174,6 +174,38 @@ async function call(port, options = {}) {
   return { status: response.status, headers: response.headers, text, json };
 }
 
+/**
+ * A proxied request to the bridge that answers when its answer ends, and
+ * that the test can cut off from the phone's side.
+ */
+function openProxied(port, path, headers) {
+  let request;
+  const promise = new Promise((resolve) => {
+    request = http.request({ hostname: '127.0.0.1', port, path, method: 'GET', headers }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      const finish = () => resolve({
+        status: res.statusCode,
+        text: Buffer.concat(chunks).toString('utf8'),
+        retryAfter: res.headers['retry-after'],
+      });
+      res.on('end', finish);
+      res.on('close', finish);
+      res.on('error', finish);
+    });
+    request.on('error', () => resolve({ status: 0, text: '' }));
+    request.end();
+  });
+  return { promise, abort: () => request.destroy() };
+}
+
+/** Answer once `read` returns what `wanted` says, or false after a second. */
+async function eventually(read, wanted) {
+  const deadline = Date.now() + 1000;
+  while (read() !== wanted && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  return read() === wanted;
+}
+
 test('the owner credential is required, and a loopback caller is the only one considered', async () => {
   const owners = bridgeParseOwnerLogins('Owner@Example.com');
   assert.deepEqual([...owners], ['owner@example.com']);
