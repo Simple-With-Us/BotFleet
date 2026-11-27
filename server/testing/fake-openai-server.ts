@@ -83,6 +83,15 @@ export interface FakeOpenAiServer {
 
 const DEFAULT_MODELS_BODY = { data: [{ id: "fake-model", object: "model" }] };
 
+/** On every answered request. A kept-alive socket outlives the fake that
+ *  opened it: the next fake a file starts takes the same port, and the
+ *  caller's pool then hands a request to the socket of the fake that is gone,
+ *  which fails that request at random with ECONNRESET or `other side closed`.
+ *  A connection that ends with its answer is never pooled, so it is never
+ *  reused. The one script that must not carry it is the one that cuts its
+ *  own body off (`kind: "close"`). */
+const CLOSE_CONNECTION = { connection: "close" };
+
 function readRequestBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = "";
@@ -105,7 +114,7 @@ function recordHeaders(req: IncomingMessage): Record<string, string> {
 }
 
 function sendSse(res: ServerResponse, script: Extract<ScriptedCompletion, { kind: "sse" }>): void {
-  res.writeHead(script.status ?? 200, { "content-type": "text/event-stream" });
+  res.writeHead(script.status ?? 200, { ...CLOSE_CONNECTION, "content-type": "text/event-stream" });
   const frames = script.frames;
   for (let i = 0; i < frames.length; i++) {
     const isLast = i === frames.length - 1;
@@ -125,7 +134,7 @@ export async function startFakeOpenAiServer(): Promise<FakeOpenAiServer> {
 
   const answerDirect = (res: ServerResponse, script: DirectCompletion): void => {
     if (script.kind === "json") {
-      res.writeHead(script.status ?? 200, { "content-type": "application/json" });
+      res.writeHead(script.status ?? 200, { ...CLOSE_CONNECTION, "content-type": "application/json" });
       res.end(JSON.stringify(script.body));
       return;
     }
@@ -135,6 +144,10 @@ export async function startFakeOpenAiServer(): Promise<FakeOpenAiServer> {
       return;
     }
     if (script.kind === "close") {
+      // Not `CLOSE_CONNECTION` here: a body that is cut off is a premature
+      // close only while the connection was meant to stay open. Said to
+      // close, it reads as a finished empty stream instead, and the retry
+      // this script exists to provoke never happens.
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.flushHeaders();
       setImmediate(() => res.destroy());
@@ -151,7 +164,7 @@ export async function startFakeOpenAiServer(): Promise<FakeOpenAiServer> {
       if (method === "GET" && url.startsWith("/v1/models")) {
         requests.push({ method, url, headers: recordHeaders(req), body: undefined });
         const body = modelsQueue.shift() ?? DEFAULT_MODELS_BODY;
-        res.writeHead(200, { "content-type": "application/json" });
+        res.writeHead(200, { ...CLOSE_CONNECTION, "content-type": "application/json" });
         res.end(JSON.stringify(body));
         return;
       }
@@ -168,12 +181,12 @@ export async function startFakeOpenAiServer(): Promise<FakeOpenAiServer> {
 
         const script = completionQueue.shift();
         if (!script) {
-          res.writeHead(500, { "content-type": "application/json" });
+          res.writeHead(500, { ...CLOSE_CONNECTION, "content-type": "application/json" });
           res.end(JSON.stringify({ error: "fake-openai-server: no scripted response queued for this request" }));
           return;
         }
         if (script.kind === "json") {
-          res.writeHead(script.status ?? 200, { "content-type": "application/json" });
+          res.writeHead(script.status ?? 200, { ...CLOSE_CONNECTION, "content-type": "application/json" });
           res.end(JSON.stringify(script.body));
           return;
         }
@@ -195,13 +208,13 @@ export async function startFakeOpenAiServer(): Promise<FakeOpenAiServer> {
       }
 
       requests.push({ method, url, headers: recordHeaders(req), body: undefined });
-      res.writeHead(404, { "content-type": "application/json" });
+      res.writeHead(404, { ...CLOSE_CONNECTION, "content-type": "application/json" });
       res.end(JSON.stringify({ error: `fake-openai-server: no route for ${method} ${url}` }));
     })().catch((error) => {
       // A thrown error inside the async handler must still answer the
       // socket, or the test hangs on the response instead of failing fast.
       if (!res.headersSent) {
-        res.writeHead(500, { "content-type": "application/json" });
+        res.writeHead(500, { ...CLOSE_CONNECTION, "content-type": "application/json" });
       }
       res.end(JSON.stringify({ error: `fake-openai-server: handler threw: ${String(error)}` }));
     });
