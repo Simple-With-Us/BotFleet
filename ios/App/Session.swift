@@ -1329,8 +1329,8 @@ final class Session: ObservableObject {
         let failed = rotation.currentEndpoint ?? connection.activeEndpoint ??
             CompanionEndpoint.direct(host: connection.host, port: connection.port, priority: 10_000)
         var next: String?
-        if let candidate = rotation.advanceEndpoint(after: error), let token {
-            client = CompanionClient(connection: connection.dialing(candidate), token: token)
+        if let candidate = rotation.advanceEndpoint(after: error), let rebuilt = makeClient(dialing: candidate) {
+            client = rebuilt
             next = candidate.displayAddress
             log.info("advancing to companion route \(candidate.url, privacy: .public)")
         }
