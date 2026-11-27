@@ -817,6 +817,8 @@ export function gateConfigFromSecrets(secrets) {
     ? crypto.createHash('sha256').update(gateToken, 'utf8').digest('hex')
     : null;
 
+  const bridgeOrigin = isText(secrets?.[BRIDGE_ORIGIN_SECRET_NAME]) ? secrets[BRIDGE_ORIGIN_SECRET_NAME].trim() : '';
+
   return {
     owners: parseOwnerLogins(ownerLogins),
     publicOrigin,
