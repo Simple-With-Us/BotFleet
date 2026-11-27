@@ -1318,6 +1318,67 @@ final class Session: ObservableObject {
         }
     }
 
+    /// Reads the server's token again when the keychain was locked for it,
+    /// off the main thread as at launch.
+    private func readTheServersTokenAgain() {
+        guard serverTokenUnread, let id = connection?.bridgeConnection?.id else { return }
+        Task { [weak self] in
+            let read = await Task.detached(priority: .userInitiated) { () -> CompanionLaunchTokenRead in
+                assert(!Thread.isMainThread)
+                return Self.readLaunchToken(id)
+            }.value
+            self?.adoptServerToken(read)
+        }
+    }
+
+    private func adoptServerToken(_ read: CompanionLaunchTokenRead) {
+        switch read {
+        case let .token(server):
+            serverTokenUnread = false
+            bridgeToken = server
+            // Under server-first the server leads from now on, so the stream
+            // moves to it.
+            guard connection?.prefersBridge == true else { return }
+            adoptWalk()
+            restartStream()
+            connect()
+        case .missing:
+            serverTokenUnread = false
+            dropServerPairing()
+            adoptWalk()
+        case .unavailable:
+            // Still locked: tried again the next time the app comes forward.
+            break
+        }
+    }
+
+    /// Asks the Mac, once per reconnect, which placement it runs while the
+    /// phone is following the server. A Mac that changed its mode would
+    /// otherwise not be heard until its route failed. A Mac that is asleep
+    /// does not answer, and the mode last heard stands.
+    private func askTheMacItsPlacement() {
+        guard let mac = connection, let token, let route = mac.orderedEndpoints.first else { return }
+        let asking = CompanionClient(connection: mac.dialing(route), token: token)
+        Task { [weak self] in
+            guard let metadata = try? await asking.connectionMetadata() else { return }
+            self?.heardTheMacsPlacement(metadata)
+        }
+    }
+
+    private func heardTheMacsPlacement(_ metadata: CompanionConnectionMetadata) {
+        guard var updated = connection, let placement = metadata.placement,
+              placement != updated.placement else { return }
+        let followed = updated.prefersBridge
+        updated.reconcile(metadata)
+        connection = updated
+        CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
+        // Whether the server leads changed, so the stream moves at once.
+        guard updated.prefersBridge != followed else { return }
+        adoptWalk()
+        restartStream()
+        connect()
+    }
+
     /// Declines the server's code. Nothing is paired.
     func declineServerPairing() {
         serverPairingOffer = nil
