@@ -476,6 +476,9 @@ extension Connection {
     /// bridge's own connection, so the caller sends the token that belongs
     /// to it and to nothing else.
     public func dialing(_ candidate: CompanionEndpoint) -> Connection {
+        if isBridgeRoute(candidate), let bridge = bridgeConnection {
+            return bridge.dialing(candidate)
+        }
         guard allowsEndpoint(candidate) else { return self }
         var copy = self
         copy.activeEndpoint = candidate
