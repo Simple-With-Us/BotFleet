@@ -1373,3 +1373,19 @@ test("every pairing refusal the core can name has a sentence for the person", ()
     sentences.add(sentence);
   }
   // Each reason reads differently, so a person can tell what to do next.
+  assert.equal(sentences.size, 6);
+  // A reason this does not know gets the general sentence, not its wording.
+  const unknown = bridgePairRefusalSentence("something new went wrong");
+  assert.equal(unknown, "This server could not complete the pairing. Start pairing again.");
+  assert.equal(bridgePairRefusalSentence(undefined), unknown);
+});
+
+test("a retried pairing is refused by name and never answers a body the app would store", () => {
+  assert.equal(BRIDGE_PAIR_REPLAY_REFUSAL.status, 409);
+  assert.match(BRIDGE_PAIR_REPLAY_REFUSAL.error, /issued only once/);
+  assert.ok(Object.isFrozen(BRIDGE_PAIR_REPLAY_REFUSAL));
+  // Nothing shaped like `PairResponse`: no token, so nothing to save.
+  assert.equal("token" in BRIDGE_PAIR_REPLAY_REFUSAL, false);
+  assert.equal("device" in BRIDGE_PAIR_REPLAY_REFUSAL, false);
+  assert.equal("serverName" in BRIDGE_PAIR_REPLAY_REFUSAL, false);
+});
