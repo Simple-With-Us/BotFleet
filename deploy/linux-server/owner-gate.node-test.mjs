@@ -562,7 +562,7 @@ function createFakeUpstream() {
   return { upstream, state };
 }
 
-function gateRequest({ port, headers = {}, path = "/api/thing" }) {
+function gateRequest({ port, headers = {}, path = "/api/thing", method = "GET", body = undefined }) {
   return new Promise((resolve, reject) => {
     const req = http.request(
       { host: "127.0.0.1", port, path, method: "GET", headers, agent: false },
