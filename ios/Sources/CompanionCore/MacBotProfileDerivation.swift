@@ -109,7 +109,7 @@ public final class DatabaseCliLoginCredentials: NativeServiceCredentialSource, @
     }
 
     public func credentials(forBotId botId: String) async throws -> NativeServiceCredentialResult {
-        let engines = try await cache.engines(load: {
+        let engines = try await cache.engines(forBotId: botId, load: {
             var map: [String: EngineMatrixID] = [:]
             for record in try await database.loadBots() {
                 if let derived = MacBotProfileDerivation.derive(from: record) {
@@ -123,6 +123,12 @@ public final class DatabaseCliLoginCredentials: NativeServiceCredentialSource, @
             return .available(environment: Self.minimalEnvironment())
         }
         return .unavailable
+    }
+
+    /// Clears the cached bot-engine lookup map so deletions and updates take
+    /// effect immediately across the cache TTL window.
+    public func invalidateCache() async {
+        await cache.invalidate()
     }
 
     /// The only variables a CLI-login child is explicitly given: its login
@@ -145,21 +151,32 @@ public final class DatabaseCliLoginCredentials: NativeServiceCredentialSource, @
 }
 
 /// Registered-engine map with the same lazy TTL shape as the workspace
-/// source's bot-id cache: the bot table has no change signal, so one load
-/// serves every bot until the entry expires, and a miss after expiry
-/// reloads the table once rather than scanning per bot.
+/// source's `RegisteredBotIdCache`: positive hits are served from cache
+/// until the TTL expires or the cache is invalidated on bot removal, while a
+/// miss reloads the table once so directly stored bots resolve immediately.
 private actor CliLoginCredentialCache {
     private var cachedEngines: [String: EngineMatrixID]?
     private var loadedAt: Date?
     private let ttl: TimeInterval = 30
 
-    func engines(load: @Sendable () async throws -> [String: EngineMatrixID]) async throws -> [String: EngineMatrixID] {
-        if let cachedEngines, let loadedAt, Date().timeIntervalSince(loadedAt) < ttl {
+    func engines(
+        forBotId botId: String,
+        load: @Sendable () async throws -> [String: EngineMatrixID]
+    ) async throws -> [String: EngineMatrixID] {
+        if let cachedEngines,
+           let loadedAt,
+           cachedEngines[botId] != nil,
+           Date().timeIntervalSince(loadedAt) < ttl {
             return cachedEngines
         }
         let loaded = try await load()
         cachedEngines = loaded
         loadedAt = Date()
         return loaded
+    }
+
+    func invalidate() {
+        cachedEngines = nil
+        loadedAt = nil
     }
 }

@@ -654,6 +654,21 @@ public actor DatabaseService {
         }
     }
 
+    public func deleteBot(id: String) throws {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = "DELETE FROM bots WHERE id = ?1;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
     // MARK: - Message Operations
 
     public func insertMessage(_ message: MessageRecord) throws {

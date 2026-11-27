@@ -1313,21 +1313,27 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         selectedThreadId = activeMainThreadId
     }
 
-    /// Creates a bot through the harness and selects it.  The harness picks
-    /// the name, colour and greeting, exactly as it does for the phone, so
-    /// a bot created here is indistinguishable from one created anywhere
-    /// else.  A failure is reported in `fleetActionErrorMessage` instead of
-    /// failing silently behind a button that looks live.
+    /// Creates a bot through the native chat service when running without a
+    /// Node harness, or through the connected harness client otherwise.
+    /// A failure is reported in `fleetActionErrorMessage` instead of failing
+    /// silently behind a button that looks live.
     public func createBot() async {
-        guard let client = client else {
+        guard !isCreatingBot else { return }
+        guard nativeChat != nil || client != nil else {
             fleetActionErrorMessage = "Not connected, so a bot cannot be added yet."
             return
         }
-        guard !isCreatingBot else { return }
         isCreatingBot = true
         defer { isCreatingBot = false }
         do {
-            let bot = try await client.createBot()
+            let bot: Bot
+            if let chat = nativeChat {
+                bot = try await chat.createBot()
+            } else if let client = client {
+                bot = try await client.createBot()
+            } else {
+                return
+            }
             // Creating a bot does not broadcast, so fold the new bot in
             // optimistically, exactly as the phone does (Session.createBot):
             // the bot is already made, and selecting a bot that is missing
