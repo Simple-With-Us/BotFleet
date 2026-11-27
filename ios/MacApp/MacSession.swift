@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import CoreVideo
+import Combine
 import CompanionCore
 #if os(macOS)
 import AppKit
@@ -99,6 +100,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     @Published public private(set) var port: Int = 8799
     public let servers: ServersCoordinator
     public let resources: ResourcesCoordinator
+    private var placementTelling = Set<AnyCancellable>()
 
     // Lifecycle & Remote Wake state (BF-2497)
     @Published public var lifecycleSettings = MacLifecycleSettings()
@@ -398,6 +400,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         self.companionListener.onStateChange = { [weak self] state in
             self?.companionListenerState = state
         }
+        self.tellTheListenerThePlacement()
         // Registering the notification categories is not asking for
         // permission:  the permission prompt stays lazy, at the first event
         // that actually needs the person.
@@ -983,6 +986,20 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
                 connect: { self.connect(host: $0) }
             )
         }
+    }
+
+    /// Phones read which placement this Mac runs off its advertisement, so
+    /// the listener is told whenever the applied one changes. The selection a
+    /// session starts with is nobody's choice: it is the default until the
+    /// saved servers have been read, and that read publishes the real one.
+    private func tellTheListenerThePlacement() {
+        servers.$placement
+            .dropFirst()
+            .sink { [weak self] settings in
+                let mode = settings.applied.mode
+                Task { await self?.companionListener.setPlacement(mode) }
+            }
+            .store(in: &placementTelling)
     }
 
     /// Turns the native companion listener on or off from Settings.  The

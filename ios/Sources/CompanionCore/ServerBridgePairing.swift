@@ -217,7 +217,10 @@ public actor ServerBridgePairingBackend: PhonePairingBackend {
             return CompanionEndpointAdvertisement()
         }
         lastError = nil
-        return CompanionEndpointAdvertisement(serverName: wire.serverName, hosts: [], endpoints: wire.endpoints)
+        // Marked as the server's: the invite the card draws from it then
+        // names the server, and a phone already paired with this Mac keeps
+        // that pairing and adds the server beside it (`PairingInvite.role`).
+        return CompanionEndpointAdvertisement(serverName: wire.serverName, hosts: [], endpoints: wire.endpoints, isBridge: true)
     }
 
     // MARK: - The wire

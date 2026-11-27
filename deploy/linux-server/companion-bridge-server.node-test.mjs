@@ -1701,10 +1701,13 @@ test('POST /api/pair answers the body the iOS app decodes as PairResponse', asyn
     // configured route in the one kind the shipped decoder accepts for it.
     assert.equal(paired.json.serverName, 'BotFleet Server');
     assert.deepEqual(paired.json.endpoints, [{ url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 }]);
+    // `PairResponse.isBridge`: a phone paired with a Mac keeps that pairing
+    // and holds this one beside it.
+    assert.equal(paired.json.isBridge, true);
 
     // Exactly the keys `PairResponse` names and exactly the keys
     // `PairedDevice` names: nothing is sent that the app does not decode.
-    assert.deepEqual(Object.keys(paired.json).sort(), ['device', 'endpoints', 'serverName', 'token']);
+    assert.deepEqual(Object.keys(paired.json).sort(), ['device', 'endpoints', 'isBridge', 'serverName', 'token']);
     assert.deepEqual(Object.keys(paired.json.device).sort(), ['createdAt', 'id', 'lastSeenAt', 'name']);
     assert.deepEqual(Object.keys(paired.json.endpoints[0]).sort(), ['kind', 'priority', 'url']);
 
@@ -1999,6 +2002,7 @@ test('the advertisement carries the configured routes, and falls back to the rou
     assert.equal(listed.status, 200);
     assert.deepEqual(listed.json, {
       serverName: 'BotFleet Server',
+      isBridge: true,
       endpoints: [
         { url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 },
         { url: 'https://cdn.example', kind: 'hosted', priority: 100 },
@@ -2024,6 +2028,7 @@ test('the advertisement carries the configured routes, and falls back to the rou
     });
     assert.deepEqual(JSON.parse(viaServe.buffer.toString('utf8')), {
       serverName: 'BotFleet Server',
+      isBridge: true,
       endpoints: [{ url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 }],
     });
     // A proxy that names no forwarded host leaves the Host to speak.
@@ -2037,7 +2042,7 @@ test('the advertisement carries the configured routes, and falls back to the rou
     // A direct loopback call, such as a curl on the host, advertises
     // nothing: a loopback address is no route a phone can dial.
     const direct = await call(derived.port, { path: '/api/companion/endpoints' });
-    assert.deepEqual(direct.json, { serverName: 'BotFleet Server', endpoints: [] });
+    assert.deepEqual(direct.json, { serverName: 'BotFleet Server', isBridge: true, endpoints: [] });
     // A loopback address named in a forwarding header is no route either.
     const loopback = await rawCall(derived.port, {
       path: '/api/companion/endpoints',
@@ -2131,6 +2136,7 @@ test('the pairing body is built from the Swift types it feeds, field for field',
       lastSeenAt: 1_700_000_000_000, // PairedDevice.lastSeenAt
     },
     serverName: 'BotFleet Server', // PairResponse.serverName
+    isBridge: true, // PairResponse.isBridge
     endpoints: [{ url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 }], // PairResponse.endpoints
   });
   // No route to offer: the optional field is absent, not empty.

@@ -640,9 +640,16 @@ public struct PairResponse: Codable, Sendable {
     /// Full HTTPS/HTTP routes from newer sidecars. Absent during a staggered
     /// rollout; `hosts` remains the compatibility path for older builds.
     public var endpoints: [CompanionEndpoint]?
+    /// The placement the computer had applied when it answered. Absent from
+    /// older builds and from the server's bridge, and left alone then: the
+    /// phone keeps what it last read.
+    public var placement: NativePlacementMode?
+    /// True when it was the server's companion bridge that answered. Such a
+    /// pairing belongs beside a Mac pairing, not in its place.
+    public var isBridge: Bool
 
     private enum CodingKeys: String, CodingKey {
-        case token, device, serverName, hosts, endpoints
+        case token, device, serverName, hosts, endpoints, placement, isBridge
     }
 
     public init(from decoder: Decoder) throws {
@@ -660,6 +667,10 @@ public struct PairResponse: Codable, Sendable {
         } else {
             endpoints = nil
         }
+        // A mode this build does not know is not an error either: by the time
+        // this is read, the credential has been redeemed.
+        placement = try? container.decode(NativePlacementMode.self, forKey: .placement)
+        isBridge = (try? container.decode(Bool.self, forKey: .isBridge)) ?? false
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -669,6 +680,8 @@ public struct PairResponse: Codable, Sendable {
         try container.encode(serverName, forKey: .serverName)
         try container.encodeIfPresent(hosts, forKey: .hosts)
         try container.encodeIfPresent(endpoints, forKey: .endpoints)
+        try container.encodeIfPresent(placement, forKey: .placement)
+        if isBridge { try container.encode(true, forKey: .isBridge) }
     }
 }
 
@@ -682,13 +695,20 @@ public struct CompanionConnectionMetadata: Decodable, Sendable {
     public var serverName: String
     public var hosts: [String]?
     public var endpoints: [CompanionEndpoint]
+    /// The placement the computer had applied, when it says. Absent from the
+    /// server's bridge and from older builds.
+    public var placement: NativePlacementMode?
+    /// True when the server's companion bridge answered.
+    public var isBridge: Bool
 
-    private enum CodingKeys: String, CodingKey { case serverName, hosts, endpoints }
+    private enum CodingKeys: String, CodingKey { case serverName, hosts, endpoints, placement, isBridge }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         serverName = try container.decode(String.self, forKey: .serverName)
         hosts = try container.decodeIfPresent([String].self, forKey: .hosts)
+        placement = try? container.decode(NativePlacementMode.self, forKey: .placement)
+        isBridge = (try? container.decode(Bool.self, forKey: .isBridge)) ?? false
 
         // Endpoint metadata is a replacement snapshot, not an optional hint.
         // Keep a future malformed kind from discarding valid routes beside it,
@@ -703,7 +723,10 @@ public struct CompanionConnectionMetadata: Decodable, Sendable {
         }.map(\.element)
         var seen = Set<String>()
         endpoints = stable.filter { seen.insert($0.url).inserted }.prefix(8).map { $0 }
-        guard !endpoints.isEmpty else {
+        // A snapshot with no route is refused, so the caller keeps the routes
+        // it has, with one exception. A Mac that advertises no route still
+        // says which placement it runs, and a phone has to hear that.
+        guard !endpoints.isEmpty || placement != nil else {
             throw DecodingError.dataCorruptedError(
                 forKey: .endpoints,
                 in: container,

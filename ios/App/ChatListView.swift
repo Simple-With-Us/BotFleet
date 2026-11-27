@@ -45,6 +45,9 @@ struct ChatListView: View {
     /// DEBUG `-store-preview -open-settings`: land on Settings, for the
     /// screenshot harness.
     @State private var showingDebugSettings = false
+    /// DEBUG `-store-preview -open-connection-security`: land on Connection
+    /// & Security, for the screenshot harness.
+    @State private var showingDebugConnection = false
 
     /// Room for the floating bar, so the last row can scroll clear of it.
     private static let barClearance: CGFloat = 96
@@ -87,6 +90,7 @@ struct ChatListView: View {
                     roster
                         .navigationDestination(for: Chat.self) { ChatView(chat: $0) }
                         .navigationDestination(isPresented: $showingDebugSettings) { SettingsView() }
+                        .navigationDestination(isPresented: $showingDebugConnection) { ConnectionSecurityView() }
                 }
             }
         }
@@ -117,6 +121,9 @@ struct ChatListView: View {
             }
             if ProcessInfo.processInfo.arguments.contains("-open-settings") {
                 showingDebugSettings = true
+            }
+            if ProcessInfo.processInfo.arguments.contains("-open-connection-security") {
+                showingDebugConnection = true
             }
         }
 #endif

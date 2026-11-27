@@ -846,15 +846,15 @@ export function bridgeRedeemPairing({ state, presented, requestId = '', replayDe
 /**
  * The body `POST /api/pair` answers, in the shape the iOS app decodes as
  * `PairResponse` (`ios/Sources/CompanionCore/Models.swift`). The app
- * requires `token`, `device` and `serverName`, and reads `endpoints` when it
- * is there.
+ * requires `token`, `device` and `serverName`, and reads `endpoints` and
+ * `isBridge` when they are there.
  *
  * Every field names the Swift type it feeds. Nothing else is sent: the app
  * ignores what it does not know, and a field it did not ask for is one more
  * thing to keep honest.
  *
  * @param {{credential: string, device: {id: string, name: string, pairedAtMs: number}, advertised: Array<{url: string, kind: string, priority: number}>}} input
- * @returns {{token: string, device: {id: string, name: string, createdAt: number, lastSeenAt: number}, serverName: string, endpoints?: Array<{url: string, kind: string, priority: number}>}}
+ * @returns {{token: string, device: {id: string, name: string, createdAt: number, lastSeenAt: number}, serverName: string, isBridge: boolean, endpoints?: Array<{url: string, kind: string, priority: number}>}}
  */
 export function bridgePairResponse({ credential, device, advertised }) {
   const response = {
@@ -873,6 +873,12 @@ export function bridgePairResponse({ credential, device, advertised }) {
     // `PairResponse.serverName`: what the phone's connection list calls this
     // server.
     serverName: BRIDGE_SERVER_NAME,
+    // `PairResponse.isBridge`: this is the server, and not a computer. A
+    // phone that is already paired with a Mac keeps that pairing and holds
+    // this one beside it (`Connection.bridgeConnection`), which is what lets
+    // it follow the server under `serverFirst` and fall back to the Mac.
+    // A computer never sends the field, so false is the default there.
+    isBridge: true,
   };
   // `PairResponse.endpoints`, each a `CompanionEndpoint` of `url`, `kind`
   // and `priority`. It is optional in Swift, and it is left out rather than
@@ -1289,8 +1295,9 @@ async function handleLocalRoute({
     // routes. `hosts` is left out on purpose. It is the older builds' list
     // of plain `http` addresses, and the bridge answers on its advertised
     // route alone, so a host entry would name a cleartext route that does
-    // not exist.
-    respondJson(res, 200, { serverName: BRIDGE_SERVER_NAME, endpoints: advertised });
+    // not exist. `isBridge` says whose advertisement it is, as the pairing
+    // answer does.
+    respondJson(res, 200, { serverName: BRIDGE_SERVER_NAME, endpoints: advertised, isBridge: true });
     return;
   }
 

@@ -73,6 +73,7 @@ Prerequisites, all owner-side:
 - A named TestFlight build of the iOS companion (bundle `app.botfleet.ios`).  TestFlight `202611270252` shipped from the hosted run on 2026-11-27 and carries the pairing contract the bridge serves; the build number is recorded at run time, never assumed.
 - A way to open a pairing window on the server.  No app opens one today, and a code lives 300 seconds, so for now a seat opens the window at the moment of the run; BF-2713 gives the Mac app that screen, and until it ships the QR half of P1 waits on it.
 - A physical iPhone paired with the **server** bridge (not the Mac), with the Mac asleep for the server-first rows.
+- For P8 only, a build that carries BF-2714 and a phone paired with the Mac as well as the server. The Mac says its applied placement in its advertisement, and the phone keeps the last one it heard, so the Mac has to have been reached once in `serverFirst`.
 - The scoped APNs grant for the Linux sender, by name only: `APNS_KEY_P8`, `APNS_KEY_ID`, and `APNS_TEAM_ID`.  The three names are present where the bridge reads them, and its start line reports `apns sender: key material present`.  Values are never written in this checklist, in Linear, or in chat.
 
 | # | Observe | Expected | Proves |
@@ -84,6 +85,8 @@ Prerequisites, all owner-side:
 | P5 | Background the app, then trigger a server-owned event | An APNs alert arrives from the Linux sender | Background wake — the row P3 cannot close |
 | P6 | Trigger an approval with the app terminated | The alert and Live Activity arrive; one device, one sender | The one-sender rule across the Mac-asleep seam |
 | P7 | Queue a Mac-only job while the Mac is asleep, then wake the Mac | The job visibly waits for the Mac secondary, then resumes exactly once, with no duplicate execution and no second authoritative writer | Primary and secondary stay in their lanes |
+| P8 | With the Mac in `serverFirst` and the phone paired with both, stop the bridge's route and let the phone reconnect, then bring the route back and reconnect again | The first reconnect falls back to the Mac's route with one hydrate and no duplicate frames, and the second leads with the server again | The phone prefers the bridge under `serverFirst` and falls back when it does not answer (BF-2714) |
+| P9 | Scan the server's code from the Mac app's Phone tab while the phone is already paired with the Mac | The phone offers to pair with the server beside the Mac, keeps its Mac pairing, and the Server section of Connection & Security names the server | Pairing with the server does not replace the Mac (BF-2714) |
 
 ## Non-Authorizations
 

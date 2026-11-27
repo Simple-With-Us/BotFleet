@@ -151,11 +151,24 @@ public struct CompanionEndpointAdvertisement: Sendable, Equatable {
     public var hosts: [String]
     /// Complete routes, each with its own scheme and port.
     public var endpoints: [CompanionEndpoint]
+    /// True when these are the server's routes, read from its companion
+    /// bridge, and not this computer's own. It is a mark for the app that
+    /// shows the advertisement: a pairing invite built from it is a bridge
+    /// invite, which a phone holds beside its Mac pairing instead of in its
+    /// place (`PairingInvite.role`). It is never sent on the wire from here;
+    /// this computer is never the bridge.
+    public var isBridge: Bool
 
-    public init(serverName: String = "", hosts: [String] = [], endpoints: [CompanionEndpoint] = []) {
+    public init(
+        serverName: String = "",
+        hosts: [String] = [],
+        endpoints: [CompanionEndpoint] = [],
+        isBridge: Bool = false
+    ) {
         self.serverName = serverName
         self.hosts = hosts
         self.endpoints = endpoints
+        self.isBridge = isBridge
     }
 
     /// Builds an ordered endpoint advertisement from explicit host inputs,
@@ -658,6 +671,12 @@ public actor NativeCompanionServer {
     /// recover a reply lost in transit.
     private var pairingReplay: PairingReplay?
     private var endpointAdvertisement: CompanionEndpointAdvertisement
+    /// The placement the Mac app last applied, when it has told this server.
+    /// A phone reads it to learn which side owns the work: under
+    /// `serverFirst` a phone that is also paired with the server's bridge
+    /// follows the bridge first. It is the app's to set (`setPlacement`) and
+    /// outlives a socket stop, unlike the routes.
+    private var appliedPlacement: NativePlacementMode?
     private let clock: @Sendable () -> Date
     private var config: CompanionServerConfig
     private var bots: [CompanionBotRecord]
@@ -920,6 +939,12 @@ public actor NativeCompanionServer {
         } else {
             return nil
         }
+        // A code the server opened pairs the phone with the server, which a
+        // phone already paired with this Mac keeps beside that pairing. The
+        // mark travels in the link, because nothing else in it says so.
+        if advertisement.isBridge {
+            items.append(URLQueryItem(name: "role", value: "bridge"))
+        }
 
         let trimmedName = advertisement.serverName.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedName.isEmpty {
@@ -958,7 +983,8 @@ public actor NativeCompanionServer {
         return CompanionEndpointAdvertisement(
             serverName: String(raw.serverName.prefix(maxAdvertisedServerNameLength)),
             hosts: Array(hosts.prefix(maxAdvertisedEndpoints)),
-            endpoints: Array(endpoints.prefix(maxAdvertisedEndpoints))
+            endpoints: Array(endpoints.prefix(maxAdvertisedEndpoints)),
+            isBridge: raw.isBridge
         )
     }
 
@@ -1094,6 +1120,13 @@ public actor NativeCompanionServer {
     /// advertise, for when the app's routes change.
     public func setEndpointAdvertisement(_ advertisement: CompanionEndpointAdvertisement) {
         endpointAdvertisement = Self.sanitizedAdvertisement(advertisement)
+    }
+
+    /// Says which placement the Mac app has applied. Sent beside the routes
+    /// from now on; nil, for an older app or a mode this build does not
+    /// know, sends nothing and leaves the phone what it last read.
+    public func setPlacement(_ mode: NativePlacementMode?) {
+        appliedPlacement = mode
     }
 
     /// Opens a fresh pairing window with generated manual and QR credentials.
@@ -1596,6 +1629,7 @@ public actor NativeCompanionServer {
             let serverName: String
             let hosts: [String]?
             let endpoints: [CompanionEndpoint]?
+            let placement: NativePlacementMode?
         }
         let advertisement = endpointAdvertisement
         return .json(200, PairEnvelope(
@@ -1603,7 +1637,8 @@ public actor NativeCompanionServer {
             device: device,
             serverName: advertisement.serverName,
             hosts: advertisement.hosts.isEmpty ? nil : advertisement.hosts,
-            endpoints: advertisement.endpoints.isEmpty ? nil : advertisement.endpoints
+            endpoints: advertisement.endpoints.isEmpty ? nil : advertisement.endpoints,
+            placement: appliedPlacement
         ))
     }
 
@@ -1615,10 +1650,12 @@ public actor NativeCompanionServer {
         struct EndpointSnapshot: Encodable {
             let serverName: String
             let endpoints: [CompanionEndpoint]
+            let placement: NativePlacementMode?
         }
         return .json(200, EndpointSnapshot(
             serverName: endpointAdvertisement.serverName,
-            endpoints: endpointAdvertisement.endpoints
+            endpoints: endpointAdvertisement.endpoints,
+            placement: appliedPlacement
         ))
     }
 

@@ -121,6 +121,13 @@ public protocol CompanionListenerBackend: Sendable {
     ) async throws -> UInt16?
     /// Stops the listener; a stop with nothing running is not an error.
     func stop() async
+    /// Says which placement the Mac app has applied, so a phone can read it
+    /// off the advertisement. A backend with no server to tell does nothing.
+    func setPlacement(_ mode: NativePlacementMode?) async
+}
+
+extension CompanionListenerBackend {
+    public func setPlacement(_ mode: NativePlacementMode?) async {}
 }
 
 /// Owns the companion listener's lifecycle for the native Mac app.
@@ -201,6 +208,13 @@ public final class CompanionListenerController {
         } else {
             await stop(then: .off)
         }
+    }
+
+    /// Tells phones which placement this Mac is running. The backend keeps
+    /// it for a listener that is not up yet, so it is said from the first
+    /// answer once the listener starts.
+    public func setPlacement(_ mode: NativePlacementMode?) async {
+        await backend.setPlacement(mode)
     }
 
     /// Applies the exit policy the same way the harness shutdown reads it.
@@ -302,6 +316,9 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
     /// Held here, so a server built on a later start is built with it.  The
     /// owner-side setters below also tell a server that is already up.
     private var desktopLaunch: CompanionDesktopLaunchWiring
+    /// The placement the app has applied, for the same reason: told to a
+    /// server that is up, and told to one built on a later start.
+    private var placement: NativePlacementMode?
 
     /// - Parameters:
     ///   - port: the port to bind; 0 lets the system pick one.
@@ -339,6 +356,9 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
         }
         var options = self.options
         options.advertisedName = advertising?.name
+        // Said before the socket opens, whichever way this server came to be,
+        // so no first answer leaves the mode out.
+        await server.setPlacement(placement)
         // The server answers once the socket is ready, with the port it bound,
         // or throws the listener's own error; a loopback bind drops the
         // advertisement whatever was asked.
@@ -355,6 +375,15 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
         // set, and the tab agrees with `GET /api/companion/endpoints`.
         await server.setEndpointAdvertisement(CompanionEndpointAdvertisement())
         lastAdvertisement = CompanionEndpointAdvertisement()
+    }
+
+    /// Says which placement the Mac app has applied. Told to a server that is
+    /// up, and kept for one built on a later start, so it is said from that
+    /// server's first answer.
+    public func setPlacement(_ mode: NativePlacementMode?) async {
+        placement = mode
+        guard let server else { return }
+        await server.setPlacement(mode)
     }
 
     /// Sets the gate `POST /api/desktop/open` keeps after its loopback check.
