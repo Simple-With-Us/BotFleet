@@ -1699,6 +1699,53 @@ async function proxyRequest({ req, res, method, url, decision, host, port, upstr
     const chunks = [];
     let size = 0;
     let settled = false;
+    const fail = (error, message) => {
+      if (settled) return;
+      settled = true;
+      logger(`[companion-bridge] ${method} ${pathOf(url)}: ${error.message}`);
+      response.destroy();
+      if (res.headersSent || res.writableEnded || res.destroyed) res.destroy();
+      else respondJson(res, 502, { error: message });
+    };
+    response.on('data', (chunk) => {
+      if (settled) return;
+      size += chunk.length;
+      if (size > MAX_BRIDGE_JSON_BODY_BYTES) {
+        fail(new Error('the harness answer was too large to check'), 'the response from the harness was too large');
+        return;
+      }
+      chunks.push(chunk);
+    });
+    response.on('aborted', () => fail(new Error('the harness did not finish its answer'), 'the harness did not finish its answer'));
+    response.on('error', (error) => fail(error, 'the harness did not finish its answer'));
+    response.on('end', () => {
+      if (settled) return;
+      const body = Buffer.concat(chunks);
+      const text = body.toString('utf8');
+      let prepared;
+      try {
+        prepared = bridgeScrubWireJson(text);
+      } catch (error) {
+        fail(error, 'the response could not be prepared for this device');
+        return;
+      }
+      settled = true;
+      const headers = bridgeDownstreamHeaders(response.headers);
+      // A body that named no withheld key is the harness's own answer, byte
+      // for byte, with the length the harness stated.
+      if (prepared === text) {
+        res.writeHead(response.statusCode ?? 502, headers);
+        res.end(body);
+        return;
+      }
+      const out = Buffer.from(prepared, 'utf8');
+      // The body was re-serialized, so nothing the harness said about its
+      // framing survives.
+      headers['content-length'] = String(out.length);
+      res.writeHead(response.statusCode ?? 502, headers);
+      res.end(out);
+    });
+  }
 
   const isEventStream = method === 'GET' && pathOf(url) === '/api/events' && deviceId && activeSseStreams;
   let unregisterSse = () => {};
@@ -1711,6 +1758,7 @@ async function proxyRequest({ req, res, method, url, decision, host, port, upstr
     const closeStream = () => {
       try { upstream.destroy(); } catch { /* ignore */ }
       try { upstreamResponse?.destroy(); } catch { /* ignore */ }
+      try { sseScrubStream?.destroy(); } catch { /* ignore */ }
       try { res.destroy(); } catch { /* ignore */ }
     };
     set.add(closeStream);
@@ -1728,7 +1776,8 @@ async function proxyRequest({ req, res, method, url, decision, host, port, upstr
     if (!res.headersSent) respondJson(res, 502, { error: 'the harness did not answer' });
     else res.destroy();
   });
-  req.pipe(upstream);
+  if (forwardedBody) upstream.end(forwardedBody);
+  else req.pipe(upstream);
   req.on('error', () => {
     unregisterSse();
     upstream.destroy();
@@ -1742,12 +1791,20 @@ async function proxyRequest({ req, res, method, url, decision, host, port, upstr
   // that opened it.
   res.on('close', () => {
     unregisterSse();
+    sseScrubStream?.destroy();
     // Only a response that did not finish tears the upstream down:  a
     // finished one has already had its upstream end with it.
     if (!res.writableFinished) {
       upstream.destroy();
       upstreamResponse?.destroy();
     }
+  });
+  // A write the socket refused must not become an unhandled error on the
+  // response: the stream paths above write to it by hand rather than through
+  // `pipe`, which would have attached this itself.
+  res.on('error', () => {
+    upstreamResponse?.destroy();
+    upstream.destroy();
   });
 }
 
@@ -1816,10 +1873,39 @@ export function parseBridgeArgs(argv) {
 }
 
 /**
+ * The Infisical name that holds the bridge's own reachable route or routes.
+ *
+ * The bridge is published on its own port, so no other name in the folder
+ * can stand in for it: `BOTFLEET_SERVER_URL` is the owner gate's route, and
+ * `BOTFLEET_PUBLIC_ORIGIN` is the one browser origin the gate accepts. The
+ * value is one absolute origin or a comma-separated list, first entry first,
+ * each an `http` or `https` origin with no path, credentials, query or
+ * fragment, such as the route `tailscale serve` publishes for this bridge.
+ *
+ * It is optional. Without it the advertisement is derived from the route
+ * each request arrived on, which is right behind a proxy that sets the
+ * forwarding headers and empty on a direct loopback call. A value that is
+ * present and unusable stops the bridge instead, because a route the owner
+ * believes is advertised and is not is worse than a start that fails loudly.
+ */
+export const BRIDGE_ORIGIN_SECRET_NAME = 'BOTFLEET_COMPANION_BRIDGE_ORIGIN';
+
+/** Every name the bridge reads from Infisical, for its one scoped read. */
+export const BRIDGE_CONFIG_SECRET_NAMES = Object.freeze([
+  'BOTFLEET_OWNER_LOGINS',
+  'BOTFLEET_PUBLIC_ORIGIN',
+  'BOTFLEET_SERVER_GATE_TOKEN',
+  BRIDGE_ORIGIN_SECRET_NAME,
+]);
+
+/**
  * The configuration the bridge reads from Infisical.
  *
+ * Throws when the advertised routes are configured but unusable. The message
+ * names the Infisical name and the rule it broke, and never the value.
+ *
  * @param {Record<string, string>|undefined} secrets
- * @returns {{owners: Set<string>, publicOrigin: string, tokenSha256: string|null}}
+ * @returns {{owners: Set<string>, publicOrigin: string, tokenSha256: string|null, origins: string[]}}
  */
 export function bridgeConfigFromSecrets(secrets) {
   const ownerLogins = isText(secrets?.BOTFLEET_OWNER_LOGINS) ? secrets.BOTFLEET_OWNER_LOGINS : '';
@@ -1828,10 +1914,15 @@ export function bridgeConfigFromSecrets(secrets) {
   const tokenSha256 = gateToken
     ? crypto.createHash('sha256').update(gateToken, 'utf8').digest('hex')
     : null;
+  const origins = bridgeParseOrigins(secrets?.[BRIDGE_ORIGIN_SECRET_NAME]);
+  if (!origins.ok) {
+    throw new Error(`${BRIDGE_ORIGIN_SECRET_NAME} is not usable: ${origins.reason}`);
+  }
   return {
     owners: bridgeParseOwnerLogins(ownerLogins),
     publicOrigin,
     tokenSha256,
+    origins: origins.origins,
   };
 }
 
@@ -1886,14 +1977,16 @@ async function main() {
   try {
     secrets = await readInfisicalSecrets({
       serviceToken,
-      names: ['BOTFLEET_OWNER_LOGINS', 'BOTFLEET_PUBLIC_ORIGIN', 'BOTFLEET_SERVER_GATE_TOKEN'],
+      names: [...BRIDGE_CONFIG_SECRET_NAMES],
     });
   } catch (error) {
     fail(`companion bridge: cannot read its config from Infisical: ${error?.message ?? 'unreachable'}`);
     return;
   }
 
-  const { owners, publicOrigin, tokenSha256 } = bridgeConfigFromSecrets(secrets);
+  // A configured route that is unusable throws, and the start fails with the
+  // name and the rule it broke, never the value.
+  const { owners, publicOrigin, tokenSha256, origins } = bridgeConfigFromSecrets(secrets);
   if (owners.size === 0 && !tokenSha256) {
     fail(
       'companion bridge: refusing to start: no owner credential in Infisical ' +
@@ -1929,6 +2022,7 @@ async function main() {
     owners,
     publicOrigin,
     tokenSha256,
+    origins,
     apns,
     startEventSubscriber: apns.available,
     log: (message) => {
@@ -1958,7 +2052,8 @@ async function main() {
     process.stdout.write(
       `${new Date().toISOString()} [companion-bridge] listening on ${BRIDGE_HOST}:${boundPort} ` +
         `-> harness ${BRIDGE_UPSTREAM_HOST}:${BRIDGE_UPSTREAM_PORT} ` +
-        `(owners: ${owners.size}, token: ${tokenSha256 ? 'yes' : 'no'})\n`,
+        `(owners: ${owners.size}, token: ${tokenSha256 ? 'yes' : 'no'}, ` +
+        `advertised routes: ${origins.length} configured or derived per request)\n`,
     );
   });
 }
