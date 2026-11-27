@@ -143,6 +143,10 @@ final class Session: ObservableObject {
     /// sends `token`, a route of the server sends this one, and neither ever
     /// travels to the other.
     private var bridgeToken: String?
+    /// True when the server's token could not be read because the keychain
+    /// was locked: read again each time the app comes to the front, until it
+    /// reads.
+    private var serverTokenUnread = false
     /// Which of the connection's stored hosts the next attempt dials. The
     /// walk advances on address-shaped failures and the winner is promoted —
     /// and persisted — when a stream goes live.
