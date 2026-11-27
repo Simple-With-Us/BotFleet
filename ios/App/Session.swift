@@ -1331,7 +1331,10 @@ final class Session: ObservableObject {
                 assert(!Thread.isMainThread)
                 return Self.readLaunchToken(id)
             }.value
-            self?.adoptServerToken(read)
+            // The pairing can change while the keychain answers: a sign-out,
+            // a removal or a new pairing. A read of another pairing is dropped.
+            guard let self, self.connection?.bridgeConnection?.id == id else { return }
+            self.adoptServerToken(read)
         }
     }
 
