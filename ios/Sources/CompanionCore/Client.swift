@@ -255,6 +255,7 @@ public struct PairingInvite: Equatable, Sendable {
     public init(connection: Connection, credential: String, role: Role = .computer) {
         self.connection = connection
         self.credential = credential
+        self.role = role
     }
 
     public static func parse(_ url: URL) -> PairingInvite? {
