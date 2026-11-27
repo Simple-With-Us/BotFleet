@@ -197,6 +197,42 @@ public struct Connection: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
+/// A pairing held inside another one: the phone's pairing with the server's
+/// companion bridge, kept beside its pairing with the Mac. A struct cannot
+/// hold itself, not even optionally; an enum boxes its payload, so it can
+/// hold the struct. On disk it is the plain connection, with no wrapper.
+public indirect enum CompanionBridgePairing: Codable, Hashable, Sendable {
+    case paired(Connection)
+
+    /// `nil` for `nil`, and a pairing that holds no pairing of its own: the
+    /// server is the end of the line.
+    static func holding(_ connection: Connection?) -> CompanionBridgePairing? {
+        guard var connection else { return nil }
+        connection.bridge = nil
+        return .paired(connection)
+    }
+
+    /// The bridge pairing as the connection it is.
+    public var connection: Connection {
+        get {
+            switch self {
+            case let .paired(connection): return connection
+            }
+        }
+        set { self = .paired(newValue) }
+    }
+
+    public init(from decoder: Decoder) throws {
+        self = .paired(try Connection(from: decoder))
+        // Whatever was written under the server holds no server of its own.
+        connection.bridge = nil
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        try connection.encode(to: encoder)
+    }
+}
+
 /// A pairing window handed from the desktop to the app as a QR/deep link.
 /// It contains only the address and a short-lived, single-use credential.
 /// New desktop builds put a high-entropy token in the QR; older builds carry
