@@ -1,6 +1,6 @@
 # iOS Companion Sync Acceptance Checklist (BF-2652)
 
-Status: checklist plus Slot 1 receipt (`Refs BF-2652`).  Slot 1 is verified offline at the exact revision below.  Slots 2 and 3 are **not verified**, and nothing in this document deploys, enables, grants, or schedules them.
+Status: checklist plus the Slot 1 and Slot 2 receipts (`Refs BF-2652`).  Slot 1 is verified offline at the exact revision the server serves, and Slot 2 is verified on that server.  Slot 3 is **not verified**, and nothing in this document deploys, enables, grants, or schedules it.
 
 ## The Three Evidence Slots
 
