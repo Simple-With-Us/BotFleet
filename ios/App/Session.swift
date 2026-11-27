@@ -1373,7 +1373,11 @@ final class Session: ObservableObject {
     private func askTheMacItsPlacement() {
         guard let mac = connection, let token, let route = mac.orderedEndpoints.first else { return }
         let asking = CompanionClient(connection: mac.dialing(route), token: token)
-        Task { [weak self] in
+        let askedFor = mac.id
+        // One ask at a time: a reconnect cancels the one before it, so a slow
+        // answer never lands over a newer one.
+        placementProbe?.cancel()
+        placementProbe = Task { [weak self] in
             guard let metadata = try? await asking.connectionMetadata() else { return }
             self?.heardTheMacsPlacement(metadata)
         }
