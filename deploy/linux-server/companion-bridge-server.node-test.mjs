@@ -2339,7 +2339,7 @@ test('the profile and organize bodies are checked before they reach the harness,
       headers: ownerHeaders({ 'content-type': 'application/json' }),
       body: '{"name":"Rio"}',
     });
-    assert.equal(anonymous.status, 403);
+    assert.equal(anonymous.status, 401);
     assert.equal(seen.length, 2);
   } finally {
     await bridge.close();
