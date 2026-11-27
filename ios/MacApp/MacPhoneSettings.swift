@@ -93,6 +93,24 @@ struct MacPhoneSettings: View {
             .padding(24)
         }
         .task(id: session.companionListenerEnabled) { await reload() }
+        .task(id: servers.hosts) { await prepareServerPairing() }
+    }
+
+    /// The server a phone can pair with: the one the saved placement names,
+    /// or the only other server this Mac is enrolled on. The credential is
+    /// the one enrolled for that host and no other.
+    private func prepareServerPairing() async {
+        await servers.load()
+        let remote = servers.hosts.filter { !$0.isLocal }
+        let placed = servers.placement.saved.serverID
+        guard let server = remote.first(where: { $0.id == placed }) ?? remote.first else {
+            serverBackend = nil
+            serverLabel = ""
+            return
+        }
+        let credential = await servers.credential(for: server)
+        serverBackend = ServerBridgePairingBackend(host: server, credential: credential)
+        serverLabel = server.name
     }
 
     private var pairingCard: some View {
