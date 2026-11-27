@@ -640,6 +640,13 @@ public struct PairResponse: Codable, Sendable {
     /// Full HTTPS/HTTP routes from newer sidecars. Absent during a staggered
     /// rollout; `hosts` remains the compatibility path for older builds.
     public var endpoints: [CompanionEndpoint]?
+    /// The placement the computer had applied when it answered. Absent from
+    /// older builds and from the server's bridge, and left alone then: the
+    /// phone keeps what it last read.
+    public var placement: NativePlacementMode?
+    /// True when it was the server's companion bridge that answered. Such a
+    /// pairing belongs beside a Mac pairing, not in its place.
+    public var isBridge: Bool
 
     private enum CodingKeys: String, CodingKey {
         case token, device, serverName, hosts, endpoints
