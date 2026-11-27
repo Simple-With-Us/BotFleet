@@ -1701,6 +1701,9 @@ test('POST /api/pair answers the body the iOS app decodes as PairResponse', asyn
     // configured route in the one kind the shipped decoder accepts for it.
     assert.equal(paired.json.serverName, 'BotFleet Server');
     assert.deepEqual(paired.json.endpoints, [{ url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 }]);
+    // `PairResponse.isBridge`: a phone paired with a Mac keeps that pairing
+    // and holds this one beside it.
+    assert.equal(paired.json.isBridge, true);
 
     // Exactly the keys `PairResponse` names and exactly the keys
     // `PairedDevice` names: nothing is sent that the app does not decode.
