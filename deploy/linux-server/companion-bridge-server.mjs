@@ -1723,8 +1723,9 @@ async function proxyRequest({ req, res, method, url, decision, host, port, upstr
     const chunks = [];
     let size = 0;
     let settled = false;
-    // The room this answer took goes back exactly once, on whichever way it
-    // ends: forwarded, refused, cut off, or torn down with the request.
+    // The room this answer took goes back exactly once, on whichever way the
+    // answer ends: forwarded, refused, cut off, or closed without another
+    // word.  The flag is the guard itself, so no path can give it back twice.
     const settle = () => {
       settled = true;
       jsonScrubs.inFlight -= 1;
