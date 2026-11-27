@@ -83,7 +83,7 @@ and writes nothing into it.
 | The receipt names the pinned commit and build | `scripts/verify-native-host-artifact.mjs release` reads `artifact.json` and refuses another source commit, another build, or anything but a Developer ID distribution | `another commit or build than the pinned ones` |
 | The bytes on disk are the bytes the receipt names | the image is hashed again and compared with the receipt's `artifactSha256` | `does not hash to the digest the receipt names` |
 | The mounted image holds the executable the receipt names, with its signature intact | the image is mounted read-only and `verifyNativeHostArtifact` runs on `bin/BotFleetNativeHost` inside it: both slices, both real signatures, the team, the hardened runtime, the stamp and the exact file set | `Native host artifact verification refused.` |
-| The image never stays mounted | the detach runs on every path out, and the mount point is removed only after the detach is confirmed | a failed detach fails the job |
+| The image never stays mounted | the detach runs on every path out, and the mount point is removed only after the detach is confirmed twice, by `hdiutil`'s exit status and by the file system, and then with whatever was left inside it | a failed detach fails the job |
 | What is attached is what was verified | the attach job downloads the artifact, hashes it again against the digest the macOS job reported, and refuses a release that is no longer a draft | `not the one the build job verified` |
 
 A green run prints, from the macOS job,
