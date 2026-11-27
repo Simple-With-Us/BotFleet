@@ -2042,7 +2042,7 @@ test('the advertisement carries the configured routes, and falls back to the rou
     // A direct loopback call, such as a curl on the host, advertises
     // nothing: a loopback address is no route a phone can dial.
     const direct = await call(derived.port, { path: '/api/companion/endpoints' });
-    assert.deepEqual(direct.json, { serverName: 'BotFleet Server', endpoints: [] });
+    assert.deepEqual(direct.json, { serverName: 'BotFleet Server', isBridge: true, endpoints: [] });
     // A loopback address named in a forwarding header is no route either.
     const loopback = await rawCall(derived.port, {
       path: '/api/companion/endpoints',
