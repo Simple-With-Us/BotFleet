@@ -98,7 +98,9 @@ struct MacPhoneSettings: View {
 
     /// The server a phone can pair with: the one the saved placement names,
     /// or the only other server this Mac is enrolled on. The credential is
-    /// the one enrolled for that host and no other.
+    /// the one enrolled for that host and no other. The backend is the one
+    /// this process keeps for that server, so a pairing window it opened
+    /// survives this tab closing and can still be closed when it reopens.
     private func prepareServerPairing() async {
         await servers.load()
         let remote = servers.hosts.filter { !$0.isLocal }
