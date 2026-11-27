@@ -221,6 +221,19 @@ struct RootView: View {
         } message: { message in
             Text(message)
         }
+        .alert(
+            "Pair With The Server?",
+            isPresented: Binding(
+                get: { session.serverPairingOffer != nil },
+                set: { if !$0 { session.declineServerPairing() } }
+            ),
+            presenting: session.serverPairingOffer
+        ) { _ in
+            Button("Pair With The Server") { Task { await session.pairWithOfferedServer() } }
+            Button("Not Now", role: .cancel) { session.declineServerPairing() }
+        } message: { offer in
+            Text("\(offer.connection.name) will be paired beside \(session.connection?.name ?? "this Mac").\u{00A0} This iPhone follows the server when the Mac runs server-first, and falls back to the Mac when the server does not answer.")
+        }
     }
 
     @ViewBuilder
