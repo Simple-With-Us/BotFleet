@@ -706,7 +706,7 @@ test('a proxied route needs a device the bridge knows; one it does not know, or 
       path: '/api/bots',
       headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
     });
-    assert.equal(revoked.status, 403);
+    assert.equal(revoked.status, 401);
     assert.equal(reached, 1);
   } finally {
     await bridge.close();
