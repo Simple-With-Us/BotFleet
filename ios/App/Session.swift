@@ -562,7 +562,10 @@ final class Session: ObservableObject {
         }
     }
 
-    private func applyLaunchDecision(_ decision: CompanionLaunchRestoreDecision) {
+    private func applyLaunchDecision(
+        _ decision: CompanionLaunchRestoreDecision,
+        serverToken: CompanionLaunchTokenRead = .missing
+    ) {
         launchRestoreDecision = decision
         switch decision {
         case .unpaired:
