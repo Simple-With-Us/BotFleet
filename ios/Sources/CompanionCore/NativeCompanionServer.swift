@@ -1654,7 +1654,8 @@ public actor NativeCompanionServer {
         }
         return .json(200, EndpointSnapshot(
             serverName: endpointAdvertisement.serverName,
-            endpoints: endpointAdvertisement.endpoints
+            endpoints: endpointAdvertisement.endpoints,
+            placement: appliedPlacement
         ))
     }
 
