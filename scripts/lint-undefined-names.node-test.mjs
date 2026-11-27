@@ -64,8 +64,8 @@ test("a Node script that calls a name it never defines is refused, and one that 
 });
 
 test("the rule is on for the repository's Node scripts, with Node's globals declared", () => {
-  const config = JSON.parse(readFileSync(join(repoRoot, ".oxlintrc.json"), "utf8"));
-  const override = config.overrides?.find((entry) => entry.rules?.["no-undef"] === "error");
+  const config = LintConfig.parse(JSON.parse(readFileSync(join(repoRoot, ".oxlintrc.json"), "utf8")));
+  const override = config.overrides.find((entry) => entry.rules["no-undef"] === "error");
   assert.deepEqual(override?.files, ["**/*.mjs", "**/*.cjs"]);
   assert.equal(config.env?.node, true);
   // TypeScript is left out on purpose: without type information the rule
