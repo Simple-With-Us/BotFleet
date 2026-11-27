@@ -1650,6 +1650,7 @@ public actor NativeCompanionServer {
         struct EndpointSnapshot: Encodable {
             let serverName: String
             let endpoints: [CompanionEndpoint]
+            let placement: NativePlacementMode?
         }
         return .json(200, EndpointSnapshot(
             serverName: endpointAdvertisement.serverName,
