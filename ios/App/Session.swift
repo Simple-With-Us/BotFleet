@@ -520,6 +520,7 @@ final class Session: ObservableObject {
         }.value
         guard generation == launchGeneration else { return }
         let tokenRead: CompanionLaunchTokenRead
+        var serverTokenRead: CompanionLaunchTokenRead = .missing
         if let saved {
             let connectionId = saved.connection.id
             tokenRead = await Task.detached(priority: .userInitiated) { () -> CompanionLaunchTokenRead in
