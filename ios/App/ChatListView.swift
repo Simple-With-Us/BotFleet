@@ -122,6 +122,9 @@ struct ChatListView: View {
             if ProcessInfo.processInfo.arguments.contains("-open-settings") {
                 showingDebugSettings = true
             }
+            if ProcessInfo.processInfo.arguments.contains("-open-connection-security") {
+                showingDebugConnection = true
+            }
         }
 #endif
         .task { _ = await session.configStatus() }
