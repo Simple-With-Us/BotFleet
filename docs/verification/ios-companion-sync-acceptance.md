@@ -34,7 +34,7 @@ Linux/Hetzner is the primary BotFleet server.  Both the Mac app and the iPhone 
 The earlier 46/46 core result at `a024b67f` is superseded by this receipt: that revision predates the landed #2190 packaging, so only the counts at `c202b4d6` count for BF-2652.
 
 
-What would prove it, none of which was done here:
+## Slot 1 Receipt: The Revision The Server Serves
 
 - The serving host reports its exact revision (`git -C <serving checkout> rev-parse HEAD`) and it matches a revision whose Slot 1 receipt exists.
 - `botfleet-companion-bridge.service` is enabled only under the owner's `BF_COMPANION_BRIDGE=1` decision, listens on loopback, and is published through the owner's `tailscale serve` step.
