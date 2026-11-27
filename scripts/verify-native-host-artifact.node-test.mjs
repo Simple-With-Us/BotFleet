@@ -211,6 +211,47 @@ test("a mount that fails leaves no mount point behind, and one that succeeds han
   } finally { rmSync(mountpoint, { recursive: true, force: true }); }
 });
 
+test("a directory this script did not make is refused and never removed, however it is named", () => {
+  // The removal is recursive, so the path is held to the one name this
+  // script gives and the one place it puts it.
+  const kept = [];
+  const unmount = (path) => unmountDiskImage(path, { detached: () => true, mounted: () => false });
+  const refuses = (path, label) => {
+    assert.throws(() => unmount(path), /not a directory this script made/, label);
+    assert.equal(existsSync(path), true, `${label} is still there`);
+  };
+
+  // Another name in the temporary directory.
+  const other = mkdtempSync(join(tmpdir(), "someone-elses-"));
+  writeFileSync(join(other, "kept"), "x");
+  kept.push(other);
+  refuses(other, "a directory with another name");
+
+  // This script's name, somewhere else.
+  const elsewhere = mkdtempSync(join(tmpdir(), "elsewhere-"));
+  const planted = join(elsewhere, "bf-native-host-mount-planted");
+  mkdirSync(planted);
+  writeFileSync(join(planted, "kept"), "x");
+  kept.push(elsewhere);
+  refuses(planted, "this script's name outside the temporary directory");
+
+  // This script's name in the temporary directory, pointing somewhere else.
+  const target = mkdtempSync(join(tmpdir(), "link-target-"));
+  writeFileSync(join(target, "kept"), "x");
+  const link = join(realpathSync(tmpdir()), "bf-native-host-mount-link");
+  symlinkSync(target, link);
+  kept.push(target);
+  assert.throws(() => unmount(link), /not a directory this script made/);
+  assert.equal(existsSync(join(target, "kept")), true, "the link's target is untouched");
+  rmSync(link);
+
+  // The root, and nothing.
+  refuses(sep, "the root of the file system");
+  assert.throws(() => unmount(""), /not a directory this script made/);
+
+  for (const path of kept) rmSync(path, { recursive: true, force: true });
+});
+
 test("a tree that may still be mounted is never removed", () => {
   // hdiutil answers that the detach worked, and the file system answers otherwise.
   const stillMounted = mountPoint(["volume-content"]);
