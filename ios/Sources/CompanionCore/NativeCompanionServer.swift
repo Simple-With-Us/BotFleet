@@ -159,7 +159,12 @@ public struct CompanionEndpointAdvertisement: Sendable, Equatable {
     /// this computer is never the bridge.
     public var isBridge: Bool
 
-    public init(serverName: String = "", hosts: [String] = [], endpoints: [CompanionEndpoint] = []) {
+    public init(
+        serverName: String = "",
+        hosts: [String] = [],
+        endpoints: [CompanionEndpoint] = [],
+        isBridge: Bool = false
+    ) {
         self.serverName = serverName
         self.hosts = hosts
         self.endpoints = endpoints
