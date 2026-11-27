@@ -1188,3 +1188,486 @@ function isJsonString(value) {
  * @param {unknown} value
  * @returns {boolean}
  */
+function isJsonObject(value) {
+  if (value === null || value === undefined || Array.isArray(value)) return false;
+  return Object.prototype.toString.call(value) === '[object Object]';
+}
+
+/**
+ * The refusal for a body that is not a JSON object, or null when it is one.
+ * Every body check below starts here, so a check never reads keys off an
+ * array, a string or a number.
+ *
+ * @param {unknown} body
+ * @returns {{status: number, error: string}|null}
+ */
+function bridgeBodyShapeRefusal(body) {
+  return isJsonObject(body) ? null : { status: 400, error: 'body must be a JSON object' };
+}
+
+/**
+ * Validate a paired phone's bot profile body before it reaches the broader
+ * harness route. Reject the whole request rather than silently stripping a
+ * field the person expected to save.
+ *
+ * @param {unknown} body
+ * @returns {{status: number, error: string}|null}
+ */
+export function bridgeProfilePatchDenial(body) {
+  const shape = bridgeBodyShapeRefusal(body);
+  if (shape) return shape;
+  const unsupported = Object.keys(body).find((field) => !BRIDGE_PROFILE_PATCH_FIELD_SET.has(field));
+  return unsupported
+    ? { status: 403, error: `${unsupported} can only be changed in BotFleet on your computer` }
+    : null;
+}
+
+/**
+ * Validate the organize boundary before a body reaches the harness. The
+ * harness copies `hidden`, `pinned` and `unread` into the stored bot, so the
+ * types are checked here as well as the names. Whole-request rejection,
+ * like the profile route. The harness stays the authority on length limits
+ * and on rules that need the stored bot, such as refusing to archive the
+ * Chief Of Staff.
+ *
+ * @param {unknown} body
+ * @returns {{status: number, error: string}|null}
+ */
+export function bridgeBotOrganizeDenial(body) {
+  const shape = bridgeBodyShapeRefusal(body);
+  if (shape) return shape;
+  const fields = Object.keys(body);
+  if (fields.length === 0) return { status: 400, error: 'nothing to save' };
+  const unsupported = fields.find((field) => !BRIDGE_BOT_ORGANIZE_FIELD_SET.has(field));
+  if (unsupported) {
+    return { status: 403, error: `${unsupported} can only be changed in BotFleet on your computer` };
+  }
+  for (const field of fields) {
+    const value = body[field];
+    if (BRIDGE_BOT_ORGANIZE_BOOLEAN_FIELDS.has(field)) {
+      if (value !== true && value !== false) return { status: 400, error: `${field} must be true or false` };
+    } else if (field === 'section') {
+      if (value !== null && !isJsonString(value)) {
+        return { status: 400, error: 'section must be a string or null' };
+      }
+    } else if (field === 'pinnedMessageId') {
+      if (value !== null && !(isJsonString(value) && /^[\w-]*$/.test(value))) {
+        return { status: 400, error: 'pinnedMessageId must be a message id or null' };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The body check a forwarded request needs, or null when the route list
+ * alone decides it. One lookup for the proxy, so a new checked route is one
+ * line here rather than another branch there.
+ *
+ * @param {string} method
+ * @param {string} path the raw, undecoded path
+ * @returns {((body: unknown) => {status: number, error: string}|null)|null}
+ */
+export function bridgeBodyCheck(method, path) {
+  const raw = String(path ?? '');
+  if (method !== 'PATCH') return null;
+  if (BRIDGE_PROFILE_PATCH_ROUTE_PATTERN.test(raw)) return bridgeProfilePatchDenial;
+  if (BRIDGE_BOT_ORGANIZE_ROUTE_PATTERN.test(raw)) return bridgeBotOrganizeDenial;
+  return null;
+}
+
+/**
+ * The keys the harness may say and a phone has no business holding, copied
+ * from the sidecar's `wire.ts`.
+ *
+ * `resumeCursors` is the harness's own bookkeeping, the native session id to
+ * resume per instance per task. `sshAlias` is the self-hosted VPS label, a
+ * name for one of the owner's servers, which the config status echoes in
+ * `vps`. The phone renders configured-or-not and nothing more, so
+ * `{configured: true}` survives and the label does not.
+ *
+ * The harness already drops `resumeCursors` at source today. The scrubber
+ * stays, because it is the sidecar's rule and because a harness that carries
+ * an older payload must not hand the phone anything the Mac withholds.
+ */
+export const BRIDGE_WITHHELD_RESPONSE_KEYS = Object.freeze(['resumeCursors', 'sshAlias']);
+
+const BRIDGE_WITHHELD_RESPONSE_KEY_SET = new Set(BRIDGE_WITHHELD_RESPONSE_KEYS);
+
+/**
+ * Whether a serialized payload names a withheld key at all. This is the fast
+ * path: a payload that names none is forwarded as the exact bytes that
+ * arrived, with no parse and no re-serialization.
+ *
+ * @param {string} text
+ * @returns {boolean}
+ */
+function holdsWithheldKey(text) {
+  for (const key of BRIDGE_WITHHELD_RESPONSE_KEYS) {
+    if (text.includes(key)) return true;
+  }
+  return false;
+}
+
+/**
+ * Recursively drop the withheld keys, wherever they appear.
+ *
+ * @template T
+ * @param {T} value
+ * @returns {T}
+ */
+export function bridgeScrub(value) {
+  if (value === null || value === undefined) return value;
+  if (Array.isArray(value)) return value.map(bridgeScrub);
+  if (!isJsonObject(value)) return value;
+  // A null prototype, so a payload key spelled `__proto__` becomes an own
+  // property of the copy instead of the copy's prototype.
+  const out = Object.create(null);
+  for (const [key, inner] of Object.entries(value)) {
+    if (BRIDGE_WITHHELD_RESPONSE_KEY_SET.has(key)) continue;
+    out[key] = bridgeScrub(inner);
+  }
+  return out;
+}
+
+/**
+ * Scrub one serialized JSON payload.
+ *
+ * A payload that names no withheld key comes back as the same string. One
+ * that does not parse comes back unchanged too: it was never JSON, so
+ * there is nothing of ours in it to remove. One that parses but cannot be
+ * scrubbed throws, because a deeply nested body can outlast the scrubber's
+ * recursion while `JSON.parse` handles it, and forwarding that unscrubbed
+ * would send exactly what the scrubber exists to withhold. The caller must
+ * end the response rather than forward it.
+ *
+ * @param {string} jsonString
+ * @returns {string}
+ */
+export function bridgeScrubWireJson(jsonString) {
+  const text = String(jsonString ?? '');
+  if (!holdsWithheldKey(text)) return text;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return text;
+  }
+  return JSON.stringify(bridgeScrub(parsed));
+}
+
+/**
+ * Whether a body is worth parsing at all, decided by its content type. An
+ * image endpoint must never be parsed as JSON.
+ *
+ * The `+json` suffix counts: `application/problem+json` is JSON by every
+ * measure that matters here, and the harness only has to answer one error
+ * that way for a withheld key to reach a phone unscrubbed.
+ *
+ * @param {string|undefined} contentType
+ * @returns {boolean}
+ */
+export function bridgeIsJson(contentType) {
+  const media = String(contentType ?? '').split(';')[0].trim().toLowerCase();
+  return media === 'application/json' || media.endsWith('+json');
+}
+
+/**
+ * How much of a single SSE event the scrubber holds while waiting for its
+ * terminator. Generous, because the largest real frame is a bot payload,
+ * orders of magnitude under this; the number only exists to be a ceiling.
+ */
+export const MAX_BRIDGE_SSE_EVENT_BYTES = 1024 * 1024;
+
+/**
+ * The first event terminator in `text`, whichever spelling it uses.
+ *
+ * A partial terminator at the end of a chunk, such as a CRLF pair missing
+ * its last byte, matches neither and stays buffered: the rest is one chunk
+ * away, and splitting an event across a scrub would corrupt it.
+ *
+ * @param {string} text
+ * @returns {{index: number, terminator: string}|null}
+ */
+function nextEventBoundary(text) {
+  let best = null;
+  for (const terminator of ['\n\n', '\r\n\r\n', '\r\r']) {
+    const index = text.indexOf(terminator);
+    if (index < 0) continue;
+    // Earliest wins, and on a tie the longer terminator does: an LF-only
+    // match inside a CRLF pair would cut the event a byte short of its end.
+    if (!best || index < best.index || (index === best.index && terminator.length > best.terminator.length)) {
+      best = { index, terminator };
+    }
+  }
+  return best;
+}
+
+/**
+ * One complete SSE event, its `data:` payload scrubbed and everything else
+ * kept. The ending the event arrived with is the one it leaves with, and
+ * `id:` lines are never touched: they are the resume cursor.
+ *
+ * An event that names no withheld key is returned as the exact text that
+ * arrived, so a keepalive comment or an ordinary frame crosses unchanged.
+ *
+ * @param {string} event
+ * @returns {string}
+ */
+function scrubBridgeEvent(event) {
+  if (!holdsWithheldKey(event)) return event;
+  const eol = event.includes('\r\n') ? '\r\n' : event.includes('\r') ? '\r' : '\n';
+  return event
+    .split(/\r\n|\r|\n/)
+    .map((line) => {
+      // `: keepalive` comments, `id:`, `event:`, `retry:` are not ours to touch.
+      if (!line.startsWith('data:')) return line;
+      const raw = line.slice(5).trimStart();
+      if (!raw) return line;
+      return `data: ${bridgeScrubWireJson(raw)}`;
+    })
+    .join(eol);
+}
+
+/**
+ * A scrubber for one SSE stream, fed one decoded chunk at a time.
+ *
+ * It must not swallow blank lines: the blank line IS the event terminator,
+ * and a rewrite that normalizes it produces a stream that parses to nothing
+ * while both ends look healthy. It must not wait for more than one event
+ * either: buffering to a frame boundary is fine, and buffering for a size
+ * or a timer turns a live stream into a batch one. Both line endings are
+ * recognised, because a scrubber that knows only LF buffers a CRLF stream
+ * forever waiting for a boundary that never comes.
+ *
+ * Buffering to a boundary is bounded by the sender's good behaviour, which
+ * is not a bound. A stream that never sends a terminator grows the buffer
+ * without limit, so passing the ceiling throws and the caller drops the
+ * connection: there is no safe way to flush half an event.
+ *
+ * @returns {(chunk: string) => string}
+ */
+export function createBridgeSseScrubber() {
+  let pending = '';
+  return (chunk) => {
+    pending += chunk;
+    let out = '';
+    for (;;) {
+      const boundary = nextEventBoundary(pending);
+      if (!boundary) break;
+      const event = pending.slice(0, boundary.index);
+      pending = pending.slice(boundary.index + boundary.terminator.length);
+      out += scrubBridgeEvent(event) + boundary.terminator;
+    }
+    if (pending.length > MAX_BRIDGE_SSE_EVENT_BYTES) {
+      throw new Error(`SSE event exceeded ${MAX_BRIDGE_SSE_EVENT_BYTES} bytes without a terminator`);
+    }
+    return out;
+  };
+}
+
+/** The most routes one advertisement carries, the cap the iOS decoder accepts. */
+export const BRIDGE_MAX_ENDPOINTS = 8;
+
+/**
+ * What the bridge calls itself in the phone's connection list. The bridge
+ * is one process serving the whole server, so unlike a Mac it has no name of
+ * its own to offer, and a fixed honest label beats an empty one that leaves
+ * a typed address standing in for the server's name.
+ */
+export const BRIDGE_SERVER_NAME = 'BotFleet Server';
+
+/**
+ * A host in the form the kind rules compare: lowercase, without IPv6
+ * brackets, and without the trailing dot a resolver accepts.
+ *
+ * @param {string} hostname
+ * @returns {string}
+ */
+function normalizedHostName(hostname) {
+  let host = String(hostname ?? '').trim().toLowerCase();
+  if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
+  while (host.endsWith('.')) host = host.slice(0, -1);
+  return host;
+}
+
+/**
+ * A Tailscale MagicDNS name, by the rule the iOS decoder applies: longer
+ * than the suffix and ending in `.ts.net`.
+ *
+ * @param {string} host
+ * @returns {boolean}
+ */
+function isTailnetHostName(host) {
+  return host.length > '.ts.net'.length && host.endsWith('.ts.net');
+}
+
+/**
+ * Whether a host is one no phone can dial to reach this server: loopback,
+ * the unspecified address, a link-local address, or a name that resolves to
+ * loopback. Advertising one hands the phone a route that cannot work.
+ *
+ * @param {string} host a normalized host name
+ * @returns {boolean}
+ */
+function isUnroutableHostName(host) {
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (host === '0.0.0.0' || host === '::' || host === '::1') return true;
+  if (/^127(\.\d{1,3}){3}$/.test(host)) return true;
+  if (/^169\.254(\.\d{1,3}){2}$/.test(host)) return true;
+  return /^fe[89ab]/.test(host);
+}
+
+/**
+ * Read one configured or derived origin and answer it in normal form, or an
+ * empty string when it is not a route a phone could dial.
+ *
+ * A hosted route is public internet infrastructure, so accepting a typo as
+ * though it were a route is worse than refusing it. It has to be an absolute
+ * `http` or `https` origin: paths, credentials, queries and fragments have
+ * no place in a base URL and make request construction ambiguous.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function bridgeCleanOrigin(text) {
+  let parsed;
+  try {
+    parsed = new URL(String(text ?? '').trim());
+  } catch {
+    return '';
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return '';
+  if (parsed.username !== '' || parsed.password !== '') return '';
+  if (parsed.pathname !== '/' || parsed.search !== '' || parsed.hash !== '') return '';
+  if (isUnroutableHostName(normalizedHostName(parsed.hostname))) return '';
+  return parsed.origin;
+}
+
+/**
+ * The endpoint kind the iOS `CompanionEndpoint` decoder will accept for a
+ * route, or an empty string when it accepts none.
+ *
+ * The kind decides whether the phone will send its credential over the
+ * route: `hosted` and `tailnet` are protected transports, `lan` and
+ * `bonjour` are cleartext and need the person's explicit choice. The decoder
+ * is strict about the pairing of scheme and kind. `tailnet` is accepted only
+ * for plain `http` on a `.ts.net` name, which is how the Mac sidecar's own
+ * tailnet route is published. `tailscale serve --https` terminates TLS, so
+ * the bridge's tailnet route arrives as `https`, and for an `https` URL the
+ * decoder accepts exactly one kind, `hosted`. That is therefore the label a
+ * bridge route behind `tailscale serve` has to carry to be decodable at all.
+ *
+ * @param {string} url
+ * @returns {'hosted'|'tailnet'|'lan'|''}
+ */
+export function bridgeEndpointKind(url) {
+  let parsed;
+  try {
+    parsed = new URL(String(url ?? ''));
+  } catch {
+    return '';
+  }
+  if (parsed.protocol === 'https:') return 'hosted';
+  if (parsed.protocol !== 'http:') return '';
+  return isTailnetHostName(normalizedHostName(parsed.hostname)) ? 'tailnet' : 'lan';
+}
+
+/**
+ * The routes one advertisement carries, best first, as the iOS
+ * `CompanionEndpoint` decodes them.
+ *
+ * @param {string[]|undefined} origins normalized origins, in preference order
+ * @returns {Array<{url: string, kind: 'hosted'|'tailnet'|'lan', priority: number}>}
+ */
+export function bridgeEndpoints(origins) {
+  const endpoints = [];
+  const seen = new Set();
+  for (const candidate of Array.isArray(origins) ? origins : []) {
+    if (endpoints.length >= BRIDGE_MAX_ENDPOINTS) break;
+    const origin = bridgeCleanOrigin(candidate);
+    const kind = origin ? bridgeEndpointKind(origin) : '';
+    if (!origin || !kind || seen.has(origin)) continue;
+    seen.add(origin);
+    endpoints.push({ url: origin, kind, priority: endpoints.length * 100 });
+  }
+  return endpoints;
+}
+
+/**
+ * Parse the configured advertisement: one origin or a comma-separated list,
+ * first entry first. An entry that is blank is ignored, a duplicate costs
+ * nothing, and anything that is not a clean origin is refused loudly rather
+ * than skipped, because a skipped entry is a route the owner believes is
+ * advertised and is not.
+ *
+ * @param {string|undefined} value
+ * @returns {{ok: true, origins: string[]} | {ok: false, reason: string}}
+ */
+export function bridgeParseOrigins(value) {
+  const origins = [];
+  for (const part of String(value ?? '').split(',')) {
+    const origin = bridgeCleanOrigin(part);
+    if (!origin) {
+      if (part.trim() === '') continue;
+      return {
+        ok: false,
+        reason:
+          'every entry must be an absolute http or https origin with no path, credentials, query or fragment, ' +
+          'and no loopback or link-local host',
+      };
+    }
+    if (origins.includes(origin)) continue;
+    origins.push(origin);
+    if (origins.length > BRIDGE_MAX_ENDPOINTS) {
+      return { ok: false, reason: `at most ${BRIDGE_MAX_ENDPOINTS} origins may be listed` };
+    }
+  }
+  return { ok: true, origins };
+}
+
+/**
+ * A device name comes from the phone, so it is untrusted display text:
+ * clamp the length and drop control characters before it reaches a UI.
+ *
+ * @param {unknown} raw
+ * @returns {string}
+ */
+export function bridgeCleanDeviceName(raw) {
+  const name = String(raw ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .trim()
+    .slice(0, 60);
+  return name || 'Companion';
+}
+
+/**
+ * The pairing refusal a person reads, for one internal reason.
+ *
+ * The iOS app shows the server's own error text, so this is the sentence on
+ * the pairing screen. A reason this does not know gets the general sentence
+ * rather than the internal wording, which is written for a log.
+ *
+ * @param {string} reason
+ * @returns {string}
+ */
+export function bridgePairRefusalSentence(reason) {
+  switch (reason) {
+    case 'no pairing window is open':
+      return 'No pairing window is open on this server, so there is nothing to pair with. Start pairing again.';
+    case 'window expired':
+      return 'That pairing window has expired. Start pairing again.';
+    case 'window already spent':
+      return 'That pairing credential was already used. Start pairing again.';
+    case 'no attempts left':
+      return 'Too many incorrect codes. Start pairing again.';
+    case 'bad credential':
+      return 'That pairing code or token is not right.';
+    case 'the device limit is reached':
+      return 'Too many paired devices. Remove one first.';
+    default:
+      return 'This server could not complete the pairing. Start pairing again.';
+  }
+}
+
+/**
