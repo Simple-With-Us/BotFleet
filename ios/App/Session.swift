@@ -1301,9 +1301,10 @@ final class Session: ObservableObject {
     }
 
     /// Pairs with the server whose code was offered. The Mac's pairing stays.
-    func pairWithOfferedServer() async {
-        guard let offer = serverPairingOffer else { return }
-        serverPairingOffer = nil
+    /// Takes the offer itself and not the session's copy of it, which the
+    /// alert that asked clears as it closes.
+    func pairWithOfferedServer(_ offer: PairingInvite) async {
+        if serverPairingOffer == offer { serverPairingOffer = nil }
         do {
             try await pair(
                 with: offer.connection,
