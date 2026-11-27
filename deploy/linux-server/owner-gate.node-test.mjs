@@ -565,7 +565,7 @@ function createFakeUpstream() {
 function gateRequest({ port, headers = {}, path = "/api/thing", method = "GET", body = undefined }) {
   return new Promise((resolve, reject) => {
     const req = http.request(
-      { host: "127.0.0.1", port, path, method: "GET", headers, agent: false },
+      { host: "127.0.0.1", port, path, method, headers, agent: false },
       (res) => {
         const chunks = [];
         res.on("data", (chunk) => chunks.push(chunk));
