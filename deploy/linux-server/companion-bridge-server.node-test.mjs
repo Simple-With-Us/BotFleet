@@ -20,8 +20,11 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import {
+  BRIDGE_CONFIG_SECRET_NAMES,
   BRIDGE_MAX_DEVICES,
+  BRIDGE_ORIGIN_SECRET_NAME,
   BRIDGE_WINDOW_MAX_ATTEMPTS,
+  bridgeAdvertisedEndpoints,
   bridgeConfigFromSecrets,
   bridgeDownstreamHeaders,
   bridgeHeaderValue,
@@ -29,9 +32,11 @@ import {
   bridgeMintPairingCode,
   bridgeMintPairingToken,
   bridgeOwnerDecision,
+  bridgePairResponse,
   bridgeParseOwnerLogins,
   bridgePresentedDeviceCredential,
   bridgePresentedDeviceId,
+  bridgeRequestOrigin,
   bridgeRouteSummary,
   BridgeDeviceRegistry,
   BridgeState,
@@ -42,6 +47,7 @@ import {
   isBridgeLoopbackAddress,
   parseBridgeArgs,
 } from './companion-bridge-server.mjs';
+import { BRIDGE_ALLOWED_ROUTES } from './companion-bridge.mjs';
 import {
   bridgeApnsMaterial,
   bridgeApnsNamesSummary,
@@ -168,6 +174,38 @@ async function call(port, options = {}) {
   return { status: response.status, headers: response.headers, text, json };
 }
 
+/**
+ * A proxied request to the bridge that answers when its answer ends, and
+ * that the test can cut off from the phone's side.
+ */
+function openProxied(port, path, headers) {
+  let request;
+  const promise = new Promise((resolve) => {
+    request = http.request({ hostname: '127.0.0.1', port, path, method: 'GET', headers }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      const finish = () => resolve({
+        status: res.statusCode,
+        text: Buffer.concat(chunks).toString('utf8'),
+        retryAfter: res.headers['retry-after'],
+      });
+      res.on('end', finish);
+      res.on('close', finish);
+      res.on('error', finish);
+    });
+    request.on('error', () => resolve({ status: 0, text: '' }));
+    request.end();
+  });
+  return { promise, abort: () => request.destroy() };
+}
+
+/** Answer once `read` returns what `wanted` says, or false after a second. */
+async function eventually(read, wanted) {
+  const deadline = Date.now() + 1000;
+  while (read() !== wanted && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  return read() === wanted;
+}
+
 test('the owner credential is required, and a loopback caller is the only one considered', async () => {
   const owners = bridgeParseOwnerLogins('Owner@Example.com');
   assert.deepEqual([...owners], ['owner@example.com']);
@@ -228,31 +266,60 @@ test('the route table names the local routes and the proxied routes', () => {
   const summary = bridgeRouteSummary();
   assert.ok(summary.local.includes('POST /api/companion/pairing/open'));
   assert.ok(summary.local.includes('POST /api/companion/pairing/redeem'));
+  assert.ok(summary.local.includes('POST /api/pair'));
   assert.ok(summary.local.includes('GET /api/companion/devices'));
   assert.ok(summary.local.includes('DELETE /api/companion/devices/:id'));
-  assert.ok(summary.proxied.includes('GET /api/fleet'));
+  assert.ok(summary.proxied.includes('GET /api/health'));
+  assert.ok(summary.proxied.includes('GET /api/bots'));
   assert.ok(summary.proxied.includes('GET /api/events'));
+  assert.ok(summary.proxied.includes('PATCH /api/bots/:id/profile'));
+  // The table is advertised in the sidecar's order, so a diff of the two
+  // reads top to bottom.
+  assert.ok(summary.proxied.indexOf('GET /api/events') < summary.proxied.indexOf('GET /api/bots'));
+  // The first table's routes are gone, and the one sidecar route with no
+  // per-device grant on the bridge is not on it either.
+  for (const gone of ['GET /api/fleet', 'GET /api/threads/:id', 'POST /api/threads/:id/messages', 'POST /api/bots/:id/computer/join']) {
+    assert.equal([...summary.local, ...summary.proxied].includes(gone), false, gone);
+  }
+  // Nothing is both local and forwarded.
+  for (const label of summary.local) assert.equal(summary.proxied.includes(label), false, label);
 });
 
 test('a request without an owner credential is refused before the route is considered', async () => {
   const bridge = await startBridge();
   try {
-    const refused = await call(bridge.port, { path: '/api/fleet', headers: {} });
-    assert.equal(refused.status, 403);
-    assert.equal(refused.json.error, 'owner identity required');
+    for (const path of ['/api/bots', '/api/health', '/api/pair']) {
+      const refused = await call(bridge.port, { method: path === '/api/pair' ? 'POST' : 'GET', path, headers: {} });
+      assert.equal(refused.status, 403, path);
+      assert.equal(refused.json.error, 'owner identity required', path);
+    }
   } finally {
     await bridge.close();
   }
 });
 
 test('an unlisted route is 404 and a wrong method on a listed route is 405', async () => {
-  const bridge = await startBridge();
+  let reached = 0;
+  const bridge = await startBridge({
+    harnessHandler: (req, res) => {
+      reached += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    },
+  });
   try {
     const unknown = await call(bridge.port, { path: '/api/nope' });
     assert.equal(unknown.status, 404);
+    // A route the harness really has, and the phone may not ask for.
+    const offLimits = await call(bridge.port, { method: 'POST', path: '/api/webhooks', body: '{}' });
+    assert.equal(offLimits.status, 404);
+    assert.equal(offLimits.json.error, 'no bridge route');
 
-    const wrongMethod = await call(bridge.port, { path: '/api/fleet', method: 'POST' });
-    assert.equal(wrongMethod.status, 405);
+    for (const [method, path] of [['PUT', '/api/config'], ['POST', '/api/health'], ['GET', '/api/companion/pairing/redeem']]) {
+      const wrongMethod = await call(bridge.port, { method, path });
+      assert.equal(wrongMethod.status, 405, `${method} ${path}`);
+    }
+    assert.equal(reached, 0, 'none of them reaches the harness');
   } finally {
     await bridge.close();
   }
@@ -270,11 +337,11 @@ test('a proxied route crosses with its query byte for byte', async () => {
   try {
     const device = await bridge.pair();
     const response = await call(bridge.port, {
-      path: '/api/threads/thread-1?since=12%3A34&filter=a$b&x=1&x=2',
+      path: '/api/threads/thread-1/messages?since=12%3A34&filter=a$b&x=1&x=2',
       headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
     });
     assert.equal(response.status, 200);
-    assert.equal(seen.path, '/api/threads/thread-1');
+    assert.equal(seen.path, '/api/threads/thread-1/messages');
     assert.equal(seen.query, '?since=12%3A34&filter=a$b&x=1&x=2');
   } finally {
     await bridge.close();
@@ -291,11 +358,13 @@ test('a proxied request body reaches the harness unchanged', async () => {
     },
   });
   try {
-    const body = JSON.stringify({ prompt: 'hello', nested: { a: [1, 2] } });
+    // A route with no body check: the bytes the phone sent are the bytes the
+    // harness reads, spacing and key order included.
+    const body = '{ "requestId": "req-1",  "behavior":"allow", "nested": { "a": [1, 2] } }';
     const device = await bridge.pair();
     await call(bridge.port, {
       method: 'POST',
-      path: '/api/threads/thread-1/messages',
+      path: '/api/threads/thread-1/respond',
       headers: ownerHeaders({
         'content-type': 'application/json',
         authorization: `Bearer ${device.credential}`,
@@ -303,6 +372,7 @@ test('a proxied request body reaches the harness unchanged', async () => {
       body,
     });
     assert.equal(seen.body, body);
+    assert.equal(seen.path, '/api/threads/thread-1/respond');
   } finally {
     await bridge.close();
   }
@@ -604,13 +674,13 @@ test('a proxied route needs a device the bridge knows, and a revoked one is refu
   });
   try {
     // No device credential at all:  the bridge refuses before the harness.
-    const anonymous = await call(bridge.port, { path: '/api/fleet' });
+    const anonymous = await call(bridge.port, { path: '/api/bots' });
     assert.equal(anonymous.status, 403);
     assert.equal(reached, 0);
 
     // A credential the bridge never issued is refused as well.
     const stranger = await call(bridge.port, {
-      path: '/api/fleet',
+      path: '/api/bots',
       headers: ownerHeaders({ authorization: `Bearer ${DEVICE_CREDENTIAL}` }),
     });
     assert.equal(stranger.status, 403);
@@ -619,7 +689,7 @@ test('a proxied route needs a device the bridge knows, and a revoked one is refu
     // A paired device reaches the harness.
     const device = await bridge.pair();
     const allowed = await call(bridge.port, {
-      path: '/api/fleet',
+      path: '/api/bots',
       headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
     });
     assert.equal(allowed.status, 200);
@@ -628,7 +698,7 @@ test('a proxied route needs a device the bridge knows, and a revoked one is refu
     // A revoked device does not.
     await call(bridge.port, { method: 'DELETE', path: `/api/companion/devices/${device.deviceId}` });
     const revoked = await call(bridge.port, {
-      path: '/api/fleet',
+      path: '/api/bots',
       headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
     });
     assert.equal(revoked.status, 403);
@@ -1038,7 +1108,7 @@ test('a failing durable save pauses the trust-extending routes and a working sav
     // it, and proxying extends no trust the state would have to hold.
     const proxied = await call(bridge.port, {
       method: 'GET',
-      path: '/api/fleet',
+      path: '/api/bots',
       headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
     });
     assert.equal(proxied.status, 200);
@@ -1053,7 +1123,7 @@ test('a failing durable save pauses the trust-extending routes and a working sav
     assert.equal(revokeRefused.status, 503);
     const revokedProxy = await call(bridge.port, {
       method: 'GET',
-      path: '/api/fleet',
+      path: '/api/bots',
       headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
     });
     assert.equal(revokedProxy.status, 403);
@@ -1433,6 +1503,1188 @@ test('loopback SSE notify frames send background alerts and Live Activities whil
     assert.equal(bridge.state.registry.pushTokenCount(), 1);
   } finally {
     for (const r of sseClients) r.destroy();
+    await bridge.close();
+  }
+});
+
+// ── the shipped iOS app's contract: the health probe, pairing, the
+//    advertisement, and the routes a paired phone syncs through ─────────────
+
+/**
+ * One request through Node's own client, so the raw bytes and the headers
+ * come back exactly as they crossed and a `Host` header can be set by hand.
+ */
+function rawCall(port, { method = 'GET', path = '/', headers = {}, body } = {}) {
+  return new Promise((resolve, reject) => {
+    const request = http.request({ hostname: '127.0.0.1', port, path, method, headers }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('error', reject);
+      response.on('end', () => {
+        resolve({ status: response.statusCode, headers: response.headers, buffer: Buffer.concat(chunks) });
+      });
+    });
+    request.on('error', reject);
+    if (body !== undefined) request.end(body);
+    else request.end();
+  });
+}
+
+/** Open a pairing window on the bridge and hand back the operator's answer. */
+async function openWindow(port) {
+  const opened = await call(port, {
+    method: 'POST',
+    path: '/api/companion/pairing/open',
+    headers: ownerHeaders({ 'content-type': 'application/json' }),
+    body: '{}',
+  });
+  assert.equal(opened.status, 200);
+  return opened.json;
+}
+
+/** A request id in the shape `UUID().uuidString` spells it, which is what
+ *  `pairFirstReachable` mints for one logical pairing. */
+const PAIR_REQUEST_ID = '8D5C0F2A-1B3E-4F5A-9C8D-1234567890AB';
+
+/** The body `CompanionClient.pair` builds: six digits travel as `code`, the
+ *  QR token as `credential`, and the request id rides along. */
+function pairBody(credential, deviceName = "Jay's iPhone", pairRequestId = PAIR_REQUEST_ID) {
+  const body = { [/^\d{6}$/.test(credential) ? 'code' : 'credential']: credential, deviceName };
+  if (pairRequestId !== null) body.pairRequestId = pairRequestId;
+  return JSON.stringify(body);
+}
+
+/** The app's pairing call. */
+function pairPhone(port, credential, options = {}) {
+  return call(port, {
+    method: 'POST',
+    path: '/api/pair',
+    headers: ownerHeaders({ 'content-type': 'application/json' }),
+    body: pairBody(credential, options.deviceName, options.pairRequestId),
+  });
+}
+
+/** A port nothing is listening on, for a bridge whose harness is down. */
+async function closedPort() {
+  const probe = net.createServer();
+  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  const { port } = probe.address();
+  await new Promise((resolve) => probe.close(resolve));
+  return port;
+}
+
+/** A concrete path that one forwarded row's pattern accepts. */
+function samplePath(pattern) {
+  // One pass over the pattern's source, so a class is filled in where it
+  // stands and the literal words of the route (`api`, `bots`, `skills`) are
+  // never mistaken for a class.
+  const fill = new Map([
+    [String.raw`[A-Za-z0-9][A-Za-z0-9_-]{0,127}`, 'acct-1'],
+    [String.raw`(?:png|jpe?g|gif|webp)`, 'png'],
+    [String.raw`(?:cancel|seen)`, 'cancel'],
+    [String.raw`[a-z0-9-]+`, 'skill-1'],
+    [String.raw`[\w-]+`, 'x1'],
+    [String.raw`\d+`, '0'],
+    [String.raw`\/`, '/'],
+    [String.raw`\.`, '.'],
+  ]);
+  const token = /\[A-Za-z0-9\]\[A-Za-z0-9_-\]\{0,127\}|\(\?:png\|jpe\?g\|gif\|webp\)|\(\?:cancel\|seen\)|\[a-z0-9-\]\+|\[\\w-\]\+|\\d\+|\\\/|\\\./g;
+  return pattern.source
+    .replace(/^\^/, '')
+    .replace(/\$$/, '')
+    .replace(token, (match) => fill.get(match));
+}
+
+/** A body each forwarded row accepts where the bridge checks one. */
+const CHECKED_BODIES = [
+  [/^\/api\/bots\/[\w-]+\/profile$/, '{"name":"Rio"}'],
+  [/^\/api\/bots\/[\w-]+$/, '{"hidden":true}'],
+];
+
+test('GET /api/health is forwarded before pairing, behind the owner credential, untouched', async () => {
+  // What the harness answers, pid and build identity included. The app's
+  // `healthy` reads `app` and `ready` and ignores the rest.
+  const identity = JSON.stringify({ app: 'botfleet', pid: 4312, static: false, hostId: 'h-1', version: '0.1.0+test', ready: true });
+  let seen = null;
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      seen = { info, headers: { ...req.headers } };
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(identity)) });
+      res.end(identity);
+    },
+  });
+  try {
+    // No device exists yet, and none is asked for.
+    assert.deepEqual(bridge.state.registry.activeIds(), []);
+    const health = await rawCall(bridge.port, { path: '/api/health', headers: ownerHeaders() });
+    assert.equal(health.status, 200);
+    assert.equal(health.buffer.toString('utf8'), identity);
+    assert.equal(health.headers['content-type'], 'application/json');
+    assert.equal(health.headers['content-length'], String(Buffer.byteLength(identity)));
+    assert.equal(seen.info.path, '/api/health');
+    assert.equal(seen.info.query, '');
+    assert.equal(seen.info.body, '');
+    // The harness sees a plain loopback caller: the companion stamp the
+    // bridge sets itself, and neither credential the phone or the owner sent.
+    assert.equal(seen.headers['x-botfleet-companion'], '1');
+    assert.equal(seen.headers['x-botfleet-gate-token'], undefined);
+    assert.equal(seen.headers['tailscale-user-login'], undefined);
+    assert.equal(seen.headers.authorization, undefined);
+
+    // A device credential sent along changes nothing: health is not a device
+    // route, so the bearer is dropped like every other identity header.
+    const withBearer = await rawCall(bridge.port, { path: '/api/health', headers: ownerHeaders({ authorization: `Bearer ${DEVICE_CREDENTIAL}` }) });
+    assert.equal(withBearer.status, 200);
+    assert.equal(seen.headers.authorization, undefined);
+
+    // The query string crosses untouched, and the answer's own status too:
+    // a harness that is booting says so with `ready: false`, and a harness
+    // that refuses says so with its status. Neither is rewritten here.
+    const booting = JSON.stringify({ app: 'botfleet', ready: false, booting: true });
+    const bootingBridge = await startBridge({
+      harnessHandler: (req, res, info) => {
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end(info.query === '?probe=1' ? booting : identity);
+      },
+    });
+    try {
+      const answered = await rawCall(bootingBridge.port, { path: '/api/health?probe=1', headers: ownerHeaders() });
+      assert.equal(answered.status, 503);
+      assert.equal(answered.buffer.toString('utf8'), booting);
+    } finally {
+      await bootingBridge.close();
+    }
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('a health probe against a harness that is not there answers 502 and nothing else', async () => {
+  const bridge = await startBridge({ bridgeOptions: { upstreamPort: await closedPort() } });
+  try {
+    const health = await call(bridge.port, { path: '/api/health' });
+    assert.equal(health.status, 502);
+    assert.deepEqual(health.json, { error: 'the harness did not answer' });
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('POST /api/pair answers the body the iOS app decodes as PairResponse', async () => {
+  const bridge = await startBridge({ bridgeOptions: { origins: ['https://box.example.ts.net:8800'] } });
+  try {
+    const opened = await openWindow(bridge.port);
+    const paired = await pairPhone(bridge.port, opened.token);
+    assert.equal(paired.status, 201);
+
+    // `PairResponse.token`: the device credential, in the shape this bridge
+    // mints, shown once.
+    assert.match(paired.json.token, /^bf_brd_[A-Za-z0-9_-]{43}$/);
+
+    // `PairResponse.device`, which the app decodes as `PairedDevice`. The
+    // bridge names the device with a UUID, as the Mac sidecar does, and the
+    // app never sends an id of its own.
+    assert.match(paired.json.device.id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    assert.equal(paired.json.device.name, "Jay's iPhone");
+    assert.equal(Number.isInteger(paired.json.device.createdAt), true, 'PairedDevice.createdAt is epoch milliseconds');
+    assert.ok(Math.abs(paired.json.device.createdAt - Date.now()) < 60_000);
+    assert.equal(paired.json.device.lastSeenAt, paired.json.device.createdAt);
+
+    // `PairResponse.serverName`, and `PairResponse.endpoints` carrying the
+    // configured route in the one kind the shipped decoder accepts for it.
+    assert.equal(paired.json.serverName, 'BotFleet Server');
+    assert.deepEqual(paired.json.endpoints, [{ url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 }]);
+
+    // Exactly the keys `PairResponse` names and exactly the keys
+    // `PairedDevice` names: nothing is sent that the app does not decode.
+    assert.deepEqual(Object.keys(paired.json).sort(), ['device', 'endpoints', 'serverName', 'token']);
+    assert.deepEqual(Object.keys(paired.json.device).sort(), ['createdAt', 'id', 'lastSeenAt', 'name']);
+    assert.deepEqual(Object.keys(paired.json.endpoints[0]).sort(), ['kind', 'priority', 'url']);
+
+    // The registry holds digests only: neither the device credential nor
+    // the pairing code or token is anywhere in the durable state.
+    const serialized = JSON.stringify(bridge.state.toState());
+    assert.equal(serialized.includes(paired.json.token), false);
+    assert.equal(serialized.includes(opened.token), false);
+    assert.equal(serialized.includes(opened.code), false);
+
+    // The credential works: the new device reaches a forwarded route, and
+    // with it the pairing is spent.
+    const used = await call(bridge.port, { path: '/api/bots', headers: ownerHeaders({ authorization: `Bearer ${paired.json.token}` }) });
+    assert.equal(used.status, 200);
+    assert.equal(bridge.state.registry.activeIds().length, 1);
+    assert.equal(bridge.state.window.spent, true);
+    assert.equal(bridge.state.window.replay.deviceId, paired.json.device.id);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('POST /api/pair takes the six-digit code too, and a request with no id pairs exactly once', async () => {
+  const bridge = await startBridge();
+  try {
+    // The code, as a person types it.
+    const opened = await openWindow(bridge.port);
+    const byCode = await pairPhone(bridge.port, opened.code, { deviceName: 'Typed in by hand' });
+    assert.equal(byCode.status, 201);
+    assert.match(byCode.json.token, /^bf_brd_/);
+    assert.equal(byCode.json.device.name, 'Typed in by hand');
+    // No advertisement is configured and the request arrived on a loopback
+    // address, so there is no route to offer and the field is left out
+    // rather than sent empty.
+    assert.equal('endpoints' in byCode.json, false);
+    assert.equal('hosts' in byCode.json, false);
+
+    // An older client that sends no request id keeps exactly-once behaviour:
+    // the pairing succeeds, nothing is recorded for a replay, and a retry of
+    // the same request is an ordinary spent-window refusal.
+    const second = await openWindow(bridge.port);
+    const once = await pairPhone(bridge.port, second.token, { pairRequestId: null });
+    assert.equal(once.status, 201);
+    assert.equal(bridge.state.window.replay, null);
+    const retried = await pairPhone(bridge.port, second.token, { pairRequestId: null });
+    assert.equal(retried.status, 401);
+    assert.equal(retried.json.error, 'That pairing credential was already used. Start pairing again.');
+
+    // A device name with control characters is cleaned before it is stored.
+    const third = await openWindow(bridge.port);
+    const messy = await pairPhone(bridge.port, third.token, { deviceName: '  Ping\u0007\u001fPong \n' });
+    assert.equal(messy.status, 201);
+    // Each control character becomes one space and runs are not collapsed,
+    // which is what the sidecar's `cleanDeviceName` does with the same name.
+    assert.equal(messy.json.device.name, 'Ping  Pong');
+    assert.equal(bridge.state.registry.activeIds().length, 3);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('POST /api/pair refuses a wrong code, a spent window, an expired window and a burned budget, in words the app shows', async () => {
+  let clock = 1_700_000_000_000;
+  const bridge = await startBridge({ bridgeOptions: { now: () => clock } });
+  try {
+    // No window at all.
+    const idle = await pairPhone(bridge.port, 'omb_pair_' + 'a'.repeat(43));
+    assert.equal(idle.status, 401);
+    assert.equal(idle.json.error, 'No pairing window is open on this server, so there is nothing to pair with. Start pairing again.');
+    assert.deepEqual(Object.keys(idle.json), ['error']);
+
+    // A wrong code costs one attempt each time, and the right one afterwards
+    // is refused because the budget is gone.
+    const opened = await openWindow(bridge.port);
+    for (let attempt = BRIDGE_WINDOW_MAX_ATTEMPTS; attempt > 0; attempt -= 1) {
+      const wrong = await pairPhone(bridge.port, '000000');
+      assert.equal(wrong.status, 401);
+      // The attempt that uses up the budget says the budget is gone, the
+      // sentence the Mac answers on that same attempt; every earlier wrong
+      // attempt is only wrong.
+      assert.equal(
+        wrong.json.error,
+        attempt === 1 ? 'Too many incorrect codes. Start pairing again.' : 'That pairing code or token is not right.',
+      );
+      assert.equal(bridge.state.window.attemptsLeft, attempt - 1);
+    }
+    // The budget is gone, so the window is spent: the right code now answers
+    // the spent-window sentence, having heard "too many incorrect codes" on
+    // the attempt that spent it.
+    const locked = await pairPhone(bridge.port, opened.code);
+    assert.equal(locked.status, 401);
+    assert.equal(locked.json.error, 'That pairing credential was already used. Start pairing again.');
+    assert.equal(bridge.state.window.spent, true);
+    assert.equal(bridge.state.registry.activeIds().length, 0);
+
+    // A QR token that is not the window's is a wrong code too.
+    const second = await openWindow(bridge.port);
+    const stranger = await pairPhone(bridge.port, 'omb_pair_' + 'b'.repeat(43));
+    assert.equal(stranger.status, 401);
+    assert.equal(stranger.json.error, 'That pairing code or token is not right.');
+    assert.equal(bridge.state.window.attemptsLeft, BRIDGE_WINDOW_MAX_ATTEMPTS - 1);
+
+    // The window outlives its TTL and is spent by the expiry.
+    clock += 300_001;
+    const expired = await pairPhone(bridge.port, second.code);
+    assert.equal(expired.status, 401);
+    assert.equal(expired.json.error, 'That pairing window has expired. Start pairing again.');
+    assert.equal(bridge.state.window.spent, true);
+
+    // A spent window answers the same credential the way the app expects a
+    // used one to read, whether or not it carries the request id.
+    const third = await openWindow(bridge.port);
+    clock += 1;
+    const spent = await pairPhone(bridge.port, third.token);
+    assert.equal(spent.status, 201);
+    const used = await pairPhone(bridge.port, third.token, { pairRequestId: 'ANOTHER-REQUEST-ID-000000000001' });
+    assert.equal(used.status, 401);
+    assert.equal(used.json.error, 'That pairing credential was already used. Start pairing again.');
+    assert.equal(bridge.state.registry.activeIds().length, 1);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('a replay of the same pairing request is refused by name and mints nothing', async () => {
+  const bridge = await startBridge();
+  try {
+    const opened = await openWindow(bridge.port);
+    const first = await pairPhone(bridge.port, opened.token);
+    assert.equal(first.status, 201);
+
+    // The same phone request, back after a lost response. The bridge hands
+    // a credential out once and keeps only its digest, so it cannot answer
+    // the pairing again; it says so instead of answering a body the app
+    // would store with an empty token.
+    const replay = await pairPhone(bridge.port, opened.token);
+    assert.equal(replay.status, 409);
+    assert.match(replay.json.error, /issued only once/);
+    assert.deepEqual(Object.keys(replay.json), ['error']);
+    assert.equal('token' in replay.json, false);
+    assert.equal('device' in replay.json, false);
+    assert.equal(bridge.state.registry.activeIds().length, 1);
+    assert.equal(bridge.state.window.replay.deviceId, first.json.device.id);
+    assert.equal(JSON.stringify(bridge.state.toState()).includes(first.json.token), false);
+
+    // The first credential still works; a lost response costs nothing that
+    // already succeeded.
+    const used = await call(bridge.port, { path: '/api/bots', headers: ownerHeaders({ authorization: `Bearer ${first.json.token}` }) });
+    assert.equal(used.status, 200);
+
+    // The same id with another credential, or the same credential under
+    // another id, is not a replay.
+    for (const other of [
+      pairBody('omb_pair_' + 'c'.repeat(43)),
+      pairBody('000000'),
+      pairBody(opened.token, "Jay's iPhone", 'ANOTHER-REQUEST-ID-000000000002'),
+    ]) {
+      const refused = await call(bridge.port, {
+        method: 'POST',
+        path: '/api/pair',
+        headers: ownerHeaders({ 'content-type': 'application/json' }),
+        body: other,
+      });
+      assert.equal(refused.status, 401, other);
+      assert.equal('token' in refused.json, false);
+    }
+
+    // A device the owner revoked is not brought back by a replay.
+    const revoked = await call(bridge.port, { method: 'DELETE', path: `/api/companion/devices/${first.json.device.id}` });
+    assert.equal(revoked.status, 200);
+    const afterRevoke = await pairPhone(bridge.port, opened.token);
+    assert.equal(afterRevoke.status, 401);
+    assert.equal('token' in afterRevoke.json, false);
+    assert.equal(bridge.state.registry.activeIds().length, 0);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('POST /api/pair refuses a body that is not the app\'s contract, and none of them costs an attempt', async () => {
+  const bridge = await startBridge();
+  try {
+    const opened = await openWindow(bridge.port);
+    for (const [body, error] of [
+      ['not json', 'the request body is not valid JSON'],
+      ['[]', 'the request body is not a JSON object'],
+      ['"omb_pair_' + 'a'.repeat(43) + '"', 'the request body is not a JSON object'],
+      ['{}', 'a pairing code or credential is required'],
+      ['{"credential":""}', 'a pairing code or credential is required'],
+      ['{"code":"","credential":""}', 'a pairing code or credential is required'],
+      ['{"deviceName":"No credential"}', 'a pairing code or credential is required'],
+      // The redeem route's field names are not the app's.
+      ['{"token":"' + opened.token + '","deviceId":"phone-1"}', 'the pairing request does not match the contract'],
+      ['{"code":"123456","unexpected":1}', 'the pairing request does not match the contract'],
+      ['{"code":"123456","requestId":"pairing-request-0001"}', 'the pairing request does not match the contract'],
+      // A number is not coerced into the code it spells.
+      ['{"code":123456}', 'the pairing request does not match the contract'],
+      ['{"credential":"' + opened.token + '","deviceName":5}', 'the pairing request does not match the contract'],
+      ['{"credential":"' + opened.token + '","pairRequestId":7}', 'the pairing request does not match the contract'],
+    ]) {
+      const refused = await call(bridge.port, {
+        method: 'POST',
+        path: '/api/pair',
+        headers: ownerHeaders({ 'content-type': 'application/json' }),
+        body,
+      });
+      assert.equal(refused.status, 400, body);
+      assert.equal(refused.json.error, error, body);
+      assert.deepEqual(Object.keys(refused.json), ['error']);
+    }
+    // A body over the size limit is refused the same way.
+    const oversized = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/pair',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ credential: 'x'.repeat(70 * 1024) }),
+    });
+    assert.equal(oversized.status, 400);
+    assert.equal(oversized.json.error, 'the request body is too large');
+
+    // The real credential still redeems afterwards: none of the refusals
+    // spent the window or burned an attempt.
+    assert.equal(bridge.state.window.spent, false);
+    assert.equal(bridge.state.window.attemptsLeft, BRIDGE_WINDOW_MAX_ATTEMPTS);
+    const paired = await pairPhone(bridge.port, opened.token);
+    assert.equal(paired.status, 201);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('no new pairing window opens while the durable state refuses a save', async () => {
+  let savesWork = true;
+  const bridge = await startBridge({ bridgeOptions: { persist: () => savesWork } });
+  try {
+    await openWindow(bridge.port);
+    const first = await bridge.pair('phone-before-saves-fail');
+    assert.ok(first.credential);
+
+    savesWork = false;
+    // `openWindow` asserts the 200, so this call is made by hand: a window
+    // that cannot be saved is not opened, and the refusal says why.
+    const refused = await call(bridge.port, {
+      method: 'POST',
+      path: '/api/companion/pairing/open',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: '{}',
+    });
+    assert.equal(refused.status, 503);
+    assert.match(refused.json.error, /could not be saved/);
+    assert.equal(bridge.state.registry.activeIds().length, 1);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('a pairing whose durable save fails is rolled back, confirms nothing, and works when saves recover (fresh window)', async () => {
+  let savesWork = true;
+  const bridge = await startBridge({ bridgeOptions: { persist: () => savesWork } });
+  try {
+    const opened = await openWindow(bridge.port);
+    assert.match(opened.code, /^\d{6}$/);
+    savesWork = false;
+    const refused = await pairPhone(bridge.port, opened.token);
+    // The phone is not told a pairing happened, no credential leaves the
+    // bridge, and the in-memory spend is rolled back: the window is unspent
+    // again and the device row is gone.
+    assert.equal(refused.status, 503);
+    assert.equal(refused.json.token, undefined);
+    assert.match(refused.json.error, /could not be saved/);
+    assert.equal(bridge.state.registry.activeIds().length, 0);
+    assert.equal(bridge.state.window.spent, false);
+
+    // Saves recover, and the SAME request pairs for real.
+    savesWork = true;
+    const paired = await pairPhone(bridge.port, opened.token);
+    assert.equal(paired.status, 201);
+    assert.match(paired.json.token, /^bf_brd_/);
+    assert.equal(bridge.state.registry.activeIds().length, 1);
+    assert.equal(bridge.state.window.spent, true);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('the advertisement carries the configured routes, and falls back to the route the request arrived on', async () => {
+  const configured = await startBridge({
+    bridgeOptions: { origins: ['https://box.example.ts.net:8800', 'https://cdn.example'] },
+  });
+  try {
+    const listed = await call(configured.port, { path: '/api/companion/endpoints' });
+    assert.equal(listed.status, 200);
+    assert.deepEqual(listed.json, {
+      serverName: 'BotFleet Server',
+      endpoints: [
+        { url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 },
+        { url: 'https://cdn.example', kind: 'hosted', priority: 100 },
+      ],
+    });
+    // `hosts` is the older builds' list of plain http addresses. The bridge
+    // answers on its advertised route alone, so it names none.
+    assert.equal('hosts' in listed.json, false);
+    // The advertisement needs the owner credential and no device.
+    const anonymous = await call(configured.port, { path: '/api/companion/endpoints', headers: {} });
+    assert.equal(anonymous.status, 403);
+  } finally {
+    await configured.close();
+  }
+
+  const derived = await startBridge();
+  try {
+    // What `tailscale serve` hands the loopback hop: the original Host, the
+    // same value as X-Forwarded-Host, and the scheme it terminated.
+    const viaServe = await rawCall(derived.port, {
+      path: '/api/companion/endpoints',
+      headers: ownerHeaders({ 'x-forwarded-proto': 'https', 'x-forwarded-host': 'box.example.ts.net:8800', host: 'box.example.ts.net:8800' }),
+    });
+    assert.deepEqual(JSON.parse(viaServe.buffer.toString('utf8')), {
+      serverName: 'BotFleet Server',
+      endpoints: [{ url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 }],
+    });
+    // A proxy that names no forwarded host leaves the Host to speak.
+    const byHost = await rawCall(derived.port, {
+      path: '/api/companion/endpoints',
+      headers: ownerHeaders({ 'x-forwarded-proto': 'http', host: 'box.example.ts.net:8080' }),
+    });
+    assert.deepEqual(JSON.parse(byHost.buffer.toString('utf8')).endpoints, [
+      { url: 'http://box.example.ts.net:8080', kind: 'tailnet', priority: 0 },
+    ]);
+    // A direct loopback call, such as a curl on the host, advertises
+    // nothing: a loopback address is no route a phone can dial.
+    const direct = await call(derived.port, { path: '/api/companion/endpoints' });
+    assert.deepEqual(direct.json, { serverName: 'BotFleet Server', endpoints: [] });
+    // A loopback address named in a forwarding header is no route either.
+    const loopback = await rawCall(derived.port, {
+      path: '/api/companion/endpoints',
+      headers: ownerHeaders({ 'x-forwarded-proto': 'https', 'x-forwarded-host': '127.0.0.1:8797' }),
+    });
+    assert.deepEqual(JSON.parse(loopback.buffer.toString('utf8')).endpoints, []);
+  } finally {
+    await derived.close();
+  }
+});
+
+test('the request-derived origin trusts the forwarding headers from a loopback peer only', () => {
+  const forwarded = { 'x-forwarded-proto': 'https', 'x-forwarded-host': 'box.example.ts.net:8800' };
+  assert.equal(bridgeRequestOrigin({ remoteAddress: '127.0.0.1', headers: forwarded }), 'https://box.example.ts.net:8800');
+  assert.equal(bridgeRequestOrigin({ remoteAddress: '::1', headers: forwarded }), 'https://box.example.ts.net:8800');
+  assert.equal(bridgeRequestOrigin({ remoteAddress: '::ffff:127.0.0.1', headers: forwarded }), 'https://box.example.ts.net:8800');
+  // A peer that is not on loopback names no route, whatever it sends.
+  for (const remoteAddress of ['192.168.1.44', '203.0.113.9', '100.64.0.1', '', undefined]) {
+    assert.equal(bridgeRequestOrigin({ remoteAddress, headers: forwarded }), '', String(remoteAddress));
+  }
+  // Without a proxy the socket speaks: plain http, or https on a TLS socket.
+  assert.equal(bridgeRequestOrigin({ remoteAddress: '127.0.0.1', headers: { host: 'box.example.ts.net:8080' } }), 'http://box.example.ts.net:8080');
+  assert.equal(
+    bridgeRequestOrigin({ remoteAddress: '127.0.0.1', encrypted: true, headers: { host: 'cdn.example' } }),
+    'https://cdn.example',
+  );
+  // A scheme that is neither, or a host that is not one, derives nothing.
+  assert.equal(
+    bridgeRequestOrigin({ remoteAddress: '127.0.0.1', headers: { 'x-forwarded-proto': 'wss', host: 'box.example.ts.net:8080' } }),
+    'http://box.example.ts.net:8080',
+  );
+  assert.equal(bridgeRequestOrigin({ remoteAddress: '127.0.0.1', headers: { host: 'localhost:8797' } }), '');
+  assert.equal(bridgeRequestOrigin({ remoteAddress: '127.0.0.1', headers: { 'x-forwarded-host': 'a b', 'x-forwarded-proto': 'https' } }), '');
+  assert.equal(bridgeRequestOrigin({ remoteAddress: '127.0.0.1', headers: {} }), '');
+  // The configured routes win over anything a request says.
+  assert.deepEqual(
+    bridgeAdvertisedEndpoints({ origins: ['https://cdn.example'], remoteAddress: '127.0.0.1', headers: forwarded }),
+    [{ url: 'https://cdn.example', kind: 'hosted', priority: 0 }],
+  );
+  assert.deepEqual(bridgeAdvertisedEndpoints({ origins: [], remoteAddress: '192.168.1.44', headers: forwarded }), []);
+});
+
+test('the advertised routes are read from Infisical by name, and an unusable value fails the start', () => {
+  assert.equal(BRIDGE_ORIGIN_SECRET_NAME, 'BOTFLEET_COMPANION_BRIDGE_ORIGIN');
+  assert.deepEqual([...BRIDGE_CONFIG_SECRET_NAMES], [
+    'BOTFLEET_OWNER_LOGINS',
+    'BOTFLEET_PUBLIC_ORIGIN',
+    'BOTFLEET_SERVER_GATE_TOKEN',
+    'BOTFLEET_COMPANION_BRIDGE_ORIGIN',
+  ]);
+  // Absent is no advertisement and not an error; the other names still read.
+  const absent = bridgeConfigFromSecrets({ BOTFLEET_SERVER_GATE_TOKEN: OWNER_TOKEN, BOTFLEET_OWNER_LOGINS: 'owner@example.com' });
+  assert.deepEqual(absent.origins, []);
+  assert.equal(absent.tokenSha256, sha256Hex(OWNER_TOKEN));
+  assert.deepEqual([...absent.owners], ['owner@example.com']);
+  assert.deepEqual(bridgeConfigFromSecrets({}).origins, []);
+  assert.deepEqual(bridgeConfigFromSecrets({ BOTFLEET_COMPANION_BRIDGE_ORIGIN: ' , ' }).origins, []);
+
+  const configured = bridgeConfigFromSecrets({
+    BOTFLEET_COMPANION_BRIDGE_ORIGIN: 'https://Box.Example.ts.net:8800, http://box.example.ts.net:8080',
+  });
+  assert.deepEqual(configured.origins, ['https://box.example.ts.net:8800', 'http://box.example.ts.net:8080']);
+
+  // A value that is present and unusable is refused, naming the rule and
+  // never the value.
+  for (const bad of ['box.example.ts.net:8800', 'https://box.example.ts.net:8800/path', 'ftp://box.example.ts.net', 'https://127.0.0.1:8800']) {
+    assert.throws(
+      () => bridgeConfigFromSecrets({ BOTFLEET_COMPANION_BRIDGE_ORIGIN: bad }),
+      (error) => {
+        assert.match(error.message, /^BOTFLEET_COMPANION_BRIDGE_ORIGIN is not usable: /);
+        assert.equal(error.message.includes(bad), false);
+        return true;
+      },
+      bad,
+    );
+  }
+});
+
+test('the pairing body is built from the Swift types it feeds, field for field', () => {
+  const response = bridgePairResponse({
+    credential: 'bf_brd_fixture',
+    device: { id: 'd-1', name: 'Phone', pairedAtMs: 1_700_000_000_000 },
+    advertised: [{ url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 }],
+  });
+  assert.deepEqual(response, {
+    token: 'bf_brd_fixture', // PairResponse.token
+    device: {
+      id: 'd-1', // PairedDevice.id
+      name: 'Phone', // PairedDevice.name
+      createdAt: 1_700_000_000_000, // PairedDevice.createdAt
+      lastSeenAt: 1_700_000_000_000, // PairedDevice.lastSeenAt
+    },
+    serverName: 'BotFleet Server', // PairResponse.serverName
+    endpoints: [{ url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 }], // PairResponse.endpoints
+  });
+  // No route to offer: the optional field is absent, not empty.
+  const bare = bridgePairResponse({ credential: 'bf_brd_fixture', device: { id: 'd-1', name: 'Phone', pairedAtMs: 1 }, advertised: [] });
+  assert.equal('endpoints' in bare, false);
+  // The advertisement is copied, so a later edit to it cannot change a body
+  // already built.
+  const advertised = [{ url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 }];
+  const copied = bridgePairResponse({ credential: 'c', device: { id: 'd-1', name: 'Phone', pairedAtMs: 1 }, advertised });
+  advertised[0].url = 'https://elsewhere.example';
+  assert.equal(copied.endpoints[0].url, 'https://box.example.ts.net:8800');
+});
+
+test('every forwarded route needs a paired device, and each one reaches the harness only with it', async () => {
+  const reached = [];
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      reached.push(`${req.method} ${info.path}`);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    },
+  });
+  try {
+    const rows = BRIDGE_ALLOWED_ROUTES.filter((route) => route.local === false && route.path !== '/api/health');
+    assert.ok(rows.length >= 80, `the mirrored list has ${rows.length} rows`);
+    const device = await bridge.pair('phone-every-route');
+
+    for (const route of rows) {
+      const path = samplePath(route.pattern);
+      assert.equal(route.pattern.test(path), true, `${route.method} ${path}`);
+      const checked = CHECKED_BODIES.find(([pattern]) => pattern.test(path));
+      const body = route.method === 'GET' || route.method === 'DELETE' ? undefined : (checked ? checked[1] : '{}');
+      const json = body === undefined ? {} : { 'content-type': 'application/json' };
+      const label = `${route.method} ${path}`;
+
+      // Without a device credential the bridge refuses before the harness
+      // is asked, and a credential it never issued is refused the same way.
+      const anonymous = await call(bridge.port, { method: route.method, path, headers: ownerHeaders(json), body });
+      assert.equal(anonymous.status, 403, label);
+      assert.equal(anonymous.json.error, 'device credential required', label);
+      const stranger = await call(bridge.port, {
+        method: route.method,
+        path,
+        headers: ownerHeaders({ ...json, authorization: `Bearer ${DEVICE_CREDENTIAL}` }),
+        body,
+      });
+      assert.equal(stranger.status, 403, label);
+      assert.equal(stranger.json.error, 'unknown device', label);
+    }
+    assert.equal(reached.length, 0, 'nothing reached the harness without a paired device');
+
+    // With the paired device every row is forwarded, to the same path.
+    for (const route of rows) {
+      const path = samplePath(route.pattern);
+      const checked = CHECKED_BODIES.find(([pattern]) => pattern.test(path));
+      const body = route.method === 'GET' || route.method === 'DELETE' ? undefined : (checked ? checked[1] : '{}');
+      const json = body === undefined ? {} : { 'content-type': 'application/json' };
+      const allowed = await call(bridge.port, {
+        method: route.method,
+        path,
+        headers: ownerHeaders({ ...json, authorization: `Bearer ${device.credential}` }),
+        body,
+      });
+      assert.equal(allowed.status, 200, `${route.method} ${path}`);
+    }
+    assert.deepEqual(reached, rows.map((route) => `${route.method} ${samplePath(route.pattern)}`));
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('the forwarded request carries the companion stamp and neither credential', async () => {
+  const seen = [];
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      seen.push({ info, headers: { ...req.headers } });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    },
+  });
+  try {
+    const device = await bridge.pair('phone-stamp');
+    await call(bridge.port, {
+      method: 'POST',
+      path: '/api/bots/b-1/messages',
+      headers: ownerHeaders({
+        'content-type': 'application/json',
+        authorization: `Bearer ${device.credential}`,
+        'x-botfleet-device': 'phone-stamp',
+        'tailscale-user-login': 'owner@example.com',
+        'x-forwarded-for': '203.0.113.9',
+        'x-botfleet-owner-challenge': 'a'.repeat(64),
+      }),
+      body: '{"text":"hello"}',
+    });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].info.path, '/api/bots/b-1/messages');
+    assert.equal(seen[0].info.body, '{"text":"hello"}');
+    assert.equal(seen[0].headers['x-botfleet-companion'], '1');
+    // The phone's device credential is the bridge's business and the owner
+    // credential is the gate's: neither means anything to the harness, so
+    // neither travels. The stamp is what tells the harness a phone asked.
+    for (const name of ['authorization', 'x-botfleet-device', 'x-botfleet-gate-token', 'tailscale-user-login', 'x-forwarded-for', 'x-botfleet-owner-challenge']) {
+      assert.equal(seen[0].headers[name], undefined, name);
+    }
+    assert.equal(seen[0].headers.host, `127.0.0.1:${bridge.harness.port}`);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('a route that must stay closed never reaches the harness, with a paired device or without', async () => {
+  let reached = 0;
+  const bridge = await startBridge({
+    harnessHandler: (req, res) => {
+      reached += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    },
+  });
+  try {
+    const device = await bridge.pair('phone-closed-routes');
+    for (const [method, path, status] of [
+      // The sidecar's cloud desktop route, which needs a per-device grant
+      // the bridge cannot give.
+      ['POST', '/api/bots/b-1/computer/join', 404],
+      ['POST', '/api/bots/x/y/computer/join', 404],
+      // A route the harness has and the sidecar keeps off the phone.
+      ['POST', '/api/bots/b-1/always-allow', 404],
+      ['POST', '/api/bots/b-1/skills', 405],
+      ['POST', '/api/bots/apply-defaults', 405],
+      ['POST', '/api/webhooks', 404],
+      ['DELETE', '/api/connectors/github', 404],
+      ['GET', '/api/runtime', 404],
+      ['GET', '/api/host/resources', 404],
+      ['GET', '/api/placement/identity', 404],
+      ['POST', '/api/system/control/stop', 404],
+      ['GET', '/api/fleet', 404],
+      ['GET', '/api/threads/t-1', 404],
+      // An id with an encoded character in it.
+      ['POST', '/api/bots/b%2D1/messages', 404],
+      ['GET', '/api/bots/%252e', 404],
+      ['GET', '/api/threads/t-1/messages/m%2E1/image', 404],
+    ]) {
+      const label = `${method} ${path}`;
+      const body = method === 'GET' ? undefined : '{}';
+      const json = body === undefined ? {} : { 'content-type': 'application/json' };
+      const withDevice = await call(bridge.port, { method, path, headers: ownerHeaders({ ...json, authorization: `Bearer ${device.credential}` }), body });
+      assert.equal(withDevice.status, status, label);
+      assert.equal(withDevice.json.ok, undefined, label);
+      const withoutDevice = await call(bridge.port, { method, path, headers: ownerHeaders(json), body });
+      assert.equal(withoutDevice.status, status, label);
+    }
+    assert.equal(reached, 0);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('the profile and organize bodies are checked before they reach the harness, and forwarded re-serialized', async () => {
+  const seen = [];
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      seen.push(info);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    },
+  });
+  try {
+    const device = await bridge.pair('phone-body-check');
+    const auth = ownerHeaders({ 'content-type': 'application/json', authorization: `Bearer ${device.credential}` });
+
+    for (const [path, body, status, error] of [
+      ['/api/bots/b-1/profile', '{"name":"Rio","ownMcpServers":{"a":{"command":"x"}}}', 403, 'ownMcpServers can only be changed in BotFleet on your computer'],
+      ['/api/bots/b-1/profile', '{"mcpServers":["a"]}', 403, 'mcpServers can only be changed in BotFleet on your computer'],
+      ['/api/bots/b-1/profile', '{"composio":{"connected":true}}', 403, 'composio can only be changed in BotFleet on your computer'],
+      ['/api/bots/b-1/profile', '{"cloudBackend":"x"}', 403, 'cloudBackend can only be changed in BotFleet on your computer'],
+      ['/api/bots/b-1/profile', '{"extraCwds":["/"]}', 403, 'extraCwds can only be changed in BotFleet on your computer'],
+      ['/api/bots/b-1', '{"hidden":true,"autoApprove":true}', 403, 'autoApprove can only be changed in BotFleet on your computer'],
+      ['/api/bots/b-1', '{"computers":["local"]}', 403, 'computers can only be changed in BotFleet on your computer'],
+      ['/api/bots/b-1', '{"name":"Rio"}', 403, 'name can only be changed in BotFleet on your computer'],
+      ['/api/bots/b-1', '{"hidden":"yes"}', 400, 'hidden must be true or false'],
+      ['/api/bots/b-1', '{"pinnedMessageId":"../m-1"}', 400, 'pinnedMessageId must be a message id or null'],
+      ['/api/bots/b-1', '{}', 400, 'nothing to save'],
+      ['/api/bots/b-1', 'nope', 400, 'the request body is not valid JSON'],
+      ['/api/bots/b-1/profile', '[]', 400, 'the request body is not a JSON object'],
+    ]) {
+      const refused = await call(bridge.port, { method: 'PATCH', path, headers: auth, body });
+      assert.equal(refused.status, status, `${path} ${body}`);
+      assert.deepEqual(refused.json, { error }, `${path} ${body}`);
+    }
+    assert.equal(seen.length, 0, 'none of them reached the harness');
+
+    // A body that passes crosses as the validated object: re-serialized, so
+    // the bytes the harness reads are the bytes the bridge checked.
+    await call(bridge.port, { method: 'PATCH', path: '/api/bots/b-1/profile', headers: auth, body: '{ "name" :  "Rio" , "autoApprove": false }' });
+    await call(bridge.port, { method: 'PATCH', path: '/api/bots/b-1', headers: auth, body: '{"pinned":true,"section":"Work"}' });
+    assert.deepEqual(
+      seen.map((info) => `${info.path} ${info.body}`),
+      ['/api/bots/b-1/profile {"name":"Rio","autoApprove":false}', '/api/bots/b-1 {"pinned":true,"section":"Work"}'],
+    );
+
+    // Without a device credential the body is refused before it is read.
+    const anonymous = await call(bridge.port, {
+      method: 'PATCH',
+      path: '/api/bots/b-1/profile',
+      headers: ownerHeaders({ 'content-type': 'application/json' }),
+      body: '{"name":"Rio"}',
+    });
+    assert.equal(anonymous.status, 403);
+    assert.equal(seen.length, 2);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('a checked body that is too large is refused before it is read', async () => {
+  const bridge = await startBridge();
+  try {
+    const device = await bridge.pair('phone-big-body');
+    const refused = await call(bridge.port, {
+      method: 'PATCH',
+      path: '/api/bots/b-1/profile',
+      headers: ownerHeaders({ 'content-type': 'application/json', authorization: `Bearer ${device.credential}` }),
+      body: JSON.stringify({ name: 'x'.repeat(70 * 1024) }),
+    });
+    assert.equal(refused.status, 400);
+    assert.equal(refused.json.error, 'the request body is too large');
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('JSON responses reach the phone without the withheld keys, and everything else byte for byte', async () => {
+  // Spacing, number spelling and key order that a re-serialization would
+  // not give back: proof that a clean body is never parsed.
+  const clean = '{ "app": "botfleet", "ready": true, "n": 1.50, "bots": [ ] }';
+  const dirty = '{ "vps": { "configured": true, "sshAlias": "prod-vps" }, "bots": [ { "id": "b1", "resumeCursors": { "g": "s" } } ] }';
+  const image = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0xc3, 0xa9, 0x00]);
+  // A body that names a withheld key nested past any plausible stack: it
+  // parses, and the scrubber's recursion gives out.
+  const deep = `${'['.repeat(20_000)}{"sshAlias":"prod-vps"}${']'.repeat(20_000)}`;
+  const answers = {
+    '/api/instances': { type: 'application/json', body: Buffer.from(clean, 'utf8') },
+    '/api/config': { type: 'application/json', body: Buffer.from(dirty, 'utf8') },
+    '/api/quotas': { type: 'application/problem+json; charset=utf-8', body: Buffer.from(dirty, 'utf8') },
+    '/api/attachments/a.png': { type: 'image/png', body: image },
+    '/api/search?q=a%20b': { type: 'application/json', body: Buffer.from('{ "hits": [ { "text": "resume cursors and an ssh alias in prose" } ] }', 'utf8') },
+    '/api/jobs': { type: 'application/json', body: Buffer.from(deep, 'utf8') },
+  };
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      const answer = answers[`${info.path}${info.query}`];
+      assert.ok(answer, `unexpected ${info.path}${info.query}`);
+      res.writeHead(200, { 'content-type': answer.type, 'content-length': String(answer.body.length) });
+      res.end(answer.body);
+    },
+  });
+  try {
+    const device = await bridge.pair('phone-scrub');
+    const get = async (path) => {
+      const response = await rawCall(bridge.port, { path, headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }) });
+      return { ...response, text: response.buffer.toString('utf8') };
+    };
+
+    const cleanAnswer = await get('/api/instances');
+    assert.equal(cleanAnswer.status, 200);
+    assert.equal(cleanAnswer.text, clean);
+    assert.equal(cleanAnswer.headers['content-length'], String(Buffer.byteLength(clean)));
+    assert.equal(cleanAnswer.headers['content-type'], 'application/json');
+
+    const scrubbed = await get('/api/config');
+    assert.equal(scrubbed.status, 200);
+    assert.equal(scrubbed.text.includes('sshAlias'), false);
+    assert.equal(scrubbed.text.includes('prod-vps'), false);
+    assert.equal(scrubbed.text.includes('resumeCursors'), false);
+    assert.deepEqual(JSON.parse(scrubbed.text), { vps: { configured: true }, bots: [{ id: 'b1' }] });
+    assert.equal(scrubbed.headers['content-length'], String(Buffer.byteLength(scrubbed.text)));
+    assert.equal(scrubbed.headers['content-type'], 'application/json');
+
+    // The structured suffix counts as JSON, so an error body cannot carry
+    // a withheld key past the scrubber.
+    const problem = await get('/api/quotas');
+    assert.equal(problem.status, 200);
+    assert.equal(problem.text.includes('sshAlias'), false);
+    assert.deepEqual(JSON.parse(problem.text), { vps: { configured: true }, bots: [{ id: 'b1' }] });
+    assert.equal(problem.headers['content-type'], 'application/problem+json; charset=utf-8');
+
+    // Prose that merely resembles a withheld key is not touched.
+    const prose = await get('/api/search?q=a%20b');
+    assert.equal(prose.text, answers['/api/search?q=a%20b'].body.toString('utf8'));
+
+    // Anything that is not JSON is not parsed: the bytes are the bytes.
+    const picture = await get('/api/attachments/a.png');
+    assert.equal(picture.status, 200);
+    assert.ok(picture.buffer.equals(image));
+
+    // A body the scrubber cannot finish is not forwarded at all.
+    const unfinished = await get('/api/jobs');
+    assert.equal(unfinished.status, 502);
+    assert.deepEqual(JSON.parse(unfinished.text), { error: 'the response could not be prepared for this device' });
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('an event stream is scrubbed frame by frame, keeps its framing, and still ends when the device is revoked', async () => {
+  const streams = [];
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      if (info.path !== '/api/events') {
+        res.writeHead(200);
+        res.end('{}');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      res.socket?.setNoDelay(true);
+      res.write(': keepalive\n\n');
+      res.write('id: a:1\ndata: {"kind":"bot","bot":{"id":"b1","resumeCursors":{"g":"s"}}}\n\n');
+      // One event in three writes, the first cut inside a two-byte character
+      // and the second cut inside the terminator.
+      const frame = Buffer.from(
+        'id: a:2\ndata: {"kind":"config","text":"caf\u00e9","vps":{"sshAlias":"prod-vps","configured":true}}\n\n',
+        'utf8',
+      );
+      const accent = frame.indexOf(Buffer.from('\u00e9', 'utf8'));
+      res.write(frame.subarray(0, accent + 1));
+      setTimeout(() => res.write(frame.subarray(accent + 1, frame.length - 1)), 10);
+      setTimeout(() => res.write(frame.subarray(frame.length - 1)), 20);
+      streams.push(res);
+    },
+  });
+  try {
+    const device = await bridge.pair('phone-sse-scrub');
+    const collected = [];
+    let ended = false;
+    const stream = http.request(
+      {
+        hostname: '127.0.0.1',
+        port: bridge.port,
+        path: '/api/events?screens=off&since=%3Ccursor%3A1%3E',
+        method: 'GET',
+        headers: ownerHeaders({ authorization: `Bearer ${device.credential}`, accept: 'text/event-stream' }),
+      },
+      (response) => {
+        assert.equal(response.statusCode, 200);
+        assert.ok(String(response.headers['content-type']).includes('text/event-stream'));
+        response.on('data', (chunk) => collected.push(chunk));
+        for (const event of ['end', 'close', 'error']) response.on(event, () => { ended = true; });
+      },
+    );
+    stream.on('error', () => { ended = true; });
+    stream.end();
+
+    const text = () => Buffer.concat(collected).toString('utf8');
+    const frames = () => text().split('\n\n').length - 1;
+    const deadline = Date.now() + 3000;
+    while (frames() < 3 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const streamed = text();
+    // The comment, both ids and both terminators crossed, and nothing was
+    // rewritten: one blank line after each event and no extra bytes.
+    assert.ok(streamed.startsWith(': keepalive\n\n'));
+    assert.ok(streamed.includes('id: a:1\ndata: '));
+    assert.ok(streamed.includes('id: a:2\ndata: '));
+    assert.equal(frames(), 3);
+    // The withheld keys did not cross, under either spelling or nesting.
+    assert.equal(streamed.includes('resumeCursors'), false);
+    assert.equal(streamed.includes('"g":"s"'), false);
+    assert.equal(streamed.includes('sshAlias'), false);
+    assert.equal(streamed.includes('prod-vps'), false);
+    // What the phone renders survived, and the character split across two
+    // chunks arrived whole.
+    const data = streamed.split('\n').filter((line) => line.startsWith('data: ')).map((line) => JSON.parse(line.slice('data: '.length)));
+    assert.deepEqual(data, [
+      { kind: 'bot', bot: { id: 'b1' } },
+      { kind: 'config', text: 'caf\u00e9', vps: { configured: true } },
+    ]);
+
+    // Revoking the device still ends the stream at once.
+    const revoked = await call(bridge.port, { method: 'DELETE', path: `/api/companion/devices/${device.deviceId}` });
+    assert.equal(revoked.status, 200);
+    const closeDeadline = Date.now() + 3000;
+    while (!ended && Date.now() < closeDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(ended, true, 'the stream ended after the revoke');
+    stream.destroy();
+  } finally {
+    for (const stream of streams) stream.destroy();
+    await bridge.close();
+  }
+});
+
+test('an event stream the scrubber cannot hold is ended, never forwarded half an event', async () => {
+  const streams = [];
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      if (info.path !== '/api/events') {
+        res.writeHead(200);
+        res.end('{}');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      // One megabyte and more of an event that never ends.
+      res.write(`data: ${'x'.repeat(1024 * 1024 + 4096)}`);
+      streams.push(res);
+    },
+  });
+  try {
+    const device = await bridge.pair('phone-sse-overflow');
+    const response = await new Promise((resolve) => {
+      const request = http.request(
+        {
+          hostname: '127.0.0.1',
+          port: bridge.port,
+          path: '/api/events',
+          method: 'GET',
+          headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
+        },
+        (res) => {
+          const chunks = [];
+          res.on('data', (chunk) => chunks.push(chunk));
+          const finish = () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString('utf8') });
+          res.on('end', finish);
+          res.on('close', finish);
+          res.on('error', finish);
+        },
+      );
+      request.on('error', () => resolve({ status: 0, text: '' }));
+      request.end();
+    });
+    // The stream is cut and nothing of the oversized event crosses. The
+    // downstream headers are written but not flushed until the first byte
+    // crosses, and no byte ever does here, so the phone sees the connection
+    // reset before any status rather than a 200 that ends empty.
+    assert.ok(response.status === 0 || response.status === 200, `status ${response.status}`);
+    assert.equal(response.text.length, 0);
+  } finally {
+    for (const stream of streams) stream.destroy();
+    await bridge.close();
+  }
+});
+
+test('an answer that finds no room to be held for checking is refused at once, and the room comes back', async () => {
+  const held = [];
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      if (info.query.startsWith('?hold=')) {
+        // An answer that begins and then waits, so the bridge is holding it.
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{"held":"');
+        res.write(info.query.slice(6));
+        held.push({ number: info.query.slice(6), res });
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    },
+  });
+  try {
+    const device = await bridge.pair('phone-scrub-ceiling');
+    const headers = ownerHeaders({ authorization: `Bearer ${device.credential}` });
+    const open = (path) => openProxied(bridge.port, path, headers);
+    const heldSoFar = () => held.length;
+    const untilHeld = async (count) => {
+      while (heldSoFar() < count) await new Promise((resolve) => setTimeout(resolve, 5));
+    };
+    const answer = (number) => held.find((entry) => entry.number === number).res;
+
+    // Two answers are held; the third finds no room and is told to retry.
+    const first = open('/api/quotas?hold=1');
+    const second = open('/api/quotas?hold=2');
+    await untilHeld(2);
+    const third = await open('/api/quotas?hold=3').promise;
+    assert.equal(third.status, 503);
+    assert.equal(third.retryAfter, '1');
+    assert.match(JSON.parse(third.text).error, /too many answers/);
+
+    // The bridge can only know an answer is JSON once its headers arrive, so
+    // the harness began the third answer too. The bridge let go of that one
+    // the moment it saw them, which is what keeps its own memory bounded.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(heldSoFar(), 3);
+
+    // The room comes back as the held answers finish, whole and untouched.
+    answer('1').end('"}');
+    answer('2').end('"}');
+    assert.deepEqual(JSON.parse((await first.promise).text), { held: '1' });
+    assert.deepEqual(JSON.parse((await second.promise).text), { held: '2' });
+    const after = await open('/api/quotas').promise;
+    assert.equal(after.status, 200);
+    assert.equal(after.text, '{"ok":true}');
+
+    // A phone that vanishes mid-answer gives the room back too.
+    const vanished = open('/api/quotas?hold=4');
+    await untilHeld(4);
+    vanished.abort();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const fifth = open('/api/quotas?hold=5');
+    const sixth = open('/api/quotas?hold=6');
+    await untilHeld(6);
+    const seventh = await open('/api/quotas?hold=7').promise;
+    assert.equal(seventh.status, 503, 'two are held again, so the ceiling is back in force');
+    answer('5').end('"}');
+    answer('6').end('"}');
+    await Promise.all([fifth.promise, sixth.promise]);
+  } finally {
+    for (const entry of held.splice(0)) entry.res.destroy();
+    await bridge.close();
+  }
+});
+
+test('an answer torn down with nothing but a close gives its room back, and the phone hears why', async () => {
+  const held = [];
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      if (info.query.startsWith('?cut=')) {
+        // An answer that begins, and whose connection then goes away.
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{"cut":"');
+        setTimeout(() => res.socket.destroy(), 30);
+        return;
+      }
+      if (info.query.startsWith('?hold=')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{"held":"');
+        res.write(info.query.slice(6));
+        held.push({ number: info.query.slice(6), res });
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    },
+  });
+  // A teardown the bridge hears nothing from but `close`:  on the bridge's
+  // own connections to the harness, the events it otherwise learns a cut
+  // answer from are kept from it.
+  const emit = http.IncomingMessage.prototype.emit;
+  http.IncomingMessage.prototype.emit = function (event, ...args) {
+    if (this.socket?.remotePort === bridge.harness.port && (event === 'aborted' || event === 'error')) return true;
+    return emit.call(this, event, ...args);
+  };
+  try {
+    const device = await bridge.pair('phone-scrub-close');
+    const open = (path) => openProxied(bridge.port, path, ownerHeaders({ authorization: `Bearer ${device.credential}` }));
+    const cut = await Promise.race([open('/api/quotas?cut=1').promise,
+      new Promise((resolve) => setTimeout(() => resolve({ status: 'still waiting', text: '' }), 2000))]);
+    assert.equal(cut.status, 502);
+    assert.deepEqual(JSON.parse(cut.text), { error: 'the harness did not finish its answer' });
+    // The room that answer took is back: two more are held at once again.
+    const second = open('/api/quotas?hold=2');
+    const third = open('/api/quotas?hold=3');
+    assert.equal(await eventually(() => held.length, 2), true, 'two answers are held, so the room came back');
+    for (const entry of held.splice(0)) entry.res.end('"}');
+    assert.deepEqual(JSON.parse((await second.promise).text), { held: '2' });
+    assert.deepEqual(JSON.parse((await third.promise).text), { held: '3' });
+  } finally {
+    http.IncomingMessage.prototype.emit = emit;
+    for (const entry of held.splice(0)) entry.res.destroy();
     await bridge.close();
   }
 });
