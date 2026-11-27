@@ -2002,6 +2002,7 @@ test('the advertisement carries the configured routes, and falls back to the rou
     assert.equal(listed.status, 200);
     assert.deepEqual(listed.json, {
       serverName: 'BotFleet Server',
+      isBridge: true,
       endpoints: [
         { url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 },
         { url: 'https://cdn.example', kind: 'hosted', priority: 100 },
