@@ -257,6 +257,10 @@ struct MacPhoneSettings: View {
     }
 
     private func phoneDate(_ seconds: Double) -> String {
+        Self.phoneDateString(seconds)
+    }
+
+    static func phoneDateString(_ seconds: Double) -> String {
         Date(timeIntervalSince1970: seconds).formatted(date: .abbreviated, time: .omitted)
     }
 
