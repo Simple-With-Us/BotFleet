@@ -76,6 +76,14 @@ struct MacPhoneSettings: View {
                         .foregroundColor(.secondary)
                 }
 
+                if let serverBackend {
+                    ServerPairingCard(backend: serverBackend, title: serverLabel)
+                } else if servers.isLoaded {
+                    Text("No server to pair a phone with.\u{00A0} Add one under Servers.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
                 if let errorMessage {
                     Text(errorMessage)
                         .font(.caption)
