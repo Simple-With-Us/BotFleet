@@ -2168,7 +2168,7 @@ test('every forwarded route needs a paired device, and each one reaches the harn
       // Without a device credential the bridge refuses before the harness
       // is asked, and a credential it never issued is refused the same way.
       const anonymous = await call(bridge.port, { method: route.method, path, headers: ownerHeaders(json), body });
-      assert.equal(anonymous.status, 403, label);
+      assert.equal(anonymous.status, 401, label);
       assert.equal(anonymous.json.error, 'device credential required', label);
       const stranger = await call(bridge.port, {
         method: route.method,
