@@ -1237,7 +1237,7 @@ test('push-token, live-activity-token, and push-health routes enforce auth, vali
         headers: ownerHeaders(body ? { 'content-type': 'application/json' } : {}),
         body,
       });
-      assert.equal(denied.status, 403, `${method} ${path}`);
+      assert.equal(denied.status, 401, `${method} ${path}`);
     }
 
     // Invalid token or unsupported kind returns 400.
