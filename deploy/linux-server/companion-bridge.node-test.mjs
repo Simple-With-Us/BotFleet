@@ -4,15 +4,38 @@
 // registry: no listener is started, no port is bound, no credential leaves
 // a digest, and nothing is sent anywhere.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   BRIDGE_ALLOWED_ROUTES,
+  BRIDGE_BOT_ORGANIZE_FIELDS,
+  BRIDGE_BOT_ORGANIZE_ROUTE_PATTERN,
+  BRIDGE_MAX_ENDPOINTS,
+  BRIDGE_PAIR_REPLAY_REFUSAL,
+  BRIDGE_PROFILE_PATCH_FIELDS,
+  BRIDGE_PROFILE_PATCH_ROUTE_PATTERN,
+  BRIDGE_SERVER_NAME,
+  BRIDGE_WITHHELD_RESPONSE_KEYS,
+  MAX_BRIDGE_SSE_EVENT_BYTES,
+  bridgeBodyCheck,
+  bridgeBotOrganizeDenial,
+  bridgeCleanDeviceName,
+  bridgeCleanOrigin,
   bridgeDeviceDecision,
+  bridgeEndpointKind,
+  bridgeEndpoints,
+  bridgeIsJson,
   bridgeLocalRouteRequiresDevice,
+  bridgePairRefusalSentence,
+  bridgeParseOrigins,
+  bridgeProfilePatchDenial,
   bridgeRouteDecision,
+  bridgeScrub,
+  bridgeScrubWireJson,
   buildBridgeAlertPayload,
   buildBridgeLiveActivityContent,
   buildBridgeLiveActivityPayload,
+  createBridgeSseScrubber,
   liveActivityTopic,
   openBridgePairingWindow,
   pushSenderForDevice,
@@ -45,9 +68,188 @@ function spentWithReplay(overrides = {}) {
   return { window: first.window, credentialDigest: first.credentialDigest };
 }
 
+/** The bridge rows that forward to the harness, health excluded: the copy of
+ *  the sidecar's allowlist. */
+function mirroredHarnessRoutes() {
+  return BRIDGE_ALLOWED_ROUTES.filter((route) => route.local === false && route.path !== "/api/health");
+}
+
+/**
+ * Read the Mac sidecar's allowlist as text. The two lists are written in two
+ * languages and nothing else ties them together, so this is the only place
+ * the copy can be checked against its source.
+ */
+function sidecarAllowList() {
+  const source = readFileSync(new URL("../../companion/src/routes.ts", import.meta.url), "utf8");
+  const opener = "const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [";
+  const start = source.indexOf(opener);
+  assert.notEqual(start, -1, "the sidecar still declares its ALLOWED list where this test reads it");
+  const end = source.indexOf("\n];", start);
+  assert.notEqual(end, -1, "the sidecar's ALLOWED list still closes where this test reads it");
+  const block = source.slice(start, end);
+  const entries = [];
+  let inlineRows = 0;
+  let namedRows = 0;
+  for (const line of block.split("\n")) {
+    const inline = line.match(/^\s*\{ method: "([A-Z]+)", path: (\/.*\/[a-z]*),? \},?\s*$/);
+    if (inline) {
+      entries.push(`${inline[1]} ${inline[2]}`);
+      inlineRows += 1;
+      continue;
+    }
+    const named = line.match(/^\s*([A-Z_]+),\s*$/);
+    if (!named) continue;
+    const definition = source.match(
+      new RegExp(`const ${named[1]} = \\{\\s*method: "([A-Z]+)",\\s*path: (\\/.*\\/[a-z]*),?\\s*\\} as const;`),
+    );
+    assert.ok(definition, `${named[1]} is still a method-and-path constant`);
+    entries.push(`${definition[1]} ${definition[2]}`);
+    namedRows += 1;
+  }
+  // A parser that matched nothing would pass forever, so every row the block
+  // declares has to come back. The first line declares one `path:` in its
+  // type annotation, which is not a row, and two rows are named constants.
+  assert.equal(inlineRows, block.match(/\bpath:/g).length - 1, "every inline row of the sidecar list was read");
+  assert.equal(namedRows, (block.match(/^\s*[A-Z][A-Z_]+,\s*$/gm) ?? []).length, "every named row was read");
+  assert.equal(namedRows, 2, "the two named rows are the organize route and the cloud desktop join");
+  return entries;
+}
+
+/** One quoted list out of the sidecar source, by the name of its constant. */
+function sidecarQuotedList(constant) {
+  const source = readFileSync(new URL("../../companion/src/routes.ts", import.meta.url), "utf8");
+  const opener = source.indexOf(`const ${constant} = [`);
+  assert.notEqual(opener, -1, `the sidecar still declares ${constant} where this test reads it`);
+  const closer = source.indexOf("] as const;", opener);
+  assert.notEqual(closer, -1, `${constant} still closes where this test reads it`);
+  const body = source.slice(opener + `const ${constant} = [`.length, closer);
+  // The list carries comments, and a comment may quote a word, so only one
+  // quoted string on its own line is a member.
+  const members = [...body.matchAll(/^\s*"([^"]+)",?\s*$/gm)].map((match) => match[1]);
+  assert.ok(members.length > 0, `${constant} still has members`);
+  return members;
+}
+
+test("the harness routes the bridge forwards are the sidecar's allowlist, pattern for pattern", () => {
+  const sidecar = new Set(sidecarAllowList());
+  const bridge = new Set(mirroredHarnessRoutes().map((route) => `${route.method} /${route.pattern.source}/${route.pattern.flags}`));
+  // Nothing is forwarded that the sidecar does not allow: the bridge can
+  // never be the wider door.
+  for (const entry of bridge) {
+    assert.ok(sidecar.has(entry), `the bridge forwards ${entry}, which the sidecar does not allow`);
+  }
+  // And everything the sidecar allows is forwarded, except the rows named
+  // here. A row added to the sidecar later fails this test until someone
+  // decides, in this diff, whether a phone may reach it through the bridge.
+  const local = new Set(BRIDGE_ALLOWED_ROUTES.filter((route) => route.local === true).map((route) => `${route.method} ${route.path}`));
+  const notForwarded = [...sidecar].filter((entry) => !bridge.has(entry)).sort();
+  assert.deepEqual(
+    notForwarded,
+    [
+      "GET /^\\/api\\/companion\\/endpoints$/",
+      "GET /^\\/api\\/companion\\/push-health$/",
+      "POST /^\\/api\\/bots\\/[\\w-]+\\/computer\\/join$/",
+      "POST /^\\/api\\/companion\\/live-activity-token$/",
+      "POST /^\\/api\\/update\\/check$/",
+      "POST /^\\/api\\/update\\/run$/",
+      "POST /^\\/api\\/companion\\/push-token$/",
+    ].sort(),
+  );
+  for (const [method, path] of [
+    ["GET", "/api/companion/endpoints"],
+    ["GET", "/api/companion/push-health"],
+    ["POST", "/api/companion/live-activity-token"],
+    ["POST", "/api/companion/push-token"],
+  ]) {
+    assert.ok(local.has(`${method} ${path}`), `${method} ${path} is served by the bridge itself`);
+  }
+  // The one sidecar route with no bridge counterpart stays closed. On the
+  // Mac it needs a per-device grant the computer owner switches on; the
+  // bridge has none, so it is not open for every paired phone.
+  const join = bridgeRouteDecision("POST", "/api/bots/b-1/computer/join");
+  assert.equal(join.ok, false);
+  assert.equal(join.status, 404);
+  // The two update actions stay closed for the same reason in kind: they
+  // stop and replace the harness, and on this host that is a production
+  // service. The read-only status row is the one update route a phone gets.
+  for (const path of ["/api/update/check", "/api/update/run"]) {
+    const decision = bridgeRouteDecision("POST", path);
+    assert.equal(decision.ok, false, `POST ${path} is not a bridge route`);
+    assert.equal(decision.status, 404);
+  }
+  assert.equal(bridgeRouteDecision("GET", "/api/update/status").ok, true);
+});
+
+test("the two checked bodies use the sidecar's own routes and field lists", () => {
+  const source = readFileSync(new URL("../../companion/src/routes.ts", import.meta.url), "utf8");
+  const profile = source.match(/export function isCompanionProfilePatch\([^)]*\): boolean \{\s*return method === "PATCH" && (\/.*\/)\.test\(path\);/);
+  assert.ok(profile, "the sidecar still names its profile route where this test reads it");
+  assert.equal(BRIDGE_PROFILE_PATCH_ROUTE_PATTERN.source, profile[1].slice(1, -1));
+  const organize = source.match(/const COMPANION_BOT_ORGANIZE_ROUTE = \{\s*method: "([A-Z]+)",\s*path: (\/.*\/),?\s*\} as const;/);
+  assert.ok(organize, "the sidecar still names its organize route where this test reads it");
+  assert.equal(BRIDGE_BOT_ORGANIZE_ROUTE_PATTERN.source, organize[2].slice(1, -1));
+  assert.deepEqual([...BRIDGE_PROFILE_PATCH_FIELDS], sidecarQuotedList("COMPANION_PROFILE_PATCH_FIELDS"));
+  assert.deepEqual([...BRIDGE_BOT_ORGANIZE_FIELDS], sidecarQuotedList("COMPANION_BOT_ORGANIZE_FIELDS"));
+  const wire = readFileSync(new URL("../../companion/src/wire.ts", import.meta.url), "utf8");
+  const withheld = wire.match(/const WITHHELD_KEYS = new Set\(\[([^\]]*)\]\)/);
+  assert.ok(withheld, "the sidecar still names its withheld keys where this test reads it");
+  assert.deepEqual(
+    [...BRIDGE_WITHHELD_RESPONSE_KEYS],
+    [...withheld[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]),
+  );
+});
+
+test("every forwarded row is a paired-device route anchored at both ends", () => {
+  for (const route of mirroredHarnessRoutes()) {
+    assert.equal(route.local, false, `${route.method} ${route.path}`);
+    assert.equal(route.requiresDevice, true, `${route.method} ${route.path}`);
+    assert.ok(route.pattern instanceof RegExp, `${route.method} ${route.path} matches on the raw path`);
+    assert.ok(route.pattern.source.startsWith("^") && route.pattern.source.endsWith("$"), `${route.method} ${route.path} is anchored`);
+    assert.equal(route.pattern.global, false, `${route.method} ${route.path} keeps no state between calls`);
+  }
+  // An id is `[\w-]+` and nothing wider, so an encoded character inside one
+  // fails to match and the door stays closed, the way it does on the Mac.
+  for (const url of [
+    "/api/bots/b%2D1/messages",
+    "/api/bots/%252e",
+    "/api/bots/b%2F1/messages",
+    "/api/threads/t-1/messages/m%2E1/image",
+  ]) {
+    assert.equal(bridgeRouteDecision("GET", url).status, 404, url);
+    assert.equal(bridgeRouteDecision("POST", url).status, 404, url);
+  }
+});
+
+test("the routes a phone calls before it is paired need no device, and nothing else is let off", () => {
+  const health = bridgeRouteDecision("GET", "/api/health");
+  assert.equal(health.ok, true);
+  assert.equal(health.local, false);
+  assert.equal(health.route.requiresDevice, false);
+  const pair = bridgeRouteDecision("POST", "/api/pair");
+  assert.equal(pair.ok, true);
+  assert.equal(pair.local, true);
+  assert.equal(pair.route.requiresDevice, false);
+  const advertisement = bridgeRouteDecision("GET", "/api/companion/endpoints");
+  assert.equal(advertisement.ok, true);
+  assert.equal(advertisement.route.requiresDevice, false);
+  // Everything else that is not local is a device route, and the local
+  // device routes are the three the Phone tab registers through.
+  for (const route of BRIDGE_ALLOWED_ROUTES) {
+    if (route.path === "/api/health" || route.path === "/api/pair") continue;
+    if (route.local === false) assert.equal(route.requiresDevice, true, `${route.method} ${route.path}`);
+  }
+  assert.equal(bridgeLocalRouteRequiresDevice("POST", "/api/companion/push-token"), true);
+  assert.equal(bridgeLocalRouteRequiresDevice("POST", "/api/companion/live-activity-token"), true);
+  assert.equal(bridgeLocalRouteRequiresDevice("GET", "/api/companion/push-health"), true);
+  assert.equal(bridgeLocalRouteRequiresDevice("GET", "/api/companion/devices"), false);
+  assert.equal(bridgeLocalRouteRequiresDevice("POST", "/api/companion/pairing/redeem"), false);
+  assert.equal(bridgeLocalRouteRequiresDevice("POST", "/api/pair"), false);
+});
+
 test("every companion route the Phone tab needs is on the bridge", () => {
   for (const [method, url, local] of [
     ["GET", "/api/companion/endpoints", true],
+    ["POST", "/api/pair", true],
     ["POST", "/api/companion/pairing/open", true],
     ["POST", "/api/companion/pairing/redeem", true],
     ["GET", "/api/companion/devices", true],
@@ -55,48 +257,104 @@ test("every companion route the Phone tab needs is on the bridge", () => {
     ["POST", "/api/companion/push-token", true],
     ["POST", "/api/companion/live-activity-token", true],
     ["GET", "/api/companion/push-health", true],
-    ["GET", "/api/fleet", false],
-    ["GET", "/api/threads/t-1", false],
-    ["POST", "/api/threads/t-1/messages", false],
-    ["POST", "/api/threads/t-1/interrupt", false],
+    ["GET", "/api/health", false],
+    ["GET", "/api/bots", false],
+    ["GET", "/api/threads/t-1/messages", false],
+    ["POST", "/api/threads/t-1/respond", false],
+    ["POST", "/api/bots/b-1/interrupt", false],
     ["GET", "/api/events", false],
   ]) {
     const decision = bridgeRouteDecision(method, url);
     assert.equal(decision.ok, true, `${method} ${url}`);
     assert.equal(decision.local, local, `${method} ${url} locality`);
   }
-  assert.equal(bridgeLocalRouteRequiresDevice("POST", "/api/companion/push-token"), true);
-  assert.equal(bridgeLocalRouteRequiresDevice("POST", "/api/companion/live-activity-token"), true);
-  assert.equal(bridgeLocalRouteRequiresDevice("GET", "/api/companion/push-health"), true);
-  assert.equal(bridgeLocalRouteRequiresDevice("GET", "/api/companion/devices"), false);
-  assert.equal(bridgeLocalRouteRequiresDevice("POST", "/api/companion/pairing/redeem"), false);
+});
+
+test("routes no shipped client calls are not forwarded, dead or not", () => {
+  // The bridge's first table named these four. The iOS app calls none of
+  // them against a server, and the harness serves none of them, so each one
+  // was a door to a route that did not exist yet: a later harness release
+  // would have opened it to every paired phone without anyone deciding.
+  // Each is refused. Three are unknown paths, and the fourth shares its path
+  // with the transcript read, so it answers 405 as any wrong method does.
+  for (const [method, url, status] of [
+    ["GET", "/api/fleet", 404],
+    ["GET", "/api/threads/t-1", 404],
+    ["POST", "/api/threads/t-1/messages", 405],
+    ["POST", "/api/threads/t-1/interrupt", 404],
+  ]) {
+    const decision = bridgeRouteDecision(method, url);
+    assert.equal(decision.ok, false, `${method} ${url}`);
+    assert.equal(decision.status, status, `${method} ${url}`);
+  }
+  // What the app does call on those shapes is forwarded instead.
+  assert.equal(bridgeRouteDecision("GET", "/api/threads/t-1/messages").ok, true);
+  assert.equal(bridgeRouteDecision("POST", "/api/threads/t-1/respond").ok, true);
+  assert.equal(bridgeRouteDecision("POST", "/api/bots/b-1/messages").ok, true);
+  assert.equal(bridgeRouteDecision("POST", "/api/bots/b-1/interrupt").ok, true);
 });
 
 test("unknown paths, wrong methods, and traversal are refused", () => {
   assert.equal(bridgeRouteDecision("GET", "/api/admin").ok, false);
   assert.equal(bridgeRouteDecision("GET", "/api/admin").status, 404);
-  const wrongMethod = bridgeRouteDecision("POST", "/api/fleet");
+  const wrongMethod = bridgeRouteDecision("PUT", "/api/bots");
   assert.equal(wrongMethod.ok, false);
   assert.equal(wrongMethod.status, 405);
-  assert.equal(bridgeRouteDecision("GET", "/api/threads/../fleet").status, 404);
-  assert.equal(bridgeRouteDecision("GET", "/api/threads//messages").status, 404);
-  assert.equal(bridgeRouteDecision("GET", "/api/threads/t-1/messages/extra").status, 404);
+  // A method on a route another method owns is a 405, and it is the same
+  // answer whether or not the caller may use either.
+  assert.equal(bridgeRouteDecision("POST", "/api/config").status, 405);
+  assert.equal(bridgeRouteDecision("GET", "/api/companion/pairing/redeem").status, 405);
+  assert.equal(bridgeRouteDecision("GET", "/api/bots/../config").status, 404);
+  assert.equal(bridgeRouteDecision("GET", "/api/bots//messages").status, 404);
+  assert.equal(bridgeRouteDecision("GET", "/api/bots/b-1/messages/extra").status, 404);
+  // Families the sidecar keeps off the phone stay off it here, under every
+  // method: webhooks and triggers, the local VM, teams, the bare
+  // per-connector delete, always-allow, the owner's runtime routes, and the
+  // internal peer endpoints.
+  for (const url of [
+    "/api/webhooks",
+    "/api/webhooks/wh-1",
+    "/api/resource-triggers",
+    "/api/local-computer",
+    "/api/teams",
+    "/api/connectors/github",
+    "/api/bots/b-1/always-allow",
+    "/api/runtime",
+    "/api/runtime/quiesce",
+    "/api/internal/peers",
+    "/api/config/api-key/minimax",
+    "/api/devices",
+  ]) {
+    for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE"]) {
+      assert.equal(bridgeRouteDecision(method, url).ok, false, `${method} ${url}`);
+    }
+  }
+  // The computer-defaults route is the sidecar's one overlap, and the bridge
+  // behaves the same way. The harness serves it as a POST only, so the POST
+  // is refused (405, because sibling rows own the path), while a PATCH or a
+  // DELETE reads `apply-defaults` as a bot id exactly as the sidecar's own
+  // patterns do, and the harness answers that there is no such bot.
+  const computerDefaults = bridgeRouteDecision("POST", "/api/bots/apply-defaults");
+  assert.equal(computerDefaults.ok, false);
+  assert.equal(computerDefaults.status, 405);
+  assert.equal(bridgeBodyCheck("PATCH", "/api/bots/apply-defaults"), bridgeBotOrganizeDenial);
 });
 
 test("percent-encoded dot and slash forms are refused as traversal", () => {
   for (const url of [
-    "/api/threads/%2e/fleet",
-    "/api/threads/%2E%2E/fleet",
-    "/api/threads/%252e/fleet",
-    "/api/threads/a%2fb/messages",
-    "/api/threads/%c0%af/messages",
+    "/api/bots/%2e/config",
+    "/api/bots/%2E%2E/config",
+    "/api/bots/%252e/config",
+    "/api/bots/a%2fb/messages",
+    "/api/bots/%c0%af/messages",
     "/api/companion/devices/%2e",
   ]) {
     assert.equal(bridgeRouteDecision("GET", url).status, 404, url);
   }
-  const singleEncoded = bridgeRouteDecision("GET", "/api/threads/%252e");
-  assert.equal(singleEncoded.ok, true);
-  assert.equal(singleEncoded.upstream, "/api/threads/%252e");
+  // A double-encoded dot is a closed door too. The sidecar matches its
+  // patterns on the undecoded path, so an id carrying a per cent sign never
+  // matches at all, here as there.
+  assert.equal(bridgeRouteDecision("GET", "/api/bots/%252e").status, 404);
 });
 
 test("matching strips the query but the upstream keeps it byte for byte", () => {
@@ -105,15 +363,37 @@ test("matching strips the query but the upstream keeps it byte for byte", () => 
   assert.equal(decision.upstream, "/api/events?since=%3Ccursor%3A42%3E&tail=1");
   const device = bridgeRouteDecision("DELETE", "/api/companion/devices/d-1?x=1");
   assert.equal(device.upstream, "/api/companion/devices/d-1?x=1");
+  const page = bridgeRouteDecision("GET", "/api/threads/t-1/messages?limit=50&before=m-1%3A2&around=a$b");
+  assert.equal(page.upstream, "/api/threads/t-1/messages?limit=50&before=m-1%3A2&around=a$b");
+  const search = bridgeRouteDecision("GET", "/api/search?q=a%20b%2Bc&limit=40");
+  assert.equal(search.upstream, "/api/search?q=a%20b%2Bc&limit=40");
 });
 
-test("a $-sequence in a path param is inserted verbatim, not expanded", () => {
-  const decision = bridgeRouteDecision("GET", "/api/threads/$&");
+test("a $-sequence in a path or a query is passed verbatim, not expanded", () => {
+  const decision = bridgeRouteDecision("GET", "/api/events?since=$&$1$`$'");
   assert.equal(decision.ok, true);
-  assert.equal(decision.upstream, "/api/threads/$&");
+  assert.equal(decision.upstream, "/api/events?since=$&$1$`$'");
   const quote = bridgeRouteDecision("DELETE", "/api/companion/devices/$'");
   assert.equal(quote.ok, true);
   assert.equal(quote.upstream, "/api/companion/devices/$'");
+  const ampersand = bridgeRouteDecision("DELETE", "/api/companion/devices/$&");
+  assert.equal(ampersand.ok, true);
+  assert.equal(ampersand.upstream, "/api/companion/devices/$&");
+});
+
+test("the case-insensitive attachment row keeps the name's case on the way through", () => {
+  const upper = bridgeRouteDecision("GET", "/api/attachments/Photo-1.PNG");
+  assert.equal(upper.ok, true);
+  assert.equal(upper.upstream, "/api/attachments/Photo-1.PNG");
+  // and it is still one bare filename with an image extension, never a path
+  for (const url of [
+    "/api/attachments/Photo-1.PNG/extra",
+    "/api/attachments/Photo-1.svg",
+    "/api/attachments/Photo-1.png%2F..%2Fconfig.json",
+    "/api/attachments/../config",
+  ]) {
+    assert.equal(bridgeRouteDecision("GET", url).status, 404, url);
+  }
 });
 
 test("pairing windows spend exactly once on a fake clock", () => {
@@ -685,3 +965,47 @@ test("push token validation and Live Activity payload match iOS ActivityKit expe
   assert.equal(startPayload.aps.event, "start");
   assert.equal(startPayload.aps["content-state"].requestId, "req-1");
 });
+
+test("a profile body may carry only the fields the sidecar allows a phone", () => {
+  // The harness's bot editor accepts every one of these, and none of them
+  // is a phone's to write: a bot's own MCP servers and their credentials,
+  // its connected-app settings, its cloud backend, extra working folders.
+  for (const field of [
+    "ownMcpServers",
+    "mcpServers",
+    "composio",
+    "connectorTools",
+    "cloudBackend",
+    "autoStartVps",
+    "extraCwds",
+    "userNotes",
+    "maxHistoryTurns",
+    "historySummaryModel",
+    "alwaysAllow",
+    "effort",
+  ]) {
+    const denial = bridgeProfilePatchDenial({ name: "Rio", [field]: {} });
+    assert.equal(denial.status, 403, field);
+    assert.equal(denial.error, `${field} can only be changed in BotFleet on your computer`, field);
+  }
+  // Every field on the list passes, alone and together.
+  const body = {};
+  for (const field of BRIDGE_PROFILE_PATCH_FIELDS) body[field] = null;
+  assert.equal(bridgeProfilePatchDenial(body), null);
+  assert.equal(bridgeProfilePatchDenial({}), null);
+  // The whole request is refused, never trimmed: a field the person expected
+  // to save is not silently dropped.
+  assert.equal(bridgeProfilePatchDenial({ name: "Rio", ownMcpServers: {} }).status, 403);
+  // A body that is not a JSON object is refused before any key is read.
+  for (const bad of [[], "name", 3, null, undefined]) {
+    assert.deepEqual(bridgeProfilePatchDenial(bad), { status: 400, error: "body must be a JSON object" });
+  }
+});
+
+test("an organize body may carry the six roster fields and nothing else", () => {
+  assert.deepEqual(bridgeBotOrganizeDenial({}), { status: 400, error: "nothing to save" });
+  assert.equal(bridgeBotOrganizeDenial({ hidden: true, section: "Work", pinnedMessageId: "m-1" }), null);
+  assert.equal(bridgeBotOrganizeDenial({ section: null, pinnedMessageId: null, chiefOfStaff: false }), null);
+  assert.equal(bridgeBotOrganizeDenial({ pinnedMessageId: "" }), null);
+  // Execution policy, computer grants and the persona fields never pass.
+  for (const field of ["autoApprove", "bypassPermissions", "computers", "cwd", "name", "color", "off"]) {
