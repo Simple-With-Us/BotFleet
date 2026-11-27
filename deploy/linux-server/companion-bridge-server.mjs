@@ -1295,8 +1295,9 @@ async function handleLocalRoute({
     // routes. `hosts` is left out on purpose. It is the older builds' list
     // of plain `http` addresses, and the bridge answers on its advertised
     // route alone, so a host entry would name a cleartext route that does
-    // not exist.
-    respondJson(res, 200, { serverName: BRIDGE_SERVER_NAME, endpoints: advertised });
+    // not exist. `isBridge` says whose advertisement it is, as the pairing
+    // answer does.
+    respondJson(res, 200, { serverName: BRIDGE_SERVER_NAME, endpoints: advertised, isBridge: true });
     return;
   }
 
