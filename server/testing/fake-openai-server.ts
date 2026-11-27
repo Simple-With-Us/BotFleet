@@ -214,7 +214,7 @@ export async function startFakeOpenAiServer(): Promise<FakeOpenAiServer> {
       // A thrown error inside the async handler must still answer the
       // socket, or the test hangs on the response instead of failing fast.
       if (!res.headersSent) {
-        res.writeHead(500, { "content-type": "application/json" });
+        res.writeHead(500, { ...CLOSE_CONNECTION, "content-type": "application/json" });
       }
       res.end(JSON.stringify({ error: `fake-openai-server: handler threw: ${String(error)}` }));
     });
