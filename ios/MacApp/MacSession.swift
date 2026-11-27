@@ -988,6 +988,20 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         }
     }
 
+    /// Phones read which placement this Mac runs off its advertisement, so
+    /// the listener is told whenever the applied one changes. The selection a
+    /// session starts with is nobody's choice: it is the default until the
+    /// saved servers have been read, and that read publishes the real one.
+    private func tellTheListenerThePlacement() {
+        servers.$placement
+            .dropFirst()
+            .sink { [weak self] settings in
+                let mode = settings.applied.mode
+                Task { await self?.companionListener.setPlacement(mode) }
+            }
+            .store(in: &placementTelling)
+    }
+
     /// Turns the native companion listener on or off from Settings.  The
     /// setting is written before the listener moves, and a refusal is shown
     /// on the same line the other lifecycle toggles use.
