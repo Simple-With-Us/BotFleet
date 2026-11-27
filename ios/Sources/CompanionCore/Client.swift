@@ -303,7 +303,11 @@ public struct PairingInvite: Equatable, Sendable {
         // does, rather than guessing who it pairs with.
         if let role = values["role"], role != "bridge" { return nil }
         connection.establishRoutePolicyFromInvite()
-        return PairingInvite(connection: connection, credential: credential)
+        return PairingInvite(
+            connection: connection,
+            credential: credential,
+            role: values["role"] == nil ? .computer : .bridge
+        )
     }
 
     /// Unpadded base64url JSON keeps the typed array in one unambiguous query
