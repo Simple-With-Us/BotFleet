@@ -871,7 +871,7 @@ async function main() {
     return;
   }
 
-  const { owners, publicOrigin, tokenSha256 } = gateConfigFromSecrets(secrets);
+  const { owners, publicOrigin, tokenSha256, bridgeEnabled } = gateConfigFromSecrets(secrets);
 
   //  The digest goes through the gate's own hash check, so a malformed hash
   //  is a configuration error rather than a silently ignored value.  The hash
