@@ -20,7 +20,7 @@
 // the image is mounted read-only and detached again, and no packaged
 // executable is ever run.
 
-import { lstatSync, mkdtempSync, readFileSync, realpathSync, rmdirSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
