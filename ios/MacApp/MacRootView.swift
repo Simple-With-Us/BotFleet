@@ -7,6 +7,9 @@ import AppKit
 public struct MacRootView: View {
     @EnvironmentObject private var session: MacSession
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    #if os(macOS)
+    @Environment(\.openSettings) private var openSettings
+    #endif
 
     public init() {}
 
@@ -29,7 +32,15 @@ public struct MacRootView: View {
             }
         }
         .navigationTitle(session.activeTitle)
+        .onAppear {
+            #if os(macOS)
+            session.registerSettingsSceneOpener { openSettings() }
+            #endif
+        }
         .onOpenURL { url in
+            #if os(macOS)
+            session.registerSettingsSceneOpener { openSettings() }
+            #endif
             session.routeSettingsDeepLink(url)
         }
         .toolbar {
@@ -99,6 +110,9 @@ struct MacStatusPillView: View {
 
 struct MacSidebarView: View {
     @EnvironmentObject private var session: MacSession
+    #if os(macOS)
+    @Environment(\.openSettings) private var openSettings
+    #endif
 
     var body: some View {
         VStack(spacing: 0) {
@@ -161,16 +175,22 @@ struct MacSidebarView: View {
 
             HStack {
                 Button(action: {
+                    #if os(macOS)
+                    session.registerSettingsSceneOpener { openSettings() }
+                    #endif
                     session.activeSettingsSection = .general
                     //  Choosing the section is not enough:  the Settings
                     //  window has to open, or the button does nothing.
                     session.presentSettingsScene()
                 }) {
                     Label("Settings", systemImage: "gearshape")
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
+                .help("Open Settings (⌘,)")
+                .accessibilityLabel("Settings")
 
                 Spacer()
 

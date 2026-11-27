@@ -241,6 +241,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     private var notificationAuthorizationTask: Task<Bool, Never>?
     #if os(macOS)
     private var voiceCaptureCoordinator: MacVoiceCaptureCoordinator?
+    private var settingsSceneOpener: (() -> Void)?
     #endif
 
     public init(
@@ -590,15 +591,102 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         }
     }
 
+    #if os(macOS)
+    /// Registers SwiftUI's `@Environment(\.openSettings)` action so every
+    /// programmatic Settings trigger opens the native macOS 14+ `Settings`
+    /// scene instead of relying on removed AppKit selectors.
+    public func registerSettingsSceneOpener(_ opener: @escaping () -> Void) {
+        settingsSceneOpener = opener
+    }
+    #endif
+
     /// Presents the app's Settings scene.
     public func presentSettingsScene() {
         #if os(macOS)
-        let settingsSelector = NSSelectorFromString("showSettingsWindow:")
-        if NSApp.sendAction(settingsSelector, to: nil, from: nil) { return }
-        let preferencesSelector = NSSelectorFromString("showPreferencesWindow:")
-        NSApp.sendAction(preferencesSelector, to: nil, from: nil)
+        NSApp.activate(ignoringOtherApps: true)
+        if let opener = settingsSceneOpener {
+            opener()
+            if Self.settingsWindowIsPresent {
+                Self.focusSettingsWindowIfPresent()
+                return
+            }
+            // SwiftUI presents the Settings scene asynchronously, so a
+            // window missing in this same runloop turn may still be on its
+            // way.  Verify on the next main-queue turn; only discard the
+            // opener and fall through to the AppKit fallbacks if the window
+            // is still absent then.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if Self.settingsWindowIsPresent {
+                    Self.focusSettingsWindowIfPresent()
+                } else {
+                    self.settingsSceneOpener = nil
+                    self.presentSettingsViaAppKitFallbacks()
+                }
+            }
+            return
+        }
+        presentSettingsViaAppKitFallbacks()
         #endif
     }
+
+    #if os(macOS)
+    private static var settingsWindowIsPresent: Bool {
+        NSApp.windows.contains { $0.identifier?.rawValue == "com_apple_SwiftUI_Settings_window" }
+    }
+
+    /// The AppKit fallback chain for presenting Settings when no SwiftUI
+    /// scene opener produced a window: the main-menu Settings item first,
+    /// then the legacy `showSettingsWindow:` / `showPreferencesWindow:`
+    /// selectors.
+    private func presentSettingsViaAppKitFallbacks() {
+        if Self.triggerMainMenuSettingsItem() {
+            Self.focusSettingsWindowIfPresent()
+            return
+        }
+        let settingsSelector = NSSelectorFromString("showSettingsWindow:")
+        if NSApp.sendAction(settingsSelector, to: nil, from: nil) {
+            Self.focusSettingsWindowIfPresent()
+            return
+        }
+        let preferencesSelector = NSSelectorFromString("showPreferencesWindow:")
+        _ = NSApp.sendAction(preferencesSelector, to: nil, from: nil)
+        Self.focusSettingsWindowIfPresent()
+    }
+    #endif
+
+    #if os(macOS)
+    private static func triggerMainMenuSettingsItem() -> Bool {
+        guard let appMenu = NSApp.mainMenu?.items.first?.submenu else {
+            return false
+        }
+        let relevantModifiers: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
+        guard let index = appMenu.items.firstIndex(where: { item in
+            item.isEnabled
+                && item.keyEquivalent == ","
+                && item.keyEquivalentModifierMask.intersection(relevantModifiers) == .command
+        }) else {
+            return false
+        }
+        appMenu.performActionForItem(at: index)
+        // Report success only when a Settings window actually opened; a
+        // menu item that handles the action without opening Settings must
+        // not suppress the selector fallbacks in the caller.
+        return Self.settingsWindowIsPresent
+    }
+
+    private static func focusSettingsWindowIfPresent() {
+        let focus = {
+            if let settingsWindow = NSApp.windows.first(where: { window in
+                window.identifier?.rawValue == "com_apple_SwiftUI_Settings_window"
+            }) {
+                settingsWindow.makeKeyAndOrderFront(nil)
+            }
+        }
+        focus()
+        DispatchQueue.main.async(execute: focus)
+    }
+    #endif
 
     /// Opens the app's Settings on the section that resolves a voice failure,
     /// and the system privacy pane when the failure needs one.
