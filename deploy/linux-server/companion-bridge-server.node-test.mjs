@@ -2536,3 +2536,91 @@ test('an event stream the scrubber cannot hold is ended, never forwarded half an
     await bridge.close();
   }
 });
+
+test('an answer that finds no room to be held for checking is refused at once, and the room comes back', async () => {
+  const held = [];
+  const bridge = await startBridge({
+    harnessHandler: (req, res, info) => {
+      if (info.query.startsWith('?hold=')) {
+        // An answer that begins and then waits, so the bridge is holding it.
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{"held":"');
+        res.write(info.query.slice(6));
+        held.push({ number: info.query.slice(6), res });
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    },
+  });
+  try {
+    const device = await bridge.pair('phone-scrub-ceiling');
+    const headers = ownerHeaders({ authorization: `Bearer ${device.credential}` });
+    const open = (path) => {
+      let request;
+      const promise = new Promise((resolve) => {
+        request = http.request({ hostname: '127.0.0.1', port: bridge.port, path, method: 'GET', headers }, (res) => {
+          const chunks = [];
+          res.on('data', (chunk) => chunks.push(chunk));
+          const finish = () => resolve({
+            status: res.statusCode,
+            text: Buffer.concat(chunks).toString('utf8'),
+            retryAfter: res.headers['retry-after'],
+          });
+          res.on('end', finish);
+          res.on('close', finish);
+          res.on('error', finish);
+        });
+        request.on('error', () => resolve({ status: 0, text: '' }));
+        request.end();
+      });
+      return { promise, abort: () => request.destroy() };
+    };
+    const heldSoFar = () => held.length;
+    const untilHeld = async (count) => {
+      while (heldSoFar() < count) await new Promise((resolve) => setTimeout(resolve, 5));
+    };
+    const answer = (number) => held.find((entry) => entry.number === number).res;
+
+    // Two answers are held; the third finds no room and is told to retry.
+    const first = open('/api/quotas?hold=1');
+    const second = open('/api/quotas?hold=2');
+    await untilHeld(2);
+    const third = await open('/api/quotas?hold=3').promise;
+    assert.equal(third.status, 503);
+    assert.equal(third.retryAfter, '1');
+    assert.match(JSON.parse(third.text).error, /too many answers/);
+
+    // The bridge can only know an answer is JSON once its headers arrive, so
+    // the harness began the third answer too. The bridge let go of that one
+    // the moment it saw them, which is what keeps its own memory bounded.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(heldSoFar(), 3);
+
+    // The room comes back as the held answers finish, whole and untouched.
+    answer('1').end('"}');
+    answer('2').end('"}');
+    assert.deepEqual(JSON.parse((await first.promise).text), { held: '1' });
+    assert.deepEqual(JSON.parse((await second.promise).text), { held: '2' });
+    const after = await open('/api/quotas').promise;
+    assert.equal(after.status, 200);
+    assert.equal(after.text, '{"ok":true}');
+
+    // A phone that vanishes mid-answer gives the room back too.
+    const vanished = open('/api/quotas?hold=4');
+    await untilHeld(4);
+    vanished.abort();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const fifth = open('/api/quotas?hold=5');
+    const sixth = open('/api/quotas?hold=6');
+    await untilHeld(6);
+    const seventh = await open('/api/quotas?hold=7').promise;
+    assert.equal(seventh.status, 503, 'two are held again, so the ceiling is back in force');
+    answer('5').end('"}');
+    answer('6').end('"}');
+    await Promise.all([fifth.promise, sixth.promise]);
+  } finally {
+    for (const entry of held.splice(0)) entry.res.destroy();
+    await bridge.close();
+  }
+});
