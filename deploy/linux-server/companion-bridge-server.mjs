@@ -1212,7 +1212,14 @@ async function handleRequest({
     );
     if (!device.ok) {
       logger(`[companion-bridge] refused ${method} ${pathOf(url)}: ${device.reason}`);
-      respondJson(res, 403, { error: device.reason });
+      // 401, which is what the Mac sidecar answers a phone it does not know.
+      // The app reads 401 as "this phone is not paired" and offers to pair
+      // again; it reads 403 as something that can only be done on the
+      // computer, and a revoked phone would have been told that for good.
+      // The sidecar sends its 401 bare; the challenge is named here because
+      // a 401 without it is not an answer a generic client can act on.
+      res.setHeader('www-authenticate', 'Bearer realm="companion-bridge"');
+      respondJson(res, 401, { error: device.reason });
       return;
     }
     deviceId = device.deviceId;

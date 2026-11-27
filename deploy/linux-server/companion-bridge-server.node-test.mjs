@@ -663,7 +663,7 @@ test('the command line takes the bootstrap token file and the state file', () =>
   assert.match(unknown.error, /unknown argument/);
 });
 
-test('a proxied route needs a device the bridge knows, and a revoked one is refused', async () => {
+test('a proxied route needs a device the bridge knows; one it does not know, or has revoked, is answered 401 as the Mac sidecar does', async () => {
   let reached = 0;
   const bridge = await startBridge({
     harnessHandler: (req, res) => {
@@ -674,8 +674,13 @@ test('a proxied route needs a device the bridge knows, and a revoked one is refu
   });
   try {
     // No device credential at all:  the bridge refuses before the harness.
+    // 401 is the status the app reads as "this phone is not paired"; a 403
+    // it reads as something that can only be done on the computer, and a
+    // phone that lost its pairing would never be offered a new one.
     const anonymous = await call(bridge.port, { path: '/api/bots' });
-    assert.equal(anonymous.status, 403);
+    assert.equal(anonymous.status, 401);
+    assert.equal(anonymous.json.error, 'device credential required');
+    assert.equal(anonymous.headers.get('www-authenticate'), 'Bearer realm="companion-bridge"');
     assert.equal(reached, 0);
 
     // A credential the bridge never issued is refused as well.
@@ -683,7 +688,8 @@ test('a proxied route needs a device the bridge knows, and a revoked one is refu
       path: '/api/bots',
       headers: ownerHeaders({ authorization: `Bearer ${DEVICE_CREDENTIAL}` }),
     });
-    assert.equal(stranger.status, 403);
+    assert.equal(stranger.status, 401);
+    assert.equal(stranger.json.error, 'unknown device');
     assert.equal(reached, 0);
 
     // A paired device reaches the harness.
@@ -701,7 +707,7 @@ test('a proxied route needs a device the bridge knows, and a revoked one is refu
       path: '/api/bots',
       headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
     });
-    assert.equal(revoked.status, 403);
+    assert.equal(revoked.status, 401);
     assert.equal(reached, 1);
   } finally {
     await bridge.close();
@@ -1126,7 +1132,7 @@ test('a failing durable save pauses the trust-extending routes and a working sav
       path: '/api/bots',
       headers: ownerHeaders({ authorization: `Bearer ${device.credential}` }),
     });
-    assert.equal(revokedProxy.status, 403);
+    assert.equal(revokedProxy.status, 401);
 
     // The save works again and the routes come back.
     savesWork = true;
@@ -1219,7 +1225,8 @@ test('push-token, live-activity-token, and push-health routes enforce auth, vali
     const pushToken = 'Ab'.repeat(32);
     const laToken = 'Cd'.repeat(32);
 
-    // Device credential is required on all three routes.
+    // Device credential is required on all three routes, and its absence
+    // is 401 as on every other route that needs a device.
     for (const [method, path, body] of [
       ['POST', '/api/companion/push-token', JSON.stringify({ token: pushToken })],
       ['POST', '/api/companion/live-activity-token', JSON.stringify({ token: laToken, kind: 'push-to-start' })],
@@ -1231,7 +1238,7 @@ test('push-token, live-activity-token, and push-health routes enforce auth, vali
         headers: ownerHeaders(body ? { 'content-type': 'application/json' } : {}),
         body,
       });
-      assert.equal(denied.status, 403, `${method} ${path}`);
+      assert.equal(denied.status, 401, `${method} ${path}`);
     }
 
     // Invalid token or unsupported kind returns 400.
@@ -2162,7 +2169,7 @@ test('every forwarded route needs a paired device, and each one reaches the harn
       // Without a device credential the bridge refuses before the harness
       // is asked, and a credential it never issued is refused the same way.
       const anonymous = await call(bridge.port, { method: route.method, path, headers: ownerHeaders(json), body });
-      assert.equal(anonymous.status, 403, label);
+      assert.equal(anonymous.status, 401, label);
       assert.equal(anonymous.json.error, 'device credential required', label);
       const stranger = await call(bridge.port, {
         method: route.method,
@@ -2170,7 +2177,7 @@ test('every forwarded route needs a paired device, and each one reaches the harn
         headers: ownerHeaders({ ...json, authorization: `Bearer ${DEVICE_CREDENTIAL}` }),
         body,
       });
-      assert.equal(stranger.status, 403, label);
+      assert.equal(stranger.status, 401, label);
       assert.equal(stranger.json.error, 'unknown device', label);
     }
     assert.equal(reached.length, 0, 'nothing reached the harness without a paired device');
@@ -2333,7 +2340,7 @@ test('the profile and organize bodies are checked before they reach the harness,
       headers: ownerHeaders({ 'content-type': 'application/json' }),
       body: '{"name":"Rio"}',
     });
-    assert.equal(anonymous.status, 403);
+    assert.equal(anonymous.status, 401);
     assert.equal(seen.length, 2);
   } finally {
     await bridge.close();
