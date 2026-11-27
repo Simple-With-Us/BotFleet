@@ -188,7 +188,6 @@ targets:
     platform: macOS
     sources:
     - path: MacApp
-    - path: MacApp/Assets.xcassets
     - path: MacUpdater
     - path: Assets.xcassets
     dependencies:

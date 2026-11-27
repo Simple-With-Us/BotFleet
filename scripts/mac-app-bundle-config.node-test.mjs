@@ -7,14 +7,16 @@ import { fileURLToPath } from "node:url";
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 describe("BotFleetMac app icon and Settings scene wiring", () => {
-  it("wires MacApp/Assets.xcassets and AppIcon in ios/project.yml", () => {
+  it("wires MacApp/Assets.xcassets and AppIcon cleanly without duplicate sources in ios/project.yml", () => {
     const projectYml = readFileSync(join(REPO_ROOT, "ios", "project.yml"), "utf8");
     const macSectionStart = projectYml.indexOf("  BotFleetMac:");
     const schemesStart = projectYml.indexOf("schemes:");
     assert.ok(macSectionStart !== -1 && schemesStart > macSectionStart, "BotFleetMac target section exists");
     const macSection = projectYml.slice(macSectionStart, schemesStart);
 
-    assert.match(macSection, /- path:\s*MacApp\/Assets\.xcassets/);
+    assert.match(macSection, /- path:\s*MacApp\b/);
+    assert.doesNotMatch(macSection, /- path:\s*MacApp\/Assets\.xcassets/);
+    assert.ok(existsSync(join(REPO_ROOT, "ios", "MacApp", "Assets.xcassets", "Contents.json")));
     assert.match(macSection, /ASSETCATALOG_COMPILER_APPICON_NAME:\s*AppIcon/);
   });
 

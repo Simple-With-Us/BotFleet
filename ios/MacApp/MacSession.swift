@@ -644,9 +644,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     private static func focusSettingsWindowIfPresent() {
         let focus = {
             if let settingsWindow = NSApp.windows.first(where: { window in
-                let identifier = window.identifier?.rawValue ?? ""
-                return identifier == "com_apple_SwiftUI_Settings_window"
-                    || identifier.localizedCaseInsensitiveContains("settings")
+                window.identifier?.rawValue == "com_apple_SwiftUI_Settings_window"
             }) {
                 settingsWindow.makeKeyAndOrderFront(nil)
             }
