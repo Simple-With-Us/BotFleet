@@ -395,6 +395,11 @@ extension Connection {
         let cleanedName = metadata.serverName.trimmingCharacters(in: .whitespacesAndNewlines)
             .filter { (!$0.isASCII && !$0.isNewline) || $0.asciiValue.map { $0 >= 32 && $0 != 127 } == true }
         if !cleanedName.isEmpty { name = String(cleanedName.prefix(80)) }
+        if metadata.endpoints.isEmpty {
+            // No route came with it: a Mac that advertises none. What it said
+            // is its mode and its name, and the routes stay as they are.
+            return
+        }
 
         if let advertisedHosts = metadata.hosts {
             hosts = Array(advertisedHostsAllowedByRoutePolicy(advertisedHosts).prefix(8))
