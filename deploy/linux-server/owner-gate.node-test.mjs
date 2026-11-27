@@ -971,3 +971,18 @@ test("bridgeAdminTarget names the five routes and refuses the rest of the prefix
   assert.equal(bridgeAdminTarget("DELETE", "/api/companion/bridge/devices/../pairing"), null);
   assert.equal(bridgeAdminTarget("GET", "/api/companion/bridge/"), null);
 
+  // Without its trailing slash the prefix is not a prefix: that path is the
+  // harness's to answer, 404 or not.
+  assert.equal(bridgeAdminTarget("GET", "/api/companion/bridge"), undefined);
+
+  // Not under the prefix at all: the harness answers, as before.
+  assert.equal(bridgeAdminTarget("GET", "/api/companion/endpoints"), undefined);
+  assert.equal(bridgeAdminTarget("GET", "/api/bots"), undefined);
+  assert.equal(bridgeAdminTarget("GET", "/api/companion/bridge-other/endpoints"), undefined);
+});
+
+test("bridgeUpstreamHeaders keeps only what the bridge needs for its own owner decision", () => {
+  const headers = bridgeUpstreamHeaders(
+    {
+      host: "box.tailnet.ts.net:8799",
+      accept: "application/json",
