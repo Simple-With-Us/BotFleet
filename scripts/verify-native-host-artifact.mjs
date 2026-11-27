@@ -98,8 +98,7 @@ const attachDiskImage = (image, mountpoint) =>
 // directory let one stray entry fail a verification that had passed.
 export function unmountDiskImage(mountpoint, { detached = detachDiskImage, mounted = isMountPoint } = {}) {
   if (!detached(mountpoint)) refuse("the disk image did not detach");
-  if (mounted(mountpoint)) refuse("the disk image is still mounted after the detach");
-  rmSync(mountpoint, { recursive: true, force: true });
+  if (!removeMountPoint(mountpoint, mounted)) refuse("the disk image is still mounted after the detach");
 }
 
 const detachDiskImage = (mountpoint) =>
