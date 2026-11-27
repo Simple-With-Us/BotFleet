@@ -678,7 +678,8 @@ test('a proxied route needs a device the bridge knows; one it does not know, or 
     // it reads as something that can only be done on the computer, and a
     // phone that lost its pairing would never be offered a new one.
     const anonymous = await call(bridge.port, { path: '/api/bots' });
-    assert.equal(anonymous.status, 403);
+    assert.equal(anonymous.status, 401);
+    assert.equal(anonymous.json.error, 'device credential required');
     assert.equal(reached, 0);
 
     // A credential the bridge never issued is refused as well.
