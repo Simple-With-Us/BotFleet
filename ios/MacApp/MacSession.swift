@@ -400,6 +400,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         self.companionListener.onStateChange = { [weak self] state in
             self?.companionListenerState = state
         }
+        self.tellTheListenerThePlacement()
         // Registering the notification categories is not asking for
         // permission:  the permission prompt stays lazy, at the first event
         // that actually needs the person.
