@@ -823,6 +823,7 @@ export function gateConfigFromSecrets(secrets) {
     owners: parseOwnerLogins(ownerLogins),
     publicOrigin,
     tokenSha256,
+    bridgeEnabled: bridgeOrigin !== '',
   };
 }
 
