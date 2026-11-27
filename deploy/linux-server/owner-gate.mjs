@@ -129,6 +129,27 @@ const DEFAULT_HARNESS_PORT = 8799;
 const HEALTH_PATH = '/__gate/health';
 const GATE_NAME = 'botfleet-owner-gate';
 
+// The companion bridge listens on loopback beside the harness.  Its port is
+// fixed in code like the others; whether this host has a bridge at all is
+// Infisical's answer, the same name the bridge reads for its advertised route.
+const DEFAULT_BRIDGE_PORT = 8797;
+const BRIDGE_ORIGIN_SECRET_NAME = 'BOTFLEET_COMPANION_BRIDGE_ORIGIN';
+const BRIDGE_ADMIN_PREFIX = '/api/companion/bridge/';
+const BRIDGE_DEVICE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+// What the bridge must see to reach the same owner decision the gate just
+// reached.  Everything else about the caller, its edge headers included,
+// stays at the gate.
+const BRIDGE_FORWARDED_HEADERS = Object.freeze([
+  'accept',
+  'content-type',
+  'content-length',
+  'origin',
+  'sec-fetch-site',
+  'tailscale-user-login',
+  'x-botfleet-gate-token',
+]);
+
 /** The Infisical names the gate reads. */
 const GATE_SECRET_NAMES = [
   'BOTFLEET_OWNER_LOGINS',
