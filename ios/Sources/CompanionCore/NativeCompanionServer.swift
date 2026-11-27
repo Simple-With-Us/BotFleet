@@ -939,6 +939,12 @@ public actor NativeCompanionServer {
         } else {
             return nil
         }
+        // A code the server opened pairs the phone with the server, which a
+        // phone already paired with this Mac keeps beside that pairing. The
+        // mark travels in the link, because nothing else in it says so.
+        if advertisement.isBridge {
+            items.append(URLQueryItem(name: "role", value: "bridge"))
+        }
 
         let trimmedName = advertisement.serverName.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedName.isEmpty {
