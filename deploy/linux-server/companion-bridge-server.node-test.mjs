@@ -2136,6 +2136,7 @@ test('the pairing body is built from the Swift types it feeds, field for field',
       lastSeenAt: 1_700_000_000_000, // PairedDevice.lastSeenAt
     },
     serverName: 'BotFleet Server', // PairResponse.serverName
+    isBridge: true, // PairResponse.isBridge
     endpoints: [{ url: 'https://box.example.ts.net:8800', kind: 'hosted', priority: 0 }], // PairResponse.endpoints
   });
   // No route to offer: the optional field is absent, not empty.
