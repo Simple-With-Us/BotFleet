@@ -472,7 +472,9 @@ extension Connection {
     }
 
     /// A copy dialing one complete route without changing its stored policy
-    /// order or keychain identity.
+    /// order or keychain identity. A route of the server bridge gives the
+    /// bridge's own connection, so the caller sends the token that belongs
+    /// to it and to nothing else.
     public func dialing(_ candidate: CompanionEndpoint) -> Connection {
         guard allowsEndpoint(candidate) else { return self }
         var copy = self
