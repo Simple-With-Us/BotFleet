@@ -155,6 +155,7 @@ const GATE_SECRET_NAMES = [
   'BOTFLEET_OWNER_LOGINS',
   'BOTFLEET_PUBLIC_ORIGIN',
   'BOTFLEET_SERVER_GATE_TOKEN',
+  BRIDGE_ORIGIN_SECRET_NAME,
 ];
 
 /** How the vault is named in a message.  Names and metadata only. */
