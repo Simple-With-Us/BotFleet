@@ -160,6 +160,10 @@ node --input-type=module -e 'import { unmountDiskImage } from "./scripts/verify-
 test -d "$work/mnt/bin"
 # After a detach, it removes the mount point with anything left inside it.
 hdiutil detach "$work/mnt"
+touch "$work/mnt/left-behind"
+node --input-type=module -e 'import { unmountDiskImage } from "./scripts/verify-native-host-artifact.mjs";
+  unmountDiskImage(process.argv[1], { detached: () => true });' "$work/mnt"
+test ! -e "$work/mnt"
 rm -rf "$work"
 ```
 
