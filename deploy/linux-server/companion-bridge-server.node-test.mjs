@@ -663,7 +663,7 @@ test('the command line takes the bootstrap token file and the state file', () =>
   assert.match(unknown.error, /unknown argument/);
 });
 
-test('a proxied route needs a device the bridge knows, and a revoked one is refused', async () => {
+test('a proxied route needs a device the bridge knows; one it does not know, or has revoked, is answered 401 as the Mac sidecar does', async () => {
   let reached = 0;
   const bridge = await startBridge({
     harnessHandler: (req, res) => {
