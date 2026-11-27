@@ -695,6 +695,11 @@ public struct CompanionConnectionMetadata: Decodable, Sendable {
     public var serverName: String
     public var hosts: [String]?
     public var endpoints: [CompanionEndpoint]
+    /// The placement the computer had applied, when it says. Absent from the
+    /// server's bridge and from older builds.
+    public var placement: NativePlacementMode?
+    /// True when the server's companion bridge answered.
+    public var isBridge: Bool
 
     private enum CodingKeys: String, CodingKey { case serverName, hosts, endpoints }
 
