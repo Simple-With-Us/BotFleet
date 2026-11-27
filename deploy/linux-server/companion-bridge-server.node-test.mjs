@@ -687,7 +687,8 @@ test('a proxied route needs a device the bridge knows; one it does not know, or 
       path: '/api/bots',
       headers: ownerHeaders({ authorization: `Bearer ${DEVICE_CREDENTIAL}` }),
     });
-    assert.equal(stranger.status, 403);
+    assert.equal(stranger.status, 401);
+    assert.equal(stranger.json.error, 'unknown device');
     assert.equal(reached, 0);
 
     // A paired device reaches the harness.
