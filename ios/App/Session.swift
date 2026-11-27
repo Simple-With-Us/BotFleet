@@ -1351,6 +1351,7 @@ final class Session: ObservableObject {
             connect()
         case .missing:
             serverTokenUnread = false
+            let onServer = rotation.currentEndpoint.map { connection?.isBridgeRoute($0) == true } == true
             dropServerPairing()
             adoptWalk()
         case .unavailable:
