@@ -144,6 +144,10 @@ export async function startFakeOpenAiServer(): Promise<FakeOpenAiServer> {
       return;
     }
     if (script.kind === "close") {
+      // Not `CLOSE_CONNECTION` here: a body that is cut off is a premature
+      // close only while the connection was meant to stay open. Said to
+      // close, it reads as a finished empty stream instead, and the retry
+      // this script exists to provoke never happens.
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.flushHeaders();
       setImmediate(() => res.destroy());
