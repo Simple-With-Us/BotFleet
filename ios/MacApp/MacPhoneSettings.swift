@@ -25,6 +25,15 @@ import CoreImage.CIFilterBuiltins
 /// names, or the one server this Mac is enrolled on.
 struct MacPhoneSettings: View {
     @ObservedObject var session: MacSession
+    @ObservedObject private var servers: ServersCoordinator
+
+    @State private var serverBackend: ServerBridgePairingBackend?
+    @State private var serverLabel: String = ""
+
+    init(session: MacSession) {
+        self.session = session
+        self._servers = ObservedObject(wrappedValue: session.servers)
+    }
 
     @State private var devices: [PairedDevice] = []
     @State private var window: NativePairingWindow?
