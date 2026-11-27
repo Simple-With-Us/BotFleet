@@ -32,8 +32,17 @@
  * malformed entry is skipped rather than trusted.  The credential itself is
  * returned to the phone once, at redeem time, and never again.
  *
- * What this file is NOT: it does not bind anything but loopback, it does
- * not retire the Node `:8810` sidecar, and it does not change any route on
+ * The contract with the phone is the shipped iOS app's.  The app probes
+ * `GET /api/health`, redeems a code or QR token at `POST /api/pair`, and
+ * then syncs through the harness routes the Mac companion sidecar allows a
+ * paired phone (`companion/src/routes.ts`), which the core mirrors pattern
+ * for pattern.  On the phone's behalf the bridge also does what the sidecar
+ * does: it checks the two PATCH bodies that reach broader harness routes
+ * against a field allowlist, and it withholds the keys a phone has no
+ * business holding from JSON and event-stream responses.
+ *
+ * What this file is NOT: it does not bind anything but loopback, it does not
+ * retire the Node `:8810` sidecar, and it does not change any route on
  * the harness.  The APNs material the Linux sender uses is resolved by
  * `companion-bridge-apns.mjs` through the scoped read-only Infisical
  * binding, and when present, `companion-bridge-apns-sender.mjs` delivers
@@ -43,14 +52,26 @@
 
 import crypto from 'node:crypto';
 import http from 'node:http';
+import { StringDecoder } from 'node:string_decoder';
+import { Transform } from 'node:stream';
 import { z } from 'zod';
 import { pathToFileURL } from 'node:url';
 
 import {
   BRIDGE_ALLOWED_ROUTES,
+  BRIDGE_PAIR_REPLAY_REFUSAL,
+  BRIDGE_SERVER_NAME,
+  bridgeBodyCheck,
+  bridgeCleanDeviceName,
+  bridgeCleanOrigin,
   bridgeDeviceDecision,
-  bridgeLocalRouteRequiresDevice,
+  bridgeEndpoints,
+  bridgeIsJson,
+  bridgePairRefusalSentence,
+  bridgeParseOrigins,
   bridgeRouteDecision,
+  bridgeScrubWireJson,
+  createBridgeSseScrubber,
   OMB_PAIR_TOKEN,
   openBridgePairingWindow,
   redeemBridgePairingWindow,
@@ -92,6 +113,15 @@ const DEVICE_AUTHORIZATION_HEADER = 'authorization';
 const OWNER_TOKEN_HEADER = 'x-botfleet-gate-token';
 /** The header `tailscale serve` adds for a user-owned device. */
 const OWNER_LOGIN_HEADER = 'tailscale-user-login';
+/**
+ * The two headers a reverse proxy on this host adds to name the route the
+ * phone actually dialed.  They are read for the advertisement only, and only
+ * from a loopback peer: the bridge binds loopback alone, so the loopback peer
+ * is the proxy, and anything that arrives some other way is refused before
+ * it gets this far.
+ */
+const FORWARDED_PROTO_HEADER = 'x-forwarded-proto';
+const FORWARDED_HOST_HEADER = 'x-forwarded-host';
 
 /** The route the listener answers for itself, without touching the harness. */
 const BRIDGE_HEALTH_PATH = '/__bridge/health';
@@ -274,6 +304,56 @@ export function bridgePresentedDeviceId(headers) {
 }
 
 /**
+ * The origin of the route the phone dialed, read off the request itself.
+ *
+ * This is the fallback for a host where nobody has configured the bridge's
+ * own origin yet.  `tailscale serve` hands the loopback hop the original
+ * `Host`, the same value again as `X-Forwarded-Host`, and `X-Forwarded-Proto`
+ * for the scheme it terminated, and it sets each of them itself, overwriting
+ * whatever the phone sent.  So the two forwarded headers are read first, the
+ * `Host` header stands in when the proxy named no forwarded host, and the
+ * socket says plain `http` only when nothing else does.
+ *
+ * The forwarding headers are honoured for a loopback peer and nobody else.
+ * A peer that is not on loopback has no business naming a route, and such a
+ * peer is refused by the owner check in any case; the rule is repeated here
+ * so the helper is safe on its own.
+ *
+ * A host no phone can dial, such as the loopback address a local curl uses,
+ * answers an empty string: a route that cannot work is not advertised.
+ *
+ * @param {{remoteAddress?: string, encrypted?: boolean, headers?: Record<string, string|string[]|undefined>}} [request]
+ * @returns {string}
+ */
+export function bridgeRequestOrigin({ remoteAddress, encrypted = false, headers } = {}) {
+  if (!isBridgeLoopbackAddress(remoteAddress)) return '';
+  const forwardedProto = (bridgeHeaderValue(headers, FORWARDED_PROTO_HEADER) ?? '').trim().toLowerCase();
+  const scheme = forwardedProto === 'https' || forwardedProto === 'http'
+    ? forwardedProto
+    : encrypted
+      ? 'https'
+      : 'http';
+  const forwardedHost = (bridgeHeaderValue(headers, FORWARDED_HOST_HEADER) ?? '').split(',')[0].trim();
+  const host = forwardedHost || (bridgeHeaderValue(headers, 'host') ?? '').trim();
+  if (!host) return '';
+  return bridgeCleanOrigin(`${scheme}://${host}`);
+}
+
+/**
+ * The routes one advertisement carries: the configured ones, or, when none
+ * is configured, the one the request itself arrived on.
+ *
+ * @param {{origins?: string[], remoteAddress?: string, encrypted?: boolean, headers?: Record<string, string|string[]|undefined>}} [request]
+ * @returns {Array<{url: string, kind: string, priority: number}>}
+ */
+export function bridgeAdvertisedEndpoints({ origins, remoteAddress, encrypted, headers } = {}) {
+  const configured = bridgeEndpoints(origins);
+  if (configured.length > 0) return configured;
+  const derived = bridgeRequestOrigin({ remoteAddress, encrypted, headers });
+  return derived ? bridgeEndpoints([derived]) : [];
+}
+
+/**
  * Mint one device credential.  It is shown to the phone once and only its
  * digest is kept.
  *
@@ -337,6 +417,24 @@ const PairingRedeemSchema = z.strictObject({
   deviceId: z.string().max(64).optional(),
   deviceName: z.string().max(120).optional(),
   requestId: z.string().max(128).optional(),
+});
+
+/**
+ * The body the iOS app sends to `POST /api/pair`, which is
+ * `CompanionClient.pair` in `ios/Sources/CompanionCore/Client.swift`.
+ *
+ * A six-digit credential travels as `code`, the QR token as `credential`,
+ * and the app sends exactly one of the two.  `pairRequestId` is a UUID the
+ * app mints for one logical pairing, and it is what makes a retry after a
+ * lost response recognisable.  An unknown key is a refusal, as on the other
+ * pairing routes: this body is what redeems a credential, so nothing rides
+ * along that the contract did not name.
+ */
+const PairRequestSchema = z.strictObject({
+  credential: z.string().max(256).optional(),
+  code: z.string().max(64).optional(),
+  deviceName: z.string().max(120).optional(),
+  pairRequestId: z.string().max(128).optional(),
 });
 
 const PushTokenSchema = z.strictObject({
@@ -581,6 +679,18 @@ export class BridgeDeviceRegistry {
       pairedAtMs: entry.pairedAtMs,
     }));
   }
+
+  /**
+   * One active device's public row, or null. This is the same shape the
+   * list answers, for the device a pairing just minted.
+   *
+   * @param {string} id
+   * @returns {{id: string, name: string, pairedAtMs: number}|null}
+   */
+  publicDevice(id) {
+    const row = this.devices.find((entry) => entry.id === String(id ?? '') && entry.revokedAtMs === null);
+    return row ? { id: row.id, name: row.name, pairedAtMs: row.pairedAtMs } : null;
+  }
 }
 
 /**
@@ -734,6 +844,46 @@ export function bridgeRedeemPairing({ state, presented, requestId = '', replayDe
 }
 
 /**
+ * The body `POST /api/pair` answers, in the shape the iOS app decodes as
+ * `PairResponse` (`ios/Sources/CompanionCore/Models.swift`). The app
+ * requires `token`, `device` and `serverName`, and reads `endpoints` when it
+ * is there.
+ *
+ * Every field names the Swift type it feeds. Nothing else is sent: the app
+ * ignores what it does not know, and a field it did not ask for is one more
+ * thing to keep honest.
+ *
+ * @param {{credential: string, device: {id: string, name: string, pairedAtMs: number}, advertised: Array<{url: string, kind: string, priority: number}>}} input
+ * @returns {{token: string, device: {id: string, name: string, createdAt: number, lastSeenAt: number}, serverName: string, endpoints?: Array<{url: string, kind: string, priority: number}>}}
+ */
+export function bridgePairResponse({ credential, device, advertised }) {
+  const response = {
+    // `PairResponse.token`: the device credential, shown to the phone this
+    // once. From here on the bridge holds only its digest.
+    token: credential,
+    // `PairResponse.device`, a `PairedDevice`. The bridge learns of a device
+    // when it pairs and keeps no last-seen stamp, so both stamps are the
+    // pairing moment, in epoch milliseconds as the Mac sidecar sends them.
+    device: {
+      id: device.id, // `PairedDevice.id`
+      name: device.name, // `PairedDevice.name`
+      createdAt: device.pairedAtMs, // `PairedDevice.createdAt`
+      lastSeenAt: device.pairedAtMs, // `PairedDevice.lastSeenAt`
+    },
+    // `PairResponse.serverName`: what the phone's connection list calls this
+    // server.
+    serverName: BRIDGE_SERVER_NAME,
+  };
+  // `PairResponse.endpoints`, each a `CompanionEndpoint` of `url`, `kind`
+  // and `priority`. It is optional in Swift, and it is left out rather than
+  // sent empty when there is no route to offer, the way the sidecar sends
+  // it: an absent field is what a phone reads as "keep the route you paired
+  // on", where an empty list is ambiguous.
+  if (Array.isArray(advertised) && advertised.length > 0) response.endpoints = advertised.map((entry) => ({ ...entry }));
+  return response;
+}
+
+/**
  * The bridge's own route table: the local routes it answers and the proxied
  * routes it forwards, taken from the core so the two cannot drift.
  *
@@ -876,11 +1026,14 @@ async function readJsonBody(req, limit = 64 * 1024) {
 /**
  * Create the bridge listener.
  *
- * @param {{state: BridgeState, owners?: Set<string>|string, publicOrigin?: string, tokenSha256?: string|null, upstreamHost?: string, upstreamPort?: number|string, log?: (message: string) => void, now?: () => number, persist?: (state: BridgeState) => boolean}} options
+ * @param {{state: BridgeState, owners?: Set<string>|string, publicOrigin?: string, tokenSha256?: string|null, upstreamHost?: string, upstreamPort?: number|string, log?: (message: string) => void, now?: () => number, persist?: (state: BridgeState) => boolean, origins?: string[]}} options
  *   The persist callback answers whether the state reached durable storage.
  *   `false` (or a throw) fails every trust-extending route closed for that
  *   change:  a pairing or a revocation that only lives in memory is one a
  *   restart forgets, so the caller hears a 503 instead of an unearned 200.
+ *   `origins` are the routes the bridge advertises, in preference order and
+ *   already normalized; with none, the advertisement is derived from the
+ *   route each request arrived on.
  * @returns {import('node:http').Server}
  */
 export function createCompanionBridge({
@@ -893,6 +1046,7 @@ export function createCompanionBridge({
   log,
   now = () => Date.now(),
   persist = () => true,
+  origins = [],
   apns,
   apnsSender,
   startEventSubscriber = false,
@@ -965,6 +1119,7 @@ export function createCompanionBridge({
       logger,
       now,
       persist: persistState,
+      origins,
       sender,
       activeSseStreams,
       disconnectDeviceSse,
@@ -1008,7 +1163,7 @@ export function createCompanionBridge({
  */
 async function handleRequest({
   req, res, state, owners, publicOrigin, tokenSha256,
-  host, port, upstreamAgent, logger, now, persist,
+  host, port, upstreamAgent, logger, now, persist, origins,
   sender, activeSseStreams, disconnectDeviceSse,
 }) {
   const method = String(req.method ?? 'GET').toUpperCase();
@@ -1038,49 +1193,50 @@ async function handleRequest({
     return;
   }
 
-  if (decision.local) {
-    let deviceId = '';
-    if (bridgeLocalRouteRequiresDevice(method, url)) {
-      const device = state.registry.decide(
-        bridgePresentedDeviceCredential(req.headers),
-        bridgePresentedDeviceId(req.headers),
-      );
-      if (!device.ok) {
-        logger(`[companion-bridge] refused ${method} ${pathOf(url)}: ${device.reason}`);
-        respondJson(res, 403, { error: device.reason });
-        return;
-      }
-      deviceId = device.deviceId;
+  // The device credential is read per route, from the matched row.  Every
+  // proxied route needs it, and so does a local route that extends a
+  // device's reach.  The routes a phone calls before it is paired, the
+  // health probe and `POST /api/pair`, do not: there is no device yet.  The
+  // bridge holds its own registry either way, so a device the bridge revoked
+  // does not reach the harness through the bridge at all, and a revocation
+  // takes effect here and not only on the Mac.
+  let deviceId = '';
+  if (decision.route.requiresDevice) {
+    const device = state.registry.decide(
+      bridgePresentedDeviceCredential(req.headers),
+      bridgePresentedDeviceId(req.headers),
+    );
+    if (!device.ok) {
+      logger(`[companion-bridge] refused ${method} ${pathOf(url)}: ${device.reason}`);
+      respondJson(res, 403, { error: device.reason });
+      return;
     }
+    deviceId = device.deviceId;
+  }
+
+  if (decision.local) {
+    // The advertisement is the bridge's own, so it is read from the request
+    // here and never from the harness.
+    const advertised = bridgeAdvertisedEndpoints({
+      origins,
+      remoteAddress: req.socket?.remoteAddress,
+      encrypted: Boolean(req.socket?.encrypted),
+      headers: req.headers,
+    });
     await handleLocalRoute({
       req,
       res,
       method,
       url,
-      decision,
       state,
       logger,
       now,
       persist,
       deviceId,
+      advertised,
       sender,
       disconnectDeviceSse,
     });
-    return;
-  }
-
-  // A proxied route is the harness's route, so the device credential that
-  // reaches it is the harness's own.  The bridge still holds its own
-  // registry, and a device the bridge revoked may not reach the harness
-  // through the bridge at all:  the bridge checks its registry before it
-  // forwards, so a revocation takes effect here and not only on the Mac.
-  const device = state.registry.decide(
-    bridgePresentedDeviceCredential(req.headers),
-    bridgePresentedDeviceId(req.headers),
-  );
-  if (!device.ok) {
-    logger(`[companion-bridge] refused ${method} ${pathOf(url)}: ${device.reason}`);
-    respondJson(res, 403, { error: device.reason });
     return;
   }
 
@@ -1094,7 +1250,7 @@ async function handleRequest({
     port,
     upstreamAgent,
     logger,
-    deviceId: device.deviceId,
+    deviceId,
     activeSseStreams,
   });
 }
@@ -1112,12 +1268,17 @@ async function handleRequest({
  * @returns {Promise<void>}
  */
 async function handleLocalRoute({
-  req, res, method, url, state, logger, now, persist, deviceId, sender, disconnectDeviceSse,
+  req, res, method, url, state, logger, now, persist, deviceId, advertised, sender, disconnectDeviceSse,
 }) {
   const path = pathOf(url);
 
   if (method === 'GET' && path === '/api/companion/endpoints') {
-    respondJson(res, 200, { serverName: '', endpoints: [] });
+    // The shape `CompanionConnectionMetadata` decodes: the name and the
+    // routes. `hosts` is left out on purpose. It is the older builds' list
+    // of plain `http` addresses, and the bridge answers on its advertised
+    // route alone, so a host entry would name a cleartext route that does
+    // not exist.
+    respondJson(res, 200, { serverName: BRIDGE_SERVER_NAME, endpoints: advertised });
     return;
   }
 
@@ -1297,6 +1458,91 @@ async function handleLocalRoute({
     return;
   }
 
+  if (method === 'POST' && path === '/api/pair') {
+    // The app's own pairing call, answered through the same window logic as
+    // the redeem route above: one spend per window, an attempt budget, and a
+    // replay for the same request id.
+    const body = await readJsonBody(req);
+    if (!body.ok) {
+      respondJson(res, 400, { error: body.reason });
+      return;
+    }
+    const parsed = PairRequestSchema.safeParse(body.value);
+    if (!parsed.success) {
+      respondJson(res, 400, { error: 'the pairing request does not match the contract' });
+      return;
+    }
+    // The app sends its one credential under one of two names, so the first
+    // one it actually sent is the credential.
+    const presented = [parsed.data.credential, parsed.data.code]
+      .map((value) => String(value ?? ''))
+      .find((value) => value !== '') ?? '';
+    if (!presented) {
+      respondJson(res, 400, { error: 'a pairing code or credential is required' });
+      return;
+    }
+    const windowBefore = state.window;
+    const redeemed = bridgeRedeemPairing({
+      state,
+      presented,
+      requestId: String(parsed.data.pairRequestId ?? ''),
+      // The bridge names the device, as the Mac sidecar does. The app sends
+      // no device id, only a name for display.
+      replayDeviceId: crypto.randomUUID(),
+      deviceName: bridgeCleanDeviceName(parsed.data.deviceName),
+      nowMs: now(),
+    });
+    if (!redeemed.ok) {
+      logger(`[companion-bridge] refused a pairing: ${redeemed.reason}`);
+      // The refusal and its burned attempt are real in memory either way, so
+      // they are saved exactly as the redeem route saves them.
+      persist(state);
+      // The wrong attempt that uses up the budget spends the window with it,
+      // so that one answer says the budget is gone. Without this it would
+      // read as one more wrong code, and the next try would say the
+      // credential was used, which is no help to someone holding the right
+      // code. The core's own wording is unchanged; this is only the sentence.
+      const lockedOut = redeemed.reason === 'bad credential'
+        && state.window?.spent === true
+        && state.window.attemptsLeft === 0;
+      // The app shows the server's own error text on the pairing screen, so
+      // the reason is put into words there and stays as wording for the log.
+      respondJson(res, 401, { error: bridgePairRefusalSentence(lockedOut ? 'no attempts left' : redeemed.reason) });
+      return;
+    }
+    if (redeemed.replayed) {
+      // The same phone request, back after a lost response. The window
+      // answers with the same device and never a second credential, and the
+      // credential is not handed out twice, so there is no body here that the
+      // app could store as a pairing: one with an empty token would leave it
+      // paired to nothing. It is refused by name instead.
+      respondJson(res, BRIDGE_PAIR_REPLAY_REFUSAL.status, { error: BRIDGE_PAIR_REPLAY_REFUSAL.error });
+      return;
+    }
+    const device = state.registry.publicDevice(redeemed.deviceId);
+    if (!device) {
+      // The pairing succeeded in memory but its row is gone, which no
+      // ordinary request can cause; nothing is confirmed.
+      state.window = windowBefore;
+      logger('[companion-bridge] a pairing minted no device row; it is not confirmed');
+      respondJson(res, 500, { error: 'the pairing could not be completed' });
+      return;
+    }
+    if (!persist(state)) {
+      // A pairing the durable state cannot hold is not confirmed to the
+      // phone, and it does not stay half-done in memory either: the spend
+      // and the just-minted device row are rolled back, so once a save
+      // succeeds the same request can run again for real.
+      state.window = windowBefore;
+      state.registry.removeDevice(redeemed.deviceId);
+      logger('[companion-bridge] the durable state refused a save; the pairing was rolled back and is not confirmed');
+      unsaved();
+      return;
+    }
+    respondJson(res, 201, bridgePairResponse({ credential: redeemed.credential, device, advertised }));
+    return;
+  }
+
   if (method === 'GET' && path === '/api/companion/devices') {
     respondJson(res, 200, { devices: state.registry.publicDevices() });
     return;
@@ -1323,18 +1569,83 @@ async function handleLocalRoute({
 }
 
 /**
+ * The most JSON one response may hold while it is checked for withheld keys.
+ * Far above any real payload: it exists to have a ceiling at all, because
+ * the whole body is held before any of it is forwarded.
+ */
+const MAX_BRIDGE_JSON_BODY_BYTES = 32 * 1024 * 1024;
+
+/**
+ * The transform one event-stream response passes through on its way to the
+ * phone.  Bytes are decoded as UTF-8 across chunk boundaries, so a character
+ * split between two chunks is not corrupted, and each chunk is handed to the
+ * scrubber, which holds back only the part of an event that has not ended
+ * yet.
+ *
+ * @returns {import('node:stream').Transform}
+ */
+function createBridgeSseScrubStream() {
+  const decoder = new StringDecoder('utf8');
+  const scrub = createBridgeSseScrubber();
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      try {
+        callback(null, scrub(decoder.write(chunk)));
+      } catch (error) {
+        callback(error);
+      }
+    },
+    flush(callback) {
+      try {
+        callback(null, scrub(decoder.end()));
+      } catch (error) {
+        callback(error);
+      }
+    },
+  });
+}
+
+/**
  * Forward one request to the harness, byte for byte.
  *
  * The URL keeps its raw query string, so a cursor parameter or a `$`-literal
  * path reaches the harness exactly as the phone wrote it, and the response
  * body is streamed, so an SSE frame arrives when the harness wrote it.
  *
+ * Two things are done on the phone's behalf on the way through, both copied
+ * from the Mac companion sidecar.  A body that is bound for a broader harness
+ * route is checked against a field allowlist first, and what is forwarded is
+ * the re-serialized, validated object, never the bytes the phone sent.  And
+ * the two keys a phone has no business holding are withheld from JSON and
+ * event-stream responses.  A response that names neither key crosses as the
+ * exact bytes the harness wrote, so for everything else the proxy is still
+ * byte for byte.
+ *
  * @param {object} input
  * @returns {Promise<void>}
  */
-function proxyRequest({ req, res, method, url, decision, host, port, upstreamAgent, logger, deviceId = '', activeSseStreams }) {
+async function proxyRequest({ req, res, method, url, decision, host, port, upstreamAgent, logger, deviceId = '', activeSseStreams }) {
   const target = new URL(decision.upstream, `http://${host}:${port}`);
+
+  let forwardedBody = null;
+  const bodyCheck = bridgeBodyCheck(method, pathOf(url));
+  if (bodyCheck) {
+    const body = await readJsonBody(req);
+    if (!body.ok) {
+      respondJson(res, 400, { error: body.reason });
+      return;
+    }
+    const denial = bodyCheck(body.value);
+    if (denial) {
+      logger(`[companion-bridge] refused ${method} ${pathOf(url)}: ${denial.error}`);
+      respondJson(res, denial.status, { error: denial.error });
+      return;
+    }
+    forwardedBody = Buffer.from(JSON.stringify(body.value), 'utf8');
+  }
+
   let upstreamResponse = null;
+  let sseScrubStream = null;
   const upstream = http.request({
     hostname: host,
     port,
@@ -1344,10 +1655,50 @@ function proxyRequest({ req, res, method, url, decision, host, port, upstreamAge
     agent: upstreamAgent,
   }, (response) => {
     upstreamResponse = response;
+    const contentType = String(bridgeHeaderValue(response.headers, 'content-type') ?? '');
+    const encoding = String(bridgeHeaderValue(response.headers, 'content-encoding') ?? '').trim().toLowerCase();
+
+    if (contentType.includes('text/event-stream')) {
+      // Headers first, so the stream looks live at both ends; then every
+      // frame is scrubbed as it arrives. A frame the scrubber cannot hold,
+      // an event with no terminator, ends the stream rather than growing
+      // without bound or forwarding half an event.
+      sseScrubStream = createBridgeSseScrubStream();
+      sseScrubStream.on('error', (error) => {
+        logger(`[companion-bridge] the event stream for ${deviceId} ended: ${error.message}`);
+        response.destroy();
+        res.destroy();
+      });
+      res.writeHead(response.statusCode ?? 502, bridgeDownstreamHeaders(response.headers));
+      response.pipe(sseScrubStream).pipe(res);
+      response.on('error', () => res.destroy());
+      return;
+    }
+
+    // The bridge asks for no compressed answer, so this is a guard rather
+    // than a path. An encoded body cannot be read for its keys without
+    // decoding it, and it is forwarded intact rather than broken.
+    if (bridgeIsJson(contentType) && (encoding === '' || encoding === 'identity')) {
+      forwardScrubbedJson(response);
+      return;
+    }
+
     res.writeHead(response.statusCode ?? 502, bridgeDownstreamHeaders(response.headers));
     response.pipe(res);
     response.on('error', () => res.destroy());
   });
+
+  /**
+   * Hold one JSON response whole, withhold the keys a phone may not hold,
+   * and forward it. The status line waits for the body, because a body that
+   * changes changes its length too.
+   *
+   * @param {import('node:http').IncomingMessage} response
+   */
+  function forwardScrubbedJson(response) {
+    const chunks = [];
+    let size = 0;
+    let settled = false;
 
   const isEventStream = method === 'GET' && pathOf(url) === '/api/events' && deviceId && activeSseStreams;
   let unregisterSse = () => {};
