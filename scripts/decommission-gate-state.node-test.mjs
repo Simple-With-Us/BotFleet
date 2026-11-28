@@ -25,6 +25,16 @@ import {
 // used to resolve `board` in preference to the current CLI.  The
 // resolver's choice is pinned here: simple-board, never board.
 
+/**
+ * A temp directory under its canonical spelling.  The resolver returns
+ * the path it validated through realpath, so a test root spelled through
+ * a symlinked TMPDIR (macOS /var -> /private/var) would compare unequal
+ * to the resolved path although both name the same directory (BF-2719).
+ */
+function tempRoot(prefix) {
+  return realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+}
+
 /** A stand-in CLI that answers nothing, because the resolver never runs it. */
 function writeFakeCli(path) {
   writeFileSync(path, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
@@ -42,7 +52,7 @@ function linkWhich(root) {
 
 /** A private directory that stands in for one PATH entry. */
 function fakeBin(names) {
-  const root = mkdtempSync(join(tmpdir(), "bf-linear-cli-"));
+  const root = tempRoot("bf-linear-cli-");
   for (const name of names) writeFakeCli(join(root, name));
   linkWhich(root);
   return root;
@@ -50,7 +60,7 @@ function fakeBin(names) {
 
 /** A private HOME, optionally holding a verified CLI under ~/.local/bin. */
 function fakeHome(names) {
-  const root = mkdtempSync(join(tmpdir(), "bf-linear-home-"));
+  const root = tempRoot("bf-linear-home-");
   if (names.length === 0) return root;
   mkdirSync(join(root, ".local", "bin"), { recursive: true });
   for (const name of names) writeFakeCli(join(root, ".local", "bin", name));
@@ -77,7 +87,7 @@ function withEnv(env, run) {
 
 /** A private HOME whose own directory name can be chosen. */
 function fakeHomeNamed(name, names) {
-  const parent = mkdtempSync(join(tmpdir(), "bf-linear-home-"));
+  const parent = tempRoot("bf-linear-home-");
   const home = join(parent, name);
   mkdirSync(home, { recursive: true });
   if (names.length > 0) {
@@ -190,7 +200,7 @@ test("BOARD_CLI may not name a retired CLI in a different case", () => {
 });
 
 test("a BOARD_CLI symlink to a retired board binary is refused", () => {
-  const root = mkdtempSync(join(tmpdir(), "bf-linear-symlink-"));
+  const root = tempRoot("bf-linear-symlink-");
   try {
     // A stand-in for the retired binary, never executed: the resolver only
     // resolves paths, it never runs them.
@@ -208,7 +218,7 @@ test("a BOARD_CLI symlink to a retired board binary is refused", () => {
 });
 
 test("a BOARD_CLI symlink to the current CLI is still accepted", () => {
-  const root = mkdtempSync(join(tmpdir(), "bf-linear-symlink-"));
+  const root = tempRoot("bf-linear-symlink-");
   try {
     writeFakeCli(join(root, "current-cli"));
     const link = join(root, "simple-board");
@@ -226,7 +236,7 @@ test("the verified default that resolves to a retired CLI is refused", () => {
   // The default branch under ~/.local/bin carries the same gate as the
   // override and the PATH branch.  A verified default that is a symlink to
   // the retired binary is that retired write route under an innocent name.
-  const root = mkdtempSync(join(tmpdir(), "bf-linear-default-"));
+  const root = tempRoot("bf-linear-default-");
   try {
     writeFakeCli(join(root, "board"));
     const binDir = join(root, ".local", "bin");
@@ -324,7 +334,7 @@ test("a HOME inside the retired backend directory is still refused", () => {
 });
 
 test("BOARD_CLI inside a directory named mac-collab is refused", () => {
-  const parent = mkdtempSync(join(tmpdir(), "bf-linear-override-"));
+  const parent = tempRoot("bf-linear-override-");
   try {
     const retiredBin = join(parent, "mac-collab", "bin");
     mkdirSync(retiredBin, { recursive: true });
