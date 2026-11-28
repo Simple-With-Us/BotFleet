@@ -270,10 +270,6 @@ public func eventStream(
                     case nil:
                         continue
                     }
-                    // \r\n is legal; the parser tolerates a stray \r too
-                    if line.last == 0x0D { line.removeLast() }
-                    let text = String(decoding: line, as: UTF8.self)
-                    line.removeAll(keepingCapacity: true)
 
                     guard let event = parser.line(text) else { continue }
                     guard let data = event.data.data(using: .utf8) else { continue }
