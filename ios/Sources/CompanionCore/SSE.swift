@@ -140,6 +140,58 @@ public struct SSEParser: Sendable {
     }
 }
 
+/// The stream loop's half of the bound: it turns bytes into lines and stops
+/// keeping a line's bytes once the line is over the limit.  The rest of that
+/// line is read and thrown away until its newline, so a server that never
+/// sends one cannot grow memory either.
+public struct SSELineBuffer: Sendable {
+    public enum Output: Equatable, Sendable {
+        /// A complete line, without its newline.
+        case line(String)
+        /// A line that went over the limit has ended. Its event is dropped
+        /// whole; `SSEParser.lineOverLimit()` is how the caller says so.
+        case droppedLine
+    }
+
+    private let byteLimit: Int
+    private var line: [UInt8] = []
+    /// True once the line in progress went over the limit.
+    private var droppingLine = false
+    /// Lines dropped for going over the limit since this buffer was made.
+    public private(set) var droppedLineCount = 0
+
+    public init(byteLimit: Int = SSEByteLimit) {
+        self.byteLimit = max(1, byteLimit)
+    }
+
+    /// Bytes held for the line in progress.
+    public var bufferedByteCount: Int { line.count }
+
+    /// Feeds one byte and returns a value only when that byte ends a line.
+    public mutating func feed(_ byte: UInt8) -> Output? {
+        guard byte == 0x0A else {
+            if droppingLine { return nil }
+            if line.count >= byteLimit {
+                line.removeAll(keepingCapacity: false)
+                droppingLine = true
+                return nil
+            }
+            line.append(byte)
+            return nil
+        }
+        if droppingLine {
+            droppingLine = false
+            droppedLineCount += 1
+            return .droppedLine
+        }
+        // \r\n is legal; the parser tolerates a stray \r too
+        if line.last == 0x0D { line.removeLast() }
+        let text = String(decoding: line, as: UTF8.self)
+        line.removeAll(keepingCapacity: true)
+        return .line(text)
+    }
+}
+
 /// A live connection to `/api/events`, as an async sequence of frames.
 ///
 /// Built as an `AsyncThrowingStream` around a single Task, rather than as a
