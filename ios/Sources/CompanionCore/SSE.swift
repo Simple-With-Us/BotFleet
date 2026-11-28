@@ -223,7 +223,9 @@ public func eventStream(
                 var parser = SSEParser()
                 var lines = SSELineBuffer()
                 let decoder = JSONDecoder()
-                var line = [UInt8]()
+                func logDroppedEvent() {
+                    log.error("dropped an event over the stream size limit (\(SSEByteLimit, privacy: .public) bytes); the stream goes on at its next event")
+                }
 
                 // Split on newlines by hand rather than using `bytes.lines`.
                 //
