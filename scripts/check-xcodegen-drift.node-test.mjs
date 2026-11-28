@@ -33,12 +33,14 @@ describe("check-xcodegen-drift (BF-2718)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it("names the three Info.plists and the project bundle", () => {
+  it("names each target's Info.plist and entitlements file", () => {
     assert.deepEqual(GENERATED_PATHS, [
       "ios/App/Info.plist",
+      "ios/App/BotFleet.entitlements",
       "ios/Widgets/Info.plist",
+      "ios/Widgets/BotFleetWidgets.entitlements",
       "ios/MacApp/Info.plist",
-      "ios/BotFleet.xcodeproj",
+      "ios/MacApp/BotFleetMac.entitlements",
     ]);
   });
 

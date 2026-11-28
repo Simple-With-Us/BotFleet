@@ -18,15 +18,19 @@ import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
- * Everything `xcodegen generate` rewrites from ios/project.yml: the
- * `info.path` of each app target plus the project bundle itself.  A new
- * target with an `info:` block must add its plist here.
+ * Every tracked file `xcodegen generate` rewrites from ios/project.yml:
+ * each app target's `info.path` and `entitlements.path`.  A new target
+ * with an `info:` or `entitlements:` block must add its files here.
+ * The generated `.xcodeproj` is deliberately absent: ios/.gitignore
+ * ignores `*.xcodeproj`, so git cannot see it drift.
  */
 export const GENERATED_PATHS = [
   "ios/App/Info.plist",
+  "ios/App/BotFleet.entitlements",
   "ios/Widgets/Info.plist",
+  "ios/Widgets/BotFleetWidgets.entitlements",
   "ios/MacApp/Info.plist",
-  "ios/BotFleet.xcodeproj",
+  "ios/MacApp/BotFleetMac.entitlements",
 ];
 
 /** The repository root this script lives in (scripts/ is one level down). */
