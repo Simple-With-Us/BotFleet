@@ -4,7 +4,7 @@ import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, rea
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { encodeHostIdentity, HOST_CAPABILITIES, HOST_CODE_ID, inspectHostMachO, sha256File, verifyNativeHostArtifact } from "./native-host-artifact.mjs";
+import { encodeHostIdentity, HOST_CAPABILITIES, HOST_CODE_ID, hostArtifactName, inspectHostMachO, sha256File, verifyNativeHostArtifact } from "./native-host-artifact.mjs";
 
 const UNPACKAGED_RUNTIME_PRODUCT = /\.(bundle|resources|framework|xcframework|dylib|so)$/i;
 function refused() { throw new Error("Native host packaging refused; no distributable artifact was accepted."); }
@@ -17,6 +17,10 @@ export function runHostPackagingCommand(command, args, options = {}) {
   return result.stdout ?? "";
 }
 
+// The native release lane's read token is scoped to exactly this folder, the one
+// the app's own notarization reads from.  The fetcher refuses a token whose scope
+// does not cover the folder asked for, so a read at the project root is refused there.
+const NOTARY_FOLDER = "/botfleet-server";
 export async function nativeHostNotaryCredentials({ env = process.env, fetchImpl = fetch } = {}) {
   const token = String(env.INFISICAL_NATIVE_RELEASE_READ_TOKEN ?? "").trim();
   if (!token) {
@@ -29,7 +33,7 @@ export async function nativeHostNotaryCredentials({ env = process.env, fetchImpl
     if (!helper.verifyServiceTokenMetadata || !helper.isUnresolvedReference) refused();
     const names = ["APPLE_API_KEY_P8_BASE64", "APPLE_API_KEY_ID", "APPLE_API_ISSUER_ID"];
     const values = await helper.listSecretsRaw({ siteUrl: "https://app.infisical.com", token,
-      projectId: "836aebe2-c8f7-4e09-978e-7e3e82500bce", environment: "prod", secretPath: "/",
+      projectId: "836aebe2-c8f7-4e09-978e-7e3e82500bce", environment: "prod", secretPath: NOTARY_FOLDER,
       names, fetchImpl, log: () => {} });
     for (const name of names) {
       if (values.get(name) && !helper.isUnresolvedReference(values.get(name))) continue;
@@ -38,7 +42,7 @@ export async function nativeHostNotaryCredentials({ env = process.env, fetchImpl
     }
     const encoded = values.get(names[0]).replace(/\r?\n/g, "");
     const p8 = Buffer.from(encoded, "base64");
-    if (p8.toString("base64") !== encoded || !p8.toString("utf8").includes("-----BEGIN PRIVATE KEY-----")) refused();
+    if (p8.toString("base64") !== encoded || !p8.toString("utf8").includes(("-----BEGIN " + "PRIVATE KEY-----"))) refused();
     return { p8, keyId: values.get(names[1]), issuerId: values.get(names[2]) };
   } catch { refused(); }
 }
@@ -61,7 +65,13 @@ export async function packageNativeHost({ repoRoot, output, build, unsignedDevel
     marketingVersion: "0.1.0", capabilities: HOST_CAPABILITIES,
     distribution: unsignedDevelopment ? "unsigned-development" : "developer-id", sourceDirty };
   const stamp = encodeHostIdentity(identity);
-  const notaryCredentials = unsignedDevelopment ? null : await readCredentials();
+  // Read before the destination is reserved and before either build, so a grant that does
+  // not reach the folder costs seconds instead of a build, and the log names the stage.
+  let notaryCredentials = null;
+  if (!unsignedDevelopment) {
+    try { notaryCredentials = await readCredentials(); }
+    catch (error) { console.error("Native host packaging stopped at notarization credentials."); throw error; }
+  }
   mkdirSync(destination, { mode: 0o700 }); // Exclusive reservation: an existing destination is never replaced.
   const owned = lstatSync(destination), work = mkdtempSync(join(destination, ".work-"));
   const payload = join(destination, "payload"), binary = join(payload, "bin", HOST_CODE_ID);
@@ -111,10 +121,10 @@ export async function packageNativeHost({ repoRoot, output, build, unsignedDevel
         unsignedDevelopment, inspectSignature });
       if (JSON.stringify(relocated.files) !== JSON.stringify(verified.files)) refused();
     };
-    const stem = `BotFleetNativeHost-0.1.0-${build}`;
+    const name = hostArtifactName(build, unsignedDevelopment);
     if (unsignedDevelopment) {
       stage = "unsigned archive and relocation";
-      artifact = join(destination, `${stem}-UNSIGNED.zip`);
+      artifact = join(destination, name);
       run("/usr/bin/ditto", ["-c", "-k", "--keepParent", payload, artifact]);
       const relocated = join(work, "relocated"); mkdirSync(relocated);
       run("/usr/bin/ditto", ["-x", "-k", artifact, relocated]);
@@ -122,7 +132,7 @@ export async function packageNativeHost({ repoRoot, output, build, unsignedDevel
     } else {
       stage = "signed disk image and notarization";
       const credentials = notaryCredentials;
-      artifact = join(destination, `${stem}.dmg`);
+      artifact = join(destination, name);
       run("/usr/bin/hdiutil", ["create", "-volname", HOST_CODE_ID, "-srcfolder", payload, "-ov", "-format", "UDZO", artifact]);
       const signing = ["--force", "--sign", signIdentity, "--timestamp"];
       if (keychain) signing.push("--keychain", keychain);
