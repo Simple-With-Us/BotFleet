@@ -259,8 +259,15 @@ public func eventStream(
                 // they are what keeps a frame that never ends, or a block that
                 // never closes, from growing memory without limit.
                 for try await byte in bytes {
-                    guard byte == 0x0A else {
-                        line.append(byte)
+                    let text: String
+                    switch lines.feed(byte) {
+                    case .line(let line):
+                        text = line
+                    case .droppedLine:
+                        if !parser.isDroppingEvent { logDroppedEvent() }
+                        parser.lineOverLimit()
+                        continue
+                    case nil:
                         continue
                     }
                     // \r\n is legal; the parser tolerates a stray \r too
