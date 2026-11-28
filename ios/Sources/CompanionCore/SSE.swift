@@ -83,6 +83,7 @@ public struct SSEParser: Sendable {
             reset()
             return event
         }
+        guard !droppingEvent else { return nil }
         // ": keepalive" — a comment, and the only reason this stream
         // survives a NAT with a short idle timeout
         guard !line.hasPrefix(":") else { return nil }
