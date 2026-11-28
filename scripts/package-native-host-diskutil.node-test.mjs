@@ -2,6 +2,10 @@
 // the probe must select diskutil only where `diskutil image create from`
 // answers its help with exit 0.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import {
@@ -58,5 +62,39 @@ describe("disk-image tool choice (BF-2711)", () => {
       }),
       false,
     );
+    const seenVerbs = [];
+    const spawnVerbs = (command, args) => {
+      seenVerbs.push(args);
+      return { status: args[1] === "attach" ? 0 : 1 };
+    };
+    assert.equal(diskutilImageAvailable(spawnVerbs, ["image", "attach", "--help"]), true);
+    assert.deepEqual(seenVerbs, [["image", "attach", "--help"]]);
   });
+
+  it(
+    "round-trips a real disk image where diskutil image exists",
+    { skip: process.platform !== "darwin" || !diskutilImageAvailable() },
+    () => {
+      assert.equal(diskutilImageAvailable(undefined, ["image", "attach", "--help"]), true);
+      const exec = ([command, args]) => execFileSync(command, args, { encoding: "utf8" });
+      const root = mkdtempSync(join(tmpdir(), "bf2711-test-"));
+      const source = join(root, "payload");
+      mkdirSync(source);
+      writeFileSync(join(source, "hello.txt"), "bf-2711-roundtrip\n");
+      const artifact = join(root, "out.dmg");
+      const mounted = join(root, "mounted");
+      mkdirSync(mounted);
+      try {
+        exec(diskImageCreateCommand(true, "BF2711TEST", source, artifact));
+        exec(diskImageAttachCommand(true, mounted, artifact));
+        try {
+          assert.equal(readFileSync(join(mounted, "hello.txt"), "utf8"), "bf-2711-roundtrip\n");
+        } finally {
+          exec(diskImageDetachCommand(true, mounted));
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 });

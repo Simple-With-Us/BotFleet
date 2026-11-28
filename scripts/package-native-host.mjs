@@ -23,9 +23,9 @@ export function runHostPackagingCommand(command, args, options = {}) {
 // of the exact subcommand the create path needs: it exits 0 only where
 // `diskutil image create from` exists, and any spawn failure (including a
 // non-Mac test host) selects the fallback.
-export function diskutilImageAvailable(spawn = spawnSync) {
+export function diskutilImageAvailable(spawn = spawnSync, args = ["image", "create", "from", "--help"]) {
   try {
-    return spawn("/usr/sbin/diskutil", ["image", "create", "from", "--help"], { stdio: "ignore" }).status === 0;
+    return spawn("/usr/sbin/diskutil", args, { stdio: "ignore" }).status === 0;
   } catch { return false; }
 }
 export function diskImageCreateCommand(useDiskutil, volumeName, source, artifact) {
@@ -72,6 +72,7 @@ export async function nativeHostNotaryCredentials({ env = process.env, fetchImpl
 
 export async function packageNativeHost({ repoRoot, output, build, unsignedDevelopment = false,
   signIdentity, keychain, platform = process.platform, run = runHostPackagingCommand,
+  probeSpawn = spawnSync,
   inspectSignature, readCredentials = nativeHostNotaryCredentials } = {}) {
   if (platform !== "darwin" || !repoRoot || !output || !/^[0-9]{12}$/.test(build ?? "") || /^0+$/.test(build) ||
       (!unsignedDevelopment && !signIdentity)) refused();
@@ -150,7 +151,12 @@ export async function packageNativeHost({ repoRoot, output, build, unsignedDevel
       stage = "signed disk image and notarization";
       const credentials = notaryCredentials;
       artifact = join(destination, `${stem}.dmg`);
-      const useDiskutil = diskutilImageAvailable();
+      // Probe create and attach separately, through the injectable spawn
+      // seam: a host may answer one spelling and not the other, and each
+      // verb keeps its own hdiutil fallback.  Eject has no help form to
+      // probe, so the detach below retries hdiutil before refusing.
+      const useDiskutil = diskutilImageAvailable(probeSpawn);
+      const useDiskutilAttach = useDiskutil && diskutilImageAvailable(probeSpawn, ["image", "attach", "--help"]);
       // diskutil create has no overwrite flag; the rm preserves -ov.
       if (useDiskutil) rmSync(artifact, { force: true });
       run(...diskImageCreateCommand(useDiskutil, HOST_CODE_ID, payload, artifact));
@@ -171,11 +177,16 @@ export async function packageNativeHost({ repoRoot, output, build, unsignedDevel
       if (verify().binarySha256 !== verified.binarySha256) refused();
       const mounted = join(work, "mounted"); mkdirSync(mounted);
       try {
-        run(...diskImageAttachCommand(useDiskutil, mounted, artifact));
+        run(...diskImageAttachCommand(useDiskutilAttach, mounted, artifact));
         verifyRelocation(mounted);
       } finally {
-        try { run(...diskImageDetachCommand(useDiskutil, mounted)); }
-        catch { safeCleanup = false; refused(); } // Never recursively remove a possibly mounted tree.
+        try { run(...diskImageDetachCommand(useDiskutilAttach, mounted)); }
+        catch {
+          try {
+            if (!useDiskutilAttach) throw new Error("primary detach failed");
+            run(...diskImageDetachCommand(false, mounted));
+          } catch { safeCleanup = false; refused(); } // Never recursively remove a possibly mounted tree.
+        }
       }
     }
     const receipt = { ...verified, distributable: !unsignedDevelopment, artifact: artifact.slice(destination.length + 1),
