@@ -66,9 +66,10 @@ Every agent session must start with systematic orientation before touching code:
 
 3. **Check Linear & Work Items:**
    ```bash
-   board stats
-   board list --status open,in_progress --limit 25
+   AGENT_SEAT=<SEAT> simple-board whoami
+   AGENT_SEAT=<SEAT> simple-board list --team <TEAM> --status in_progress --limit 25
    ```
+   Hosted remote mode has no `stats`, takes one `--status` at a time with `--team` (not `--app`), and needs `SIMPLE_BOARD_REMOTE_WRITES=1` for writes; see the hosted-mode paragraph in the BotFleet repo `AGENTS.md` § Linear Comes First.
    Effort logs are archived — use Linear (`simple-board` or simple-tools `linear_list` when mounted), not `~/apps/*EFFORT-LOG.md` or `docs/EFFORT-LOG.md`, for open work.
 
 ---
@@ -88,8 +89,8 @@ git -C /Users/jay/Code/<Repo> worktree add -b <seat>/<feature-slug> ~/apps/<app>
 
 Before starting substantial work, reserve your lane on Linear and Zulip:
 
-1. **Linear (`board claim` / `board file`):**
-   - Claim or file the issue In Progress with your tag, branch, worktree, and concise objective.
+1. **Linear (`simple-board claim` / `simple-board file`):**
+   - Claim or file the issue In Progress under your seat with a concise objective.  Hosted `claim` takes only `--by`, so record the branch and worktree in a follow-up `simple-board comment`; hosted `file` needs `--app` or the issue lands in OPS.
    - Do not edit archived effort logs (`~/apps/*-EFFORT-LOG.md` or repo `docs/EFFORT-LOG.md`).
 2. **GitHub Issue (when applicable):**
    - Link your branch to the corresponding GitHub Issue or create one.
