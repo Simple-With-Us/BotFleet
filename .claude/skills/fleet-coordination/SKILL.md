@@ -90,7 +90,7 @@ git -C /Users/jay/Code/<Repo> worktree add -b <seat>/<feature-slug> ~/apps/<app>
 Before starting substantial work, reserve your lane on Linear and Zulip:
 
 1. **Linear (`simple-board claim` / `simple-board file`):**
-   - Claim or file the issue In Progress with your tag, branch, worktree, and concise objective.
+   - Claim or file the issue In Progress under your seat with a concise objective.  Hosted `claim` takes only `--by`, so record the branch and worktree in a follow-up `simple-board comment`; hosted `file` needs `--app` or the issue lands in OPS.
    - Do not edit archived effort logs (`~/apps/*-EFFORT-LOG.md` or repo `docs/EFFORT-LOG.md`).
 2. **GitHub Issue (when applicable):**
    - Link your branch to the corresponding GitHub Issue or create one.

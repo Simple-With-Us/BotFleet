@@ -73,7 +73,7 @@ Then read that app's `AGENTS.md`, `STATUS.md`, and latest `docs/rollouts/`.  `do
 
 ## 4. Claim before substantial edits
 
-1. **Linear** — `AGENT_SEAT="$AGENT_SEAT" simple-board list --team <TEAM> --status in_progress` then `AGENT_SEAT="$AGENT_SEAT" SIMPLE_BOARD_REMOTE_WRITES=1 simple-board claim <id> --by "$AGENT_SEAT"`.  If nothing exists: `SIMPLE_BOARD_REMOTE_WRITES=1 simple-board file --title "..." --app <app> --severity P1 --desc "..."` (hosted `file` takes no `--by`; without `--app` the issue lands in the OPS team).  Name the lane and branch in a follow-up `simple-board comment`, since hosted `claim` has no `--where`.
+1. **Linear** — `AGENT_SEAT="$AGENT_SEAT" simple-board list --team <TEAM> --status in_progress` then `AGENT_SEAT="$AGENT_SEAT" SIMPLE_BOARD_REMOTE_WRITES=1 simple-board claim <id> --by "$AGENT_SEAT"`.  If nothing exists: `AGENT_SEAT="$AGENT_SEAT" SIMPLE_BOARD_REMOTE_WRITES=1 simple-board file --title "..." --app <app> --severity P1 --desc "..."` (hosted `file` takes no `--by`, so the `AGENT_SEAT` prefix is what attributes the issue; without `--app` it lands in the OPS team).  Name the lane and branch in a follow-up `AGENT_SEAT="$AGENT_SEAT" SIMPLE_BOARD_REMOTE_WRITES=1 simple-board comment <id> --by "$AGENT_SEAT" --text "..."`, since hosted `claim` has no `--where`.
 2. **Zulip** — post in the work topic (`<ID> <subject>`).  GitHub issue if you are executing a numbered one.
 
 Post (prefer this over Zulip MCP):
