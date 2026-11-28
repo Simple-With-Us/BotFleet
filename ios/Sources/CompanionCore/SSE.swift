@@ -6,6 +6,10 @@
 // data, comments used as keepalives, the optional space after the colon —
 // so it is the part that can be tested without a server.
 //
+// Both pieces are bounded. A line past `SSEByteLimit` is not kept, and an
+// event past it is dropped whole, so a frame that never ends cannot take
+// the app's memory with it.
+//
 // The harness's stream is documented in `server/index.ts`: each frame is
 // `id: <streamId>:<seq>` followed by one `data:` line, separated by a blank
 // line, with `: keepalive` comments every 25 seconds.
@@ -27,22 +31,59 @@ public struct SSEEvent: Equatable, Sendable {
     }
 }
 
+/// The most one line, and one event, may hold before the stream drops it.  A
+/// screen frame is a few hundred kilobytes of base64 PNG, so this is two
+/// orders of magnitude above anything the harness sends; it is also the
+/// bound `server/drivers/pi-mcp-extension.ts` puts on an MCP frame.  Past
+/// it the server is buggy or hostile, and the stream stops growing at the
+/// bound instead of taking the app down with it.
+public let SSEByteLimit = 32 * 1024 * 1024
+
 /// Line-oriented SSE parser. Feed it every line as it arrives; it returns
 /// an event when a blank line closes the block, and nil otherwise.
+///
+/// An event is bounded: once its fields hold more than `byteLimit` bytes,
+/// or one of its lines arrives over the limit, the whole event is dropped
+/// and nothing more is kept for it until the blank line that ends it.  That
+/// blank line is an exact place to pick the stream up again, because every
+/// event ends with one, so one oversized event costs one frame and not the
+/// connection.  Failing the stream instead would hand the reconnection
+/// logic a server that still has that frame to replay.
 public struct SSEParser: Sendable {
+    private let byteLimit: Int
     private var fields: [(name: String, value: String)] = []
+    /// Bytes of field names and values the event in progress holds.
+    private var bufferedBytes = 0
+    /// True once the event in progress went over the limit.
+    private var droppingEvent = false
+    /// Events dropped for going over the limit since this parser was made.
+    public private(set) var droppedEventCount = 0
 
-    public init() {}
+    public init(byteLimit: Int = SSEByteLimit) {
+        self.byteLimit = max(1, byteLimit)
+    }
+
+    /// Bytes the event in progress holds so far.
+    public var bufferedByteCount: Int { bufferedBytes }
+
+    /// True while the event in progress is over the limit and being dropped.
+    public var isDroppingEvent: Bool { droppingEvent }
 
     public mutating func line(_ raw: String) -> SSEEvent? {
         // AsyncLineSequence strips the newline but not a CR from CRLF
         let line = raw.hasSuffix("\r") ? String(raw.dropLast()) : raw
 
         guard !line.isEmpty else {
+            if droppingEvent {
+                droppedEventCount += 1
+                reset()
+                return nil
+            }
             let event = Self.event(from: fields)
-            fields.removeAll()
+            reset()
             return event
         }
+        guard !droppingEvent else { return nil }
         // ": keepalive" — a comment, and the only reason this stream
         // survives a NAT with a short idle timeout
         guard !line.hasPrefix(":") else { return nil }
@@ -53,15 +94,35 @@ public struct SSEParser: Sendable {
         var value = String(line[line.index(after: colon)...])
         // exactly one optional leading space after the colon, per the spec
         if value.hasPrefix(" ") { value.removeFirst() }
-        fields.append((name: String(line[line.startIndex..<colon]), value: value))
+        let name = String(line[line.startIndex..<colon])
+        bufferedBytes += name.utf8.count + value.utf8.count
+        guard bufferedBytes <= byteLimit else {
+            dropEvent()
+            return nil
+        }
+        fields.append((name: name, value: value))
         return nil
     }
 
-    /// Anything still buffered when the stream ends. An event without its
-    /// closing blank line is incomplete, so this is deliberately discarded
-    /// rather than guessed at.
-    public mutating func reset() {
+    /// Tells the parser that a line of the event in progress arrived longer
+    /// than the limit, so that event is dropped whole rather than half-parsed.
+    public mutating func lineOverLimit() {
+        dropEvent()
+    }
+
+    /// Lets go of the event in progress and keeps nothing more for it.
+    private mutating func dropEvent() {
+        droppingEvent = true
         fields.removeAll()
+        bufferedBytes = 0
+    }
+
+    /// Anything still buffered. An event without its closing blank line is
+    /// incomplete, so this is deliberately discarded rather than guessed at.
+    public mutating func reset() {
+        droppingEvent = false
+        fields.removeAll()
+        bufferedBytes = 0
     }
 
     static func event(from fields: [(name: String, value: String)]) -> SSEEvent? {
@@ -76,6 +137,58 @@ public struct SSEParser: Sendable {
         }
         guard !dataLines.isEmpty else { return nil }
         return SSEEvent(id: id, data: dataLines.joined(separator: "\n"))
+    }
+}
+
+/// The stream loop's half of the bound: it turns bytes into lines and stops
+/// keeping a line's bytes once the line is over the limit.  The rest of that
+/// line is read and thrown away until its newline, so a server that never
+/// sends one cannot grow memory either.
+public struct SSELineBuffer: Sendable {
+    public enum Output: Equatable, Sendable {
+        /// A complete line, without its newline.
+        case line(String)
+        /// A line that went over the limit has ended. Its event is dropped
+        /// whole; `SSEParser.lineOverLimit()` is how the caller says so.
+        case droppedLine
+    }
+
+    private let byteLimit: Int
+    private var line: [UInt8] = []
+    /// True once the line in progress went over the limit.
+    private var droppingLine = false
+    /// Lines dropped for going over the limit since this buffer was made.
+    public private(set) var droppedLineCount = 0
+
+    public init(byteLimit: Int = SSEByteLimit) {
+        self.byteLimit = max(1, byteLimit)
+    }
+
+    /// Bytes held for the line in progress.
+    public var bufferedByteCount: Int { line.count }
+
+    /// Feeds one byte and returns a value only when that byte ends a line.
+    public mutating func feed(_ byte: UInt8) -> Output? {
+        guard byte == 0x0A else {
+            if droppingLine { return nil }
+            if line.count >= byteLimit {
+                line.removeAll(keepingCapacity: false)
+                droppingLine = true
+                return nil
+            }
+            line.append(byte)
+            return nil
+        }
+        if droppingLine {
+            droppingLine = false
+            droppedLineCount += 1
+            return .droppedLine
+        }
+        // \r\n is legal; the parser tolerates a stray \r too
+        if line.last == 0x0D { line.removeLast() }
+        let text = String(decoding: line, as: UTF8.self)
+        line.removeAll(keepingCapacity: true)
+        return .line(text)
     }
 }
 
@@ -108,8 +221,11 @@ public func eventStream(
                 }
 
                 var parser = SSEParser()
+                var lines = SSELineBuffer()
                 let decoder = JSONDecoder()
-                var line = [UInt8]()
+                func logDroppedEvent() {
+                    log.error("dropped an event over the stream size limit (\(SSEByteLimit, privacy: .public) bytes); the stream goes on at its next event")
+                }
 
                 // Split on newlines by hand rather than using `bytes.lines`.
                 //
@@ -137,17 +253,29 @@ public func eventStream(
                 // which is precisely the ownership the comment above says this
                 // file exists to get right — so it stays as it is until there
                 // is a Mac to prove the replacement on.
+                //
+                // `SSELineBuffer` holds the newline split and the bound on one
+                // line; `SSEParser` holds the bound on one event. Together
+                // they are what keeps a frame that never ends, or a block that
+                // never closes, from growing memory without limit.
                 for try await byte in bytes {
-                    guard byte == 0x0A else {
-                        line.append(byte)
+                    let text: String
+                    switch lines.feed(byte) {
+                    case .line(let line):
+                        text = line
+                    case .droppedLine:
+                        if !parser.isDroppingEvent { logDroppedEvent() }
+                        parser.lineOverLimit()
+                        continue
+                    case nil:
                         continue
                     }
-                    // \r\n is legal; the parser tolerates a stray \r too
-                    if line.last == 0x0D { line.removeLast() }
-                    let text = String(decoding: line, as: UTF8.self)
-                    line.removeAll(keepingCapacity: true)
 
-                    guard let event = parser.line(text) else { continue }
+                    let wasDropping = parser.isDroppingEvent
+                    guard let event = parser.line(text) else {
+                        if parser.isDroppingEvent && !wasDropping { logDroppedEvent() }
+                        continue
+                    }
                     guard let data = event.data.data(using: .utf8) else { continue }
                     // A frame we cannot decode is one frame lost, not a dead
                     // stream: `Frame` already absorbs unknown kinds, so this
