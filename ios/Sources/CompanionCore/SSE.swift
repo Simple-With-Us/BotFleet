@@ -271,7 +271,11 @@ public func eventStream(
                         continue
                     }
 
-                    guard let event = parser.line(text) else { continue }
+                    let wasDropping = parser.isDroppingEvent
+                    guard let event = parser.line(text) else {
+                        if parser.isDroppingEvent && !wasDropping { logDroppedEvent() }
+                        continue
+                    }
                     guard let data = event.data.data(using: .utf8) else { continue }
                     // A frame we cannot decode is one frame lost, not a dead
                     // stream: `Frame` already absorbs unknown kinds, so this
