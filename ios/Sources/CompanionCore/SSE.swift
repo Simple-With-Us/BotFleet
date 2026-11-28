@@ -41,6 +41,14 @@ public let SSEByteLimit = 32 * 1024 * 1024
 
 /// Line-oriented SSE parser. Feed it every line as it arrives; it returns
 /// an event when a blank line closes the block, and nil otherwise.
+///
+/// An event is bounded: once its fields hold more than `byteLimit` bytes,
+/// or one of its lines arrives over the limit, the whole event is dropped
+/// and nothing more is kept for it until the blank line that ends it.  That
+/// blank line is an exact place to pick the stream up again, because every
+/// event ends with one, so one oversized event costs one frame and not the
+/// connection.  Failing the stream instead would hand the reconnection
+/// logic a server that still has that frame to replay.
 public struct SSEParser: Sendable {
     private var fields: [(name: String, value: String)] = []
 
