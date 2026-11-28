@@ -102,6 +102,8 @@ public final class MacTranscriptEngine: @unchecked Sendable {
     public var cachedSettledMessageCount: Int { settledBlockCache.count }
 
     /// Cached rendered blocks for settled messages that have entered the viewport.
+    /// It follows the roster: a message that leaves the roster takes its entry
+    /// with it, so a long session does not keep every message it ever showed.
     private var settledBlockCache: [String: [MacRenderedMarkdownBlock]] = [:]
     /// The text each cached block list was parsed from.  A message patched
     /// under the same id carries new text, and the cache must notice that or
