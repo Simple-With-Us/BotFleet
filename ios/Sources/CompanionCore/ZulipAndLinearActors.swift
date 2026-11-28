@@ -1146,6 +1146,25 @@ public actor LinearSyncClient {
         }
     }
 
+    /// Records a completed mutation and, once the window is full, lets the
+    /// oldest receipt go.  A key that returns after it was evicted is a new
+    /// completion and goes to the back of the order again.
+    private func recordCompletion(_ receipt: LinearSyncReceipt, forKey key: String) {
+        if completedByIdempotencyKey.updateValue(receipt, forKey: key) == nil {
+            completedKeyOrder.append(key)
+        }
+        while completedKeyOrder.count - completedKeyOrderHead > receiptCapacity {
+            completedByIdempotencyKey.removeValue(forKey: completedKeyOrder[completedKeyOrderHead])
+            completedKeyOrderHead += 1
+        }
+        // Evicted keys stay in the array until it is compacted, so the array
+        // does not grow with a host's whole life.
+        if completedKeyOrderHead >= 4_096 && completedKeyOrderHead * 2 >= completedKeyOrder.count {
+            completedKeyOrder.removeFirst(completedKeyOrderHead)
+            completedKeyOrderHead = 0
+        }
+    }
+
     /// Reserves an idempotency key for a mutation that is about to be sent.
     /// The receipt cache is only written once the mutation returns, so without
     /// this reservation two concurrent callers could send the same mutation.
