@@ -120,7 +120,8 @@ public final class MacTranscriptEngine: @unchecked Sendable {
     public init() {}
 
     /// Registers or updates the settled message roster without eagerly parsing
-    /// off-screen messages.
+    /// off-screen messages.  A message no longer on the roster loses its cached
+    /// blocks, its cached text and its measured height.
     public func setSettledMessages(_ messages: [Message]) {
         settledMessageCount = messages.count
     }
