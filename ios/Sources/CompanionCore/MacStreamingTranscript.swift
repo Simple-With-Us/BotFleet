@@ -147,6 +147,7 @@ public final class MacTranscriptEngine: @unchecked Sendable {
         let parsed = Markdown.blocks(raw).enumerated().map { idx, blk in
             MacRenderedMarkdownBlock(id: idx, block: blk, isStreamingTail: false)
         }
+        settledMessagesParsed += 1
         settledBlockCache[message.id] = parsed
         settledBlockText[message.id] = raw
         return parsed
