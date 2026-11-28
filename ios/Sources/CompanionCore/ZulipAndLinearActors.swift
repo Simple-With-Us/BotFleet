@@ -1125,7 +1125,7 @@ public actor LinearSyncClient {
             idempotencyKey: key,
             stateOrBody: taggedBody
         )
-        completedByIdempotencyKey[key] = receipt
+        recordCompletion(receipt, forKey: key)
         return receipt
     }
 
