@@ -113,6 +113,10 @@ scripts/ios-fleet/ios-app-versions.json
 .prod.vars
 .prod.vars.*
 *.vars
+*.vars.*
+*.env.*
+.envrc
 !*.example
 !*.sample
 !*.template
+!.cursor/infisical.env
