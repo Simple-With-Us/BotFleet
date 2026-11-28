@@ -37,5 +37,13 @@
 	<string>$(SENTRY_DSN)</string>
 	<key>SOURCE_COMMIT</key>
 	<string>$(SOURCE_COMMIT)</string>
+	<key>SUAutomaticallyUpdate</key>
+	<false/>
+	<key>SUFeedURL</key>
+	<string>$(BOTFLEET_NATIVE_UPDATE_FEED_URL)</string>
+	<key>SUPublicEDKey</key>
+	<string>$(BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY)</string>
+	<key>SUScheduledCheckInterval</key>
+	<integer>21600</integer>
 </dict>
 </plist>
