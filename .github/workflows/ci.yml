@@ -228,6 +228,11 @@ jobs:
           bash scripts/ios-install-xcodegen.sh
           cd ios
           xcodegen generate
+      # BF-2718: a plain checkout built without generating ships the
+      # tracked plists verbatim, so the tracked copies must already
+      # match what project.yml generates.
+      - name: Assert tracked XcodeGen output is current
+        run: node scripts/check-xcodegen-drift.mjs
       - name: Build the iOS app (unsigned)
         run: |
           cd ios
@@ -285,6 +290,10 @@ jobs:
           bash scripts/ios-install-xcodegen.sh
           cd ios
           xcodegen generate
+      # BF-2718: same drift gate as the iOS job; the Mac plist is the
+      # one that drifted (the Sparkle keys).
+      - name: Assert tracked XcodeGen output is current
+        run: node scripts/check-xcodegen-drift.mjs
       - name: Build the Mac app (unsigned)
         run: |
           cd ios
