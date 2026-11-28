@@ -95,6 +95,11 @@ public final class MacTranscriptEngine: @unchecked Sendable {
     public private(set) var settledMessagesReparsedOnLastDelta: Int = 0
     public private(set) var blocksParsedOnLastDelta: Int = 0
     public private(set) var lastDeltaParseDurationMs: Double = 0.0
+    /// Settled messages parsed from their text because the cache had nothing
+    /// for them.  A message served from the cache does not move it.
+    public private(set) var settledMessagesParsed: Int = 0
+    /// Settled messages whose rendered blocks are held right now.
+    public var cachedSettledMessageCount: Int { settledBlockCache.count }
 
     /// Cached rendered blocks for settled messages that have entered the viewport.
     private var settledBlockCache: [String: [MacRenderedMarkdownBlock]] = [:]
