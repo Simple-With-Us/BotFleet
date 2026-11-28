@@ -238,7 +238,10 @@ public final class MacTranscriptEngine: @unchecked Sendable {
     /// Nothing is streaming any more, so no block keeps the streaming tail.
     public func finishStreaming(messageId: String) {
         if activeStreamingMessageId == messageId {
-            settledBlockCache[messageId] = activeStreamingBlocks
+            settledBlockCache[messageId] = activeStreamingBlocks.map { streamed in
+                MacRenderedMarkdownBlock(id: streamed.id, block: streamed.block, isStreamingTail: false)
+            }
+            settledBlockText[messageId] = activeStreamingText
             activeStreamingMessageId = nil
             activeStreamingText = ""
             activeStreamingBlocks = []
