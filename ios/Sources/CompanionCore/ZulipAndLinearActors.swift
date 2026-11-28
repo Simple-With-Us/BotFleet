@@ -940,7 +940,8 @@ public actor LinearSyncClient {
         seat: String,
         sessionId: String,
         apiKey: String,
-        transport: LinearGraphQLTransport? = nil
+        transport: LinearGraphQLTransport? = nil,
+        receiptCapacity: Int = LinearSyncClient.defaultReceiptCapacity
     ) throws {
         let cleanSeat = seat.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         guard !cleanSeat.isEmpty else {
