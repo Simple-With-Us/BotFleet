@@ -122,6 +122,7 @@ public struct SSEParser: Sendable {
     public mutating func reset() {
         droppingEvent = false
         fields.removeAll()
+        bufferedBytes = 0
     }
 
     static func event(from fields: [(name: String, value: String)]) -> SSEEvent? {
