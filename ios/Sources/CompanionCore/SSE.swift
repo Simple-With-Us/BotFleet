@@ -120,6 +120,7 @@ public struct SSEParser: Sendable {
     /// Anything still buffered. An event without its closing blank line is
     /// incomplete, so this is deliberately discarded rather than guessed at.
     public mutating func reset() {
+        droppingEvent = false
         fields.removeAll()
     }
 
