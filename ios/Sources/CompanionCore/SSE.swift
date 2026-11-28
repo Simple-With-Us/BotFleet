@@ -80,7 +80,7 @@ public struct SSEParser: Sendable {
                 return nil
             }
             let event = Self.event(from: fields)
-            fields.removeAll()
+            reset()
             return event
         }
         // ": keepalive" — a comment, and the only reason this stream
