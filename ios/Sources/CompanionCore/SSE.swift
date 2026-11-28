@@ -74,6 +74,11 @@ public struct SSEParser: Sendable {
         let line = raw.hasSuffix("\r") ? String(raw.dropLast()) : raw
 
         guard !line.isEmpty else {
+            if droppingEvent {
+                droppedEventCount += 1
+                reset()
+                return nil
+            }
             let event = Self.event(from: fields)
             fields.removeAll()
             return event
