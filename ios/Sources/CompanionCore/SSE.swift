@@ -50,6 +50,7 @@ public let SSEByteLimit = 32 * 1024 * 1024
 /// connection.  Failing the stream instead would hand the reconnection
 /// logic a server that still has that frame to replay.
 public struct SSEParser: Sendable {
+    private let byteLimit: Int
     private var fields: [(name: String, value: String)] = []
 
     public init() {}
