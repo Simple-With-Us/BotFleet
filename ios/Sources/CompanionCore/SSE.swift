@@ -221,6 +221,7 @@ public func eventStream(
                 }
 
                 var parser = SSEParser()
+                var lines = SSELineBuffer()
                 let decoder = JSONDecoder()
                 var line = [UInt8]()
 
