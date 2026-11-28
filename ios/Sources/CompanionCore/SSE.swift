@@ -52,6 +52,12 @@ public let SSEByteLimit = 32 * 1024 * 1024
 public struct SSEParser: Sendable {
     private let byteLimit: Int
     private var fields: [(name: String, value: String)] = []
+    /// Bytes of field names and values the event in progress holds.
+    private var bufferedBytes = 0
+    /// True once the event in progress went over the limit.
+    private var droppingEvent = false
+    /// Events dropped for going over the limit since this parser was made.
+    public private(set) var droppedEventCount = 0
 
     public init() {}
 
