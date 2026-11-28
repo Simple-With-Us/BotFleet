@@ -124,6 +124,13 @@ public final class MacTranscriptEngine: @unchecked Sendable {
     /// blocks, its cached text and its measured height.
     public func setSettledMessages(_ messages: [Message]) {
         settledMessageCount = messages.count
+        guard !settledBlockCache.isEmpty || !settledBlockText.isEmpty || !measuredHeights.isEmpty else {
+            return
+        }
+        let roster = Set(messages.map(\.id))
+        settledBlockCache = settledBlockCache.filter { roster.contains($0.key) }
+        settledBlockText = settledBlockText.filter { roster.contains($0.key) }
+        measuredHeights = measuredHeights.filter { roster.contains($0.key) }
     }
 
     /// Returns cached rendered blocks for a settled message, parsing on first
