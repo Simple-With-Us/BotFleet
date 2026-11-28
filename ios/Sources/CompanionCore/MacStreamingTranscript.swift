@@ -232,6 +232,10 @@ public final class MacTranscriptEngine: @unchecked Sendable {
     }
 
     /// Commits and clears the active streaming state when the message settles.
+    /// The blocks it streamed become the message's cached settled blocks, with
+    /// the text they were parsed from, so the settled transcript is served
+    /// from the cache instead of parsing the whole message a second time.
+    /// Nothing is streaming any more, so no block keeps the streaming tail.
     public func finishStreaming(messageId: String) {
         if activeStreamingMessageId == messageId {
             settledBlockCache[messageId] = activeStreamingBlocks
