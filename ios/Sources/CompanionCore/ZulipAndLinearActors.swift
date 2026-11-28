@@ -970,6 +970,9 @@ public actor LinearSyncClient {
         "[\(seat)·\(sessionId)]"
     }
 
+    /// Receipts held for completed mutations, never more than the capacity.
+    public var retainedReceiptCount: Int { completedByIdempotencyKey.count }
+
     /// A stable digest for an idempotency key.  `hashValue` is seeded per
     /// process, so the same comment would get a different key after a restart
     /// and the de-duplication would silently stop matching.
