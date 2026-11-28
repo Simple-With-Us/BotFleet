@@ -148,7 +148,7 @@ function isMountPoint(path) {
  * unsigned development package is not a release, whatever it is renamed to.
  */
 export async function verifyHostRelease({ directory, expectedSource, expectedBuild, expectedArtifactSha256,
-  noMount = false, platform = process.platform, mountImage = mountDiskImage, unmountImage = unmountDiskImage,
+  noMount = false, platform, mountImage = mountDiskImage, unmountImage = unmountDiskImage,
   inspectSignature }) {
   pinned(expectedSource, expectedBuild);
   if (expectedArtifactSha256 !== undefined && !HEX64.test(expectedArtifactSha256)) refuse("the expected artifact digest is not a sha256");
@@ -170,7 +170,10 @@ export async function verifyHostRelease({ directory, expectedSource, expectedBui
   }
   let verified = null;
   if (!noMount) {
-    if (platform !== "darwin") {
+    // The real mount needs macOS.  An injected mount pair is a stand-in the caller owns, so
+    // it is judged on the platform the caller names, and on none when it names none.
+    const host = platform ?? (mountImage === mountDiskImage ? process.platform : "darwin");
+    if (host !== "darwin") {
       refuse("mounting the disk image needs macOS; --no-mount belongs to a job that receives bytes another job verified");
     }
     // The image is detached on every path out, including a failed verification.
