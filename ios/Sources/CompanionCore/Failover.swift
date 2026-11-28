@@ -388,9 +388,18 @@ extension Connection {
     /// protected replacement, the exact old route remains the first candidate
     /// instead of silently authorizing some other cleartext LAN address.
     public mutating func reconcile(_ metadata: CompanionConnectionMetadata) {
+        // Only the computer says which placement it runs. The server's bridge
+        // advertises none and an older computer says nothing, so both leave
+        // what was last read.
+        if let placement = metadata.placement { self.placement = placement }
         let cleanedName = metadata.serverName.trimmingCharacters(in: .whitespacesAndNewlines)
             .filter { (!$0.isASCII && !$0.isNewline) || $0.asciiValue.map { $0 >= 32 && $0 != 127 } == true }
         if !cleanedName.isEmpty { name = String(cleanedName.prefix(80)) }
+        if metadata.endpoints.isEmpty {
+            // No route came with it: a Mac that advertises none. What it said
+            // is its mode and its name, and the routes stay as they are.
+            return
+        }
 
         if let advertisedHosts = metadata.hosts {
             hosts = Array(advertisedHostsAllowedByRoutePolicy(advertisedHosts).prefix(8))
@@ -433,9 +442,48 @@ extension Connection {
         return dialing(endpoint)
     }
 
+    /// The server bridge pairing as the connection it is. Setting it stores
+    /// the pairing and nothing of its own; setting `nil` drops it, and its
+    /// token is then the caller's to remove.
+    public var bridgeConnection: Connection? {
+        get { bridge?.connection }
+        set { bridge = CompanionBridgePairing.holding(newValue) }
+    }
+
+    /// Whether the server's bridge leads the walk: there is a bridge
+    /// pairing, and the Mac last said it runs `serverFirst`. In any other
+    /// mode the Mac owns the work, and the bridge pairing is kept but not
+    /// followed.
+    public var prefersBridge: Bool {
+        bridgeConnection != nil && placement == .serverFirst
+    }
+
+    /// The routes a reconnect walks, best first: this computer's, with the
+    /// server bridge's ahead of them under `serverFirst`. An address failure
+    /// moves to the next route as it always has, which is the fallback to the
+    /// Mac when the bridge does not answer.
+    public var syncEndpoints: [CompanionEndpoint] {
+        let own = orderedEndpoints
+        guard prefersBridge,
+              let ahead = bridgeConnection?.orderedEndpoints, !ahead.isEmpty
+        else { return own }
+        var seen = Set<String>()
+        return (ahead + own).filter { seen.insert($0.url).inserted }
+    }
+
+    /// Whether a route is the server bridge's.
+    public func isBridgeRoute(_ endpoint: CompanionEndpoint) -> Bool {
+        bridgeConnection?.orderedEndpoints.contains { $0.url == endpoint.url } == true
+    }
+
     /// A copy dialing one complete route without changing its stored policy
-    /// order or keychain identity.
+    /// order or keychain identity. A route of the server bridge gives the
+    /// bridge's own connection, so the caller sends the token that belongs
+    /// to it and to nothing else.
     public func dialing(_ candidate: CompanionEndpoint) -> Connection {
+        if isBridgeRoute(candidate), let bridge = bridgeConnection {
+            return bridge.dialing(candidate)
+        }
         guard allowsEndpoint(candidate) else { return self }
         var copy = self
         copy.activeEndpoint = candidate

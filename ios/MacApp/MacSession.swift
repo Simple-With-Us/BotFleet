@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import CoreVideo
+import Combine
 import CompanionCore
 #if os(macOS)
 import AppKit
@@ -99,6 +100,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     @Published public private(set) var port: Int = 8799
     public let servers: ServersCoordinator
     public let resources: ResourcesCoordinator
+    private var placementTelling = Set<AnyCancellable>()
 
     // Lifecycle & Remote Wake state (BF-2497)
     @Published public var lifecycleSettings = MacLifecycleSettings()
@@ -241,6 +243,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     private var notificationAuthorizationTask: Task<Bool, Never>?
     #if os(macOS)
     private var voiceCaptureCoordinator: MacVoiceCaptureCoordinator?
+    private var settingsSceneOpener: (() -> Void)?
     #endif
 
     public init(
@@ -305,7 +308,29 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         // under the Mac's data directory; where the native engine's store
         // finally lives is BF-2504's call, and this path is the provisional
         // one the BF-2590 PR named.  Workspaces are confined beside it.
-        let nativeRuntimeHost = NativeMacRuntimeHost {
+        //
+        // BF-2710: on the first launch with no harness plist under any label
+        // it has used, the legacy `bots.json` and `messages.db` are copied
+        // into that store before the stored bots register, so the window
+        // opens with the bots the harness had.  Beside an installed harness
+        // nothing is copied.
+        let legacyImport = NativeLegacyStoreImport.forMacDataDirectory(
+            policyStore.dataDir,
+            harnessPlists: Self.harnessAgentLabels.map { startupPolicyStore.launchAgentPlist(label: $0) }
+        )
+        let nativeRuntimeHost = NativeMacRuntimeHost(prepare: { database in
+            switch await legacyImport.runIfNeeded(into: database) {
+            case .imported(let bots, let threads, let messages, let parityVerified):
+                NSLog(
+                    "BF-2710: imported %ld bots, %ld threads and %ld messages from the legacy store (parity %@)",
+                    bots, threads, messages, parityVerified ? "verified" : "NOT verified"
+                )
+            case .failed(let reason):
+                NSLog("BF-2710: the legacy store import failed and will be tried again next launch: %@", reason)
+            case .skipped:
+                break
+            }
+        }) {
             try FileManager.default.createDirectory(
                 at: storeURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true
@@ -375,6 +400,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         self.companionListener.onStateChange = { [weak self] state in
             self?.companionListenerState = state
         }
+        self.tellTheListenerThePlacement()
         // Registering the notification categories is not asking for
         // permission:  the permission prompt stays lazy, at the first event
         // that actually needs the person.
@@ -590,15 +616,102 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         }
     }
 
+    #if os(macOS)
+    /// Registers SwiftUI's `@Environment(\.openSettings)` action so every
+    /// programmatic Settings trigger opens the native macOS 14+ `Settings`
+    /// scene instead of relying on removed AppKit selectors.
+    public func registerSettingsSceneOpener(_ opener: @escaping () -> Void) {
+        settingsSceneOpener = opener
+    }
+    #endif
+
     /// Presents the app's Settings scene.
     public func presentSettingsScene() {
         #if os(macOS)
-        let settingsSelector = NSSelectorFromString("showSettingsWindow:")
-        if NSApp.sendAction(settingsSelector, to: nil, from: nil) { return }
-        let preferencesSelector = NSSelectorFromString("showPreferencesWindow:")
-        NSApp.sendAction(preferencesSelector, to: nil, from: nil)
+        NSApp.activate(ignoringOtherApps: true)
+        if let opener = settingsSceneOpener {
+            opener()
+            if Self.settingsWindowIsPresent {
+                Self.focusSettingsWindowIfPresent()
+                return
+            }
+            // SwiftUI presents the Settings scene asynchronously, so a
+            // window missing in this same runloop turn may still be on its
+            // way.  Verify on the next main-queue turn; only discard the
+            // opener and fall through to the AppKit fallbacks if the window
+            // is still absent then.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if Self.settingsWindowIsPresent {
+                    Self.focusSettingsWindowIfPresent()
+                } else {
+                    self.settingsSceneOpener = nil
+                    self.presentSettingsViaAppKitFallbacks()
+                }
+            }
+            return
+        }
+        presentSettingsViaAppKitFallbacks()
         #endif
     }
+
+    #if os(macOS)
+    private static var settingsWindowIsPresent: Bool {
+        NSApp.windows.contains { $0.identifier?.rawValue == "com_apple_SwiftUI_Settings_window" }
+    }
+
+    /// The AppKit fallback chain for presenting Settings when no SwiftUI
+    /// scene opener produced a window: the main-menu Settings item first,
+    /// then the legacy `showSettingsWindow:` / `showPreferencesWindow:`
+    /// selectors.
+    private func presentSettingsViaAppKitFallbacks() {
+        if Self.triggerMainMenuSettingsItem() {
+            Self.focusSettingsWindowIfPresent()
+            return
+        }
+        let settingsSelector = NSSelectorFromString("showSettingsWindow:")
+        if NSApp.sendAction(settingsSelector, to: nil, from: nil) {
+            Self.focusSettingsWindowIfPresent()
+            return
+        }
+        let preferencesSelector = NSSelectorFromString("showPreferencesWindow:")
+        _ = NSApp.sendAction(preferencesSelector, to: nil, from: nil)
+        Self.focusSettingsWindowIfPresent()
+    }
+    #endif
+
+    #if os(macOS)
+    private static func triggerMainMenuSettingsItem() -> Bool {
+        guard let appMenu = NSApp.mainMenu?.items.first?.submenu else {
+            return false
+        }
+        let relevantModifiers: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
+        guard let index = appMenu.items.firstIndex(where: { item in
+            item.isEnabled
+                && item.keyEquivalent == ","
+                && item.keyEquivalentModifierMask.intersection(relevantModifiers) == .command
+        }) else {
+            return false
+        }
+        appMenu.performActionForItem(at: index)
+        // Report success only when a Settings window actually opened; a
+        // menu item that handles the action without opening Settings must
+        // not suppress the selector fallbacks in the caller.
+        return Self.settingsWindowIsPresent
+    }
+
+    private static func focusSettingsWindowIfPresent() {
+        let focus = {
+            if let settingsWindow = NSApp.windows.first(where: { window in
+                window.identifier?.rawValue == "com_apple_SwiftUI_Settings_window"
+            }) {
+                settingsWindow.makeKeyAndOrderFront(nil)
+            }
+        }
+        focus()
+        DispatchQueue.main.async(execute: focus)
+    }
+    #endif
 
     /// Opens the app's Settings on the section that resolves a voice failure,
     /// and the system privacy pane when the failure needs one.
@@ -873,6 +986,20 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
                 connect: { self.connect(host: $0) }
             )
         }
+    }
+
+    /// Phones read which placement this Mac runs off its advertisement, so
+    /// the listener is told whenever the applied one changes. The selection a
+    /// session starts with is nobody's choice: it is the default until the
+    /// saved servers have been read, and that read publishes the real one.
+    private func tellTheListenerThePlacement() {
+        servers.$placement
+            .dropFirst()
+            .sink { [weak self] settings in
+                let mode = settings.applied.mode
+                Task { await self?.companionListener.setPlacement(mode) }
+            }
+            .store(in: &placementTelling)
     }
 
     /// Turns the native companion listener on or off from Settings.  The

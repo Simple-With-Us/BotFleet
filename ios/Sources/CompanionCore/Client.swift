@@ -38,6 +38,18 @@ public struct Connection: Codable, Hashable, Identifiable, Sendable {
     /// LAN or Bonjour origin for local pairing. Absent alongside a nil kind
     /// policy on connections saved before route consent existed.
     public var allowedLocalRouteURLs: Set<String>?
+    /// The last placement the paired Mac advertised. Nil until it says, on an
+    /// older Mac, and for a phone paired only with the server. It says which
+    /// side owns the work, and so whether the server's bridge leads the
+    /// route walk (`prefersBridge`).
+    public var placement: NativePlacementMode?
+    /// The phone's pairing with the server's companion bridge, held beside
+    /// this one. The bridge keeps its own device registry and shares no
+    /// secret with the Mac, so it is a pairing of its own: its own routes,
+    /// and its own token in the keychain under its own id. Nil until a
+    /// bridge invite is scanned. Read and write it through
+    /// `bridgeConnection`.
+    public var bridge: CompanionBridgePairing?
 
     public init(
         id: String = UUID().uuidString,
@@ -48,7 +60,9 @@ public struct Connection: Codable, Hashable, Identifiable, Sendable {
         activeEndpoint: CompanionEndpoint? = nil,
         endpoints: [CompanionEndpoint]? = nil,
         allowedRouteKinds: Set<CompanionEndpointKind>? = nil,
-        allowedLocalRouteURLs: Set<String>? = nil
+        allowedLocalRouteURLs: Set<String>? = nil,
+        placement: NativePlacementMode? = nil,
+        bridge: Connection? = nil
     ) {
         self.id = id
         self.name = name
@@ -59,6 +73,8 @@ public struct Connection: Codable, Hashable, Identifiable, Sendable {
         self.endpoints = endpoints
         self.allowedRouteKinds = allowedRouteKinds
         self.allowedLocalRouteURLs = allowedLocalRouteURLs
+        self.placement = placement
+        self.bridge = CompanionBridgePairing.holding(bridge)
     }
 
     /// The representation `URLComponents.host` accepts for a literal IPv6
@@ -181,6 +197,42 @@ public struct Connection: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
+/// A pairing held inside another one: the phone's pairing with the server's
+/// companion bridge, kept beside its pairing with the Mac. A struct cannot
+/// hold itself, not even optionally; an enum boxes its payload, so it can
+/// hold the struct. On disk it is the plain connection, with no wrapper.
+public indirect enum CompanionBridgePairing: Codable, Hashable, Sendable {
+    case paired(Connection)
+
+    /// `nil` for `nil`, and a pairing that holds no pairing of its own: the
+    /// server is the end of the line.
+    static func holding(_ connection: Connection?) -> CompanionBridgePairing? {
+        guard var connection else { return nil }
+        connection.bridge = nil
+        return .paired(connection)
+    }
+
+    /// The bridge pairing as the connection it is.
+    public var connection: Connection {
+        get {
+            switch self {
+            case let .paired(connection): return connection
+            }
+        }
+        set { self = .paired(newValue) }
+    }
+
+    public init(from decoder: Decoder) throws {
+        self = .paired(try Connection(from: decoder))
+        // Whatever was written under the server holds no server of its own.
+        connection.bridge = nil
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        try connection.encode(to: encoder)
+    }
+}
+
 /// A pairing window handed from the desktop to the app as a QR/deep link.
 /// It contains only the address and a short-lived, single-use credential.
 /// New desktop builds put a high-entropy token in the QR; older builds carry
@@ -189,10 +241,21 @@ public struct Connection: Codable, Hashable, Identifiable, Sendable {
 public struct PairingInvite: Equatable, Sendable {
     public let connection: Connection
     public let credential: String
+    /// Who the invite pairs the phone with. `.bridge` is the server's
+    /// companion bridge: a phone already paired with a Mac keeps that
+    /// pairing and adds the server beside it (`Connection.bridgeConnection`).
+    /// Any other invite is a computer, and replaces the pairing as before.
+    public let role: Role
 
-    public init(connection: Connection, credential: String) {
+    public enum Role: Equatable, Sendable {
+        case computer
+        case bridge
+    }
+
+    public init(connection: Connection, credential: String, role: Role = .computer) {
         self.connection = connection
         self.credential = credential
+        self.role = role
     }
 
     public static func parse(_ url: URL) -> PairingInvite? {
@@ -235,8 +298,16 @@ public struct PairingInvite: Equatable, Sendable {
             connection.endpoints = endpoints
             connection = connection.dialing(endpoints[0])
         }
+        // Absent is a computer. Anything present but the one word the Mac
+        // app writes for the server rejects the invite, as a bad route list
+        // does, rather than guessing who it pairs with.
+        if let role = values["role"], role != "bridge" { return nil }
         connection.establishRoutePolicyFromInvite()
-        return PairingInvite(connection: connection, credential: credential)
+        return PairingInvite(
+            connection: connection,
+            credential: credential,
+            role: values["role"] == nil ? .computer : .bridge
+        )
     }
 
     /// Unpadded base64url JSON keeps the typed array in one unambiguous query

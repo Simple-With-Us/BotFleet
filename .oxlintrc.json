@@ -26,6 +26,20 @@
       "specifier": "./tools/oxlint/anti-slop/index.ts"
     }
   ],
+  "env": {
+    "node": true
+  },
+  "overrides": [
+    {
+      "files": [
+        "**/*.mjs",
+        "**/*.cjs"
+      ],
+      "rules": {
+        "no-undef": "error"
+      }
+    }
+  ],
   "rules": {
     "anti-slop/no-chained-type-assertions": "warn",
     "anti-slop/no-conditional-empty-object-spread": "warn",

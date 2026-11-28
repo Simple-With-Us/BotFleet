@@ -41,7 +41,7 @@
     "test:process-inventory-receipt": "node --test scripts/emit-process-inventory-receipt.node-test.mjs",
     "test:mac-package-gate": "node --test scripts/mac-package-gate.node-test.mjs",
     "test:renovate-config": "node --test scripts/renovate-config.node-test.mjs",
-    "test:lint-gate": "node --test scripts/lint-pr-gate.node-test.mjs scripts/check-lint-baseline.node-test.mjs",
+    "test:lint-gate": "node --test scripts/lint-pr-gate.node-test.mjs scripts/check-lint-baseline.node-test.mjs scripts/lint-undefined-names.node-test.mjs",
     "test:e2e": "playwright test",
     "e2e:update": "playwright test --update-snapshots=changed",
     "test:tvface": "vitest run --config vitest.tvface.config.ts",

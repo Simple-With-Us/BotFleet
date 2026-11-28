@@ -72,6 +72,14 @@ final class Session: ObservableObject {
     @Published private(set) var notificationAuthorizationResolved = false
     /// A short-lived desktop handoff waiting for PairingView to present it.
     @Published private(set) var pairingInvite: PairingInvite?
+    /// A code the server opened, received while this phone is paired with a
+    /// Mac. It is offered rather than put through pairing, because pairing
+    /// with the server does not replace the Mac.
+    @Published private(set) var serverPairingOffer: PairingInvite?
+    /// The newest server code offered. Unlike the offer itself it outlives
+    /// the alert's closing, so a tap on an offer a newer one replaced can be
+    /// told apart, and ignored.
+    private var newestServerOffer: PairingInvite?
     @Published var config: ConfigStatus?
     /// Cached APNs sender health from the sidecar, surfaced as a Settings
     /// row so a closed-app wake problem is visible without opening a
@@ -134,6 +142,17 @@ final class Session: ObservableObject {
     /// dial moves to another stored host. The keychain remains the only place
     /// it is persisted.
     private var token: String?
+    /// The token of this phone's pairing with the server's bridge, when it
+    /// has one. Kept beside `token`, never in its place: a route of the Mac
+    /// sends `token`, a route of the server sends this one, and neither ever
+    /// travels to the other.
+    private var bridgeToken: String?
+    /// The Mac placement probe in flight, if any.
+    private var placementProbe: Task<Void, Never>?
+    /// True when the server's token could not be read because the keychain
+    /// was locked: read again each time the app comes to the front, until it
+    /// reads.
+    private var serverTokenUnread = false
     /// Which of the connection's stored hosts the next attempt dials. The
     /// walk advances on address-shaped failures and the winner is promoted —
     /// and persisted — when a stream goes live.
@@ -335,6 +354,27 @@ final class Session: ObservableObject {
             if ProcessInfo.processInfo.arguments.contains("-preview-off") {
                 seedOffPreview(&fleet)
             }
+            if ProcessInfo.processInfo.arguments.contains("-preview-server") {
+                // A phone paired with the server beside the Mac, under
+                // server-first, so Connection & Security has its Server
+                // section to show the screenshot harness.
+                var mac = Connection(name: "Preview Mac", host: "preview.tailnet.ts.net", port: 8810)
+                mac.placement = .serverFirst
+                if let route = CompanionEndpoint(url: "https://server.example.com", kind: .hosted, priority: 0) {
+                    mac.bridgeConnection = Connection(
+                        name: "BotFleet Server", host: route.host, port: route.port,
+                        activeEndpoint: route, endpoints: [route],
+                        allowedRouteKinds: [.hosted], allowedLocalRouteURLs: []
+                    )
+                }
+                connection = mac
+            }
+            if ProcessInfo.processInfo.arguments.contains("-preview-server-offer"),
+               // The offer a code from the Mac app's server card brings.
+               let url = URL(string: "botfleet-ios://pair?address=https://server.example.com&code=482913&role=bridge&name=BotFleet%20Server"),
+               let invite = PairingInvite.parse(url) {
+                serverPairingOffer = invite
+            }
             state.hydrate(fleet)
             // StorePreview bots all select instanceId "preview"; seed the
             // driver map so the chat-header provider mark appears in the
@@ -490,12 +530,16 @@ final class Session: ObservableObject {
         }.value
         guard generation == launchGeneration else { return }
         let tokenRead: CompanionLaunchTokenRead
+        var serverTokenRead: CompanionLaunchTokenRead = .missing
         if let saved {
             let connectionId = saved.connection.id
-            tokenRead = await Task.detached(priority: .userInitiated) { () -> CompanionLaunchTokenRead in
+            let serverId = saved.connection.bridgeConnection?.id
+            let reads = await Task.detached(priority: .userInitiated) { () -> (CompanionLaunchTokenRead, CompanionLaunchTokenRead) in
                 assert(!Thread.isMainThread)
-                return Self.readLaunchToken(connectionId)
+                return (Self.readLaunchToken(connectionId), serverId.map { Self.readLaunchToken($0) } ?? .missing)
             }.value
+            tokenRead = reads.0
+            serverTokenRead = reads.1
         } else {
             tokenRead = .missing
         }
@@ -510,7 +554,8 @@ final class Session: ObservableObject {
             )
         }
         applyLaunchDecision(
-            CompanionLaunchRestore.decide(saved: saved?.connection, token: tokenRead)
+            CompanionLaunchRestore.decide(saved: saved?.connection, token: tokenRead),
+            serverToken: serverTokenRead
         )
     }
 
@@ -527,7 +572,10 @@ final class Session: ObservableObject {
         }
     }
 
-    private func applyLaunchDecision(_ decision: CompanionLaunchRestoreDecision) {
+    private func applyLaunchDecision(
+        _ decision: CompanionLaunchRestoreDecision,
+        serverToken: CompanionLaunchTokenRead = .missing
+    ) {
         launchRestoreDecision = decision
         switch decision {
         case .unpaired:
@@ -543,12 +591,28 @@ final class Session: ObservableObject {
         case .connect(let saved, let stored):
             connection = saved
             token = stored
+            switch serverToken {
+            case let .token(server):
+                bridgeToken = server
+            case .missing:
+                // A server pairing whose token is gone from the keychain
+                // cannot be dialed, so it is not kept: the Mac's pairing is
+                // what restores.
+                bridgeToken = nil
+                if saved.bridgeConnection != nil { dropServerPairing() }
+            case .unavailable:
+                // The keychain was locked for that read. The pairing stays,
+                // and the token is read again when the app next comes to the
+                // front.
+                bridgeToken = nil
+                serverTokenUnread = saved.bridgeConnection != nil
+            }
             // New connections honor the desktop's transport policy.  Automatic
             // walking is credential-safe: protected routes stay protected, while
             // a legacy/local route is only tried when it was the exact saved route.
-            rotation = CandidateRotation(endpoints: saved.orderedEndpoints)
-            let first = rotation.currentEndpoint.map(saved.dialing) ?? saved
-            client = CompanionClient(connection: first, token: stored)
+            // The server's routes lead it when the Mac runs server-first.
+            adoptWalk()
+            if client == nil, let connection { client = CompanionClient(connection: connection, token: stored) }
             pairingGeneration += 1
             cancelPendingSettingsMutations()
             cachedInstances = []
@@ -597,7 +661,8 @@ final class Session: ObservableObject {
         with connection: Connection,
         credential: String,
         deviceName: String,
-        pairRequestId: String
+        pairRequestId: String,
+        role: PairingInvite.Role = .computer
     ) async throws {
         cancelLaunchRestore()
         var invited = connection
@@ -628,6 +693,14 @@ final class Session: ObservableObject {
         if let winner { stored.promote(winner) }
         if stored.endpoints?.isEmpty != false {
             stored.hosts = Array(stored.orderedHosts.prefix(8))
+        }
+
+        // A code the server opened pairs this phone with the server beside
+        // the Mac it is already paired with. The Mac's pairing stays.
+        if role == .bridge, self.connection != nil {
+            stored.bridge = nil
+            try adoptServerPairing(stored, token: paired.token)
+            return
         }
 
         try Keychain.save(paired.token, for: stored.id)
@@ -683,15 +756,28 @@ final class Session: ObservableObject {
     }
 
     func receivePairingURL(_ url: URL) {
-        guard CompanionPairingInvitePolicy.allowsIncomingInvite(
-            hasConnection: connection != nil,
-            pairingStateIsUnpaired: status == .unpaired
-        ) else {
-            actionError = "This phone is already paired. Unpair it in Settings before connecting it to another computer."
+        let invite = PairingInvite.parse(url)
+        // Anything but the server's code still replaces the pairing, so a
+        // phone that is paired refuses it as ever.
+        if invite?.role != .bridge {
+            guard CompanionPairingInvitePolicy.allowsIncomingInvite(
+                hasConnection: connection != nil,
+                pairingStateIsUnpaired: status == .unpaired
+            ) else {
+                actionError = "This phone is already paired. Unpair it in Settings before connecting it to another computer."
+                return
+            }
+        }
+        guard let invite else {
+            actionError = "That pairing invitation is not valid. Start pairing again on your computer."
             return
         }
-        guard let invite = PairingInvite.parse(url) else {
-            actionError = "That pairing invitation is not valid. Start pairing again on your computer."
+        // The server's code pairs the phone with the server beside the Mac
+        // it has, so it is offered rather than refused. Unpaired, or with a
+        // pairing the Mac has revoked, it is simply the first pairing.
+        if invite.role == .bridge, connection != nil, status != .unauthorized {
+            serverPairingOffer = invite
+            newestServerOffer = invite
             return
         }
         pairingInvite = CompanionPairingInvitePolicy.nextInvite(
@@ -726,6 +812,13 @@ final class Session: ObservableObject {
             after: .signedOut
         )
         if let id = connection?.id { Keychain.remove(id) }
+        if let server = connection?.bridgeConnection { Keychain.remove(server.id) }
+        bridgeToken = nil
+        serverTokenUnread = false
+        serverPairingOffer = nil
+        newestServerOffer = nil
+        placementProbe?.cancel()
+        placementProbe = nil
         CompanionConnectionStore.saveConnectionData(nil)
         UserDefaults.standard.removeObject(
             forKey: CompanionOnboardingPreferences.pendingNotificationOnboardingKey
@@ -773,6 +866,7 @@ final class Session: ObservableObject {
         }
         // back before the grace period ran out: keep the stream, drop the task
         endLinger()
+        readTheServersTokenAgain()
         guard client != nil else { return }
         if let existing = streamTask {
             if case .offline = status {
@@ -1095,6 +1189,16 @@ final class Session: ObservableObject {
                 log.notice("stream ended without an error")
                 offlineMessage = "Lost the connection."
             } catch let error as APIError where error.isUnauthorized {
+                // A refusal on a server route is the server's pairing gone,
+                // and says nothing about the Mac's: that pairing is dropped
+                // and the walk goes on. From the Mac it is the whole pairing.
+                if let failed = rotation.currentEndpoint,
+                   connection?.isBridgeRoute(failed) == true, connection?.bridgeConnection != nil {
+                    log.notice("server pairing refused: unauthorized, dropping it")
+                    dropServerPairing()
+                    adoptWalk()
+                    continue
+                }
                 log.error("stream refused: unauthorized")
                 status = .unauthorized
                 return
@@ -1154,6 +1258,186 @@ final class Session: ObservableObject {
 
     // MARK: - Which address to dial
 
+    /// The client for one route of the walk: the pairing that owns the route
+    /// and the token that belongs to that pairing and to nothing else. Nil
+    /// when that token is not in hand.
+    private func makeClient(dialing candidate: CompanionEndpoint) -> CompanionClient? {
+        guard let connection else { return nil }
+        guard let routeToken = connection.isBridgeRoute(candidate) ? bridgeToken : token else { return nil }
+        return CompanionClient(connection: connection.dialing(candidate), token: routeToken)
+    }
+
+    /// Starts the walk again from its first route, which is the server's
+    /// when the Mac runs `serverFirst` and this phone is paired with one.
+    private func adoptWalk() {
+        guard let connection else { return }
+        let walk = connection.syncEndpoints
+        // The walk starts at its first route whose token is in hand. Under
+        // serverFirst with the server's token still unread that is the Mac's,
+        // and the server's routes follow it rather than lead.
+        let dialable = walk.firstIndex { makeClient(dialing: $0) != nil }
+        let ordered = dialable.map { index in
+            [walk[index]] + walk.enumerated().filter { $0.offset != index }.map(\.element)
+        } ?? walk
+        rotation = CandidateRotation(endpoints: ordered)
+        if let first = rotation.currentEndpoint, let made = makeClient(dialing: first) {
+            client = made
+        }
+    }
+
+    /// Forgets the pairing with the server and its token. The Mac's pairing
+    /// is untouched. The walk and the client are the caller's to rebuild.
+    private func dropServerPairing() {
+        guard var mac = connection, let server = mac.bridgeConnection else { return }
+        Keychain.remove(server.id)
+        bridgeToken = nil
+        mac.bridgeConnection = nil
+        connection = mac
+        CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(mac))
+    }
+
+    /// Holds a fresh pairing with the server's bridge beside the Mac's. The
+    /// walk follows the server from now on when the Mac runs `serverFirst`.
+    private func adoptServerPairing(_ server: Connection, token: String) throws {
+        guard var mac = connection else { return }
+        try Keychain.save(token, for: server.id)
+        bridgeToken = token
+        mac.bridgeConnection = server
+        connection = mac
+        CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(mac))
+        pairingInvite = CompanionPairingInvitePolicy.nextInvite(
+            current: pairingInvite,
+            after: .pairingSucceeded
+        )
+        // The walk starts again from its first route, which is the server's
+        // when the Mac runs server-first. A stream that moves to the server
+        // cannot resume the Mac's cursor: that costs one hydrate, as a
+        // restart does.
+        newestServerOffer = nil
+        adoptWalk()
+        restartStream()
+        connect()
+    }
+
+    /// Pairs with the server whose code was offered. The Mac's pairing stays.
+    /// Takes the offer itself and not the session's copy of it, which the
+    /// alert that asked clears as it closes.
+    func pairWithOfferedServer(_ offer: PairingInvite) async {
+        // A tap on an offer a newer one replaced is ignored; the newer one is
+        // still offered.
+        guard offer == newestServerOffer else { return }
+        if serverPairingOffer == offer { serverPairingOffer = nil }
+        do {
+            try await pair(
+                with: offer.connection,
+                credential: offer.credential,
+                deviceName: PairingView.deviceName(),
+                pairRequestId: UUID().uuidString,
+                role: .bridge
+            )
+        } catch {
+            actionError = "\(error.localizedDescription)\u{00A0} Open BotFleet → Settings → Phone on your Mac and scan the server's code again."
+        }
+    }
+
+    /// Reads the server's token again when the keychain was locked for it,
+    /// off the main thread as at launch.
+    private func readTheServersTokenAgain() {
+        guard serverTokenUnread, let id = connection?.bridgeConnection?.id else { return }
+        Task { [weak self] in
+            let read = await Task.detached(priority: .userInitiated) { () -> CompanionLaunchTokenRead in
+                assert(!Thread.isMainThread)
+                return Self.readLaunchToken(id)
+            }.value
+            // The pairing can change while the keychain answers: a sign-out,
+            // a removal or a new pairing. A read of another pairing is dropped.
+            guard let self, self.connection?.bridgeConnection?.id == id else { return }
+            self.adoptServerToken(read)
+        }
+    }
+
+    private func adoptServerToken(_ read: CompanionLaunchTokenRead) {
+        switch read {
+        case let .token(server):
+            serverTokenUnread = false
+            bridgeToken = server
+            // Under server-first the server leads from now on, so the stream
+            // moves to it.
+            guard connection?.prefersBridge == true else { return }
+            adoptWalk()
+            restartStream()
+            connect()
+        case .missing:
+            serverTokenUnread = false
+            let onServer = rotation.currentEndpoint.map { connection?.isBridgeRoute($0) == true } == true
+            dropServerPairing()
+            adoptWalk()
+            // A stream that was on the server's route moves at once; one on
+            // the Mac's, which is the usual case with no token in hand, goes on.
+            if onServer {
+                restartStream()
+                connect()
+            }
+        case .unavailable:
+            // Still locked: tried again the next time the app comes forward.
+            break
+        }
+    }
+
+    /// Asks the Mac, once per reconnect, which placement it runs while the
+    /// phone is following the server. A Mac that changed its mode would
+    /// otherwise not be heard until its route failed. A Mac that is asleep
+    /// does not answer, and the mode last heard stands.
+    private func askTheMacItsPlacement() {
+        guard let mac = connection, let token, let route = mac.orderedEndpoints.first else { return }
+        let asking = CompanionClient(connection: mac.dialing(route), token: token)
+        let askedFor = mac.id
+        // One ask at a time: a reconnect cancels the one before it, so a slow
+        // answer never lands over a newer one.
+        placementProbe?.cancel()
+        placementProbe = Task { [weak self] in
+            guard let metadata = try? await asking.connectionMetadata() else { return }
+            self?.heardTheMacsPlacement(metadata, askedFor: askedFor)
+        }
+    }
+
+    private func heardTheMacsPlacement(_ metadata: CompanionConnectionMetadata, askedFor: String) {
+        // The pairing can change while the Mac answers. An answer about
+        // another pairing is dropped, and so is one that says what is already
+        // known, so nothing moves unless the mode did.
+        guard var updated = connection, updated.id == askedFor, let placement = metadata.placement,
+              placement != updated.placement else { return }
+        let followed = updated.prefersBridge
+        updated.reconcile(metadata)
+        connection = updated
+        CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
+        // Whether the server leads changed, so the stream moves at once.
+        guard updated.prefersBridge != followed else { return }
+        adoptWalk()
+        restartStream()
+        connect()
+    }
+
+    /// Declines the server's code. Nothing is paired.
+    func declineServerPairing() {
+        serverPairingOffer = nil
+    }
+
+    /// Forgets the pairing with the server, and its token. The Mac's pairing
+    /// is untouched, and the walk goes back to the Mac's routes.
+    func forgetServerPairing() {
+        dropServerPairing()
+        adoptWalk()
+        restartStream()
+        connect()
+    }
+
+    /// Whether this phone would follow a server if it were paired with one:
+    /// the Mac has said it runs `serverFirst`, and no server is paired.
+    var suggestsServerPairing: Bool {
+        connection?.placement == .serverFirst && connection?.bridgeConnection == nil
+    }
+
     /// Turn a stream failure into advice a person can act on — and, when the
     /// failure is about the address rather than the pairing, move the dial to
     /// the next stored host so the retry that follows tries somewhere new.
@@ -1164,8 +1448,8 @@ final class Session: ObservableObject {
         let failed = rotation.currentEndpoint ?? connection.activeEndpoint ??
             CompanionEndpoint.direct(host: connection.host, port: connection.port, priority: 10_000)
         var next: String?
-        if let candidate = rotation.advanceEndpoint(after: error), let token {
-            client = CompanionClient(connection: connection.dialing(candidate), token: token)
+        if let candidate = rotation.advanceEndpoint(after: error), let rebuilt = makeClient(dialing: candidate) {
+            client = rebuilt
             next = candidate.displayAddress
             log.info("advancing to companion route \(candidate.url, privacy: .public)")
         }
@@ -1192,9 +1476,15 @@ final class Session: ObservableObject {
     /// Persist the route that carried a live stream. Legacy host lists promote
     /// it for the next launch; typed lists keep their explicit policy order.
     private func rememberWorkingRoute() {
-        guard let winner = rotation.currentEndpoint, var updated = connection,
-              updated.activeEndpoint?.url != winner.url else { return }
-        updated.promote(winner)
+        guard let winner = rotation.currentEndpoint, var updated = connection else { return }
+        if updated.isBridgeRoute(winner) {
+            guard var server = updated.bridgeConnection, server.activeEndpoint?.url != winner.url else { return }
+            server.promote(winner)
+            updated.bridgeConnection = server
+        } else {
+            guard updated.activeEndpoint?.url != winner.url else { return }
+            updated.promote(winner)
+        }
         connection = updated
         CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
     }
@@ -1218,7 +1508,15 @@ final class Session: ObservableObject {
                       var updated = self.connection
                 else { return }
 
-                updated.reconcile(metadata)
+                // The answer belongs to the pairing that gave it: the Mac
+                // says its placement and its routes, the server its routes.
+                if let server = updated.bridgeConnection, server.id == sourceClient.connection.id {
+                    var refreshed = server
+                    refreshed.reconcile(metadata)
+                    updated.bridgeConnection = refreshed
+                } else {
+                    updated.reconcile(metadata)
+                }
                 self.connection = updated
                 CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
 
@@ -1227,9 +1525,14 @@ final class Session: ObservableObject {
                 // by pairing, while the saved connection uses advertised
                 // security priorities on the next launch.
                 let liveRoutes = workingEndpoint.map { route in
-                    [route] + updated.orderedEndpoints.filter { $0.url != route.url }
-                } ?? updated.orderedEndpoints
+                    [route] + updated.syncEndpoints.filter { $0.url != route.url }
+                } ?? updated.syncEndpoints
                 self.rotation = CandidateRotation(endpoints: liveRoutes)
+                // While the phone follows the server, the Mac is asked once
+                // which placement it runs: the server's answer never says.
+                if let workingEndpoint, updated.isBridgeRoute(workingEndpoint) {
+                    self.askTheMacItsPlacement()
+                }
                 log.info("refreshed \(metadata.endpoints.count, privacy: .public) companion routes")
             } catch is CancellationError {
                 return
@@ -1249,12 +1552,24 @@ final class Session: ObservableObject {
             port: parsed.port,
             priority: 0
         ) else { return false }
-        updated.resetRoutePolicy(selecting: endpoint)
+        if updated.isBridgeRoute(endpoint), var server = updated.bridgeConnection {
+            // The typed address is the server's own: it moves the server's
+            // route, and the Mac's pairing, routes and token stay out of it.
+            server.resetRoutePolicy(selecting: endpoint)
+            updated.bridgeConnection = server
+        } else {
+            updated.resetRoutePolicy(selecting: endpoint)
+        }
         connection = updated
         CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
-        rotation = CandidateRotation(endpoints: updated.orderedEndpoints)
-        if let token {
-            client = CompanionClient(connection: updated.dialing(endpoint), token: token)
+        // The typed route is dialed with the token of its own pairing. A
+        // route whose token is not in hand is not dialed: the walk then
+        // starts at its first route that has one, and the client follows it.
+        if makeClient(dialing: endpoint) != nil {
+            rotation = CandidateRotation(endpoints: [endpoint] + updated.syncEndpoints.filter { $0.url != endpoint.url })
+            client = makeClient(dialing: endpoint)
+        } else {
+            adoptWalk()
         }
         // Dial the new address now rather than on the next backoff tick —
         // someone who just typed an address is watching the banner.

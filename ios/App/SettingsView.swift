@@ -784,6 +784,7 @@ struct ConnectionSecurityView: View {
     @State private var showingFullAddress = false
     @State private var copiedAddress = false
     @State private var refreshing = false
+    @State private var confirmingServerRemoval = false
 
     var body: some View {
         Form {
@@ -841,6 +842,27 @@ struct ConnectionSecurityView: View {
                     Button("Edit address") {
                         addressText = connection.displayAddress
                         editingAddress = true
+                    }
+                }
+
+                Section("Server") {
+                    if let server = connection.bridgeConnection {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(server.name)
+                                .font(.headline)
+                            Text(connection.prefersBridge
+                                 ? "This iPhone follows the server and falls back to \(connection.name) when the server does not answer."
+                                 : "Paired, and waiting: \(connection.name) is not running server-first.")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        Button("Remove server pairing from this iPhone", role: .destructive) {
+                            confirmingServerRemoval = true
+                        }
+                    } else {
+                        Text("Pair with the server too, from BotFleet → Settings → Phone on the Mac.\u{00A0} This iPhone then follows it whenever \(connection.name) runs server-first.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
                     }
                 }
 
@@ -903,6 +925,18 @@ struct ConnectionSecurityView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This removes the connection from this iPhone only. It does not revoke this phone on your Mac. To remove Mac-side access, open BotFleet → Settings → Phone and remove this device.")
+        }
+        .confirmationDialog(
+            "Remove the server pairing?",
+            isPresented: $confirmingServerRemoval,
+            titleVisibility: .visible
+        ) {
+            Button("Remove from this iPhone", role: .destructive) {
+                session.forgetServerPairing()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes the server from this iPhone only, and your Mac pairing stays.\u{00A0} The server keeps this phone listed until you remove it there.")
         }
     }
 

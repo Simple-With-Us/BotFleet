@@ -21,6 +21,12 @@ Pairing windows, the device registry, and the advertisement are
 bridge-local; no secret is shared with the Mac. The phone holds both
 advertisements and prefers the bridge whenever placement is `serverFirst`.
 
+## Amendment (2026-11-27): The Bridge Speaks The Shipped App's Contract
+
+- The route table below was locked against routes the shipped iOS app does not call: the app probes `GET /api/health`, pairs at `POST /api/pair` and syncs on the Mac sidecar's own allowlist, none of which the table served.
+- The bridge now serves that contract, and `deploy/linux-server/README.md`, "The Contract With The Phone", is the current description of it.
+- The table below stays as the record of the Nov 22 decision and is no longer what the bridge serves.
+
 ## Route table
 
 Served locally (own registry): `GET /api/companion/endpoints`,

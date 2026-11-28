@@ -909,11 +909,24 @@ public struct URLSessionLinearGraphQLTransport: LinearGraphQLTransport {
 /// Swift GraphQL actor for Linear issue state synchronization (`claim`, `status`, `comment`).
 /// Enforces seat identity (`AGENT_SEAT`), formats `[SEAT·session]` tags, and deduplicates mutations via idempotency keys.
 public actor LinearSyncClient {
+    /// Receipts a host keeps for completed mutations.  A replay inside this
+    /// window returns its receipt without a second mutation; the oldest
+    /// receipt leaves when a new one arrives past the window, so a host that
+    /// runs for weeks holds a bounded number of them.  The size is the plugin
+    /// event ledger's ring on the server (`SEEN_RING_LIMIT`).
+    public static let defaultReceiptCapacity = 1_000
+
     public let seat: String
     public let sessionId: String
     private let apiKey: String
     private let transport: LinearGraphQLTransport
     private var completedByIdempotencyKey: [String: LinearSyncReceipt] = [:]
+    /// The keys of `completedByIdempotencyKey` in the order they completed,
+    /// oldest first.  Keys before `completedKeyOrderHead` were evicted and
+    /// only wait for the array to be compacted.
+    private var completedKeyOrder: [String] = []
+    private var completedKeyOrderHead = 0
+    private let receiptCapacity: Int
     /// Keys whose mutation is in flight.  A second caller that arrives before
     /// the first one finishes must not send the mutation again: the receipt
     /// cache is only written after the await, so without this set two
@@ -927,7 +940,8 @@ public actor LinearSyncClient {
         seat: String,
         sessionId: String,
         apiKey: String,
-        transport: LinearGraphQLTransport? = nil
+        transport: LinearGraphQLTransport? = nil,
+        receiptCapacity: Int = LinearSyncClient.defaultReceiptCapacity
     ) throws {
         let cleanSeat = seat.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         guard !cleanSeat.isEmpty else {
@@ -944,6 +958,7 @@ public actor LinearSyncClient {
         self.seat = cleanSeat
         self.sessionId = cleanSession
         self.apiKey = apiKey
+        self.receiptCapacity = max(1, receiptCapacity)
         if let transport {
             self.transport = transport
         } else {
@@ -954,6 +969,9 @@ public actor LinearSyncClient {
     public nonisolated var sessionTag: String {
         "[\(seat)·\(sessionId)]"
     }
+
+    /// Receipts held for completed mutations, never more than the capacity.
+    public var retainedReceiptCount: Int { completedByIdempotencyKey.count }
 
     /// A stable digest for an idempotency key.  `hashValue` is seeded per
     /// process, so the same comment would get a different key after a restart
@@ -1010,7 +1028,7 @@ public actor LinearSyncClient {
             idempotencyKey: key,
             stateOrBody: formattedNote
         )
-        completedByIdempotencyKey[key] = receipt
+        recordCompletion(receipt, forKey: key)
         return receipt
     }
 
@@ -1059,7 +1077,7 @@ public actor LinearSyncClient {
             idempotencyKey: key,
             stateOrBody: summary
         )
-        completedByIdempotencyKey[key] = receipt
+        recordCompletion(receipt, forKey: key)
         return receipt
     }
 
@@ -1107,7 +1125,7 @@ public actor LinearSyncClient {
             idempotencyKey: key,
             stateOrBody: taggedBody
         )
-        completedByIdempotencyKey[key] = receipt
+        recordCompletion(receipt, forKey: key)
         return receipt
     }
 
@@ -1125,6 +1143,25 @@ public actor LinearSyncClient {
         } catch {
             workflowStateIdsByName.removeValue(forKey: stateName)
             throw error
+        }
+    }
+
+    /// Records a completed mutation and, once the window is full, lets the
+    /// oldest receipt go.  A key that returns after it was evicted is a new
+    /// completion and goes to the back of the order again.
+    private func recordCompletion(_ receipt: LinearSyncReceipt, forKey key: String) {
+        if completedByIdempotencyKey.updateValue(receipt, forKey: key) == nil {
+            completedKeyOrder.append(key)
+        }
+        while completedKeyOrder.count - completedKeyOrderHead > receiptCapacity {
+            completedByIdempotencyKey.removeValue(forKey: completedKeyOrder[completedKeyOrderHead])
+            completedKeyOrderHead += 1
+        }
+        // Evicted keys stay in the array until it is compacted, so the array
+        // does not grow with a host's whole life.
+        if completedKeyOrderHead >= 4_096 && completedKeyOrderHead * 2 >= completedKeyOrder.count {
+            completedKeyOrder.removeFirst(completedKeyOrderHead)
+            completedKeyOrderHead = 0
         }
     }
 

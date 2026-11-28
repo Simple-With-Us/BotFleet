@@ -363,6 +363,19 @@ final class ServersCoordinatorTests: XCTestCase {
         XCTAssertEqual(model.placement, PlacementSettings())
         XCTAssertFalse(model.isLoaded)
         XCTAssertNotNil(model.errorMessage)
+        XCTAssertNil(model.enrolledServerIDs, "a list that was not read does not say that no server is enrolled")
+    }
+    func testTheEnrolledServerIDsNameOtherServersOnlyOnceTheListWasRead() async throws {
+        let store = FixtureHosts(), tokens = FixtureTokens(), result = verified
+        let server = HostRecord(name: "Fixture", origin: try HostOrigin("https://fixture.test"))
+        try await store.upsert(server)
+        let model = ServersCoordinator(store: store, tokens: tokens, handshake: { _, _ in result })
+        XCTAssertNil(model.enrolledServerIDs)
+        await model.load()
+        XCTAssertEqual(model.enrolledServerIDs, [server.id], "this Mac is not a server to pair with")
+        let removed = await model.remove(server)
+        XCTAssertTrue(removed)
+        XCTAssertEqual(model.enrolledServerIDs, [], "a list that was read, and holds no server, says so")
     }
     func testWireVersionUsesSharedFixtureAndServersDeepLinks() throws {
         let url = try XCTUnwrap(Bundle.module.url(forResource: "placement-wire-version", withExtension: "json", subdirectory: "Fixtures"))

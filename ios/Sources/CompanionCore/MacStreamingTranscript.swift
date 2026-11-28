@@ -95,8 +95,15 @@ public final class MacTranscriptEngine: @unchecked Sendable {
     public private(set) var settledMessagesReparsedOnLastDelta: Int = 0
     public private(set) var blocksParsedOnLastDelta: Int = 0
     public private(set) var lastDeltaParseDurationMs: Double = 0.0
+    /// Settled messages parsed from their text because the cache had nothing
+    /// for them.  A message served from the cache does not move it.
+    public private(set) var settledMessagesParsed: Int = 0
+    /// Settled messages whose rendered blocks are held right now.
+    public var cachedSettledMessageCount: Int { settledBlockCache.count }
 
     /// Cached rendered blocks for settled messages that have entered the viewport.
+    /// It follows the roster: a message that leaves the roster takes its entry
+    /// with it, so a long session does not keep every message it ever showed.
     private var settledBlockCache: [String: [MacRenderedMarkdownBlock]] = [:]
     /// The text each cached block list was parsed from.  A message patched
     /// under the same id carries new text, and the cache must notice that or
@@ -113,9 +120,17 @@ public final class MacTranscriptEngine: @unchecked Sendable {
     public init() {}
 
     /// Registers or updates the settled message roster without eagerly parsing
-    /// off-screen messages.
+    /// off-screen messages.  A message no longer on the roster loses its cached
+    /// blocks, its cached text and its measured height.
     public func setSettledMessages(_ messages: [Message]) {
         settledMessageCount = messages.count
+        guard !settledBlockCache.isEmpty || !settledBlockText.isEmpty || !measuredHeights.isEmpty else {
+            return
+        }
+        let roster = Set(messages.map(\.id))
+        settledBlockCache = settledBlockCache.filter { roster.contains($0.key) }
+        settledBlockText = settledBlockText.filter { roster.contains($0.key) }
+        measuredHeights = measuredHeights.filter { roster.contains($0.key) }
     }
 
     /// Returns cached rendered blocks for a settled message, parsing on first
@@ -132,6 +147,7 @@ public final class MacTranscriptEngine: @unchecked Sendable {
         let parsed = Markdown.blocks(raw).enumerated().map { idx, blk in
             MacRenderedMarkdownBlock(id: idx, block: blk, isStreamingTail: false)
         }
+        settledMessagesParsed += 1
         settledBlockCache[message.id] = parsed
         settledBlockText[message.id] = raw
         return parsed
@@ -216,9 +232,16 @@ public final class MacTranscriptEngine: @unchecked Sendable {
     }
 
     /// Commits and clears the active streaming state when the message settles.
+    /// The blocks it streamed become the message's cached settled blocks, with
+    /// the text they were parsed from, so the settled transcript is served
+    /// from the cache instead of parsing the whole message a second time.
+    /// Nothing is streaming any more, so no block keeps the streaming tail.
     public func finishStreaming(messageId: String) {
         if activeStreamingMessageId == messageId {
-            settledBlockCache[messageId] = activeStreamingBlocks
+            settledBlockCache[messageId] = activeStreamingBlocks.map { streamed in
+                MacRenderedMarkdownBlock(id: streamed.id, block: streamed.block, isStreamingTail: false)
+            }
+            settledBlockText[messageId] = activeStreamingText
             activeStreamingMessageId = nil
             activeStreamingText = ""
             activeStreamingBlocks = []

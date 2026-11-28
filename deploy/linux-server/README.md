@@ -38,6 +38,7 @@ The harness binds loopback and treats every loopback caller as the owner.  That 
 - `tailscale serve` is tailnet only.  Never enable Funnel: Funnel is public and adds no identity header, which would leave the gate with no owner check at all.
 - No port is exposed to the public internet, and nothing listens on a routable address.
 - The unit templates configure ordinary root paths read-only and put application data and literal temporary paths on the volume.  `/run`, `/dev/shm` and live namespace behavior still need recipe 12's write attempts; configuration text alone proves no isolation.  Private volume propagation keeps the volume busy until both services stop.
+- The companion bridge is one more hop behind the same gate: when Infisical names the bridge's advertised origin, the gate answers five paths under `/api/companion/bridge/` by passing them to the bridge on loopback, with the owner credential and nothing else about the caller.
 - Any local process on the host can still reach `127.0.0.1:8799` directly, the same as on the Mac today.  Only trusted users should have shell access on the host, and every bot shell runs as the service user.
 
 ## Where The Configuration Lives
@@ -51,6 +52,7 @@ The gate reads the **BotFleet** project (`836aebe2-c8f7-4e09-978e-7e3e82500bce`)
 | `BOTFLEET_SERVER_GATE_TOKEN` | secret | The desktop gate token.  The gate hashes it in memory and keeps only the sha256, so a leaked configuration cannot be replayed as a credential. |
 | `BOTFLEET_OWNER_LOGINS` | config | Comma-separated Tailscale logins on the owner allowlist. |
 | `BOTFLEET_PUBLIC_ORIGIN` | config | The only browser `Origin` the gate accepts. |
+| `BOTFLEET_COMPANION_BRIDGE_ORIGIN` | config | Optional. When it is set, this host has a companion bridge and the gate answers the `/api/companion/bridge/` prefix for the desktop app. The gate keeps only that fact; the bridge reads the origin itself. |
 
 At least one of `BOTFLEET_OWNER_LOGINS` and `BOTFLEET_SERVER_GATE_TOKEN` has to be there: without an owner credential the gate refuses to start rather than wave every request through to the harness.
 
@@ -209,6 +211,35 @@ tailscale serve --bg --https=8800 http://127.0.0.1:8797
 
 Tailscale Serve stays inside the tailnet.  Never enable Funnel:  Funnel is public and adds no identity header, which would leave the bridge without an owner check at all.  The bridge takes its own https port, so publishing it never disturbs the harness's route.
 
+### The Contract With The Phone
+
+The bridge speaks the shipped iOS app's own contract, so no new phone build is needed to pair with it:
+
+- Before pairing, the app probes `GET /api/health` and then redeems a code or QR token at `POST /api/pair`; both sit behind the owner credential, and neither asks for a device credential.
+- `POST /api/pair` runs the same window logic as `POST /api/companion/pairing/redeem`: one spend, an attempt budget and a replay for the same request id, answering `201` with the body the app decodes as `PairResponse`.
+- After pairing, the app syncs through the harness routes the Mac companion sidecar allows a paired phone (`companion/src/routes.ts`), which `companion-bridge.mjs` copies pattern for pattern.
+- Five sidecar rows are not forwarded: the three companion routes the bridge answers itself, `POST /api/bots/:id/computer/join`, which needs a per-device grant the bridge does not have, and the two update actions `POST /api/update/check` and `POST /api/update/run`, whose purpose is to stop and replace the harness.
+- On the phone's behalf the bridge does what the sidecar does: it checks the two `PATCH` bodies that reach broader harness routes against the sidecar's field lists, and withholds `resumeCursors` and `sshAlias` from JSON and event-stream responses.
+- The advertisement (`GET /api/companion/endpoints`, and `endpoints` in the pairing answer) carries the bridge's own route: `BOTFLEET_COMPANION_BRIDGE_ORIGIN` from Infisical when it is set, else the route the request arrived on, read from the forwarding headers a proxy in front of the bridge sets.
+- Both answers say `isBridge: true`. A computer never sends it. A phone that reads it knows the pairing belongs beside its Mac pairing rather than in its place, which is what lets it follow the server when the Mac says it runs `serverFirst`, and fall back to the Mac when the server does not answer (BF-2714).
+
+`BOTFLEET_COMPANION_BRIDGE_ORIGIN` is optional config in the same Infisical folder as the gate's names (BotFleet, prod, `/botfleet-server`):
+
+- One absolute `http` or `https` origin, or a comma-separated list with the preferred one first, with no path, credentials, query or fragment.
+- A value that is present and unusable stops the bridge at start, naming the Infisical name and the rule it broke and never the value.
+- The owner gate reads the same name for one fact, whether this host has a bridge at all, and never for the value.
+
+### Setting A Phone Up From The Mac App
+
+The Mac app's gate credential is bound to the one origin it enrolled on, so the app never talks to the bridge's own route.   When `BOTFLEET_COMPANION_BRIDGE_ORIGIN` is set, the owner gate answers five paths on the server's origin by passing them to the bridge on loopback, and the Mac app's Settings → Phone tab shows the server's code, QR, phones and routes beside the Mac's own (`ServerBridgePairingBackend`).
+
+- The five paths sit under `/api/companion/bridge/`: `GET endpoints`, `POST pairing/open`, `POST pairing/close`, `GET devices` and `DELETE devices/<id>`.
+- The owner credential crosses this hop on purpose, and nothing else about the caller does: the bridge makes the same owner decision again on its own listener.
+- Any other path under that prefix is refused at the gate with `404`, so the bridge's other owner-only routes are never reached through it.
+- On a server where the origin is not set the gate does not answer the prefix, and the Mac app reports that the server has no phone pairing.
+- A bridge that is not answering is a `502` from the gate, and the harness is reached as before.
+- `POST pairing/close` forgets the bridge's open window whole, code and QR credential alike; a close the bridge's durable state cannot hold is answered `503` and the window stays open.
+
 ### What It Holds
 
 The bridge owns its own pairing window, its own device registry and its own advertisement; no secret is shared with the Mac.  The registry holds digests only: a redeemed credential is shown to the phone once and kept as its sha256, compared with a timing-safe comparison, and a malformed entry is skipped rather than trusted.  A revoked device keeps its row, so a replayed pairing cannot mint a fresh credential for it.
@@ -232,6 +263,8 @@ node --test deploy/linux-server/companion-bridge-server.node-test.mjs
 ```
 
 That covers the owner credential, the default-deny route table, the pairing window and its spend and replay, the digest-only registry, the byte-for-byte proxying and the APNs locus.  The real-phone end-to-end run is BF-2652, and it needs a physical iPhone and an owner-authorized route; neither is done by the bridge.
+
+`node --test deploy/linux-server/companion-bridge.node-test.mjs` holds the forwarded list to the sidecar's, pattern for pattern, and names every sidecar row the bridge does not forward.
 
 ### What The Bridge Does Not Do
 

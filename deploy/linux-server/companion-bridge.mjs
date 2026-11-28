@@ -3,11 +3,13 @@
 // Locked owner decision (Jay, Nov 22): the server is the locus for endpoints
 // and for all things, so a sleeping Mac must not cut the phone off from
 // server-owned jobs, waits, or approvals. This module is the bridge decision
-// core: the restricted companion route table, per-route device digests,
-// single-spend pairing windows with same-request replay, the one-sender
-// push rule, and the native-mirrored alert payload shape. Every export is
-// pure — no listener, no binding, no Infisical read, no push is ever sent —
-// so the contract tests run with fakes and no network.
+// core: the route table the shipped iOS app pairs and syncs through, the
+// per-route device digests, single-spend pairing windows with same-request
+// replay, the body checks and the withheld-key scrubber the Mac companion
+// sidecar applies on the phone's behalf, the one-sender push rule, and the
+// native-mirrored alert payload shape. Every export is pure — no listener,
+// no binding, no Infisical read, no push is ever sent — so the contract
+// tests run with fakes and no network.
 //
 // Pairing mirrors `companion/src/devices.ts`: two credentials per window
 // (QR token plus 6-digit code), both stored as digests only. Redeeming
@@ -23,25 +25,263 @@
 import crypto from 'node:crypto';
 
 /**
+ * The harness routes a paired phone may reach through the bridge.
+ *
+ * This is the Mac companion sidecar's `ALLOWED` list
+ * (`companion/src/routes.ts`) copied pattern for pattern and in the same
+ * order, and it is a copy on purpose. The sidecar keeps that list private to
+ * its module, it is TypeScript on a path the Linux host runs as plain `.mjs`,
+ * and the sidecar's own `denyReason` answers with the Mac's statuses and its
+ * pre-pairing rules, which are not the bridge's.  A copy can drift, so
+ * `companion-bridge.node-test.mjs` reads the sidecar's source as text and
+ * fails when the two lists disagree.
+ *
+ * Like the sidecar's list this one is default deny:  a route the harness
+ * gains later stays closed to a phone until someone adds it here, in a diff
+ * that can be read.  Each pattern is anchored at both ends and matched
+ * against the UNDECODED path, so an id can only be `[\w-]+` and an encoded
+ * traversal fails to match instead of being forwarded.
+ *
+ * One sidecar route is deliberately absent.  `POST /api/bots/:id/computer/join`
+ * mints a bearer URL for a bot's cloud desktop, and the sidecar lets it
+ * through only for a device the computer owner switched on, one by one.  The
+ * bridge has no such per-device grant, so the route stays closed here rather
+ * than open for every paired phone.
+ *
+ * Each row is the method, a readable path for logs and summaries, and the
+ * pattern itself.  The order is the sidecar's.
+ */
+const PAIRED_PHONE_HARNESS_ROUTE_GROUPS = [
+  {
+    description: 'config status, and the narrow settings routes that keep /api/config write-closed to a phone',
+    routes: [
+      ['GET', '/api/config', /^\/api\/config$/],
+      ['PATCH', '/api/terminology', /^\/api\/terminology$/],
+      ['PATCH', '/api/conversation-mode', /^\/api\/conversation-mode$/],
+      ['PATCH', '/api/busy-send-default', /^\/api\/busy-send-default$/],
+      ['PATCH', '/api/features', /^\/api\/features$/],
+      ['PATCH', '/api/room-turn-timeout', /^\/api\/room-turn-timeout$/],
+      ['PATCH', '/api/auto-update', /^\/api\/auto-update$/],
+      ['PATCH', '/api/profile', /^\/api\/profile$/],
+    ],
+  },
+  {
+    description: 'live event stream; cursor params pass through untouched',
+    routes: [['GET', '/api/events', /^\/api\/events$/]],
+  },
+  {
+    description: 'engine instance roster',
+    routes: [['GET', '/api/instances', /^\/api\/instances$/]],
+  },
+  {
+    description: 'speech-to-speech call status, and one rate-limited short-lived call token',
+    routes: [
+      ['GET', '/api/sts/status', /^\/api\/sts\/status$/],
+      ['POST', '/api/sts/token', /^\/api\/sts\/token$/],
+    ],
+  },
+  {
+    description: 'roster read, bot creation, and raising the desktop app',
+    routes: [
+      ['GET', '/api/bots', /^\/api\/bots$/],
+      ['POST', '/api/bots', /^\/api\/bots$/],
+      ['POST', '/api/desktop/open', /^\/api\/desktop\/open$/],
+    ],
+  },
+  {
+    description: 'messaging a bot: send, cancel, interrupt, mark read, edit, switch branch',
+    routes: [
+      ['POST', '/api/bots/:id/messages', /^\/api\/bots\/[\w-]+\/messages$/],
+      ['DELETE', '/api/bots/:id/queue/:id', /^\/api\/bots\/[\w-]+\/queue\/[\w-]+$/],
+      ['POST', '/api/bots/:id/interrupt', /^\/api\/bots\/[\w-]+\/interrupt$/],
+      ['POST', '/api/bots/:id/read', /^\/api\/bots\/[\w-]+\/read$/],
+      ['POST', '/api/bots/:id/messages/:id/edit', /^\/api\/bots\/[\w-]+\/messages\/[\w-]+\/edit$/],
+      ['POST', '/api/bots/:id/active-branch', /^\/api\/bots\/[\w-]+\/active-branch$/],
+    ],
+  },
+  {
+    description: "a bot's tasks: create, switch, rename, snooze, delete",
+    routes: [
+      ['POST', '/api/bots/:id/tasks', /^\/api\/bots\/[\w-]+\/tasks$/],
+      ['POST', '/api/bots/:id/tasks/:id', /^\/api\/bots\/[\w-]+\/tasks\/[\w-]+$/],
+      ['PATCH', '/api/bots/:id/tasks/:id', /^\/api\/bots\/[\w-]+\/tasks\/[\w-]+$/],
+      ['DELETE', '/api/bots/:id/tasks/:id', /^\/api\/bots\/[\w-]+\/tasks\/[\w-]+$/],
+    ],
+  },
+  {
+    // The body is checked against a field allowlist before it is forwarded
+    // (`bridgeProfilePatchDenial`), because the harness route behind it is
+    // the desktop's general bot editor.
+    description: 'paired-safe bot profile subset; the bridge checks the body before forwarding',
+    routes: [['PATCH', '/api/bots/:id/profile', /^\/api\/bots\/[\w-]+\/profile$/]],
+  },
+  {
+    // Archive, Restore, Pin, Mark As Unread, Make Chief Of Staff, Move To
+    // Section and Pin Message.  The body may carry those six fields and
+    // nothing else (`bridgeBotOrganizeDenial`).
+    description: 'roster organization through the bot PATCH; the bridge checks the body before forwarding',
+    routes: [['PATCH', '/api/bots/:id', /^\/api\/bots\/[\w-]+$/]],
+  },
+  {
+    description: 'delete a bot, apply the model defaults to every bot, generate a bot avatar',
+    routes: [
+      ['DELETE', '/api/bots/:id', /^\/api\/bots\/[\w-]+$/],
+      ['POST', '/api/bots/apply-model-defaults', /^\/api\/bots\/apply-model-defaults$/],
+      ['POST', '/api/bots/:id/avatar/generate', /^\/api\/bots\/[\w-]+\/avatar\/generate$/],
+    ],
+  },
+  {
+    description: 'rooms: create, edit, delete, message, interrupt, mark read',
+    routes: [
+      ['POST', '/api/groups', /^\/api\/groups$/],
+      ['PATCH', '/api/groups/:id', /^\/api\/groups\/[\w-]+$/],
+      ['DELETE', '/api/groups/:id', /^\/api\/groups\/[\w-]+$/],
+      ['POST', '/api/groups/:id/messages', /^\/api\/groups\/[\w-]+\/messages$/],
+      ['POST', '/api/groups/:id/interrupt', /^\/api\/groups\/[\w-]+\/interrupt$/],
+      ['POST', '/api/groups/:id/read', /^\/api\/groups\/[\w-]+\/read$/],
+    ],
+  },
+  {
+    description: "a room's tasks: create, switch, rename, delete",
+    routes: [
+      ['POST', '/api/groups/:id/tasks', /^\/api\/groups\/[\w-]+\/tasks$/],
+      ['POST', '/api/groups/:id/tasks/:id', /^\/api\/groups\/[\w-]+\/tasks\/[\w-]+$/],
+      ['PATCH', '/api/groups/:id/tasks/:id', /^\/api\/groups\/[\w-]+\/tasks\/[\w-]+$/],
+      ['DELETE', '/api/groups/:id/tasks/:id', /^\/api\/groups\/[\w-]+\/tasks\/[\w-]+$/],
+    ],
+  },
+  {
+    description: 'a transcript, its images, and answering an approval',
+    routes: [
+      ['GET', '/api/threads/:id/messages', /^\/api\/threads\/[\w-]+\/messages$/],
+      ['GET', '/api/threads/:id/messages/:id/image', /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/image$/],
+      ['POST', '/api/threads/:id/messages/:id/reactions', /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/reactions$/],
+      ['GET', '/api/threads/:id/export', /^\/api\/threads\/[\w-]+\/export$/],
+      ['POST', '/api/threads/:id/respond', /^\/api\/threads\/[\w-]+\/respond$/],
+      ['POST', '/api/threads/:id/approve-all', /^\/api\/threads\/[\w-]+\/approve-all$/],
+      ['GET', '/api/search', /^\/api\/search$/],
+    ],
+  },
+  {
+    // Upload is image-or-file and capped by the harness; the GET is one bare
+    // generated filename with an image extension, never a path.
+    description: 'app-owned attachments and profile images',
+    routes: [
+      ['POST', '/api/attachments', /^\/api\/attachments$/],
+      ['GET', '/api/attachments/:file', /^\/api\/attachments\/[\w-]+\.(?:png|jpe?g|gif|webp)$/i],
+    ],
+  },
+  {
+    description: 'voice: voices, speech, the default voice, pronunciations, reply audio, and the phone\'s own recordings',
+    routes: [
+      ['GET', '/api/tts/voices', /^\/api\/tts\/voices$/],
+      ['POST', '/api/tts/speak', /^\/api\/tts\/speak$/],
+      ['PATCH', '/api/tts/default-voice', /^\/api\/tts\/default-voice$/],
+      ['PATCH', '/api/tts/pronunciations', /^\/api\/tts\/pronunciations$/],
+      ['POST', '/api/threads/:id/messages/:id/audio', /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio$/],
+      ['GET', '/api/threads/:id/messages/:id/audio/:n', /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio\/\d+$/],
+      ['GET', '/api/threads/:id/messages/:id/recording', /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/recording$/],
+      ['PATCH', '/api/threads/:id/messages/:id/recording-review', /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/recording-review$/],
+    ],
+  },
+  {
+    description: 'routines, and stopping or acknowledging a run',
+    routes: [
+      ['GET', '/api/routines', /^\/api\/routines$/],
+      ['POST', '/api/routines', /^\/api\/routines$/],
+      ['PATCH', '/api/routines/:id', /^\/api\/routines\/[\w-]+$/],
+      ['DELETE', '/api/routines/:id', /^\/api\/routines\/[\w-]+$/],
+      ['POST', '/api/routines/:id/run', /^\/api\/routines\/[\w-]+\/run$/],
+      ['POST', '/api/routine-runs/:id/cancel-or-seen', /^\/api\/routine-runs\/[\w-]+\/(?:cancel|seen)$/],
+      ['POST', '/api/routine-runs/seen', /^\/api\/routine-runs\/seen$/],
+    ],
+  },
+  {
+    // Read-only.  The sidecar also allows `POST /api/update/check` and
+    // `POST /api/update/run`, which stop and replace the harness to install
+    // an update.  Those two are deliberately absent here: on this host the
+    // harness is a production service, the updater is macOS-only today and
+    // refuses on Linux, and a route whose purpose is to stop the harness
+    // stays closed to a phone rather than open on the strength of that
+    // refusal.
+    description: 'update status, read-only; the two update actions stay closed on the bridge',
+    routes: [['GET', '/api/update/status', /^\/api\/update\/status$/]],
+  },
+  {
+    description: 'connected apps: the catalog, what is connected, one account added, one account detached',
+    routes: [
+      ['GET', '/api/connectors/catalog', /^\/api\/connectors\/catalog$/],
+      ['GET', '/api/connectors/connected', /^\/api\/connectors\/connected$/],
+      ['GET', '/api/connectors', /^\/api\/connectors$/],
+      ['POST', '/api/connectors/:id/authorize', /^\/api\/connectors\/[\w-]+\/authorize$/],
+      ['DELETE', '/api/connectors/:id/accounts/:account', /^\/api\/connectors\/[\w-]+\/accounts\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/],
+    ],
+  },
+  {
+    description: 'usage and cost, read-only; shared memory status; background jobs',
+    routes: [
+      ['GET', '/api/quotas', /^\/api\/quotas$/],
+      ['GET', '/api/tts/usage', /^\/api\/tts\/usage$/],
+      ['GET', '/api/qdrant/status', /^\/api\/qdrant\/status$/],
+      ['GET', '/api/jobs', /^\/api\/jobs$/],
+      ['GET', '/api/jobs/:id/output', /^\/api\/jobs\/[\w-]+\/output$/],
+      ['POST', '/api/jobs/:id/stop', /^\/api\/jobs\/[\w-]+\/stop$/],
+      ['POST', '/api/jobs/stop', /^\/api\/jobs\/stop$/],
+    ],
+  },
+  {
+    // Listing, reading and switching only.  Importing reads a folder off the
+    // host's own disk, so it is not on the sidecar's list and not here.
+    description: "a bot's imported skills: list, read one, switch one on or off",
+    routes: [
+      ['GET', '/api/bots/:id/skills', /^\/api\/bots\/[\w-]+\/skills$/],
+      ['GET', '/api/bots/:id/skills/:name', /^\/api\/bots\/[\w-]+\/skills\/[a-z0-9-]+$/],
+      ['PATCH', '/api/bots/:id/skills/:name', /^\/api\/bots\/[\w-]+\/skills\/[a-z0-9-]+$/],
+    ],
+  },
+];
+
+const pairedPhoneHarnessRoutes = PAIRED_PHONE_HARNESS_ROUTE_GROUPS.flatMap((group) =>
+  group.routes.map(([method, path, pattern]) => ({
+    method,
+    path,
+    pattern,
+    local: false,
+    requiresDevice: true,
+    description: group.description,
+  })),
+);
+
+/**
  * The companion subset the bridge serves, in advertisement order. A route
- * marked local is answered from the bridge's own registry (pairing and
- * devices live per route, so no secret is shared with the Mac); any other
- * route is a transparent proxy to the same harness path.
+ * marked local is answered by the bridge itself, from its own registry
+ * (pairing and devices live per route, so no secret is shared with the Mac);
+ * any other route is a transparent proxy to the same harness path.
+ *
+ * A row with a `pattern` is matched against the raw, undecoded path.  A row
+ * without one is a template whose `:param` segment is any single segment the
+ * traversal check let through.  `requiresDevice` is read per row:  a local
+ * route that extends a device's reach needs the device credential, every
+ * proxied route needs it, and the two exceptions are the routes a phone calls
+ * while it is not paired yet, `GET /api/health` and `POST /api/pair`, plus
+ * the advertisement, which is the owner's to read.
  */
 export const BRIDGE_ALLOWED_ROUTES = [
-  { method: 'GET', path: '/api/companion/endpoints', local: true, description: 'route advertisement, served locally' },
-  { method: 'POST', path: '/api/companion/pairing/open', local: true, description: 'open a pairing window' },
-  { method: 'POST', path: '/api/companion/pairing/redeem', local: true, description: 'redeem a pairing code or token once' },
-  { method: 'GET', path: '/api/companion/devices', local: true, description: 'public device list' },
-  { method: 'DELETE', path: '/api/companion/devices/:id', local: true, description: 'revoke one device' },
+  { method: 'GET', path: '/api/companion/endpoints', local: true, requiresDevice: false, description: 'route advertisement, served locally' },
+  { method: 'POST', path: '/api/pair', local: true, requiresDevice: false, description: 'pair a phone: redeem a code or QR token for a device credential, in the shape the iOS app decodes' },
+  { method: 'POST', path: '/api/companion/pairing/open', local: true, requiresDevice: false, description: 'open a pairing window' },
+  { method: 'POST', path: '/api/companion/pairing/redeem', local: true, requiresDevice: false, description: 'redeem a pairing code or token once' },
+  { method: 'POST', path: '/api/companion/pairing/close', local: true, requiresDevice: false, description: 'close the open pairing window' },
+  { method: 'GET', path: '/api/companion/devices', local: true, requiresDevice: false, description: 'public device list' },
+  { method: 'DELETE', path: '/api/companion/devices/:id', local: true, requiresDevice: false, description: 'revoke one device' },
   { method: 'POST', path: '/api/companion/push-token', local: true, requiresDevice: true, description: 'register device APNs alert token' },
   { method: 'POST', path: '/api/companion/live-activity-token', local: true, requiresDevice: true, description: 'register device Live Activity push-to-start token' },
   { method: 'GET', path: '/api/companion/push-health', local: true, requiresDevice: true, description: 'APNs sender health without key material' },
-  { method: 'GET', path: '/api/fleet', local: false, description: 'roster and fleet state hydration' },
-  { method: 'GET', path: '/api/threads/:id', local: false, description: 'thread hydration' },
-  { method: 'POST', path: '/api/threads/:id/messages', local: false, description: 'message and approval actions' },
-  { method: 'POST', path: '/api/threads/:id/interrupt', local: false, description: 'interrupt a running turn' },
-  { method: 'GET', path: '/api/events', local: false, description: 'SSE stream; cursor params pass through untouched' },
+  // The first thing the iOS app does on a route is probe this, before it has
+  // a device credential, so it is forwarded without one.  It is still behind
+  // the owner credential like every other route.
+  { method: 'GET', path: '/api/health', pattern: /^\/api\/health$/, local: false, requiresDevice: false, description: 'harness liveness and readiness, forwarded; the one proxied route a phone may call before it is paired' },
+  ...pairedPhoneHarnessRoutes,
 ];
 
 /**
@@ -54,32 +294,31 @@ export const BRIDGE_ALLOWED_ROUTES = [
  * @returns {boolean}
  */
 export function bridgeLocalRouteRequiresDevice(method, url) {
-  const verb = String(method ?? '').toUpperCase();
-  const raw = String(url ?? '');
-  const queryIndex = raw.indexOf('?');
-  const path = (queryIndex === -1 ? raw : raw.slice(0, queryIndex)) || '/';
-  const segments = path.split('/').slice(1);
-  const decoded = [];
-  for (const segment of segments) {
-    const form = decodeSegment(segment);
-    if (form === null || form === '' || form === '.' || form === '..' || form.includes('/')) return false;
-    decoded.push(form);
+  const decision = bridgeRouteDecision(method, url);
+  return decision.ok === true && decision.local === true && decision.route.requiresDevice === true;
+}
+
+/**
+ * Whether one route's path matches the request. A `pattern` row is tested
+ * against the raw, undecoded path, exactly as the sidecar tests its own
+ * patterns. A template row compares each literal segment in decoded form and
+ * lets a `:param` segment stand for any one segment the traversal check
+ * already let through.
+ *
+ * @param {{path: string, pattern?: RegExp}} route
+ * @param {string} path
+ * @param {string[]} decoded
+ * @returns {boolean}
+ */
+function routePathMatches(route, path, decoded) {
+  if (route.pattern) return route.pattern.test(path);
+  const pattern = route.path.split('/').slice(1);
+  if (pattern.length !== decoded.length) return false;
+  for (let index = 0; index < pattern.length; index += 1) {
+    const part = pattern[index];
+    if (!part.startsWith(':') && part !== decoded[index]) return false;
   }
-  for (const route of BRIDGE_ALLOWED_ROUTES) {
-    if (route.method !== verb) continue;
-    const pattern = route.path.split('/').slice(1);
-    if (pattern.length !== decoded.length) continue;
-    let matches = true;
-    for (let index = 0; index < pattern.length; index += 1) {
-      const part = pattern[index];
-      if (!part.startsWith(':') && part !== decoded[index]) {
-        matches = false;
-        break;
-      }
-    }
-    if (matches) return route.requiresDevice === true;
-  }
-  return false;
+  return true;
 }
 
 /**
@@ -102,9 +341,13 @@ function decodeSegment(segment) {
  * past it, while the upstream keeps the raw bytes verbatim. The query
  * string is stripped for matching and preserved byte for byte.
  *
+ * A path that matches a row under another method is a 405, and anything
+ * else is a 404. The answer carries the matched row so the caller reads
+ * `requiresDevice` from the table instead of a second list.
+ *
  * @param {string} method
  * @param {string} url
- * @returns {{ok: true, upstream: string, local: boolean} | {ok: false, status: number, reason: string}}
+ * @returns {{ok: true, upstream: string, local: boolean, route: {method: string, path: string, local: boolean, requiresDevice: boolean}} | {ok: false, status: number, reason: string}}
  */
 export function bridgeRouteDecision(method, url) {
   const verb = String(method ?? '').toUpperCase();
@@ -123,24 +366,14 @@ export function bridgeRouteDecision(method, url) {
   }
   let methodSeen = false;
   for (const route of BRIDGE_ALLOWED_ROUTES) {
-    const pattern = route.path.split('/').slice(1);
-    if (pattern.length !== decoded.length) continue;
-    const params = {};
-    let matches = true;
-    for (let index = 0; index < pattern.length; index += 1) {
-      const part = pattern[index];
-      if (part.startsWith(':')) {
-        params[part.slice(1)] = segments[index];
-      } else if (part !== decoded[index]) {
-        matches = false;
-        break;
-      }
+    if (!routePathMatches(route, path, decoded)) continue;
+    if (route.method !== verb) {
+      methodSeen = true;
+      continue;
     }
-    if (!matches) continue;
-    methodSeen = true;
-    if (route.method !== verb) continue;
-    const built = pattern.map((part) => (part.startsWith(':') ? params[part.slice(1)] : part));
-    return { ok: true, upstream: `/${built.join('/')}${query}`, local: route.local };
+    // The path is handed on exactly as it arrived, never rebuilt from the
+    // row, so a `$` sequence in it can never be read as a replacement.
+    return { ok: true, upstream: `${path}${query}`, local: route.local, route };
   }
   if (methodSeen) return { ok: false, status: 405, reason: 'method not allowed on this bridge route' };
   return { ok: false, status: 404, reason: 'no bridge route' };
@@ -874,3 +1107,586 @@ export function buildBridgeLiveActivityPayload({
   }
   return { aps };
 }
+
+/**
+ * The profile fields a paired phone owns, copied from the sidecar's
+ * `COMPANION_PROFILE_PATCH_FIELDS`.
+ *
+ * The harness route behind `PATCH /api/bots/:id/profile` is the desktop's
+ * general bot editor, and for a phone it enforces no field list of its own.
+ * Unchecked, a paired phone could write a bot's own MCP servers, its
+ * connected-app settings or its cloud backend through this one route, so the
+ * bridge refuses the whole request when it names a field that is not here.
+ * The harness still decides what each VALUE means, including its refusal to
+ * turn Auto-Approve on for a bot that can use the computer.
+ *
+ * The copy is checked the same way the route list is: the parity test fails
+ * when this drifts from the sidecar.
+ */
+export const BRIDGE_PROFILE_PATCH_FIELDS = Object.freeze([
+  'name',
+  'title',
+  'description',
+  'notifications',
+  'avatarUrl',
+  'avatarCrop',
+  'voice',
+  'voices',
+  'speakReplies',
+  'speechDevices',
+  'modelSelection',
+  'computers',
+  'maxToolRounds',
+  'cwd',
+  'autoApprove',
+  'autoReview',
+  'approvePeerComms',
+  'bypassPermissions',
+  'bypassLocalComputer',
+  'off',
+]);
+
+const BRIDGE_PROFILE_PATCH_FIELD_SET = new Set(BRIDGE_PROFILE_PATCH_FIELDS);
+
+/** The one bot-level PATCH a paired phone may send, as the sidecar names it. */
+export const BRIDGE_BOT_ORGANIZE_ROUTE_PATTERN = /^\/api\/bots\/[\w-]+$/;
+
+/** The profile route, as the sidecar's `isCompanionProfilePatch` names it. */
+export const BRIDGE_PROFILE_PATCH_ROUTE_PATTERN = /^\/api\/bots\/[\w-]+\/profile$/;
+
+/**
+ * The six roster-organization fields of `PATCH /api/bots/:id`, copied from
+ * the sidecar's `COMPANION_BOT_ORGANIZE_FIELDS`. Each one changes where a
+ * bot sits or how it is marked, never what it may do.
+ */
+export const BRIDGE_BOT_ORGANIZE_FIELDS = Object.freeze([
+  'hidden',
+  'pinned',
+  'unread',
+  'chiefOfStaff',
+  'section',
+  'pinnedMessageId',
+]);
+
+const BRIDGE_BOT_ORGANIZE_FIELD_SET = new Set(BRIDGE_BOT_ORGANIZE_FIELDS);
+const BRIDGE_BOT_ORGANIZE_BOOLEAN_FIELDS = new Set(['hidden', 'pinned', 'unread', 'chiefOfStaff']);
+
+/**
+ * True for a string that came out of `JSON.parse`, which never yields a
+ * boxed one, so the object tag is the same test as `typeof` without a
+ * runtime typeof check.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isJsonString(value) {
+  return Object.prototype.toString.call(value) === '[object String]';
+}
+
+/**
+ * True for a JSON object, as `JSON.parse` produces one.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isJsonObject(value) {
+  if (value === null || value === undefined || Array.isArray(value)) return false;
+  return Object.prototype.toString.call(value) === '[object Object]';
+}
+
+/**
+ * The refusal for a body that is not a JSON object, or null when it is one.
+ * Every body check below starts here, so a check never reads keys off an
+ * array, a string or a number.
+ *
+ * @param {unknown} body
+ * @returns {{status: number, error: string}|null}
+ */
+function bridgeBodyRefusal(body) {
+  return isJsonObject(body) ? null : { status: 400, error: 'body must be a JSON object' };
+}
+
+/**
+ * Validate a paired phone's bot profile body before it reaches the broader
+ * harness route. Reject the whole request rather than silently stripping a
+ * field the person expected to save.
+ *
+ * @param {unknown} body
+ * @returns {{status: number, error: string}|null}
+ */
+export function bridgeProfilePatchDenial(body) {
+  const refusal = bridgeBodyRefusal(body);
+  if (refusal) return refusal;
+  const unsupported = Object.keys(body).find((field) => !BRIDGE_PROFILE_PATCH_FIELD_SET.has(field));
+  return unsupported
+    ? { status: 403, error: `${unsupported} can only be changed in BotFleet on your computer` }
+    : null;
+}
+
+/**
+ * Validate the organize boundary before a body reaches the harness. The
+ * harness copies `hidden`, `pinned` and `unread` into the stored bot, so the
+ * types are checked here as well as the names. Whole-request rejection,
+ * like the profile route. The harness stays the authority on length limits
+ * and on rules that need the stored bot, such as refusing to archive the
+ * Chief Of Staff.
+ *
+ * @param {unknown} body
+ * @returns {{status: number, error: string}|null}
+ */
+export function bridgeBotOrganizeDenial(body) {
+  const refusal = bridgeBodyRefusal(body);
+  if (refusal) return refusal;
+  const fields = Object.keys(body);
+  if (fields.length === 0) return { status: 400, error: 'nothing to save' };
+  const unsupported = fields.find((field) => !BRIDGE_BOT_ORGANIZE_FIELD_SET.has(field));
+  if (unsupported) {
+    return { status: 403, error: `${unsupported} can only be changed in BotFleet on your computer` };
+  }
+  for (const field of fields) {
+    const value = body[field];
+    if (BRIDGE_BOT_ORGANIZE_BOOLEAN_FIELDS.has(field)) {
+      if (value !== true && value !== false) return { status: 400, error: `${field} must be true or false` };
+    } else if (field === 'section') {
+      if (value !== null && !isJsonString(value)) {
+        return { status: 400, error: 'section must be a string or null' };
+      }
+    } else if (field === 'pinnedMessageId') {
+      if (value !== null && !(isJsonString(value) && /^[\w-]*$/.test(value))) {
+        return { status: 400, error: 'pinnedMessageId must be a message id or null' };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The body check a forwarded request needs, or null when the route list
+ * alone decides it. One lookup for the proxy, so a new checked route is one
+ * line here rather than another branch there.
+ *
+ * @param {string} method
+ * @param {string} path the raw, undecoded path
+ * @returns {((body: unknown) => {status: number, error: string}|null)|null}
+ */
+export function bridgeBodyCheck(method, path) {
+  const raw = String(path ?? '');
+  if (method !== 'PATCH') return null;
+  if (BRIDGE_PROFILE_PATCH_ROUTE_PATTERN.test(raw)) return bridgeProfilePatchDenial;
+  if (BRIDGE_BOT_ORGANIZE_ROUTE_PATTERN.test(raw)) return bridgeBotOrganizeDenial;
+  return null;
+}
+
+/**
+ * The keys the harness may say and a phone has no business holding, copied
+ * from the sidecar's `wire.ts`.
+ *
+ * `resumeCursors` is the harness's own bookkeeping, the native session id to
+ * resume per instance per task. `sshAlias` is the self-hosted VPS label, a
+ * name for one of the owner's servers, which the config status echoes in
+ * `vps`. The phone renders configured-or-not and nothing more, so
+ * `{configured: true}` survives and the label does not.
+ *
+ * The harness already drops `resumeCursors` at source today. The scrubber
+ * stays, because it is the sidecar's rule and because a harness that carries
+ * an older payload must not hand the phone anything the Mac withholds.
+ */
+export const BRIDGE_WITHHELD_RESPONSE_KEYS = Object.freeze(['resumeCursors', 'sshAlias']);
+
+const BRIDGE_WITHHELD_RESPONSE_KEY_SET = new Set(BRIDGE_WITHHELD_RESPONSE_KEYS);
+
+/**
+ * Whether a serialized payload names a withheld key at all. This is the fast
+ * path: a payload that names none is forwarded as the exact bytes that
+ * arrived, with no parse and no re-serialization.
+ *
+ * @param {string} text
+ * @returns {boolean}
+ */
+function holdsWithheldKey(text) {
+  for (const key of BRIDGE_WITHHELD_RESPONSE_KEYS) {
+    if (text.includes(key)) return true;
+  }
+  return false;
+}
+
+/**
+ * Recursively drop the withheld keys, wherever they appear.
+ *
+ * @template T
+ * @param {T} value
+ * @returns {T}
+ */
+export function bridgeScrub(value) {
+  if (value === null || value === undefined) return value;
+  if (Array.isArray(value)) return value.map(bridgeScrub);
+  if (!isJsonObject(value)) return value;
+  // A null prototype, so a payload key spelled `__proto__` becomes an own
+  // property of the copy instead of the copy's prototype.
+  const out = Object.create(null);
+  for (const [key, inner] of Object.entries(value)) {
+    if (BRIDGE_WITHHELD_RESPONSE_KEY_SET.has(key)) continue;
+    out[key] = bridgeScrub(inner);
+  }
+  return out;
+}
+
+/**
+ * Scrub one serialized JSON payload.
+ *
+ * A payload that names no withheld key comes back as the same string. One
+ * that does not parse comes back unchanged too: it was never JSON, so
+ * there is nothing of ours in it to remove. One that parses but cannot be
+ * scrubbed throws, because a deeply nested body can outlast the scrubber's
+ * recursion while `JSON.parse` handles it, and forwarding that unscrubbed
+ * would send exactly what the scrubber exists to withhold. The caller must
+ * end the response rather than forward it.
+ *
+ * @param {string} jsonString
+ * @returns {string}
+ */
+export function bridgeScrubWireJson(jsonString) {
+  const text = String(jsonString ?? '');
+  // A key can also arrive spelled with escapes, `\u0073shAlias`, which
+  // decodes to a withheld name downstream while naming none here. A payload
+  // that carries any escape is parsed for its keys instead of passed on.
+  if (!holdsWithheldKey(text) && !text.includes('\\u')) return text;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return text;
+  }
+  return JSON.stringify(bridgeScrub(parsed));
+}
+
+/**
+ * Whether a body is worth parsing at all, decided by its content type. An
+ * image endpoint must never be parsed as JSON.
+ *
+ * The `+json` suffix counts: `application/problem+json` is JSON by every
+ * measure that matters here, and the harness only has to answer one error
+ * that way for a withheld key to reach a phone unscrubbed.
+ *
+ * @param {string|undefined} contentType
+ * @returns {boolean}
+ */
+export function bridgeIsJson(contentType) {
+  const media = String(contentType ?? '').split(';')[0].trim().toLowerCase();
+  return media === 'application/json' || media.endsWith('+json');
+}
+
+/**
+ * How much of a single SSE event the scrubber holds while waiting for its
+ * terminator. Generous, because the largest real frame is a bot payload,
+ * orders of magnitude under this; the number only exists to be a ceiling.
+ */
+export const MAX_BRIDGE_SSE_EVENT_BYTES = 1024 * 1024;
+
+/**
+ * The first event terminator in `text`, whichever spelling it uses.
+ *
+ * A partial terminator at the end of a chunk, such as a CRLF pair missing
+ * its last byte, matches neither and stays buffered: the rest is one chunk
+ * away, and splitting an event across a scrub would corrupt it.
+ *
+ * @param {string} text
+ * @returns {{index: number, terminator: string}|null}
+ */
+function nextEventBoundary(text) {
+  let best = null;
+  for (const terminator of ['\n\n', '\r\n\r\n', '\r\r']) {
+    const index = text.indexOf(terminator);
+    if (index < 0) continue;
+    // Earliest wins, and on a tie the longer terminator does: an LF-only
+    // match inside a CRLF pair would cut the event a byte short of its end.
+    if (!best || index < best.index || (index === best.index && terminator.length > best.terminator.length)) {
+      best = { index, terminator };
+    }
+  }
+  return best;
+}
+
+/**
+ * One complete SSE event, its `data:` payload scrubbed and everything else
+ * kept. The ending the event arrived with is the one it leaves with, and
+ * `id:` lines are never touched: they are the resume cursor.
+ *
+ * An event that names no withheld key is returned as the exact text that
+ * arrived, so a keepalive comment or an ordinary frame crosses unchanged.
+ *
+ * @param {string} event
+ * @returns {string}
+ */
+function scrubBridgeEvent(event) {
+  if (!holdsWithheldKey(event)) return event;
+  const eol = event.includes('\r\n') ? '\r\n' : event.includes('\r') ? '\r' : '\n';
+  return event
+    .split(/\r\n|\r|\n/)
+    .map((line) => {
+      // `: keepalive` comments, `id:`, `event:`, `retry:` are not ours to touch.
+      if (!line.startsWith('data:')) return line;
+      const raw = line.slice(5).trimStart();
+      if (!raw) return line;
+      return `data: ${bridgeScrubWireJson(raw)}`;
+    })
+    .join(eol);
+}
+
+/**
+ * A scrubber for one SSE stream, fed one decoded chunk at a time.
+ *
+ * It must not swallow blank lines: the blank line IS the event terminator,
+ * and a rewrite that normalizes it produces a stream that parses to nothing
+ * while both ends look healthy. It must not wait for more than one event
+ * either: buffering to a frame boundary is fine, and buffering for a size
+ * or a timer turns a live stream into a batch one. Both line endings are
+ * recognised, because a scrubber that knows only LF buffers a CRLF stream
+ * forever waiting for a boundary that never comes.
+ *
+ * Buffering to a boundary is bounded by the sender's good behaviour, which
+ * is not a bound. A stream that never sends a terminator grows the buffer
+ * without limit, so passing the ceiling throws and the caller drops the
+ * connection: there is no safe way to flush half an event.
+ *
+ * @returns {(chunk: string) => string}
+ */
+export function createBridgeSseScrubber() {
+  let pending = '';
+  return (chunk) => {
+    pending += chunk;
+    let out = '';
+    for (;;) {
+      const boundary = nextEventBoundary(pending);
+      if (!boundary) break;
+      const event = pending.slice(0, boundary.index);
+      pending = pending.slice(boundary.index + boundary.terminator.length);
+      out += scrubBridgeEvent(event) + boundary.terminator;
+    }
+    if (pending.length > MAX_BRIDGE_SSE_EVENT_BYTES) {
+      throw new Error(`SSE event exceeded ${MAX_BRIDGE_SSE_EVENT_BYTES} bytes without a terminator`);
+    }
+    return out;
+  };
+}
+
+/** The most routes one advertisement carries, the cap the iOS decoder accepts. */
+export const BRIDGE_MAX_ENDPOINTS = 8;
+
+/**
+ * What the bridge calls itself in the phone's connection list. The bridge
+ * is one process serving the whole server, so unlike a Mac it has no name of
+ * its own to offer, and a fixed honest label beats an empty one that leaves
+ * a typed address standing in for the server's name.
+ */
+export const BRIDGE_SERVER_NAME = 'BotFleet Server';
+
+/**
+ * A host in the form the kind rules compare: lowercase, without IPv6
+ * brackets, and without the trailing dot a resolver accepts.
+ *
+ * @param {string} hostname
+ * @returns {string}
+ */
+function normalizedHostName(hostname) {
+  let host = String(hostname ?? '').trim().toLowerCase();
+  if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
+  while (host.endsWith('.')) host = host.slice(0, -1);
+  return host;
+}
+
+/**
+ * A Tailscale MagicDNS name, by the rule the iOS decoder applies: longer
+ * than the suffix and ending in `.ts.net`.
+ *
+ * @param {string} host
+ * @returns {boolean}
+ */
+function isTailnetHostName(host) {
+  return host.length > '.ts.net'.length && host.endsWith('.ts.net');
+}
+
+/**
+ * Whether a host is one no phone can dial to reach this server: loopback,
+ * the unspecified address, a link-local address, or a name that resolves to
+ * loopback. Advertising one hands the phone a route that cannot work.
+ *
+ * @param {string} host a normalized host name
+ * @returns {boolean}
+ */
+function isUnroutableHostName(host) {
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (host === '0.0.0.0' || host === '::' || host === '::1') return true;
+  if (/^127(\.\d{1,3}){3}$/.test(host)) return true;
+  if (/^169\.254(\.\d{1,3}){2}$/.test(host)) return true;
+  return /^fe[89ab][0-9a-f]{0,4}:/.test(host);
+}
+
+/**
+ * Read one configured or derived origin and answer it in normal form, or an
+ * empty string when it is not a route a phone could dial.
+ *
+ * A hosted route is public internet infrastructure, so accepting a typo as
+ * though it were a route is worse than refusing it. It has to be an absolute
+ * `http` or `https` origin: paths, credentials, queries and fragments have
+ * no place in a base URL and make request construction ambiguous.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function bridgeCleanOrigin(text) {
+  let parsed;
+  try {
+    parsed = new URL(String(text ?? '').trim());
+  } catch {
+    return '';
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return '';
+  if (parsed.username !== '' || parsed.password !== '') return '';
+  if (parsed.pathname !== '/' || parsed.search !== '' || parsed.hash !== '') return '';
+  if (isUnroutableHostName(normalizedHostName(parsed.hostname))) return '';
+  return parsed.origin;
+}
+
+/**
+ * The endpoint kind the iOS `CompanionEndpoint` decoder will accept for a
+ * route, or an empty string when it accepts none.
+ *
+ * The kind decides whether the phone will send its credential over the
+ * route: `hosted` and `tailnet` are protected transports, `lan` and
+ * `bonjour` are cleartext and need the person's explicit choice. The decoder
+ * is strict about the pairing of scheme and kind. `tailnet` is accepted only
+ * for plain `http` on a `.ts.net` name, which is how the Mac sidecar's own
+ * tailnet route is published. `tailscale serve --https` terminates TLS, so
+ * the bridge's tailnet route arrives as `https`, and for an `https` URL the
+ * decoder accepts exactly one kind, `hosted`. That is therefore the label a
+ * bridge route behind `tailscale serve` has to carry to be decodable at all.
+ *
+ * @param {string} url
+ * @returns {'hosted'|'tailnet'|'lan'|''}
+ */
+export function bridgeEndpointKind(url) {
+  let parsed;
+  try {
+    parsed = new URL(String(url ?? ''));
+  } catch {
+    return '';
+  }
+  if (parsed.protocol === 'https:') return 'hosted';
+  if (parsed.protocol !== 'http:') return '';
+  return isTailnetHostName(normalizedHostName(parsed.hostname)) ? 'tailnet' : 'lan';
+}
+
+/**
+ * The routes one advertisement carries, best first, as the iOS
+ * `CompanionEndpoint` decodes them.
+ *
+ * @param {string[]|undefined} origins normalized origins, in preference order
+ * @returns {Array<{url: string, kind: 'hosted'|'tailnet'|'lan', priority: number}>}
+ */
+export function bridgeEndpoints(origins) {
+  const endpoints = [];
+  const seen = new Set();
+  for (const candidate of Array.isArray(origins) ? origins : []) {
+    if (endpoints.length >= BRIDGE_MAX_ENDPOINTS) break;
+    const origin = bridgeCleanOrigin(candidate);
+    const kind = origin ? bridgeEndpointKind(origin) : '';
+    if (!origin || !kind || seen.has(origin)) continue;
+    seen.add(origin);
+    endpoints.push({ url: origin, kind, priority: endpoints.length * 100 });
+  }
+  return endpoints;
+}
+
+/**
+ * Parse the configured advertisement: one origin or a comma-separated list,
+ * first entry first. An entry that is blank is ignored, a duplicate costs
+ * nothing, and anything that is not a clean origin is refused loudly rather
+ * than skipped, because a skipped entry is a route the owner believes is
+ * advertised and is not.
+ *
+ * @param {string|undefined} value
+ * @returns {{ok: true, origins: string[]} | {ok: false, reason: string}}
+ */
+export function bridgeParseOrigins(value) {
+  const origins = [];
+  for (const part of String(value ?? '').split(',')) {
+    const origin = bridgeCleanOrigin(part);
+    if (!origin) {
+      if (part.trim() === '') continue;
+      return {
+        ok: false,
+        reason:
+          'every entry must be an absolute http or https origin with no path, credentials, query or fragment, ' +
+          'and no loopback or link-local host',
+      };
+    }
+    if (origins.includes(origin)) continue;
+    origins.push(origin);
+    if (origins.length > BRIDGE_MAX_ENDPOINTS) {
+      return { ok: false, reason: `at most ${BRIDGE_MAX_ENDPOINTS} origins may be listed` };
+    }
+  }
+  return { ok: true, origins };
+}
+
+/**
+ * A device name comes from the phone, so it is untrusted display text:
+ * clamp the length and drop control characters before it reaches a UI.
+ *
+ * @param {unknown} raw
+ * @returns {string}
+ */
+export function bridgeCleanDeviceName(raw) {
+  const name = String(raw ?? '')
+    // By Unicode category rather than a spelled-out range: Cc is every
+    // control character (C0, DEL and the C1 block, NEL included) and Zl, Zp
+    // are the line and paragraph separators. The sidecar's cleaner stops at
+    // C0 and DEL; the fleet's review rule asks for the terminators too,
+    // because a name that carries one splits a line in a device list.
+    .replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, ' ')
+    .trim()
+    .slice(0, 60);
+  return name || 'Companion';
+}
+
+/**
+ * The pairing refusal a person reads, for one internal reason.
+ *
+ * The iOS app shows the server's own error text, so this is the sentence on
+ * the pairing screen. A reason this does not know gets the general sentence
+ * rather than the internal wording, which is written for a log.
+ *
+ * @param {string} reason
+ * @returns {string}
+ */
+export function bridgePairRefusalSentence(reason) {
+  switch (reason) {
+    case 'no pairing window is open':
+      return 'No pairing window is open on this server, so there is nothing to pair with. Start pairing again.';
+    case 'window expired':
+      return 'That pairing window has expired. Start pairing again.';
+    case 'window already spent':
+      return 'That pairing credential was already used. Start pairing again.';
+    case 'no attempts left':
+      return 'Too many incorrect codes. Start pairing again.';
+    case 'bad credential':
+      return 'That pairing code or token is not right.';
+    case 'the device limit is reached':
+      return 'Too many paired devices. Remove one first.';
+    default:
+      return 'This server could not complete the pairing. Start pairing again.';
+  }
+}
+
+/**
+ * The refusal for a retried pairing request. The bridge hands a device
+ * credential out exactly once and keeps only its digest, so the same phone
+ * request that arrives after a lost response cannot be answered with a
+ * credential a second time, and a body shaped like a pairing success with
+ * no credential would leave the phone holding an empty token.
+ */
+export const BRIDGE_PAIR_REPLAY_REFUSAL = Object.freeze({
+  status: 409,
+  error: 'That pairing request was already completed, and its credential is issued only once. Start pairing again.',
+});
