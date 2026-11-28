@@ -909,6 +909,13 @@ public struct URLSessionLinearGraphQLTransport: LinearGraphQLTransport {
 /// Swift GraphQL actor for Linear issue state synchronization (`claim`, `status`, `comment`).
 /// Enforces seat identity (`AGENT_SEAT`), formats `[SEAT·session]` tags, and deduplicates mutations via idempotency keys.
 public actor LinearSyncClient {
+    /// Receipts a host keeps for completed mutations.  A replay inside this
+    /// window returns its receipt without a second mutation; the oldest
+    /// receipt leaves when a new one arrives past the window, so a host that
+    /// runs for weeks holds a bounded number of them.  The size is the plugin
+    /// event ledger's ring on the server (`SEEN_RING_LIMIT`).
+    public static let defaultReceiptCapacity = 1_000
+
     public let seat: String
     public let sessionId: String
     private let apiKey: String
