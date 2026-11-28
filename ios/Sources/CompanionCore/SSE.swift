@@ -94,7 +94,13 @@ public struct SSEParser: Sendable {
         var value = String(line[line.index(after: colon)...])
         // exactly one optional leading space after the colon, per the spec
         if value.hasPrefix(" ") { value.removeFirst() }
-        fields.append((name: String(line[line.startIndex..<colon]), value: value))
+        let name = String(line[line.startIndex..<colon])
+        bufferedBytes += name.utf8.count + value.utf8.count
+        guard bufferedBytes <= byteLimit else {
+            dropEvent()
+            return nil
+        }
+        fields.append((name: name, value: value))
         return nil
     }
 
