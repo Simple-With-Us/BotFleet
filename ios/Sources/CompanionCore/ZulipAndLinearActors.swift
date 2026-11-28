@@ -921,6 +921,12 @@ public actor LinearSyncClient {
     private let apiKey: String
     private let transport: LinearGraphQLTransport
     private var completedByIdempotencyKey: [String: LinearSyncReceipt] = [:]
+    /// The keys of `completedByIdempotencyKey` in the order they completed,
+    /// oldest first.  Keys before `completedKeyOrderHead` were evicted and
+    /// only wait for the array to be compacted.
+    private var completedKeyOrder: [String] = []
+    private var completedKeyOrderHead = 0
+    private let receiptCapacity: Int
     /// Keys whose mutation is in flight.  A second caller that arrives before
     /// the first one finishes must not send the mutation again: the receipt
     /// cache is only written after the await, so without this set two
