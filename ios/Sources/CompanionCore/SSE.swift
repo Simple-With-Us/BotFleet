@@ -31,6 +31,14 @@ public struct SSEEvent: Equatable, Sendable {
     }
 }
 
+/// The most one line, and one event, may hold before the stream drops it.  A
+/// screen frame is a few hundred kilobytes of base64 PNG, so this is two
+/// orders of magnitude above anything the harness sends; it is also the
+/// bound `server/drivers/pi-mcp-extension.ts` puts on an MCP frame.  Past
+/// it the server is buggy or hostile, and the stream stops growing at the
+/// bound instead of taking the app down with it.
+public let SSEByteLimit = 32 * 1024 * 1024
+
 /// Line-oriented SSE parser. Feed it every line as it arrives; it returns
 /// an event when a blank line closes the block, and nil otherwise.
 public struct SSEParser: Sendable {
