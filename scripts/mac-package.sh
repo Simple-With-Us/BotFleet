@@ -109,6 +109,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Create the DMG (BF-2711).  hdiutil is deprecated on macOS 27, so prefer
+# `diskutil image` where the host has it and keep the hdiutil spelling as
+# the fallback for older runners.  The rm preserves hdiutil's -ov
+# (overwrite) semantics, which diskutil create does not offer.
+create_dmg() { # volume-name source-folder destination.dmg
+  rm -f "$3"
+  if /usr/sbin/diskutil image create from --help >/dev/null 2>&1; then
+    /usr/sbin/diskutil image create from --format UDZO --volumeName "$1" "$2" "$3" >/dev/null
+  else
+    /usr/bin/hdiutil create -volname "$1" -srcfolder "$2" -ov -format UDZO "$3" >/dev/null
+  fi
+}
+
 # Resolve the Apple notarization credentials.  Nothing is printed.
 #
 # The store is the only source.  The environment is not a second source and
@@ -306,7 +319,7 @@ fi
 
 # Final bytes only from here: stapling already rewrote the bundle.
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$OUT/${APP_NAME}.zip"
-hdiutil create -volname "BotFleet" -srcfolder "$APP" -ov -format UDZO "$OUT/${APP_NAME}.dmg" >/dev/null
+create_dmg "BotFleet" "$APP" "$OUT/${APP_NAME}.dmg"
 
 if [ "$SKIP_NOTARIZE" -ne 0 ]; then
   echo "done: $OUT/${APP_NAME}.zip, $OUT/${APP_NAME}.dmg (NOT DISTRIBUTABLE; no appcast generated)"

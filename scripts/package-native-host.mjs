@@ -17,6 +17,33 @@ export function runHostPackagingCommand(command, args, options = {}) {
   return result.stdout ?? "";
 }
 
+// Disk-image tool choice (BF-2711).  hdiutil is deprecated on macOS 27, so
+// prefer `diskutil image` where the host has it and keep the hdiutil
+// spelling as the fallback for older runners.  The probe is the help text
+// of the exact subcommand the create path needs: it exits 0 only where
+// `diskutil image create from` exists, and any spawn failure (including a
+// non-Mac test host) selects the fallback.
+export function diskutilImageAvailable(spawn = spawnSync, args = ["image", "create", "from", "--help"]) {
+  try {
+    return spawn("/usr/sbin/diskutil", args, { stdio: "ignore" }).status === 0;
+  } catch { return false; }
+}
+export function diskImageCreateCommand(useDiskutil, volumeName, source, artifact) {
+  return useDiskutil
+    ? ["/usr/sbin/diskutil", ["image", "create", "from", "--format", "UDZO", "--volumeName", volumeName, source, artifact]]
+    : ["/usr/bin/hdiutil", ["create", "-volname", volumeName, "-srcfolder", source, "-ov", "-format", "UDZO", artifact]];
+}
+export function diskImageAttachCommand(useDiskutil, mountPoint, artifact) {
+  return useDiskutil
+    ? ["/usr/sbin/diskutil", ["image", "attach", "--readOnly", "--nobrowse", "--mountPoint", mountPoint, artifact]]
+    : ["/usr/bin/hdiutil", ["attach", "-readonly", "-nobrowse", "-mountpoint", mountPoint, artifact]];
+}
+export function diskImageDetachCommand(useDiskutil, mountPoint) {
+  return useDiskutil
+    ? ["/usr/sbin/diskutil", ["eject", mountPoint]]
+    : ["/usr/bin/hdiutil", ["detach", mountPoint]];
+}
+
 export async function nativeHostNotaryCredentials({ env = process.env, fetchImpl = fetch } = {}) {
   const token = String(env.INFISICAL_NATIVE_RELEASE_READ_TOKEN ?? "").trim();
   if (!token) {
@@ -45,6 +72,7 @@ export async function nativeHostNotaryCredentials({ env = process.env, fetchImpl
 
 export async function packageNativeHost({ repoRoot, output, build, unsignedDevelopment = false,
   signIdentity, keychain, platform = process.platform, run = runHostPackagingCommand,
+  probeSpawn = spawnSync,
   inspectSignature, readCredentials = nativeHostNotaryCredentials } = {}) {
   if (platform !== "darwin" || !repoRoot || !output || !/^[0-9]{12}$/.test(build ?? "") || /^0+$/.test(build) ||
       (!unsignedDevelopment && !signIdentity)) refused();
@@ -123,7 +151,15 @@ export async function packageNativeHost({ repoRoot, output, build, unsignedDevel
       stage = "signed disk image and notarization";
       const credentials = notaryCredentials;
       artifact = join(destination, `${stem}.dmg`);
-      run("/usr/bin/hdiutil", ["create", "-volname", HOST_CODE_ID, "-srcfolder", payload, "-ov", "-format", "UDZO", artifact]);
+      // Probe create and attach separately, through the injectable spawn
+      // seam: a host may answer one spelling and not the other, and each
+      // verb keeps its own hdiutil fallback.  Eject has no help form to
+      // probe, so the detach below retries hdiutil before refusing.
+      const useDiskutil = diskutilImageAvailable(probeSpawn);
+      const useDiskutilAttach = useDiskutil && diskutilImageAvailable(probeSpawn, ["image", "attach", "--help"]);
+      // diskutil create has no overwrite flag; the rm preserves -ov.
+      if (useDiskutil) rmSync(artifact, { force: true });
+      run(...diskImageCreateCommand(useDiskutil, HOST_CODE_ID, payload, artifact));
       const signing = ["--force", "--sign", signIdentity, "--timestamp"];
       if (keychain) signing.push("--keychain", keychain);
       run("/usr/bin/codesign", [...signing, artifact]);
@@ -141,11 +177,16 @@ export async function packageNativeHost({ repoRoot, output, build, unsignedDevel
       if (verify().binarySha256 !== verified.binarySha256) refused();
       const mounted = join(work, "mounted"); mkdirSync(mounted);
       try {
-        run("/usr/bin/hdiutil", ["attach", "-readonly", "-nobrowse", "-mountpoint", mounted, artifact]);
+        run(...diskImageAttachCommand(useDiskutilAttach, mounted, artifact));
         verifyRelocation(mounted);
       } finally {
-        try { run("/usr/bin/hdiutil", ["detach", mounted]); }
-        catch { safeCleanup = false; refused(); } // Never recursively remove a possibly mounted tree.
+        try { run(...diskImageDetachCommand(useDiskutilAttach, mounted)); }
+        catch {
+          try {
+            if (!useDiskutilAttach) throw new Error("primary detach failed");
+            run(...diskImageDetachCommand(false, mounted));
+          } catch { safeCleanup = false; refused(); } // Never recursively remove a possibly mounted tree.
+        }
       }
     }
     const receipt = { ...verified, distributable: !unsignedDevelopment, artifact: artifact.slice(destination.length + 1),

@@ -311,8 +311,18 @@ jobs:
           mkdir -p native-upload
           app="$RUNNER_TEMP/export/BotFleet.app"
           ditto -c -k --sequesterRsrc --keepParent "$app" "native-upload/BotFleetMac-$VERSION.zip"
-          hdiutil create -volname "BotFleet" -srcfolder "$app" -ov -format UDZO \
-            "native-upload/BotFleetMac-$VERSION.dmg" > /dev/null
+          # BF-2711: hdiutil is deprecated on macOS 27.  Prefer diskutil
+          # image where the runner has it; keep hdiutil for older images.
+          # The rm preserves hdiutil's -ov (overwrite) semantics.
+          create_dmg() {
+            rm -f "$3"
+            if /usr/sbin/diskutil image create from --help > /dev/null 2>&1; then
+              /usr/sbin/diskutil image create from --format UDZO --volumeName "$1" "$2" "$3" > /dev/null
+            else
+              /usr/bin/hdiutil create -volname "$1" -srcfolder "$2" -ov -format UDZO "$3" > /dev/null
+            fi
+          }
+          create_dmg "BotFleet" "$app" "native-upload/BotFleetMac-$VERSION.dmg"
           p8="$RUNNER_TEMP/notary.p8"
           echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$p8"
           exec 3< "$p8"
