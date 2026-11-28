@@ -59,7 +59,15 @@ public struct SSEParser: Sendable {
     /// Events dropped for going over the limit since this parser was made.
     public private(set) var droppedEventCount = 0
 
-    public init() {}
+    public init(byteLimit: Int = SSEByteLimit) {
+        self.byteLimit = max(1, byteLimit)
+    }
+
+    /// Bytes the event in progress holds so far.
+    public var bufferedByteCount: Int { bufferedBytes }
+
+    /// True while the event in progress is over the limit and being dropped.
+    public var isDroppingEvent: Bool { droppingEvent }
 
     public mutating func line(_ raw: String) -> SSEEvent? {
         // AsyncLineSequence strips the newline but not a CR from CRLF
