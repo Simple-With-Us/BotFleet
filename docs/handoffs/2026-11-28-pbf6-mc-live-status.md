@@ -1,6 +1,6 @@
 # P-BF-6 Live Status And Handoff (Seat MC)
 
-Last updated: Sat, Nov 28, 1:47 AM, by MC (Muse in Bitrig, session
+Last updated: Sat, Nov 28, 2:00 AM, by MC (Muse in Bitrig, session
 `01a2207d-76b3-71d2-8dfa-e6839f3b36d6`, name wheat-asteroid).  Mirror:
 Apple Note `[BF, Muse] P-BF-6 completion pass` (Coding folder,
 `p13006`).  The durable audit behind this note is
@@ -45,22 +45,26 @@ the live system and fix this file first.
 ## In Flight (Next Actions In Order)
 
 1. **[#2259](https://github.com/Simple-With-Us/BotFleet/pull/2259)
-   (BF-2720 fleet docs, head `6f9577ea3`)** — auto-merge armed, CI
-   running at last check.  On merge: `simple-board status BF-2720 completed --resolution "Landed in #2259."`,
+   (BF-2720 fleet docs, head `fefc3c77b`)** — auto-merge armed.  Kody
+   round 1 (2 findings: missing seat/write-switch prefixes, claim-step
+   lane info) fixed and threads resolved; Kody re-requested on this
+   head.  On merge: `simple-board status BF-2720 completed --resolution "Landed in #2259."`,
    Zulip closeout in topic `BF-2720 Hosted-mode fleet docs`, then move
-   this row to Done.  Read any Kody/Seer findings on the head first and
-   fix or decline each in-thread before resolving.
+   this row to Done.
 2. **[#2258](https://github.com/Simple-With-Us/BotFleet/pull/2258)
-   (BF-2711 diskutil image, head `3f2980430`)** — deliberately NO
-   auto-merge: the issue keeps the human release-path gate.  Next:
-   confirm hosted CI green, disposition every Kody/Seer finding, then
-   leave it for the owner's merge decision.  After it lands, final
-   acceptance is a dispatched `native-mac-release.yml` run on a macOS
-   27 runner; only then close BF-2711.  Local evidence already in the
-   PR: argv tests 3/3, `test:native-release` 512 pass / 0 fail, real
-   create/attach/read/eject round trip on macOS 27.2.1.
-3. **This handoff PR** — land it, then keep updating this file in
-   follow-up commits on main (small docs PRs) as items above finish.
+   (BF-2711 diskutil image, head `5bd5b816a`)** — deliberately NO
+   auto-merge: the issue keeps the human release-path gate.  Kody
+   round 1 (3 findings: real-tool test, per-verb probe, spawn seam)
+   fixed and threads resolved, one half declined with reason
+   in-thread (workflow mount-check); Kody re-requested on this head.
+   Next: confirm hosted CI green on this head, then leave it for the
+   owner's merge decision.  After it lands, final acceptance is a
+   dispatched `native-mac-release.yml` run on a macOS 27 runner; only
+   then close BF-2711.  Local evidence: argv + real round-trip tests
+   4/4, `test:native-release` 513 pass / 0 fail on macOS 27.2.1.
+3. **This handoff note** — landed as #2260 (`8f953377`); keep updating
+   it in small follow-up docs PRs as items above finish (this update
+   is the first).
 
 ## Server Update Recipe (Exact, Reused Twice This Session)
 
@@ -115,3 +119,7 @@ files (owner property, left untouched).
   restarted, harness `ready: true` verified.
 - Sat, Nov 28, 1:47 AM — This live handoff note created; BF-2711 PR
   #2258 and BF-2720 PR #2259 in flight as described above.
+- Sat, Nov 28, 1:49 AM — Handoff note landed as #2260 (`8f953377`).
+- Sat, Nov 28, 2:00 AM — Kody round 1 fixed on #2258 (`5bd5b816a`)
+  and #2259 (`fefc3c77b`); all five threads replied and resolved,
+  Kody re-requested on both new heads; this update records it.
