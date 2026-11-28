@@ -103,3 +103,16 @@ scripts/ios-fleet/ios-app-versions.json
 # Test fixture exposure links (server/zulip/state.test.ts): tmpdir-backed,
 # one pid-named symlink per run, removed by its owner - never tracked scratch.
 .zulip-store-rel-test-*
+
+# --- No secrets in files: all secrets live only in Infisical ---
+.env
+.env.*
+*.env
+.dev.vars
+.dev.vars.*
+.prod.vars
+.prod.vars.*
+*.vars
+!*.example
+!*.sample
+!*.template
