@@ -30,13 +30,18 @@ This smoke runs the real path:
 The optional native headless host ships on a path of its own, and it can never
 be the reason the standard signed GUI release fails.
 
-The GUI release is `native-mac-release.yml`.  It archives the app, signs it,
-notarizes it, staples it, packages the ZIP and the DMG from the stapled app and
-publishes the asset set.  It does not build the optional host, and it must not
-grow a step that does.  The separation is held by
-`scripts/native-host-independent-path.node-test.mjs`, which fails if the
-release workflow ever names the host packager or the host smoke, and which
-fails if the standard test chain ever grows the host's real packaging build.
+The GUI release is `native-mac-release.yml`.   It archives the app, signs it,
+notarizes it, staples it, packages the ZIP and the DMG from the stapled app
+and attaches the asset set to a draft.   The three jobs that do that,
+`mac-native`, `assemble` and `draft`, do not build the optional host, and none
+of them needs a job that does.   The separation is held by
+`scripts/native-host-independent-path.node-test.mjs`, on the parsed
+workflow:   no GUI release job names the host packager or the host smoke, by
+any of their spellings;   nothing in the GUI release chain `needs` a host job,
+so a skipped or failed host job can neither skip nor fail the release;   and
+the standard test chain never grows the host's real packaging build.   Each of
+those assertions was checked against a workflow deliberately broken in that
+one way.
 
 The host's own path is opt-in and separate.  `pnpm smoke:native-host-package`
 runs `scripts/native-host-package-smoke.mjs`, which packages the checkout with
@@ -50,13 +55,59 @@ binaries, `scripts/native-host-artifact.node-test.mjs`.  That proof costs a
 synthetic fixture and says nothing about a shipped artifact, so it belongs in
 the chain;  the real build does not, and it stays behind its own command.
 
-What stays with the owner, and is claimed by none of this:  the Developer ID
+What stays with the owner, and is claimed by none of this:   the Developer ID
 identity and its grant, the notarization credentials, the installed and
-pre-login acceptance on a real Mac, the service credentials, and any decision
-to publish the host artifact.  A dedicated opt-in workflow for the host may be
-added later, and it must be a workflow file of its own:  a step inside the GUI
-release job would tie the optional host to the standard release, which is the
-one thing this separation exists to prevent.
+pre-login acceptance on a real Mac, the service credentials, and the decision
+to publish a release.   The host's artifact is built by the same dispatch, in
+a job of its own, when the `native-host` input is ticked.   The next section
+says what that job does and what it proves.
+
+## The Signed Artifact In The Native Release
+
+`Native Mac Release` builds the host only when its **native-host** input is
+ticked, and it builds it in a job of its own, `mac-native-host`.   That job
+checks out the commit `prepare` pinned, imports the same Developer ID
+certificate into a throwaway keychain, and runs
+`scripts/package-native-host.mjs` with the build `prepare` planned, so the
+disk image carries the same source commit, the same build number and the same
+signing team as the app beside it.   The packager builds both slices from an
+export of the committed `ios` tree, stamps the binary, signs it and verifies
+that signature itself, then notarizes, staples and checks the image.   It
+reads the notarization credentials itself, with the lane's own read token and
+from the folder that token covers.   It refuses a dirty checkout for a
+distributable build, which is why the job runs on a clean checkout of its own
+and writes nothing into it.
+
+| Property | How | Failure Cause |
+|---|---|---|
+| The receipt names the pinned commit and build | `scripts/verify-native-host-artifact.mjs release` reads `artifact.json` and refuses another source commit, another build, or anything but a Developer ID distribution | `another commit or build than the pinned ones` |
+| The bytes on disk are the bytes the receipt names | the image is hashed again and compared with the receipt's `artifactSha256` | `does not hash to the digest the receipt names` |
+| The mounted image holds the executable the receipt names, with its signature intact | the image is mounted read-only and `verifyNativeHostArtifact` runs on `bin/BotFleetNativeHost` inside it: both slices, both real signatures, the team, the hardened runtime, the stamp and the exact file set | `Native host artifact verification refused.` |
+| The image never stays mounted | the detach runs on every path out, and the mount point is removed only after the detach is confirmed twice, by `hdiutil`'s exit status and by the file system, and then with whatever was left inside it | a failed detach fails the job |
+| What is attached is what was verified | the attach job downloads the artifact, hashes it again against the digest the macOS job reported, and refuses a release that is no longer a draft | `not the one the build job verified` |
+
+A green run prints, from the macOS job,
+`Notarized container; installation is separate: BotFleetNativeHost-0.1.0-<build>.dmg`
+and then `PASS native host artifact ... mounted and verified.`   With
+**draft** ticked as well, the attach job ends with
+`native host artifact on v<version>-<build>-native: ...`, listing the asset
+beside the app's.   The Actions artifact is `native-mac-host-release` and
+holds the disk image with its receipt;   only the disk image is attached to
+the release.
+
+The job produces and publishes the artifact and does nothing else.   It never
+runs the packaged executable, installs nothing, registers no LaunchAgent or
+LaunchDaemon and touches no live host;   the test that holds the GUI release
+independent holds this too.   A failure inside the job fails the job:   no
+step there may continue past an error, and nothing is uploaded before the
+verifier passes.
+
+What a local run can prove, and what it cannot:   on a Mac, the unsigned
+development package, the verifier over it, and the verifier over a locally
+built read-only image are the recipe under Running It.   The Developer ID
+signature, the notarization and the stapling need the certificate and the
+notarization credentials, which exist only in the release lane, so the hosted
+run is their receipt.
 
 ## Running It
 
@@ -82,6 +133,58 @@ order is proved as well:  a fixture swaps the receipt's binary digest and
 asserts that the executable is never executed, and a fixture removes an
 identity field from both sides and asserts that the difference is still
 reported.
+
+### Verifying A Package With The Release Verifier
+
+`scripts/verify-native-host-artifact.mjs` is what the release workflow runs
+over the packaged host.   It can be run by hand against an unsigned
+development package, on the unpacked payload and through a locally built,
+read-only image, which is as far as a Mac without the release certificate can
+take it.   The build is the commit's own Central stamp.
+
+```sh
+work="$(mktemp -d "${TMPDIR:-/tmp}/bf-native-host.XXXXXX")"
+build="$(TZ=America/Chicago git log -1 --date=format-local:%Y%m%d%H%M --format=%cd)"
+source="$(git rev-parse HEAD)"
+node scripts/package-native-host.mjs --repo-root . --output "$work/package" --build "$build" --unsigned-dev
+node scripts/verify-native-host-artifact.mjs payload "$work/package/payload" \
+  --source "$source" --build "$build" --unsigned-development
+hdiutil create -volname BotFleetNativeHost -srcfolder "$work/package/payload" -ov -format UDZO "$work/local.dmg"
+# A mount that cannot happen leaves no mount point behind.
+node --input-type=module -e 'import { mountDiskImage } from "./scripts/verify-native-host-artifact.mjs";
+  mountDiskImage(process.argv[1]);' "$work/missing.dmg" && exit 1
+mnt="$(node --input-type=module -e 'import { mountDiskImage } from "./scripts/verify-native-host-artifact.mjs";
+  console.log(mountDiskImage(process.argv[1]));' "$work/local.dmg")"
+node scripts/verify-native-host-artifact.mjs payload "$mnt" \
+  --source "$source" --build "$build" --unsigned-development
+# While the image is on it, the verifier's own detach removes nothing.
+node --input-type=module -e 'import { unmountDiskImage } from "./scripts/verify-native-host-artifact.mjs";
+  unmountDiskImage(process.argv[1], { detached: () => true });' "$mnt" && exit 1
+test -d "$mnt/bin"
+# After a detach, it removes the mount point with anything left inside it.
+hdiutil detach "$mnt"
+touch "$mnt/left-behind"
+node --input-type=module -e 'import { unmountDiskImage } from "./scripts/verify-native-host-artifact.mjs";
+  unmountDiskImage(process.argv[1], { detached: () => true });' "$mnt"
+test ! -e "$mnt"
+# The whole detach, hdiutil and the file system both, on a mounted image.
+mnt="$(node --input-type=module -e 'import { mountDiskImage } from "./scripts/verify-native-host-artifact.mjs";
+  console.log(mountDiskImage(process.argv[1]));' "$work/local.dmg")"
+node --input-type=module -e 'import { unmountDiskImage } from "./scripts/verify-native-host-artifact.mjs";
+  unmountDiskImage(process.argv[1]);' "$mnt"
+test ! -e "$mnt"
+rm -rf "$work"
+```
+
+Each verifier call answers
+`PASS native host payload: source <commit>, build <build>, arm64+x86_64, unsigned-development.`
+or exits 1 with a refusal and no pass line.   A build or commit other than the
+stamp's is refused, and so is the same payload held to the distributable
+standard, because the real signature inspector finds nothing to trust in an
+unsigned binary.  The mount that cannot happen answers `the disk image did not mount`
+and leaves no mount point behind.  The detach that finds the image still on the
+mount point answers `the disk image is still mounted after the detach` and removes
+nothing; the others answer nothing and remove the mount point.
 
 ## What The Receipt Has To Say
 

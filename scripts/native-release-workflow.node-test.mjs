@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -526,4 +526,124 @@ test("the release path regenerates the Mac plist, so the plist cannot be the onl
   // wrong, so assert the regeneration is still there.
   assert.match(localScript, /xcodegen generate/);
   assert.match(workflow, /xcodegen generate/);
+});
+
+// The optional native headless host (BF-2635) rides the same dispatch as an
+// opt-in job and shares what the app's release is pinned to:  one commit, one
+// planned build, one Developer ID certificate.  Its separation from the GUI
+// release is proved in scripts/native-host-independent-path.node-test.mjs;
+// these hold the host job to the release's own pins.
+test("the optional native host is built from the pinned commit with the app's planned build and certificate", () => {
+  const parsed = parseYaml(workflow);
+  const host = parsed.jobs["mac-native-host"];
+  const checkout = host.steps.find((step) => String(step.uses).startsWith("actions/checkout"));
+  assert.equal(checkout.with.ref, "${{ needs.prepare.outputs.sha }}");
+  assert.equal(checkout.with["persist-credentials"], false);
+  assert.equal(checkout.uses, parsed.jobs["mac-native"].steps[0].uses);
+  assert.equal(host.env.DEVELOPER_DIR, parsed.jobs["mac-native"].env.DEVELOPER_DIR);
+  assert.ok(host.steps.some((step) => step.run === "bash scripts/ios-assert-xcode.sh 27.0"));
+  const packager = host.steps.find((step) => step.name === "Package, sign and notarize the native host");
+  assert.equal(packager.env.BUILD, "${{ needs.prepare.outputs.build }}");
+  assert.match(packager.run, /--build "\$BUILD"/);
+  // The packager reads the notarization credentials itself, with the lane's
+  // own read token and from the folder that token covers.  The APPLE trio is
+  // never handed to it through the environment, so no step here carries it.
+  assert.equal(packager.env.INFISICAL_NATIVE_RELEASE_READ_TOKEN, "${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}");
+  assert.deepEqual(Object.keys(packager.env).sort(), ["BUILD", "INFISICAL_NATIVE_RELEASE_READ_TOKEN"]);
+  // It signs through the throwaway keychain the import step fills, with the
+  // identity selector the app's archive uses, and it never builds unsigned.
+  assert.match(packager.run, /--sign-identity "Developer ID Application"/);
+  assert.match(packager.run, /--keychain "\$RUNNER_TEMP\/native-host\.keychain-db"/);
+  assert.doesNotMatch(packager.run, /--unsigned-dev/);
+  const imported = host.steps.find((step) => step.name === "Import the Developer ID certificate into a throwaway keychain");
+  assert.match(imported.run, /KEYCHAIN="\$RUNNER_TEMP\/native-host\.keychain-db"/);
+  const certificate = host.steps.find((step) => step.uses === "./.github/actions/infisical-secrets");
+  assert.equal(certificate.name, "Load the Developer ID certificate for the native host");
+  assert.deepEqual(certificate.with.names.split(/\s+/), ["MAC_CERT_P12_BASE64", "MAC_CERT_PASSWORD"]);
+  assert.equal(certificate.with.required, certificate.with.names);
+  // The output lands outside the checkout:  the packager refuses to write
+  // inside the repository, and it refuses a dirty tree for a release build.
+  assert.match(packager.run, /--repo-root \./);
+  assert.match(packager.run, /--output "\$RUNNER_TEMP\/native-host"/);
+});
+
+test("the native host artifact is verified against the pins before anything is uploaded, and re-checked before it is attached", () => {
+  const parsed = parseYaml(workflow);
+  const host = parsed.jobs["mac-native-host"];
+  const names = host.steps.map((step) => step.name);
+  const order = ["Package, sign and notarize the native host",
+    "Verify the packaged native host against the pinned commit and build", "Stage the native host artifact and its receipt"];
+  const positions = order.map((name) => names.indexOf(name));
+  assert.ok(positions.every((position, index) => position > (positions[index - 1] ?? -1)), `host steps run out of order: ${names.join(", ")}`);
+  // The upload is the last step of the job, and its artifact is its own.
+  const upload = host.steps.at(-1);
+  assert.ok(String(upload.uses).startsWith("actions/upload-artifact"));
+  assert.equal(upload.with.name, "native-mac-host-release");
+  assert.notEqual(upload.with.name, parsed.jobs["mac-native"].steps.at(-1).with.name);
+  const verify = host.steps.find((step) => step.id === "verify");
+  assert.equal(verify.env.SOURCE_COMMIT, "${{ needs.prepare.outputs.sha }}");
+  assert.equal(verify.env.BUILD, "${{ needs.prepare.outputs.build }}");
+  assert.match(verify.run, /verify-native-host-artifact\.mjs release "\$RUNNER_TEMP\/native-host" \\\n\s+--source "\$SOURCE_COMMIT" --build "\$BUILD"\)" \|\| \{/);
+  const staged = host.steps.find((step) => step.name === "Stage the native host artifact and its receipt");
+  assert.equal(staged.env.ARTIFACT, "${{ steps.verify.outputs.artifact }}");
+  assert.match(staged.run, /cp "\$RUNNER_TEMP\/native-host\/\$ARTIFACT" "\$RUNNER_TEMP\/native-host-upload\/"/);
+
+  const attach = parsed.jobs["native-host-draft"];
+  assert.equal(attach.steps.find((step) => String(step.uses).startsWith("actions/download-artifact")).with.name, "native-mac-host-release");
+  const recheck = attach.steps.find((step) => step.name === "Verify the downloaded bytes are the ones the macOS job verified");
+  assert.equal(recheck.env.ARTIFACT_SHA256, "${{ needs.mac-native-host.outputs.artifact_sha256 }}");
+  assert.match(recheck.run, /release host-assets \\\n\s+--source "\$SOURCE_COMMIT" --build "\$BUILD" \\\n\s+--expect-artifact-sha256 "\$ARTIFACT_SHA256" --no-mount/);
+  const attachNames = attach.steps.map((step) => step.name);
+  assert.ok(attachNames.indexOf(recheck.name) < attachNames.indexOf("Attach the native host artifact to the draft"));
+  const attachStep = attach.steps.find((step) => step.name === "Attach the native host artifact to the draft");
+  assert.equal(attachStep.env.ARTIFACT, "${{ needs.mac-native-host.outputs.artifact }}");
+  // The same tag the app's draft job uploads to, the same draft guard, and
+  // only the verified artifact:  the receipt stays an Actions artifact.
+  assert.match(attachStep.run, /tag="v\$\{VERSION\}-\$\{BUILD\}\$\{NATIVE_TAG_SUFFIX\}"/);
+  assert.match(attachStep.run, /jq -r \.draft <<< "\$existing"/);
+  assert.match(attachStep.run, /gh release upload "\$tag" "\$ARTIFACT" --repo "\$RELEASES_REPO" --clobber/);
+});
+
+/** Run the host job's verify step in real bash against a stand-in for the verifier, so the shipped step text is what is exercised. */
+function runHostVerifyStep(verifierStatus, verifierStdout) {
+  const step = parseYaml(workflow).jobs["mac-native-host"].steps.find((entry) => entry.id === "verify");
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-native-host-verify-"));
+  try {
+    const bin = join(directory, "bin"), spoken = join(directory, "verifier.out"), output = join(directory, "github-output");
+    mkdirSync(bin);
+    writeFileSync(spoken, verifierStdout);
+    writeFileSync(output, "");
+    writeFileSync(join(bin, "node"), '#!/bin/sh\ncat "${SPOKEN}"\nexit "${VERIFIER_STATUS}"\n', { mode: 0o755 });
+    const result = runShell(
+      `export PATH="${bin}:$PATH"\nexport SPOKEN="${spoken}" VERIFIER_STATUS=${verifierStatus}\n` +
+        `export RUNNER_TEMP="${directory}" GITHUB_OUTPUT="${output}" SOURCE_COMMIT=${"a".repeat(40)} BUILD=202611270252\n` +
+        step.run);
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr, output: readFileSync(output, "utf8") };
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+test("the host verify step hands the verifier's artifact and digest onward, and stops the job when the verifier refuses", () => {
+  const digest = "b".repeat(64), artifact = "BotFleetNativeHost-0.1.0-202611270252.dmg";
+  const passing = [
+    `PASS native host artifact ${artifact}: source ${"a".repeat(40)}, build 202611270252, arm64+x86_64, developer-id, signature verified, mounted and verified.`,
+    `artifact=${artifact}`,
+    `artifact_sha256=${digest}`,
+  ].join("\n");
+  const ok = runHostVerifyStep(0, passing);
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.match(ok.stdout, /^PASS native host artifact/m);
+  assert.equal(ok.output, `artifact=${artifact}\nartifact_sha256=${digest}\n`);
+  // A refusal fails the step, and publishes no artifact or digest for a later
+  // job to attach.
+  const refused = runHostVerifyStep(1, "");
+  assert.equal(refused.status, 1);
+  assert.equal(refused.output, "");
+  assert.match(refused.stdout + refused.stderr, /did not verify against the pinned commit and build/);
+  // A pass line without a digest is not a pass:  the step fails rather than
+  // exporting an empty pin.
+  const truncated = runHostVerifyStep(0, `PASS native host artifact x.\nartifact=${artifact}\n`);
+  assert.equal(truncated.status, 1);
+  assert.equal(truncated.output, "");
 });

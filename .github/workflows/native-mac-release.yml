@@ -38,6 +38,11 @@ on:
         required: false
         type: boolean
         default: false
+      native-host:
+        description: "Also build, sign and notarize the optional native headless host (BF-2635) as its own artifact"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -518,3 +523,154 @@ jobs:
             gh release upload "$tag" "$f" --repo "$RELEASES_REPO" --clobber
           done
           echo "native assets on $tag: $(gh release view "$tag" --repo "$RELEASES_REPO" --json assets --jq '[.assets[].name | select(startswith("BotFleetMac") or . == "appcast.xml")] | join(", ")')"
+
+  # The optional native headless host (BF-2635).  Opt-in, and nothing in the
+  # GUI release chain (mac-native, assemble, draft) needs it, so a skipped or
+  # failed host job cannot skip or fail the app's release.  It builds the same
+  # pinned commit and planned build, signs with the app's Developer ID
+  # certificate, and produces the artifact only: the packaged host is never
+  # installed, registered or run.
+  mac-native-host:
+    name: BotFleetNativeHost (sign, notarize, verify)
+    if: ${{ inputs.native-host }}
+    needs: prepare
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+    outputs:
+      artifact: ${{ steps.verify.outputs.artifact }}
+      artifact_sha256: ${{ steps.verify.outputs.artifact_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert the pinned Xcode
+        run: bash scripts/ios-assert-xcode.sh 27.0
+      - name: Load the Developer ID certificate for the native host
+        uses: ./.github/actions/infisical-secrets
+        with:
+          names: MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
+          required: MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          token: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
+        env:
+          GH_FALLBACK_MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          GH_FALLBACK_MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+      - name: Import the Developer ID certificate into a throwaway keychain
+        env:
+          MAC_CERT_P12_BASE64: ${{ env.MAC_CERT_P12_BASE64 }}
+          MAC_CERT_PASSWORD: ${{ env.MAC_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/native-host.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "$MAC_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/native-host-cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/native-host-cert.p12" -P "$MAC_CERT_PASSWORD" -T /usr/bin/codesign \
+            -t cert -f pkcs12 -k "$KEYCHAIN"
+          rm -f "$RUNNER_TEMP/native-host-cert.p12"
+          # Let codesign use the key without an interactive prompt, and nothing else:
+          # the partition list names Apple's tools, as the app's own import does.
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain
+      # The packager reads its notarization credentials itself, with this
+      # lane's read token, and writes outside the checkout.
+      - name: Package, sign and notarize the native host
+        env:
+          BUILD: ${{ needs.prepare.outputs.build }}
+          INFISICAL_NATIVE_RELEASE_READ_TOKEN: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
+        run: |
+          node scripts/package-native-host.mjs --repo-root . --output "$RUNNER_TEMP/native-host" \
+            --build "$BUILD" --sign-identity "Developer ID Application" \
+            --keychain "$RUNNER_TEMP/native-host.keychain-db"
+      # The packager's receipt is its own word for the result, so the bytes
+      # are read again against the pins this run made, and the disk image is
+      # mounted read-only to inspect what is inside.
+      - name: Verify the packaged native host against the pinned commit and build
+        id: verify
+        env:
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.sha }}
+          BUILD: ${{ needs.prepare.outputs.build }}
+        run: |
+          out="$(node scripts/verify-native-host-artifact.mjs release "$RUNNER_TEMP/native-host" \
+            --source "$SOURCE_COMMIT" --build "$BUILD")" || {
+            echo "::error::the packaged native host did not verify against the pinned commit and build"; exit 1; }
+          printf '%s\n' "$out"
+          artifact="$(printf '%s\n' "$out" | sed -n 's/^artifact=//p')"
+          digest="$(printf '%s\n' "$out" | sed -n 's/^artifact_sha256=//p')"
+          if [ -z "$artifact" ] || [ -z "$digest" ]; then
+            echo "::error::the verifier passed without naming the artifact and its digest"; exit 1
+          fi
+          printf 'artifact=%s\nartifact_sha256=%s\n' "$artifact" "$digest" >> "$GITHUB_OUTPUT"
+      - name: Stage the native host artifact and its receipt
+        env:
+          ARTIFACT: ${{ steps.verify.outputs.artifact }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/native-host-upload"
+          cp "$RUNNER_TEMP/native-host/$ARTIFACT" "$RUNNER_TEMP/native-host-upload/"
+          cp "$RUNNER_TEMP/native-host/artifact.json" "$RUNNER_TEMP/native-host-upload/"
+      # Runs whether or not the steps above succeeded, so the throwaway keychain and the
+      # certificate material never outlive the job on a runner that keeps its state.
+      - name: Remove the throwaway keychain and certificate material
+        if: ${{ always() }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/native-host.keychain-db"
+          if [ -e "$KEYCHAIN" ]; then security delete-keychain "$KEYCHAIN"; fi
+          rm -f "$RUNNER_TEMP/native-host-cert.p12"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-mac-host-release
+          path: ${{ runner.temp }}/native-host-upload
+          if-no-files-found: error
+          retention-days: 14
+
+  native-host-draft:
+    name: Attach the native host artifact to the draft release
+    # !cancelled() lets this job be evaluated after a skipped dependency, and
+    # the two result checks keep a failed or skipped host job, or a draft that
+    # did not land, from being passed over in silence.
+    if: ${{ !cancelled() && inputs.native-host && inputs.draft && !inputs.unsigned-draft && needs.mac-native-host.result == 'success' && needs.draft.result == 'success' }}
+    needs: [prepare, draft, mac-native-host]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: native-mac-host-release
+          path: host-assets
+      - name: Verify the downloaded bytes are the ones the macOS job verified
+        env:
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.sha }}
+          BUILD: ${{ needs.prepare.outputs.build }}
+          ARTIFACT_SHA256: ${{ needs.mac-native-host.outputs.artifact_sha256 }}
+        run: |
+          node scripts/verify-native-host-artifact.mjs release host-assets \
+            --source "$SOURCE_COMMIT" --build "$BUILD" \
+            --expect-artifact-sha256 "$ARTIFACT_SHA256" --no-mount
+      - name: Attach the native host artifact to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD: ${{ needs.prepare.outputs.build }}
+          ARTIFACT: ${{ needs.mac-native-host.outputs.artifact }}
+        run: |
+          cd host-assets
+          tag="v${VERSION}-${BUILD}${NATIVE_TAG_SUFFIX}"
+          existing=$(gh api "repos/$RELEASES_REPO/releases/tags/$tag") || {
+            echo "::error::$tag has no release to attach the native host to"; exit 1; }
+          is_draft=$(jq -r .draft <<< "$existing")
+          if [ "$is_draft" != true ]; then
+            echo "::error::$tag is already published; refusing to add an asset to it"
+            exit 1
+          fi
+          gh release upload "$tag" "$ARTIFACT" --repo "$RELEASES_REPO" --clobber
