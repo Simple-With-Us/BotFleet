@@ -958,6 +958,7 @@ public actor LinearSyncClient {
         self.seat = cleanSeat
         self.sessionId = cleanSession
         self.apiKey = apiKey
+        self.receiptCapacity = max(1, receiptCapacity)
         if let transport {
             self.transport = transport
         } else {
