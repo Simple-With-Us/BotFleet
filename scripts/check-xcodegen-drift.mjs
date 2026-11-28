@@ -19,13 +19,13 @@ import { fileURLToPath } from "node:url";
 
 /**
  * Every tracked file `xcodegen generate` rewrites from ios/project.yml:
- * each app target's `info.path` and `entitlements.path`.  A new target
- * with an `info:` or `entitlements:` block must add its files here.
- * The generated `.xcodeproj` is deliberately absent: ios/.gitignore
- * ignores `*.xcodeproj`, so git cannot see it drift.
+ * each app target's `info.path` and `entitlements.path` that git tracks.
+ * A new target with an `info:` or `entitlements:` block must add its
+ * tracked files here.  Two kinds of generated output are deliberately
+ * absent because git cannot see them drift: the `.xcodeproj` and the
+ * iOS App target's `ios/App/Info.plist`, both ignored by ios/.gitignore.
  */
 export const GENERATED_PATHS = [
-  "ios/App/Info.plist",
   "ios/App/BotFleet.entitlements",
   "ios/Widgets/Info.plist",
   "ios/Widgets/BotFleetWidgets.entitlements",

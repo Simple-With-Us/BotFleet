@@ -35,13 +35,34 @@ describe("check-xcodegen-drift (BF-2718)", () => {
 
   it("names each target's Info.plist and entitlements file", () => {
     assert.deepEqual(GENERATED_PATHS, [
-      "ios/App/Info.plist",
       "ios/App/BotFleet.entitlements",
       "ios/Widgets/Info.plist",
       "ios/Widgets/BotFleetWidgets.entitlements",
       "ios/MacApp/Info.plist",
       "ios/MacApp/BotFleetMac.entitlements",
     ]);
+  });
+
+  it("keeps all tracked generated paths under drift coverage", () => {
+    for (const path of GENERATED_PATHS) {
+      mkdirSync(join(root, dirname(path)), { recursive: true });
+      writeFileSync(join(root, path), "tracked\n");
+    }
+    git(root, "add", "ios");
+    git(root, "commit", "-qm", "all generated paths");
+    for (const path of GENERATED_PATHS) {
+      writeFileSync(join(root, path), "changed\n");
+      assert.deepEqual(findDriftedPaths(root), [path]);
+      git(root, "checkout", "--", path);
+    }
+  });
+
+  it("does not claim git drift coverage for ignored App Info.plist", () => {
+    writeFileSync(join(root, ".gitignore"), "ios/App/Info.plist\n");
+    mkdirSync(join(root, "ios/App"), { recursive: true });
+    writeFileSync(join(root, "ios/App/Info.plist"), "generated\n");
+    assert.deepEqual(findDriftedPaths(root), []);
+    assert.equal(GENERATED_PATHS.includes("ios/App/Info.plist"), false);
   });
 
   it("passes a clean tree", () => {
