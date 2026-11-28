@@ -253,6 +253,11 @@ public func eventStream(
                 // which is precisely the ownership the comment above says this
                 // file exists to get right — so it stays as it is until there
                 // is a Mac to prove the replacement on.
+                //
+                // `SSELineBuffer` holds the newline split and the bound on one
+                // line; `SSEParser` holds the bound on one event. Together
+                // they are what keeps a frame that never ends, or a block that
+                // never closes, from growing memory without limit.
                 for try await byte in bytes {
                     guard byte == 0x0A else {
                         line.append(byte)
