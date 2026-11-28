@@ -104,9 +104,21 @@ public struct SSEParser: Sendable {
         return nil
     }
 
-    /// Anything still buffered when the stream ends. An event without its
-    /// closing blank line is incomplete, so this is deliberately discarded
-    /// rather than guessed at.
+    /// Tells the parser that a line of the event in progress arrived longer
+    /// than the limit, so that event is dropped whole rather than half-parsed.
+    public mutating func lineOverLimit() {
+        dropEvent()
+    }
+
+    /// Lets go of the event in progress and keeps nothing more for it.
+    private mutating func dropEvent() {
+        droppingEvent = true
+        fields.removeAll()
+        bufferedBytes = 0
+    }
+
+    /// Anything still buffered. An event without its closing blank line is
+    /// incomplete, so this is deliberately discarded rather than guessed at.
     public mutating func reset() {
         fields.removeAll()
     }
