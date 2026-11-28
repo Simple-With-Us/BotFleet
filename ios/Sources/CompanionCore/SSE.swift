@@ -6,6 +6,10 @@
 // data, comments used as keepalives, the optional space after the colon —
 // so it is the part that can be tested without a server.
 //
+// Both pieces are bounded. A line past `SSEByteLimit` is not kept, and an
+// event past it is dropped whole, so a frame that never ends cannot take
+// the app's memory with it.
+//
 // The harness's stream is documented in `server/index.ts`: each frame is
 // `id: <streamId>:<seq>` followed by one `data:` line, separated by a blank
 // line, with `: keepalive` comments every 25 seconds.
